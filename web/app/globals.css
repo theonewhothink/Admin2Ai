@@ -977,6 +977,29 @@ button.chip:hover {
   margin-left: 4px;
 }
 
+@media (max-width: 519px) {
+  .tile {
+    min-height: 124px;
+    padding: 14px;
+  }
+
+  .tile-label {
+    gap: 6px;
+    font-size: 14px;
+    white-space: nowrap;
+  }
+
+  .tile-value {
+    font-size: 30px;
+  }
+
+  .tile-value small {
+    display: block;
+    margin: 6px 0 0;
+    font-size: 14px;
+  }
+}
+
 /* ==========================================================================
    Motion preferences
    ========================================================================== */

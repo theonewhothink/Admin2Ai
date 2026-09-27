@@ -76,18 +76,22 @@ function Shell({
     <article id={item.id} className={styles.outer} data-phase={phase} aria-labelledby={`${item.id}-title`}>
       <div className={styles.clip}>
         <div className={`card ${styles.card}`} data-tone={item.tone}>
-          <div className={styles.body} aria-hidden={resolved} inert={resolved}>
-            {children}
+          <div className={styles.bodyWrap}>
+            <div className={styles.body} aria-hidden={resolved} inert={resolved}>
+              {children}
+            </div>
           </div>
-          <div className={styles.done} role="status" aria-live="polite">
-            {resolved ? (
-              <>
-                <span className={styles.doneIcon}>
-                  <Icon name="check" size={20} strokeWidth={2.2} />
-                </span>
-                <span className={styles.doneText}>{message}</span>
-              </>
-            ) : null}
+          <div className={styles.doneWrap}>
+            <div className={styles.done} role="status" aria-live="polite">
+              {resolved ? (
+                <>
+                  <span className={styles.doneIcon}>
+                    <Icon name="check" size={20} strokeWidth={2.2} />
+                  </span>
+                  <span className={styles.doneText}>{message}</span>
+                </>
+              ) : null}
+            </div>
           </div>
         </div>
       </div>
@@ -247,7 +251,7 @@ function ApprovalCard({ item, companyName, onResolved }: CardProps<NeedsYouAppro
         {item.facts.map((f) => (
           <div key={f.label} className={styles.fact}>
             <dt>{f.label}</dt>
-            <dd className={`mono ${f.tone === "risk" ? "risk-text" : ""}`}>{f.value}</dd>
+            <dd className={`num ${f.tone === "risk" ? "risk-text" : ""}`}>{f.value}</dd>
           </div>
         ))}
       </dl>

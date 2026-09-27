@@ -141,3 +141,27 @@
   display: grid;
   gap: 10px;
 }
+
+/* Company rows: on phones the status moves under the name so details get the full width */
+.companyRow {
+  display: grid !important;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+}
+
+@media (max-width: 519px) {
+  .companyRow {
+    grid-template-columns: minmax(0, 1fr) auto;
+    row-gap: 6px;
+  }
+
+  .companyRow > :nth-child(2) {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
+  .companyRow > :nth-child(3) {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+  }
+}

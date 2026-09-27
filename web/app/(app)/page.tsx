@@ -71,7 +71,7 @@ export default async function HomePage({
               <ul className="card list">
                 {home.companies.map((c) => (
                   <li key={c.id}>
-                    <Link href={`/companies/${c.id}`} className="list-row">
+                    <Link href={`/companies/${c.id}`} className={`list-row ${styles.companyRow}`}>
                       <span className={styles.rowMain}>
                         <span className={styles.companyName}>{c.name}</span>
                         <span className="meta">{c.detail}</span>

@@ -126,7 +126,9 @@ class TrackedItem(BaseModel):
         if not evidence_ids:
             raise IllegalTransition(f"{to.value}: every transition requires evidence")
         if any(not isinstance(e, str) or not e.strip() for e in evidence_ids):
-            raise IllegalTransition(f"{to.value}: evidence ids must be non-blank strings")
+            raise IllegalTransition(
+                f"{to.value}: evidence ids must be non-blank strings"
+            )
 
         new_quality = quality if quality is not None else self.quality
         if to == Stage.CONFLICT:
@@ -149,7 +151,9 @@ class TrackedItem(BaseModel):
         resume_from = self._last_linear_stage() if resuming else current
         i, j = ORDER.index(resume_from), ORDER.index(to)
         if j <= i and not resuming:
-            raise IllegalTransition(f"cannot move backwards {current.value} -> {to.value}")
+            raise IllegalTransition(
+                f"cannot move backwards {current.value} -> {to.value}"
+            )
         skipped = ORDER[i + 1 : j]
         if any(s not in SKIPPABLE for s in skipped):
             raise IllegalTransition(

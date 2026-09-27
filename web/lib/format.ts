@@ -30,7 +30,8 @@ function utcDate(iso: ISODate): Date {
 }
 
 const dayMonth = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "long", timeZone: "UTC" });
-const dayMonthShort = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", timeZone: "UTC" });
+/* Fixed three-letter months: ICU versions disagree on "Sep" vs "Sept". */
+const SHORT_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const weekdayDayMonth = new Intl.DateTimeFormat("en-GB", {
   weekday: "long",
   day: "numeric",
@@ -39,7 +40,6 @@ const weekdayDayMonth = new Intl.DateTimeFormat("en-GB", {
 });
 const monthName = new Intl.DateTimeFormat("en-GB", { month: "long", timeZone: "UTC" });
 const monthYear = new Intl.DateTimeFormat("en-GB", { month: "long", year: "numeric", timeZone: "UTC" });
-const monthShort = new Intl.DateTimeFormat("en-GB", { month: "short", timeZone: "UTC" });
 const timeFormat = new Intl.DateTimeFormat("en-GB", {
   hour: "2-digit",
   minute: "2-digit",
@@ -54,7 +54,8 @@ export function formatDay(iso: ISODate): string {
 
 /** 29 Sep */
 export function formatDayShort(iso: ISODate): string {
-  return dayMonthShort.format(utcDate(iso));
+  const d = utcDate(iso);
+  return `${d.getUTCDate()} ${SHORT_MONTHS[d.getUTCMonth()]}`;
 }
 
 /** September */
@@ -64,7 +65,7 @@ export function formatMonth(key: MonthKey): string {
 
 /** Sep */
 export function formatMonthShort(key: MonthKey): string {
-  return monthShort.format(utcDate(`${key}-01`));
+  return SHORT_MONTHS[utcDate(`${key}-01`).getUTCMonth()] ?? key;
 }
 
 /** September 2026 */

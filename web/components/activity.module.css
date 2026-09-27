@@ -22,6 +22,7 @@
 @media (max-width: 519px) {
   .item {
     grid-template-columns: 32px minmax(0, 1fr);
+    row-gap: 2px;
     padding: 14px var(--s-2);
   }
 

@@ -1,5 +1,5 @@
 .list {
-  display: grid;
+  display: block;
 }
 
 /* Collapsing wrapper: animates height to zero once an item is resolved */
@@ -42,34 +42,52 @@
   box-shadow: var(--shadow-raised);
 }
 
-.body {
+/* Resolving: the question folds away and a one-line "Done." takes its place */
+.bodyWrap,
+.doneWrap {
   display: grid;
-  gap: var(--s-3);
-  transition: opacity var(--t) var(--ease), filter var(--t) var(--ease);
+  transition: grid-template-rows var(--t-slow) var(--ease), opacity var(--t) var(--ease);
 }
 
-.outer[data-phase="done"] .body,
-.outer[data-phase="leaving"] .body {
+.bodyWrap {
+  grid-template-rows: 1fr;
+}
+
+.doneWrap {
+  grid-template-rows: 0fr;
   opacity: 0;
 }
 
-/* "Done." overlay, centred over the card */
+.outer[data-phase="done"] .bodyWrap,
+.outer[data-phase="leaving"] .bodyWrap {
+  grid-template-rows: 0fr;
+  opacity: 0;
+}
+
+.outer[data-phase="done"] .doneWrap,
+.outer[data-phase="leaving"] .doneWrap {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+
+.body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  min-height: 0;
+  overflow: hidden;
+  /* room for focus rings inside the clipping box */
+  padding: 4px;
+  margin: -4px;
+}
+
 .done {
-  position: absolute;
-  inset: 0;
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 12px;
-  padding: var(--s-3);
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity var(--t) var(--ease);
-}
-
-.outer[data-phase="done"] .done,
-.outer[data-phase="leaving"] .done {
-  opacity: 1;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .doneIcon {

@@ -191,7 +191,9 @@ class Grant(BaseModel):
         return _require_aware(value)
 
     def covers(self, action: ActionKind, entity_id: str | None) -> bool:
-        return self.action is action and (self.entity_id is None or self.entity_id == entity_id)
+        return self.action is action and (
+            self.entity_id is None or self.entity_id == entity_id
+        )
 
 
 class TenantPolicy(BaseModel):
@@ -216,14 +218,23 @@ class TenantPolicy(BaseModel):
     ) -> TenantPolicy:
         """Return a copy that grants ``action`` (replacing an identical-scope grant)."""
         grant = Grant(
-            action=action, entity_id=entity_id, granted_by=granted_by, granted_at=at or utcnow()
+            action=action,
+            entity_id=entity_id,
+            granted_by=granted_by,
+            granted_at=at or utcnow(),
         )
-        kept = tuple(g for g in self.grants if (g.action, g.entity_id) != (action, entity_id))
+        kept = tuple(
+            g for g in self.grants if (g.action, g.entity_id) != (action, entity_id)
+        )
         return self.model_copy(update={"grants": kept + (grant,)})
 
-    def without_grant(self, action: ActionKind, *, entity_id: str | None = None) -> TenantPolicy:
+    def without_grant(
+        self, action: ActionKind, *, entity_id: str | None = None
+    ) -> TenantPolicy:
         """Return a copy without the grant of exactly this scope."""
-        kept = tuple(g for g in self.grants if (g.action, g.entity_id) != (action, entity_id))
+        kept = tuple(
+            g for g in self.grants if (g.action, g.entity_id) != (action, entity_id)
+        )
         return self.model_copy(update={"grants": kept})
 
 
@@ -238,6 +249,7 @@ class Approval(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    tenant_id: str
     action: ActionKind
     subject_id: str
     level: Requirement
@@ -301,7 +313,9 @@ def effective_level(action: ActionKind, context: ActionContext) -> ActionLevel:
     return base
 
 
-def authorize(action: ActionKind, policy: TenantPolicy, context: ActionContext) -> Decision:
+def authorize(
+    action: ActionKind, policy: TenantPolicy, context: ActionContext
+) -> Decision:
     """Decide whether ``action`` may run now (§25, §26).
 
     Raises :class:`PolicyError` when the context belongs to another tenant.
@@ -312,10 +326,14 @@ def authorize(action: ActionKind, policy: TenantPolicy, context: ActionContext) 
 
     if level is ActionLevel.FULLY_AUTOMATIC:
         return _allow(action, level, "Routine work. No approval needed.")
-    if level is ActionLevel.AUTOMATIC_IF_AUTHORIZED and policy.allows(action, context.entity_id):
+    if level is ActionLevel.AUTOMATIC_IF_AUTHORIZED and policy.allows(
+        action, context.entity_id
+    ):
         return _allow(action, level, "You allowed me to do this automatically.")
 
-    needed = Requirement.HARD if level is ActionLevel.HARD_APPROVAL else Requirement.OWNER
+    needed = (
+        Requirement.HARD if level is ActionLevel.HARD_APPROVAL else Requirement.OWNER
+    )
     approval = context.approval
     if approval is not None and _approval_matches(approval, action, context, needed):
         return _allow(action, level, "You approved this.")
@@ -327,7 +345,11 @@ def authorize(action: ActionKind, policy: TenantPolicy, context: ActionContext) 
     )
     reason = _blocked_reason(action, level, context, stale=stale)
     return Decision(
-        action=action, level=level, allowed_now=False, requires=needed, reason_plain=reason
+        action=action,
+        level=level,
+        allowed_now=False,
+        requires=needed,
+        reason_plain=reason,
     )
 
 
@@ -346,7 +368,8 @@ def _approval_matches(
 ) -> bool:
     """An approval counts only for this exact instance, level and set of facts."""
     return (
-        approval.action is action
+        approval.tenant_id == context.tenant_id
+        and approval.action is action
         and context.subject_id is not None
         and approval.subject_id == context.subject_id
         and approval.entity_id == context.entity_id
