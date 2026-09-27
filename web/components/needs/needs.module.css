@@ -1,0 +1,355 @@
+.list {
+  display: grid;
+}
+
+/* Collapsing wrapper: animates height to zero once an item is resolved */
+.outer {
+  display: grid;
+  grid-template-rows: 1fr;
+  margin-bottom: var(--s-2);
+  scroll-margin-top: calc(var(--header-h) + var(--s-3));
+  transition: grid-template-rows var(--t-slow) var(--ease), opacity var(--t-slow) var(--ease),
+    margin-bottom var(--t-slow) var(--ease);
+}
+
+.outer[data-phase="leaving"] {
+  grid-template-rows: 0fr;
+  opacity: 0;
+  margin-bottom: 0;
+}
+
+.clip {
+  overflow: hidden;
+  min-height: 0;
+  /* keep the card shadow visible inside the clip */
+  padding: 2px;
+  margin: -2px;
+}
+
+.card {
+  position: relative;
+  padding: var(--s-3);
+  transition: box-shadow var(--t) var(--ease);
+}
+
+@media (min-width: 720px) {
+  .card {
+    padding: var(--s-4);
+  }
+}
+
+.outer:target .card {
+  box-shadow: var(--shadow-raised);
+}
+
+.body {
+  display: grid;
+  gap: var(--s-3);
+  transition: opacity var(--t) var(--ease), filter var(--t) var(--ease);
+}
+
+.outer[data-phase="done"] .body,
+.outer[data-phase="leaving"] .body {
+  opacity: 0;
+}
+
+/* "Done." overlay, centred over the card */
+.done {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: var(--s-3);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--t) var(--ease);
+}
+
+.outer[data-phase="done"] .done,
+.outer[data-phase="leaving"] .done {
+  opacity: 1;
+}
+
+.doneIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--good-soft);
+  color: var(--good);
+  animation: pop var(--t-slow) var(--ease);
+}
+
+.doneText {
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+@keyframes pop {
+  from {
+    transform: scale(0.85);
+    opacity: 0;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+
+/* Header */
+.header {
+  display: grid;
+  gap: 6px;
+}
+
+.eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 15px;
+  font-weight: 550;
+  color: var(--attention);
+}
+
+.eyebrow[data-tone="risk"] {
+  color: var(--risk);
+}
+
+.titleRow {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--s-2);
+  flex-wrap: wrap;
+}
+
+.merchant {
+  font-size: clamp(26px, 4vw, 32px);
+  line-height: 1.1;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+}
+
+.amount {
+  font-size: clamp(26px, 4vw, 32px);
+  line-height: 1.1;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+}
+
+/* Choices */
+.fieldset {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+
+.question {
+  padding: 0;
+  margin-bottom: var(--s-2);
+  font-size: 17px;
+  line-height: 1.45;
+}
+
+.options {
+  display: grid;
+  gap: var(--s-1);
+}
+
+@media (min-width: 720px) {
+  .options {
+    max-width: 440px;
+  }
+}
+
+.optionWrap {
+  display: grid;
+  gap: var(--s-1);
+}
+
+.subChoices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-1);
+  padding-left: 48px;
+  animation: reveal var(--t) var(--ease);
+}
+
+.subChoice {
+  min-height: 40px;
+  padding: 8px 16px;
+  border-radius: var(--r-pill);
+  font-size: 15px;
+  font-weight: 500;
+  background: var(--surface);
+  box-shadow: inset 0 0 0 1px var(--line-2);
+  transition: box-shadow var(--t-fast) var(--ease), background-color var(--t-fast) var(--ease);
+}
+
+.subChoice:hover {
+  background: var(--surface-muted);
+}
+
+.subChoice[aria-checked="true"] {
+  background: var(--ink);
+  color: var(--on-ink);
+  box-shadow: none;
+}
+
+/* Confirm area slides open once a choice is made */
+.confirmArea {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  margin-top: calc(var(--s-3) * -1);
+  transition: grid-template-rows var(--t-slow) var(--ease), opacity var(--t-slow) var(--ease),
+    margin-top var(--t-slow) var(--ease);
+}
+
+.confirmArea[data-visible="true"] {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  margin-top: 0;
+}
+
+.confirmInner {
+  overflow: hidden;
+  display: grid;
+  gap: var(--s-2);
+  padding: 2px;
+  margin: -2px;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-1);
+}
+
+@media (max-width: 519px) {
+  .actions > :global(.btn) {
+    flex: 1 1 100%;
+    white-space: normal;
+  }
+}
+
+.retry {
+  font-size: 15px;
+  color: var(--attention);
+}
+
+.why {
+  margin-top: calc(var(--s-1) * -1);
+}
+
+/* Approval */
+.approvalText {
+  display: grid;
+  gap: 6px;
+  max-width: 60ch;
+}
+
+.approvalTitle {
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+
+.facts {
+  display: grid;
+  border-radius: 12px;
+  background: var(--surface-muted);
+  overflow: hidden;
+}
+
+.fact {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 4px 16px;
+  padding: 12px 16px;
+}
+
+.fact + .fact {
+  border-top: 1px solid var(--line);
+}
+
+.fact dt {
+  font-size: 15px;
+  color: var(--text-2);
+}
+
+.fact dd {
+  font-size: 15px;
+  font-weight: 550;
+}
+
+.verify {
+  display: grid;
+  gap: var(--s-2);
+  animation: reveal var(--t-slow) var(--ease);
+}
+
+.verifyStep {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: var(--s-2);
+  border-radius: 12px;
+  background: var(--surface-muted);
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+.verifyIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--surface);
+  flex-shrink: 0;
+}
+
+/* Empty state */
+.empty {
+  display: grid;
+  justify-items: center;
+  gap: var(--s-1);
+  padding: var(--s-8) var(--s-3);
+  text-align: center;
+}
+
+.empty :global(.btn) {
+  margin-top: var(--s-2);
+}
+
+.emptyIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 56px;
+  height: 56px;
+  margin-bottom: var(--s-1);
+  border-radius: 50%;
+  background: var(--good-soft);
+  color: var(--good);
+}
+
+@keyframes reveal {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}

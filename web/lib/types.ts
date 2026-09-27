@@ -128,6 +128,8 @@ export interface NeedsYouApprovalItem {
   verification: {
     optionLabel: string;
     instruction: string;
+    /** Checkbox the owner ticks after the call; required before release. */
+    checkboxLabel: string;
     confirmLabel: string;
     confirmOptionId: string;
     confirmedMessage: string;

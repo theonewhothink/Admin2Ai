@@ -1,0 +1,232 @@
+/* ---------- List ---------- */
+
+.companyList {
+  display: grid;
+  gap: var(--s-2);
+}
+
+.companyCard {
+  display: grid;
+  gap: var(--s-2);
+  padding: var(--s-3);
+}
+
+.companyTop {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--s-2);
+}
+
+.companyName {
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.companyMonth {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: var(--s-2);
+  font-size: 15px;
+}
+
+.companyMonth > :first-child {
+  color: var(--text-2);
+}
+
+.addLink {
+  justify-self: start;
+}
+
+/* ---------- Company page ---------- */
+
+.back {
+  margin-bottom: var(--s-3);
+}
+
+.head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--s-2) var(--s-3);
+  margin-bottom: var(--s-4);
+}
+
+.headMain {
+  display: grid;
+  gap: var(--s-1);
+}
+
+.monthNav {
+  margin-bottom: var(--s-3);
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.notice {
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.noticeText {
+  flex: 1 1 240px;
+  min-width: 0;
+}
+
+.monthCard {
+  display: grid;
+  gap: var(--s-4);
+  padding: var(--s-3);
+}
+
+@media (min-width: 720px) {
+  .monthCard {
+    padding: var(--s-5);
+  }
+}
+
+.monthHead {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+}
+
+.closedIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: var(--good-soft);
+  color: var(--good);
+  flex-shrink: 0;
+}
+
+.monthTitle {
+  font-size: clamp(26px, 4vw, 36px);
+  line-height: 1.1;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+}
+
+.left {
+  display: grid;
+  gap: var(--s-2);
+}
+
+.leftList {
+  display: grid;
+  gap: 14px;
+}
+
+.leftList li {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+}
+
+.leftList li > :first-child {
+  margin-top: 9px;
+}
+
+.leftText {
+  font-size: 16px;
+  line-height: 1.55;
+}
+
+.statsBlock {
+  display: grid;
+  gap: var(--s-2);
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--s-3) var(--s-2);
+}
+
+@media (min-width: 720px) {
+  .stats {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+.stat {
+  display: flex;
+  flex-direction: column-reverse;
+  justify-content: flex-end;
+  gap: 4px;
+}
+
+.statValue {
+  font-size: 30px;
+  line-height: 1;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+}
+
+.statLabel {
+  font-size: 15px;
+  line-height: 1.35;
+  color: var(--text-2);
+}
+
+.spent {
+  padding-top: var(--s-3);
+  border-top: 1px solid var(--line);
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+/* Matched items */
+.match {
+  padding: var(--s-2) var(--s-3);
+}
+
+.matchRow {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+}
+
+.matchIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: var(--surface-muted);
+  color: var(--text-2);
+  flex-shrink: 0;
+}
+
+.matchMain {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.matchName {
+  font-weight: 600;
+}
+
+.matchAmount {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.matchWhy {
+  margin-left: 52px;
+  margin-top: 2px;
+}
+
+.matchWhy :global(.disclosure-body) {
+  padding-bottom: var(--s-1);
+}
