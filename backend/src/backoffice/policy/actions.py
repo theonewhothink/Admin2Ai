@@ -16,16 +16,24 @@ Every action the operator can take has a fixed level:
 A changed beneficiary or any other fraud hard-stop (§26) forces hard approval
 for everything except pure observation (reading, extraction, retrieval,
 searching), which must keep working so the evidence can be examined.
+
+A hard approval is bound to the exact facts the approver saw: it counts only
+when it carries a ``fingerprint`` equal to the action context's. An approval
+without one never authorizes a hard-approval action.
+
+Actions may be given as ``ActionKind`` members or their string values; an
+unknown action raises :class:`PolicyError`.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator
 
-from backoffice.domain.models import utcnow
+from backoffice.domain.models import new_id, utcnow
 
 
 class PolicyError(ValueError):
@@ -145,20 +153,37 @@ _HARD_WHY: dict[ActionKind, str] = {
 _RANK = {Requirement.NONE: 0, Requirement.OWNER: 1, Requirement.HARD: 2}
 
 
-def level_of(action: ActionKind) -> ActionLevel:
+def _as_action(action: ActionKind | str) -> ActionKind:
+    try:
+        return ActionKind(action)
+    except ValueError:
+        raise PolicyError(f"unknown action {action!r}") from None
+
+
+def level_of(action: ActionKind | str) -> ActionLevel:
     """The fixed §25 level of an action."""
-    return ACTION_LEVELS[action]
+    return ACTION_LEVELS[_as_action(action)]
 
 
-def is_grantable(action: ActionKind) -> bool:
+def is_grantable(action: ActionKind | str) -> bool:
     """Only AUTOMATIC_IF_AUTHORIZED actions can be pre-granted (§25)."""
-    return ACTION_LEVELS[action] is ActionLevel.AUTOMATIC_IF_AUTHORIZED
+    return level_of(action) is ActionLevel.AUTOMATIC_IF_AUTHORIZED
 
 
 def _require_aware(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("datetimes must be timezone-aware")
     return value
+
+
+def _non_blank(value: str) -> str:
+    if not value.strip():
+        raise ValueError("must not be blank")
+    return value
+
+
+# An identifier or name: "" or "  " would let unrelated records match each other.
+NonBlank = Annotated[str, AfterValidator(_non_blank)]
 
 
 class Grant(BaseModel):
@@ -172,8 +197,8 @@ class Grant(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     action: ActionKind
-    entity_id: str | None = None
-    granted_by: str
+    entity_id: NonBlank | None = None
+    granted_by: NonBlank
     granted_at: datetime
 
     @field_validator("action")
@@ -190,8 +215,8 @@ class Grant(BaseModel):
     def _aware(cls, value: datetime) -> datetime:
         return _require_aware(value)
 
-    def covers(self, action: ActionKind, entity_id: str | None) -> bool:
-        return self.action is action and (
+    def covers(self, action: ActionKind | str, entity_id: str | None) -> bool:
+        return self.action is _as_action(action) and (
             self.entity_id is None or self.entity_id == entity_id
         )
 
@@ -201,22 +226,23 @@ class TenantPolicy(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    tenant_id: str
+    tenant_id: NonBlank
     grants: tuple[Grant, ...] = ()
 
-    def allows(self, action: ActionKind, entity_id: str | None = None) -> bool:
+    def allows(self, action: ActionKind | str, entity_id: str | None = None) -> bool:
         """True when a grant covers ``action`` for ``entity_id``."""
         return any(g.covers(action, entity_id) for g in self.grants)
 
     def with_grant(
         self,
-        action: ActionKind,
+        action: ActionKind | str,
         *,
         granted_by: str,
         entity_id: str | None = None,
         at: datetime | None = None,
     ) -> TenantPolicy:
         """Return a copy that grants ``action`` (replacing an identical-scope grant)."""
+        action = _as_action(action)
         grant = Grant(
             action=action,
             entity_id=entity_id,
@@ -229,9 +255,10 @@ class TenantPolicy(BaseModel):
         return self.model_copy(update={"grants": kept + (grant,)})
 
     def without_grant(
-        self, action: ActionKind, *, entity_id: str | None = None
+        self, action: ActionKind | str, *, entity_id: str | None = None
     ) -> TenantPolicy:
         """Return a copy without the grant of exactly this scope."""
+        action = _as_action(action)
         kept = tuple(
             g for g in self.grants if (g.action, g.entity_id) != (action, entity_id)
         )
@@ -243,20 +270,23 @@ class Approval(BaseModel):
 
     ``fingerprint`` binds the approval to the exact facts shown to the approver
     (amount, beneficiary, ...), so anything that changes afterwards voids it.
-    ``acknowledged_risk`` records that the approver saw the §26 warning.
-    Hard approvals are issued only after step-up authentication (§52).
+    Hard-approval actions require it. ``acknowledged_risk`` records that the
+    approver saw the §26 warning. Hard approvals are issued only after step-up
+    authentication (§52). ``id`` lets the audit record (§55) point at this
+    decision and lets the executor use it once.
     """
 
     model_config = ConfigDict(frozen=True)
 
-    tenant_id: str
+    id: NonBlank = Field(default_factory=lambda: new_id("apr"))
+    tenant_id: NonBlank
     action: ActionKind
-    subject_id: str
+    subject_id: NonBlank
     level: Requirement
-    approved_by: str
+    approved_by: NonBlank
     approved_at: datetime
-    entity_id: str | None = None
-    fingerprint: str | None = None
+    entity_id: NonBlank | None = None
+    fingerprint: NonBlank | None = None
     acknowledged_risk: bool = False
 
     @field_validator("level")
@@ -277,10 +307,10 @@ class ActionContext(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    tenant_id: str
-    entity_id: str | None = None
-    subject_id: str | None = None
-    fingerprint: str | None = None
+    tenant_id: NonBlank
+    entity_id: NonBlank | None = None
+    subject_id: NonBlank | None = None
+    fingerprint: NonBlank | None = None  # digest of the facts an approver would see
     beneficiary_changed: bool = False  # §26: changed IBAN / new payment recipient
     fraud_hold: bool = False  # §26: any other hard-stop signal
     unusual: bool = False  # not routine: escalates authorizable actions to the owner
@@ -292,7 +322,11 @@ class ActionContext(BaseModel):
 
 
 class Decision(BaseModel):
-    """Outcome of :func:`authorize`. ``requires`` is what is still needed."""
+    """Outcome of :func:`authorize`. ``requires`` is what is still needed.
+
+    ``approval_id`` names the human approval that allowed the action, if one
+    did; record it with the action (§55).
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -301,10 +335,12 @@ class Decision(BaseModel):
     allowed_now: bool
     requires: Requirement
     reason_plain: str
+    approval_id: str | None = None
 
 
-def effective_level(action: ActionKind, context: ActionContext) -> ActionLevel:
+def effective_level(action: ActionKind | str, context: ActionContext) -> ActionLevel:
     """The level after §26 and 'unusual' escalation. Never lowers a level."""
+    action = _as_action(action)
     base = ACTION_LEVELS[action]
     if context.hard_stop and action not in OBSERVATION_ACTIONS:
         return ActionLevel.HARD_APPROVAL
@@ -314,12 +350,14 @@ def effective_level(action: ActionKind, context: ActionContext) -> ActionLevel:
 
 
 def authorize(
-    action: ActionKind, policy: TenantPolicy, context: ActionContext
+    action: ActionKind | str, policy: TenantPolicy, context: ActionContext
 ) -> Decision:
     """Decide whether ``action`` may run now (§25, §26).
 
-    Raises :class:`PolicyError` when the context belongs to another tenant.
+    Raises :class:`PolicyError` when the context belongs to another tenant or
+    the action is unknown.
     """
+    action = _as_action(action)
     if context.tenant_id != policy.tenant_id:
         raise PolicyError("context tenant does not match policy tenant")
     level = effective_level(action, context)
@@ -336,11 +374,12 @@ def authorize(
     )
     approval = context.approval
     if approval is not None and _approval_matches(approval, action, context, needed):
-        return _allow(action, level, "You approved this.")
+        return _allow(action, level, "You approved this.", approval_id=approval.id)
     stale = (
         approval is not None
         and approval.action is action
         and approval.subject_id == context.subject_id
+        and approval.fingerprint is not None
         and approval.fingerprint != context.fingerprint
     )
     reason = _blocked_reason(action, level, context, stale=stale)
@@ -353,20 +392,27 @@ def authorize(
     )
 
 
-def _allow(action: ActionKind, level: ActionLevel, reason: str) -> Decision:
+def _allow(
+    action: ActionKind, level: ActionLevel, reason: str, *, approval_id: str | None = None
+) -> Decision:
     return Decision(
         action=action,
         level=level,
         allowed_now=True,
         requires=Requirement.NONE,
         reason_plain=reason,
+        approval_id=approval_id,
     )
 
 
 def _approval_matches(
     approval: Approval, action: ActionKind, context: ActionContext, needed: Requirement
 ) -> bool:
-    """An approval counts only for this exact instance, level and set of facts."""
+    """An approval counts only for this exact instance, level and set of facts.
+
+    A hard approval must be bound to the facts: both sides carry the same
+    fingerprint (blank fingerprints are refused on construction).
+    """
     return (
         approval.tenant_id == context.tenant_id
         and approval.action is action
@@ -374,6 +420,7 @@ def _approval_matches(
         and approval.subject_id == context.subject_id
         and approval.entity_id == context.entity_id
         and approval.fingerprint == context.fingerprint
+        and (needed is not Requirement.HARD or context.fingerprint is not None)
         and _RANK[approval.level] >= _RANK[needed]
         and (approval.acknowledged_risk or not context.hard_stop)
     )

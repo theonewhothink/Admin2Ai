@@ -95,7 +95,7 @@ def test_codes_are_two_upper_case_letters():
         ("Base de incidência", "net_amount"),
         ("IVA", "vat_amount"),
         ("Total", "gross_amount"),
-        ("Total a pagar", "gross_amount"),
+        ("Total a pagar", "amount_payable"),
         ("Retenção na fonte", "withholding"),
         ("Contribuinte", "tax_id"),
         ("NIF", "tax_id"),

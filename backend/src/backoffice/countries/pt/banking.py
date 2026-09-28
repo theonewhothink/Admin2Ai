@@ -12,6 +12,8 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal
 
+from backoffice.countries.base import CountryPackError
+
 # IBAN lengths from the SWIFT IBAN registry (ISO 13616) for the countries a
 # Portuguese SME commonly pays. verified_as_of: 2026-09-27. Countries not
 # listed are not recognised by find_ibans() rather than guessed.
@@ -24,7 +26,7 @@ IBAN_LENGTHS: dict[str, int] = {
 }
 
 # Country code + check digits, then alphanumerics optionally grouped by spaces.
-_IBAN_RUN = re.compile(r"(?<![A-Z0-9])[A-Z]{2}\d{2}(?: ?[A-Z0-9]){8,34}")
+_IBAN_RUN = re.compile(r"(?<![A-Z0-9])[A-Z]{2}[0-9]{2}(?: ?[A-Z0-9]){8,34}")
 
 
 def normalize_iban(raw: str) -> str:
@@ -42,7 +44,7 @@ def is_valid_iban(raw: str) -> bool:
     """Registered country, exact length and mod-97 == 1."""
     iban = normalize_iban(raw)
     expected = IBAN_LENGTHS.get(iban[:2])
-    if expected is None or len(iban) != expected or not iban.isalnum():
+    if expected is None or len(iban) != expected or not (iban.isascii() and iban.isalnum()):
         return False
     if not iban[2:4].isdigit():
         return False
@@ -58,14 +60,20 @@ def find_ibans(text: str) -> list[str]:
     """
     found: list[str] = []
     upper = (text or "").upper()
-    for match in _IBAN_RUN.finditer(upper):
-        iban = _cut_at_length(match.group(0), upper, match.start())
-        if iban and is_valid_iban(iban) and iban not in found:
-            found.append(iban)
+    position = 0
+    while (match := _IBAN_RUN.search(upper, position)) is not None:
+        cut = _cut_at_length(match.group(0), upper, match.start())
+        if cut is not None and is_valid_iban(cut[0]):
+            if cut[0] not in found:
+                found.append(cut[0])
+            position = cut[1]  # a second IBAN may follow on the same line
+        else:
+            position = match.start() + 1
     return found
 
 
-def _cut_at_length(run: str, text: str, start: int) -> str | None:
+def _cut_at_length(run: str, text: str, start: int) -> tuple[str, int] | None:
+    """(IBAN, end index) when the run holds exactly the registered length."""
     length = IBAN_LENGTHS.get(run[:2])
     if length is None:
         return None
@@ -78,7 +86,7 @@ def _cut_at_length(run: str, text: str, start: int) -> str | None:
             nxt = text[end] if end < len(text) else ""
             if nxt.isalnum():
                 return None
-            return normalize_iban(run[: offset + 1])
+            return normalize_iban(run[: offset + 1]), end
     return None
 
 
@@ -94,17 +102,19 @@ class MultibancoReference:
         return f"{self.entity} {self.reference}"
 
 
-class MultibancoError(ValueError):
+class MultibancoError(CountryPackError, ValueError):
     """Malformed Multibanco entity or reference."""
+
+    owner_message = "The Multibanco payment details don't look right. Please check them."
 
 
 def parse_multibanco(entity: str, reference: str, amount: Decimal | None = None) -> MultibancoReference:
     """Validate the format of an entity/reference pair (spaces are ignored)."""
     ent = re.sub(r"\s+", "", entity or "")
     ref = re.sub(r"\s+", "", reference or "")
-    if len(ent) != 5 or not ent.isdigit():
+    if len(ent) != 5 or not (ent.isascii() and ent.isdigit()):
         raise MultibancoError("Multibanco entity must have 5 digits")
-    if len(ref) != 9 or not ref.isdigit():
+    if len(ref) != 9 or not (ref.isascii() and ref.isdigit()):
         raise MultibancoError("Multibanco reference must have 9 digits")
     if amount is not None and amount <= 0:
         raise MultibancoError("Multibanco amount must be positive")

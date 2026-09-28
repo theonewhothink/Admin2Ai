@@ -1,0 +1,9 @@
+Lisbon Software Lda
+Invoice number: INV-2026-0042
+Invoice date: 2026-09-10
+Due date: 2026-10-10
+Supplier VAT: PT508602939
+Customer VAT: PT516123459
+Subtotal: 1000.00
+VAT: 230.00
+Total: 1230.00 EUR

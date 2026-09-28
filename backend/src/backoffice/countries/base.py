@@ -153,8 +153,12 @@ class FiscalQRResult:
     ``consistent`` is False when the code's own arithmetic does not add up; the
     observations are still returned so that the disagreement surfaces as a
     CONFLICT during verification instead of being hidden (§19).
-    ``usable`` is False when the document cannot support a payment (for
-    example, it was cancelled).
+    ``usable`` is False when the document cannot support a purchase or a
+    payment: it was cancelled, or it is not a tax invoice or receipt (a
+    pro-forma, quote or transport document also carries a fiscal QR code).
+    Callers must not close anything on an unusable result (§3).
+    ``notes`` are technical remarks for logs and audit, never owner copy;
+    use ``CountryPackError.owner_message`` style text for the owner.
     """
 
     country: str
@@ -217,7 +221,10 @@ class CountryPack(Protocol):
     def lookup_term(self, label: str) -> Term | None: ...
 
     def vat_rates(self, on: date, region: str | None = None) -> tuple[VATRate, ...]:
-        """Rates in force on ``on`` (all regions when ``region`` is None)."""
+        """Rates in force on ``on`` (all regions when ``region`` is None).
+
+        Empty for a region the pack does not cover.
+        """
         ...
 
     def is_plausible_vat(
@@ -228,7 +235,11 @@ class CountryPack(Protocol):
         on: date | None = None,
         region: str | None = None,
     ) -> bool | None:
-        """True/False when the rate table covers the date; None when unknown."""
+        """True/False when the rate table covers the region and date; None otherwise.
+
+        Without ``on`` the rates the table currently lists are used; the answer
+        never depends on the wall clock. Pass the document's date when known.
+        """
         ...
 
     def parse_fiscal_qr(self, payload: str, evidence_id: str) -> FiscalQRResult | None:

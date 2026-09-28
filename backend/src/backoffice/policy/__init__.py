@@ -10,9 +10,14 @@ Action levels (§25, §26):
     authorize(action, policy, context) -> Decision
     effective_level(action, context) -> ActionLevel
     level_of(action), is_grantable(action)
+    (actions may be ActionKind members or their string values; unknown -> PolicyError)
+    A hard approval counts only when Approval.fingerprint == ActionContext.fingerprint
+    (both set): it is bound to the exact facts the approver saw.
 
 Privacy (§53):
     redact(text, vault=None, kinds=ALL_KINDS) -> Redaction(text, vault, matches)
+      (Unicode spaces/hyphens/invisible characters inside values are handled;
+       token-shaped input text is re-tokenized so tokens never alias values)
     Redaction.restore(external_text) / TokenVault.restore(text)
     find_pii(text, kinds=ALL_KINDS) -> list[PiiMatch]
     is_clean(text) -> bool, iban_is_valid(s), nib_is_valid(digits), luhn_is_valid(digits)

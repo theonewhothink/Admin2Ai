@@ -451,12 +451,16 @@ def _all_owner_strings() -> list[str]:
     ]
     strings += [status_headline(n, r) for n in range(3) for r in range(2)]
     strings += [explain(i) for i in Issue]
-    for kind in SourceKind:
+    never_sync = {SourceKind.UPLOAD, SourceKind.MOBILE_SCAN, SourceKind.MOBILE_SHARE}
+    for kind in set(SourceKind) - never_sync:
         for then in (None, NOW - timedelta(days=1), NOW - timedelta(days=40)):
-            msg = connector_problem("Gmail", kind, then, NOW)
-            strings += [msg.title, msg.detail, msg.action_label]
+            for name in ("Gmail", "", "HTTPError 503"):
+                msg = connector_problem(name, kind, then, NOW)
+                strings += [msg.title, msg.detail, msg.action_label]
     for kind in WhyKind:
-        if kind in (WhyKind.INVOICE_TOTAL, WhyKind.BANK_CHARGE, WhyKind.QR_TOTAL):
+        amount_kinds = (WhyKind.INVOICE_TOTAL, WhyKind.CREDIT_NOTE_TOTAL, WhyKind.BANK_CHARGE,
+                        WhyKind.MONEY_RECEIVED, WhyKind.QR_TOTAL)  # fmt: skip
+        if kind in amount_kinds:
             strings += render_why([WhyFactor(kind, amount=Decimal("1"))])
         elif kind is WhyKind.DAYS_APART:
             strings += render_why([WhyFactor.days_apart(2)])
@@ -473,3 +477,180 @@ def test_every_owner_facing_string_is_plain_and_calm():
     for s in _all_owner_strings():
         assert find_jargon(s) == [], s
         assert find_off_tone(s) == [], s
+
+
+# --------------------------------------------------------------------------- review regressions
+
+
+@pytest.mark.parametrize(
+    "amount, expected",
+    [
+        (Decimal("123456789012345678901234567890.125"), "€123,456,789,012,345,678,901,234,567,890.13"),
+        (Decimal("-99999999999999999999999999999.995"), f"{MINUS}€100,000,000,000,000,000,000,000,000,000.00"),
+        (Decimal("12345678901234567890123456789"), "€12,345,678,901,234,567,890,123,456,789.00"),
+    ],
+)
+def test_format_money_never_rounds_the_integer_part(amount, expected):
+    """abs() ran outside the widened context and silently rounded to 28 digits."""
+    assert format_money(amount) == expected
+
+
+@pytest.mark.parametrize("bad", [True, False, 1.0, 2.5, "2", None])
+def test_counts_must_be_whole_numbers(bad):
+    """status_headline(True, 0) used to say 'I need one thing from you.'"""
+    with pytest.raises(TypeError):
+        status_headline(bad, 0)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        status_headline(0, bad)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        still_need(bad)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("name", ["", "   ", "ConnectionError: 401", "gmail_oauth", "API token"])
+def test_connector_names_that_are_blank_or_technical_get_generic_copy(name):
+    """A raw error or internal name passed as the connector name used to reach the owner."""
+    then = NOW.replace(day=26, hour=14, minute=42)
+    msg = connector_problem(name, SourceKind.EMAIL, then, NOW)
+    assert msg.title == "One of your accounts needs reconnecting."
+    assert msg.detail == "Your email has not synced since 14:42 yesterday."
+    portal = connector_problem(name, SourceKind.SUPPLIER_PORTAL, then, NOW)
+    assert portal.detail == "This account has not synced since 14:42 yesterday."
+    for text in (msg.title, msg.detail, portal.title, portal.detail):
+        assert find_jargon(text) == [] and name.strip() not in text or not name.strip()
+
+
+@pytest.mark.parametrize(
+    "name, kind, detail",
+    [
+        ("Your accountant", SourceKind.ACCOUNTANT, "Messages from your accountant have not synced yet."),
+        ("Ana Costa", SourceKind.ACCOUNTANT, "Messages from your accountant have not synced yet."),
+        ("Portal das Finanças", SourceKind.GOVERNMENT, "Your Portal das Finanças account has not synced yet."),
+        ("your Vodafone portal", SourceKind.SUPPLIER_PORTAL, "Your Vodafone portal account has not synced yet."),
+    ],
+)
+def test_connector_copy_reads_naturally_for_every_connected_source(name, kind, detail):
+    """ACCOUNTANT used to read 'Your Your accountant account has not synced yet.'"""
+    msg = connector_problem(name, kind, None, NOW)
+    assert msg.detail == detail
+    assert "Your Your" not in msg.title + msg.detail and "your your" not in msg.detail.lower()
+
+
+@pytest.mark.parametrize("kind", [SourceKind.UPLOAD, SourceKind.MOBILE_SCAN, SourceKind.MOBILE_SHARE])
+def test_sources_that_never_sync_cannot_need_reconnecting(kind):
+    with pytest.raises(ValueError):
+        connector_problem("Scan", kind, None, NOW)
+
+
+@pytest.mark.parametrize(
+    "text, terms",
+    [
+        ("Payment NEEDS_OWNER", ["internal name"]),
+        ("status: needs_owner", ["internal name"]),
+        ("reconciliation_exception", ["reconciliation"]),
+        ("404 Not Found", ["raw error"]),
+        ("500 Internal Server Error", ["raw error"]),
+        ("Internal Server Error", ["raw error"]),
+        ("[Errno 111] Connection refused", ["raw error"]),
+        ("Connection reset by peer", ["raw error"]),
+        ("Supplier: None", ["null"]),
+        ("Total: €None", ["null"]),
+        ("Total: nan", ["null"]),
+        ("Confidence 0.87", ["confidence %"]),
+        ("confidence: .9", ["confidence %"]),
+        ("{'iban': 'PT50...'}", ["raw data"]),
+        ('{"status": "ok"}', ["raw data"]),
+        ("[object Object]", ["raw data"]),
+    ],
+)
+def test_find_jargon_catches_leaked_internals(text, terms):
+    assert find_jargon(text) == terms
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "We sent a reminder to billing_team@vodafone.pt.",
+        "None of these payments need you.",
+        "Nothing found for September.",
+        "I am confident about 3 of them.",
+        "Your accountant replied: {see attached}.",
+    ],
+)
+def test_plain_text_with_look_alikes_passes(text):
+    assert find_jargon(text) == []
+
+
+@pytest.mark.parametrize(
+    "build, error",
+    [
+        (lambda: WhyFactor.invoice_total(83.21), TypeError),  # type: ignore[arg-type]
+        (lambda: WhyFactor.bank_charge(True), TypeError),  # type: ignore[arg-type]
+        (lambda: WhyFactor.qr_total(Decimal("1"), "EURO"), ValueError),
+        (lambda: WhyFactor.days_apart(True), TypeError),  # type: ignore[arg-type]
+        (lambda: WhyFactor.days_apart(1.5), TypeError),  # type: ignore[arg-type]
+        (lambda: WhyFactor.recurring("monthly"), TypeError),  # type: ignore[arg-type]
+    ],
+)
+def test_why_factors_are_checked_when_built(build, error):
+    """'Dates True day apart' used to render; float money failed only when shown."""
+    with pytest.raises(error):
+        build()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Unauthorized payment blocked.",
+        "Forbidden by your bank.",
+        "We saved Fatura_2026_183.pdf for you.",
+        "The file vodafone_setembro.PDF is attached.",
+    ],
+)
+def test_linter_leaves_plain_words_and_file_names_alone(text):
+    assert find_jargon(text) == []
+
+
+@pytest.mark.parametrize(
+    "text", ["401 Unauthorized", "HTTP/1.1 403 Forbidden", "Bad Request", "Gateway Timeout"]
+)
+def test_linter_flags_http_reason_phrases(text):
+    assert "raw error" in find_jargon(text) or "error code" in find_jargon(text)
+
+
+def test_bank_charge_shows_the_amount_charged_whatever_the_sign():
+    """Transaction.amount is negative for money out; '−€83.21' next to the invoice's
+    '€83.21' read like a mismatch."""
+    assert render_why([WhyFactor.bank_charge(Decimal("-83.21"))]) == ["Bank charge €83.21"]
+    assert render_why([WhyFactor.bank_charge(Decimal("83.21"))]) == ["Bank charge €83.21"]
+
+
+@pytest.mark.parametrize(
+    "amount, line",
+    [
+        (Decimal("-83.21"), "Bank charge €83.21"),
+        (Decimal("50.00"), "Money received €50.00"),
+        (Decimal("0"), "Bank charge €0.00"),
+    ],
+)
+def test_bank_movement_words_the_direction(amount, line):
+    assert render_why([WhyFactor.bank_movement(amount)]) == [line]
+
+
+def test_credit_notes_and_refunds_have_their_own_words():
+    lines = render_why(
+        [
+            WhyFactor.credit_note_total(Decimal("-50.00")),
+            WhyFactor.bank_movement(Decimal("50.00")),
+            WhyFactor.days_apart(2),
+        ]
+    )
+    assert lines == ["Credit note total €50.00", "Money received €50.00", "Dates 2 days apart"]
+    for line in lines:
+        assert find_jargon(line) == [] and find_off_tone(line) == []
+
+
+def test_unsigned_why_amounts_never_round_large_values():
+    big = Decimal("-123456789012345678901234567890.12")
+    assert render_why([WhyFactor.bank_charge(big)]) == [
+        "Bank charge €123,456,789,012,345,678,901,234,567,890.12"
+    ]

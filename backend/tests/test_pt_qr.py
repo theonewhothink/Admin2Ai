@@ -118,7 +118,11 @@ def test_tax_total_mismatch():
 
 
 def test_rounding_tolerance():
-    assert parse_qr(build(O="483.61")).is_consistent
+    within = parse_qr(build(O="483.61"))
+    assert within.is_consistent
+    # No arithmetic observation that would disagree by a cent with field O.
+    gross = by_field(qr_to_observations(within, "ev"))[CriticalField.GROSS_AMOUNT]
+    assert [(o.method, o.value) for o in gross] == [(ExtractionMethod.QR, Decimal("483.61"))]
     assert not parse_qr(build(O="483.63")).is_consistent
     assert not parse_qr(build(O="483.63"), tolerance=Decimal("0.00")).is_consistent
     assert parse_qr(build(O="483.63"), tolerance=Decimal("0.05")).is_consistent
@@ -157,7 +161,7 @@ def test_official_example_observations_include_final_consumer_as_is():
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("payload", ["", "   ", "﻿"])
+@pytest.mark.parametrize("payload", ["", "   ", "\ufeff"])
 def test_empty_payload(payload):
     assert issue_codes(payload) == {"empty"}
 
@@ -168,7 +172,7 @@ def test_non_text_payload():
 
 
 def test_surrounding_whitespace_and_bom_are_tolerated():
-    assert parse_qr("﻿" + build() + "\r\n").gross_total == Decimal("483.60")
+    assert parse_qr("\ufeff" + build() + "\r\n").gross_total == Decimal("483.60")
 
 
 @pytest.mark.parametrize("missing", ["A", "B", "C", "D", "E", "F", "G", "H", "I1", "N", "O", "Q", "R"])

@@ -20,7 +20,7 @@ PERSON = "123456789"
 @pytest.mark.parametrize(
     "raw",
     ["123456789", "PT 123 456 789", "pt123456789", "PT-123456789", "123.456.789",
-     "123-456-789", "  123 456 789  ", "123 456 789"],
+     "123-456-789", "  123 456 789  ", "123\u00a0456\u00a0789"],
 )
 def test_normalize_strips_formatting(raw):
     assert normalize_nif(raw) == "123456789"

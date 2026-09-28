@@ -89,6 +89,11 @@ _NIF_SHAPE = re.compile(r"^[0-9]{9}$")
 _CERT = re.compile(r"^[0-9]{1,4}$")
 _DATE = re.compile(r"^[0-9]{8}$")
 
+# Upper bound on the payload: a version-40 QR code holds at most 4296
+# alphanumeric characters, and a complete AT payload is well under 1000.
+# Anything longer is not a QR reading and is refused before splitting.
+MAX_PAYLOAD_CHARS = 4296
+
 # Rounding allowance for the totals checks: per-rate subtotals are rounded
 # separately from the document totals, so they can drift by a cent or two.
 DEFAULT_TOLERANCE = Decimal("0.02")
@@ -209,10 +214,13 @@ class PTQRCode:
 
     @property
     def has_tax_detail(self) -> bool:
-        """True when the code breaks the total down (blocks with amounts, L or M)."""
-        return any(b.present_fields() for b in self.tax_blocks) or (
-            self.non_taxable is not None or self.stamp_duty is not None
-        )
+        """True when the code breaks the total down (block amounts or L).
+
+        Stamp duty (M) alone is not a breakdown: on a code without VAT detail
+        (I1 "0") the rest of O is simply not itemised, so no net amount can be
+        derived and O cannot be rebuilt from its parts.
+        """
+        return any(b.present_fields() for b in self.tax_blocks) or self.non_taxable is not None
 
     @property
     def net_total(self) -> Decimal:
@@ -265,7 +273,7 @@ def looks_like_pt_qr(payload: str) -> bool:
     """Cheap sniff: does this payload claim to be an AT fiscal QR code?"""
     if not isinstance(payload, str):
         return False
-    text = payload.strip().lstrip("﻿")
+    text = payload.strip().lstrip("\ufeff")
     return text.startswith("A:") and "*B:" in text
 
 
@@ -283,7 +291,10 @@ def parse_qr(
     """
     if not isinstance(payload, str):
         raise QRCodeError([QRIssue("not_text", None, "payload must be text")])
-    raw = payload.strip().lstrip("﻿").strip()
+    raw = payload.strip().lstrip("\ufeff").strip()
+    if len(raw) > MAX_PAYLOAD_CHARS:
+        raise QRCodeError([QRIssue("payload_too_long", None,
+                                   f"payload longer than {MAX_PAYLOAD_CHARS} characters")])
     fields = _split_fields(raw)
     issues = _validate_fields(fields)
     if issues:
@@ -339,7 +350,9 @@ def _validate_fields(fields: Mapping[str, str]) -> list[QRIssue]:
     issues += _check_blocks(fields)
     for key in sorted(AMOUNT_FIELDS & fields.keys(), key=FIELD_ORDER.index):
         if not _AMOUNT.match(fields[key]):
-            issues.append(QRIssue("amount_format", key, "amount must be digits with 2 decimals, '.' separator"))
+            issues.append(
+                QRIssue("amount_format", key, "amount must be digits with 2 decimals, '.' separator")
+            )
     if not (_HASH.match(fields["Q"]) or fields["Q"] == "0"):
         issues.append(QRIssue("hash_format", "Q", "must be 4 hash characters"))
     if not _CERT.match(fields["R"]):
@@ -403,7 +416,9 @@ def _check_blocks(fields: Mapping[str, str]) -> list[QRIssue]:
                 issues.append(QRIssue("no_tax_with_detail", "I1", "'0' means no tax detail may follow"))
             continue
         if not _SPACE.match(space):
-            issues.append(QRIssue("space_format", space_key, "fiscal space must be PT, PT-AC, PT-MA or a country code"))
+            issues.append(QRIssue(
+                "space_format", space_key, "fiscal space must be PT, PT-AC, PT-MA or a country code"
+            ))
         elif space in seen_regions:
             issues.append(QRIssue("duplicate_space", space_key, f"fiscal space {space} repeated"))
         seen_regions.add(space)
@@ -516,8 +531,8 @@ def _rate_remarks(code: PTQRCode) -> list[QRIssue]:
         for bucket, base, vat in block.rate_pairs():
             result = check_rate(base, vat, region, code.issue_date, bucket=bucket)
             if result is RateCheck.IMPLAUSIBLE:
-                remarks.append(QRIssue("rate_implausible", block.block,
-                                       f"{bucket.value} VAT {vat} on {base} does not match the {region.value} rate"))
+                detail = f"{bucket.value} VAT {vat} on {base} does not match the {region.value} rate"
+                remarks.append(QRIssue("rate_implausible", block.block, detail))
             elif result is RateCheck.UNKNOWN:
                 remarks.append(QRIssue("rate_unknown", block.block,
                                        f"no {region.value} rate data for {code.issue_date.isoformat()}"))
@@ -539,10 +554,12 @@ def qr_to_observations(
 
     Net and VAT are only reported when the code carries a tax breakdown. With
     ``include_arithmetic`` a gross total recomputed from the code's own parts
-    is added (method=ARITHMETIC, same source): when the code is internally
-    inconsistent it disagrees with field O, so verification sees a CONFLICT.
-    Note both come from one evidence item; independence must be judged by
-    ``source``, not by ``method``.
+    is added (method=ARITHMETIC, same source) when it equals field O exactly,
+    or when the code is inconsistent, so that verification sees the CONFLICT.
+    A difference within the rounding tolerance adds nothing: a one-cent
+    subtotal rounding is not a disagreement worth a person's time.
+    Both observations come from one evidence item; independence must be
+    judged by ``source``, not by ``method``.
     """
     ids = QR_CONFIDENCE
     amounts = QR_CONFIDENCE if code.is_consistent else QR_INCONSISTENT_CONFIDENCE
@@ -562,8 +579,8 @@ def qr_to_observations(
     if code.has_tax_detail:
         observations.append(qr(CriticalField.NET_AMOUNT, code.net_total, _net_location(code), amounts))
         observations.append(qr(CriticalField.VAT_AMOUNT, code.vat_total, _vat_location(code), amounts))
-        if include_arithmetic:
-            recomputed = code.net_total + code.vat_total + (code.stamp_duty or Decimal("0.00"))
+        recomputed = code.net_total + code.vat_total + (code.stamp_duty or Decimal("0.00"))
+        if include_arithmetic and (recomputed == code.gross_total or not code.is_consistent):
             observations.append(NamedObservation(
                 field=CriticalField.GROSS_AMOUNT, value=recomputed, source=evidence_id,
                 method=ExtractionMethod.ARITHMETIC, confidence=ARITHMETIC_CONFIDENCE,

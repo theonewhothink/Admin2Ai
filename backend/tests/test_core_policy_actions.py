@@ -198,7 +198,11 @@ def test_matching_hard_approval_allows_that_one_payment():
     d = authorize(
         A.MONEY_MOVEMENT,
         policy(),
-        ctx(subject_id="pay_1", approval=approval(A.MONEY_MOVEMENT)),
+        ctx(
+            subject_id="pay_1",
+            fingerprint="amount=117.20",
+            approval=approval(A.MONEY_MOVEMENT, fingerprint="amount=117.20"),
+        ),
     )
     assert (
         d.allowed_now
@@ -304,27 +308,20 @@ def test_observation_continues_during_a_fraud_hold(action):
 
 
 def test_changed_beneficiary_needs_a_hard_approval_that_saw_the_warning():
-    unaware = approval(A.MONEY_MOVEMENT)
-    d = authorize(
-        A.MONEY_MOVEMENT,
-        policy(),
-        ctx(subject_id="pay_1", beneficiary_changed=True, approval=unaware),
-    )
-    assert not d.allowed_now
-    owner_only = approval(A.MONEY_MOVEMENT, R.OWNER, acknowledged_risk=True)
-    d = authorize(
-        A.MONEY_MOVEMENT,
-        policy(),
-        ctx(subject_id="pay_1", beneficiary_changed=True, approval=owner_only),
-    )
-    assert not d.allowed_now
-    aware = approval(A.MONEY_MOVEMENT, acknowledged_risk=True)
-    d = authorize(
-        A.MONEY_MOVEMENT,
-        policy(),
-        ctx(subject_id="pay_1", beneficiary_changed=True, approval=aware),
-    )
-    assert d.allowed_now
+    fp = "amount=117.20;iban=PT50...999"
+
+    def decide(a: Approval):
+        return authorize(
+            A.MONEY_MOVEMENT,
+            policy(),
+            ctx(subject_id="pay_1", fingerprint=fp, beneficiary_changed=True, approval=a),
+        )
+
+    assert not decide(approval(A.MONEY_MOVEMENT, fingerprint=fp)).allowed_now
+    owner_only = approval(A.MONEY_MOVEMENT, R.OWNER, acknowledged_risk=True, fingerprint=fp)
+    assert not decide(owner_only).allowed_now
+    aware = approval(A.MONEY_MOVEMENT, acknowledged_risk=True, fingerprint=fp)
+    assert decide(aware).allowed_now
 
 
 def test_changed_beneficiary_escalates_even_granted_supplier_requests():
@@ -394,3 +391,113 @@ def test_decisions_are_consistent_and_plain(action):
                 assert (
                     not d.allowed_now
                 )  # nothing here carries a matching hard approval
+
+
+# --------------------------------------------------------------------------- review regressions
+
+FP = "amount=117.20;iban=PT50...154"
+
+
+@pytest.mark.parametrize("action", HARD, ids=lambda a: a.value)
+def test_hard_approval_must_be_bound_to_the_facts_it_approved(action):
+    """A hard approval without a fingerprint used to authorize any amount/beneficiary."""
+    unbound = approval(action)
+    for context in (
+        ctx(subject_id="pay_1", approval=unbound),
+        ctx(subject_id="pay_1", fingerprint=FP, approval=unbound),
+        ctx(subject_id="pay_1", approval=approval(action, fingerprint=FP)),
+    ):
+        d = authorize(action, policy(), context)
+        assert not d.allowed_now and d.requires is R.HARD, context
+    bound = ctx(subject_id="pay_1", fingerprint=FP, approval=approval(action, fingerprint=FP))
+    assert authorize(action, policy(), bound).allowed_now
+
+
+def test_changed_beneficiary_approval_without_fingerprint_is_refused():
+    aware = approval(A.MONEY_MOVEMENT, acknowledged_risk=True)
+    d = authorize(
+        A.MONEY_MOVEMENT,
+        policy(),
+        ctx(subject_id="pay_1", beneficiary_changed=True, approval=aware),
+    )
+    assert not d.allowed_now
+
+
+def test_escalated_hard_level_also_needs_a_fingerprint():
+    """A fraud hold turns a reminder into a hard-approval action: same binding rule."""
+    unbound = approval(A.REMINDER, acknowledged_risk=True)
+    d = authorize(A.REMINDER, policy(), ctx(subject_id="pay_1", fraud_hold=True, approval=unbound))
+    assert not d.allowed_now
+    bound = approval(A.REMINDER, acknowledged_risk=True, fingerprint=FP)
+    d = authorize(
+        A.REMINDER, policy(), ctx(subject_id="pay_1", fraud_hold=True, fingerprint=FP, approval=bound)
+    )
+    assert d.allowed_now
+
+
+def test_unbound_approval_is_not_reported_as_stale():
+    d = authorize(
+        A.MONEY_MOVEMENT,
+        policy(),
+        ctx(subject_id="pay_1", fingerprint=FP, approval=approval(A.MONEY_MOVEMENT)),
+    )
+    assert d.reason_plain == "This moves money. I need your explicit approval every time."
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: approval(A.MONEY_MOVEMENT, subject_id=""),
+        lambda: approval(A.MONEY_MOVEMENT, subject_id="  "),
+        lambda: approval(A.MONEY_MOVEMENT, approved_by=""),
+        lambda: approval(A.MONEY_MOVEMENT, tenant_id=""),
+        lambda: approval(A.MONEY_MOVEMENT, fingerprint=""),
+        lambda: approval(A.MONEY_MOVEMENT, entity_id=" "),
+        lambda: Grant(action=A.UPLOAD, granted_by="", granted_at=T0),
+        lambda: Grant(action=A.UPLOAD, granted_by="owner:1", granted_at=T0, entity_id=""),
+        lambda: TenantPolicy(tenant_id=" "),
+        lambda: ActionContext(tenant_id=""),
+        lambda: ActionContext(tenant_id="t1", subject_id=""),
+        lambda: ActionContext(tenant_id="t1", fingerprint=" "),
+    ],
+)
+def test_blank_identifiers_are_refused(build):
+    """An approval for subject '' used to match any context whose subject was ''."""
+    with pytest.raises(ValidationError):
+        build()
+
+
+def test_actions_given_as_their_value_behave_like_the_enum():
+    p = TenantPolicy(tenant_id="t1").with_grant("upload", granted_by="owner:1", at=T0)  # type: ignore[arg-type]
+    assert p.allows("upload") and p.allows(A.UPLOAD)  # type: ignore[arg-type]
+    assert authorize("upload", p, ctx()).allowed_now  # type: ignore[arg-type]
+    assert level_of("money_movement") is L.HARD_APPROVAL  # type: ignore[arg-type]
+    assert not is_grantable("tax_filing")  # type: ignore[arg-type]
+    a = approval(A.MONEY_MOVEMENT, fingerprint=FP)
+    d = authorize("money_movement", p, ctx(subject_id="pay_1", fingerprint=FP, approval=a))  # type: ignore[arg-type]
+    assert d.allowed_now and d.action is A.MONEY_MOVEMENT
+
+
+def test_unknown_action_is_a_policy_error():
+    with pytest.raises(PolicyError):
+        authorize("wire_everything", policy(), ctx())  # type: ignore[arg-type]
+
+
+def test_decision_names_the_approval_that_allowed_it():
+    """§55: the audit record of an approved action must point at the human decision."""
+    a = approval(A.MONEY_MOVEMENT, fingerprint=FP)
+    assert a.id.startswith("apr_")
+    d = authorize(A.MONEY_MOVEMENT, policy(), ctx(subject_id="pay_1", fingerprint=FP, approval=a))
+    assert d.allowed_now and d.approval_id == a.id
+    for other in (
+        authorize(A.READING, policy(), ctx(approval=a)),
+        authorize(A.UPLOAD, policy((A.UPLOAD, None)), ctx(approval=a)),
+        authorize(A.MONEY_MOVEMENT, policy(), ctx(subject_id="pay_2", fingerprint=FP, approval=a)),
+    ):
+        assert other.approval_id is None
+
+
+def test_approval_ids_are_unique_and_survive_storage():
+    a, b = approval(A.TAX_FILING), approval(A.TAX_FILING)
+    assert a.id != b.id
+    assert Approval.model_validate_json(a.model_dump_json()) == a

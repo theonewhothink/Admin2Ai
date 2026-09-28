@@ -1,0 +1,4 @@
+Cafe Central
+Supplier VAT: PT987654322
+Date: 12/09/2026
+Total: 7,80 EUR

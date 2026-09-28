@@ -3,6 +3,7 @@
 from collections import defaultdict
 from datetime import date, timedelta
 from decimal import Decimal
+from itertools import pairwise
 
 import pytest
 
@@ -125,7 +126,7 @@ def test_table_has_no_overlaps_or_gaps_per_region_and_bucket():
     for key, entries in groups.items():
         entries.sort(key=lambda e: e.valid_from)
         assert entries[-1].valid_to is None, key  # still in force
-        for prev, nxt in zip(entries, entries[1:]):
+        for prev, nxt in pairwise(entries):
             assert prev.valid_to is not None
             assert prev.valid_to + timedelta(days=1) == nxt.valid_from, key
     for region in PTRegion:

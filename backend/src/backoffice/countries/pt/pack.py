@@ -14,7 +14,7 @@ from backoffice.countries.base import (
     Term,
     VATRate,
 )
-from backoffice.domain.models import DocumentType, ExtractionMethod, utcnow
+from backoffice.domain.models import DocumentType, ExtractionMethod
 
 from . import documents, nif, qr, text_fields
 from . import vat as pt_vat
@@ -48,7 +48,11 @@ class PortugalPack:
         return documents.lookup_term(label)
 
     def vat_rates(self, on: date, region: str | None = None) -> tuple[VATRate, ...]:
-        return pt_vat.rates_on(on, region)
+        """Rates in force on ``on``; empty for a region Portugal does not tax."""
+        region_key = _region(region) if region is not None else None
+        if region is not None and region_key is None:
+            return ()
+        return pt_vat.rates_on(on, region_key)
 
     def is_plausible_vat(
         self,
@@ -58,8 +62,14 @@ class PortugalPack:
         on: date | None = None,
         region: str | None = None,
     ) -> bool | None:
-        day = on or utcnow().date()
-        result = pt_vat.check_rate(net, vat, region or pt_vat.PTRegion.MAINLAND, day)
+        """None when the table does not cover the region or date.
+
+        Without ``on`` the rates currently in the table are used (never the clock).
+        """
+        region_key = _region(region) if region is not None else pt_vat.PTRegion.MAINLAND
+        if region_key is None:
+            return None
+        result = pt_vat.check_rate(net, vat, region_key, on)
         return None if result is pt_vat.RateCheck.UNKNOWN else result is pt_vat.RateCheck.PLAUSIBLE
 
     def parse_fiscal_qr(self, payload: str, evidence_id: str) -> FiscalQRResult | None:
@@ -72,7 +82,7 @@ class PortugalPack:
             doc_type=code.doc_type,
             observations=tuple(qr.qr_to_observations(code, evidence_id)),
             consistent=code.is_consistent,
-            usable=not code.is_cancelled,
+            usable=_can_support_payment(code),
             notes=tuple(str(w) for w in code.checks.warnings),
             payload=code,
         )
@@ -89,3 +99,22 @@ class PortugalPack:
             text, source, method=method, known_customer_tax_ids=known_customer_tax_ids
         )
         return list(result.observations)
+
+
+def _region(value: str) -> pt_vat.PTRegion | None:
+    try:
+        return pt_vat.PTRegion.parse(value)
+    except ValueError:
+        return None
+
+
+def _can_support_payment(code: qr.PTQRCode) -> bool:
+    """Not cancelled, and a tax invoice or a receipt (§3: closure needs real evidence).
+
+    Pro-formas, quotes, orders and transport documents also carry the AT QR
+    code but never evidence a purchase or a payment.
+    """
+    entry = documents.get_document_type(code.doc_type_code)
+    if code.is_cancelled or entry is None:
+        return False
+    return entry.fiscal_invoice or entry.proves_payment

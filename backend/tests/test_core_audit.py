@@ -490,3 +490,309 @@ def test_postgres_schema_keeps_body_as_verbatim_text_and_forbids_changes():
         and "BEFORE TRUNCATE" in POSTGRES_SCHEMA
     )
     assert json.loads(canonical_json({"ok": True})) == {"ok": True}
+
+
+# --------------------------------------------------------------------------- review regressions
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"hash": "é" * 64},
+        {"hash": "\udce7" * 64},
+        {"hash": None},
+        {"hash": 12345},
+        {"prev_hash": None},
+        {"prev_hash": "é" * 64},
+        {"body": None},
+        {"body": b"{}"},
+        {"seq": "2"},
+        {"tenant_id": None},
+    ],
+    ids=lambda c: f"{next(iter(c))}={next(iter(c.values()))!r}"[:30],
+)
+def test_verification_reports_tampered_records_instead_of_crashing(changes):
+    """A non-ASCII or missing hash used to raise TypeError out of verify_chain."""
+    store, _ = filled(3)
+    records = chain(store)
+    records[1] = forge(records[1], **changes)
+    report = verify_chain(records, tenant_id="t1")
+    assert not report.ok and report.problem is not None and report.checked == 1
+
+
+@pytest.mark.parametrize("body", ["[]", "1", "null", '"text"', "{}"])
+def test_body_that_is_not_a_record_object_is_reported(body):
+    """A JSON list body with a valid (recomputed) hash used to raise AttributeError."""
+    prev = genesis_hash("t1")
+    forged = AuditRecord("t1", 1, body, prev, compute_hash(prev, body))
+    assert verify_chain([forged], tenant_id="t1").problem is ChainProblem.BODY_MISMATCH
+
+
+def test_boolean_seq_in_the_body_is_not_seq_one():
+    prev = genesis_hash("t1")
+    body = canonical_json({"tenant_id": "t1", "seq": True, "at": T0})
+    forged = AuditRecord("t1", 1, body, prev, compute_hash(prev, body))
+    assert verify_chain([forged], tenant_id="t1").problem is ChainProblem.BODY_MISMATCH
+
+
+@pytest.mark.parametrize("at", [None, "yesterday", "2026-09-18T14:42:00"], ids=["missing", "garbage", "naive"])
+def test_body_without_a_valid_timestamp_is_reported(at):
+    prev = genesis_hash("t1")
+    data = {"tenant_id": "t1", "seq": 1}
+    if at is not None:
+        data["at"] = at
+    body = canonical_json(data)
+    forged = AuditRecord("t1", 1, body, prev, compute_hash(prev, body))
+    assert verify_chain([forged], tenant_id="t1").problem is ChainProblem.BODY_MISMATCH
+
+
+def test_checkpoint_with_a_garbage_hash_is_reported_not_raised():
+    store, _ = filled(3)
+    report = verify_chain(chain(store), tenant_id="t1", checkpoint=(2, "é"))
+    assert (report.problem, report.seq) == (ChainProblem.CHECKPOINT_MISMATCH, 2)
+
+
+def test_timestamps_never_go_backwards_even_if_the_clock_does():
+    ticks = iter([T0, T0 - timedelta(hours=1), T0 + timedelta(seconds=5)])
+    store = InMemoryAuditStore()
+    log = AuditLog(store, clock=lambda: next(ticks))
+    for i in range(3):
+        log.record("t1", entry(i))
+    times = [r.at for r in chain(store)]
+    assert times == [T0, T0, T0 + timedelta(seconds=5)]
+    assert log.verify("t1").ok
+
+
+def test_backdated_record_is_reported():
+    """A record claiming to predate its predecessor points at a rewrite or a broken writer."""
+    store, _ = filled(3)
+    records = chain(store)
+    rebuilt: list[AuditRecord] = []
+    prev = genesis_hash("t1")
+    for r in records:
+        data = r.data()
+        if r.seq == 3:
+            data["at"] = (T0 - timedelta(days=1)).isoformat()
+        body = canonical_json(data)
+        rebuilt.append(forge(r, body=body, prev_hash=prev, hash=compute_hash(prev, body)))
+        prev = rebuilt[-1].hash
+    report = verify_chain(rebuilt, tenant_id="t1")
+    assert (report.problem, report.seq) == (ChainProblem.TIME_REVERSED, 3)
+
+
+class RacingStore(InMemoryAuditStore):
+    """Another writer appends (with a later clock) just before our first append."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.raced = False
+
+    def append(self, record: AuditRecord) -> None:
+        if not self.raced:
+            self.raced = True
+            other = AuditLog(InMemoryAuditStore(), clock=lambda: T0 + timedelta(minutes=5))
+            rival = other._seal(record.tenant_id, entry(99), T0 + timedelta(minutes=5), self.head(record.tenant_id))
+            super().append(rival)
+        super().append(record)
+
+
+def test_retry_after_a_lost_race_takes_a_fresh_timestamp():
+    store = RacingStore()
+    log = AuditLog(store, clock=fixed_clock())
+    mine = log.record("t1", entry(1))
+    assert mine.seq == 2 and mine.at >= T0 + timedelta(minutes=5)
+    assert log.verify("t1").ok
+
+
+@pytest.mark.parametrize(
+    "value",
+    [{1: "one"}, {"a": {2: "two"}}, [{(1, 2): "pair"}], {None: "x"}],
+    ids=["int-key", "nested-int-key", "tuple-key", "none-key"],
+)
+def test_non_string_keys_are_refused(value):
+    """{1: 'x'} used to be stored as {'1': 'x'}; {1: .., '1': ..} crashed while sorting."""
+    with pytest.raises(TypeError, match="key"):
+        canonical_json(value)
+
+
+def test_naive_datetime_inside_a_model_is_refused():
+    from pydantic import BaseModel
+
+    class Seen(BaseModel):
+        at: datetime
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        canonical_json({"seen": Seen(at=datetime(2026, 9, 18, 14, 42))})
+    aware = json.loads(canonical_json({"seen": Seen(at=T0)}))
+    assert aware == {"seen": {"at": "2026-09-18T14:42:00+00:00"}}
+
+
+def test_models_are_encoded_exactly():
+    from backoffice.domain.models import FieldObservation
+
+    obs = FieldObservation(value=Decimal("83.21"), source="ev_1", method=ExtractionMethod.QR, confidence=0.99)
+    data = json.loads(canonical_json(obs))
+    assert data["value"] == "83.21" and data["method"] == "qr" and data["confidence"] == 0.99
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [{"actor": None}, {"action": None}, {"agent": 3}, {"model": b"x"}, {"parser": ""},
+     {"subject_id": " "}, {"evidence_ids": [None]}],
+    ids=lambda kw: next(iter(kw)),
+)  # fmt: skip
+def test_malformed_entries_are_value_errors(kw):
+    with pytest.raises(ValueError):
+        entry(**kw)
+
+
+@pytest.mark.parametrize("tenant", ["", " ", None])
+def test_blank_tenant_is_refused(tenant):
+    with pytest.raises(ValueError):
+        AuditLog(InMemoryAuditStore()).record(tenant, entry())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("retries", [0, -1])
+def test_log_needs_at_least_one_attempt(retries):
+    with pytest.raises(ValueError):
+        AuditLog(InMemoryAuditStore(), max_retries=retries)
+
+
+# --------------------------------------------------------------------------- Postgres store (DB-API adapter)
+
+import sqlite3  # noqa: E402  (a DB-API driver standing in for psycopg)
+from contextlib import closing  # noqa: E402
+
+# The Postgres DDL uses plpgsql triggers; SQLite gets the same table and keys.
+SQLITE_SCHEMA = """
+CREATE TABLE audit_record (
+    tenant_id TEXT NOT NULL, seq INTEGER NOT NULL CHECK (seq >= 1), at TEXT NOT NULL,
+    body TEXT NOT NULL, prev_hash TEXT NOT NULL, hash TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, seq), UNIQUE (tenant_id, prev_hash), UNIQUE (hash)
+);
+"""
+
+
+@pytest.fixture
+def sqlite_path(tmp_path):
+    """A database file with the audit table; datetimes bound as ISO text meanwhile."""
+    key = (datetime, sqlite3.PrepareProtocol)
+    previous = sqlite3.adapters.get(key)
+    sqlite3.register_adapter(datetime, lambda d: d.isoformat())
+    path = tmp_path / "audit.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.executescript(SQLITE_SCHEMA)
+    yield path
+    if previous is None:
+        sqlite3.adapters.pop(key, None)
+    else:
+        sqlite3.adapters[key] = previous
+
+
+def sqlite_store(path):
+    from backoffice.audit import PostgresAuditStore
+
+    return PostgresAuditStore(
+        lambda: closing(sqlite3.connect(path)),
+        integrity_error=sqlite3.IntegrityError,
+        placeholder="?",
+    )
+
+
+@pytest.fixture
+def pg_store(sqlite_path):
+    return sqlite_store(sqlite_path)
+
+
+def test_postgres_store_satisfies_the_protocol(pg_store):
+    assert isinstance(pg_store, AuditStore)
+
+
+def test_postgres_store_round_trips_a_verified_chain(pg_store):
+    log = AuditLog(pg_store, clock=fixed_clock())
+    written = [log.record("t1", entry(i)) for i in range(4)]
+    log.record("t2", entry(9))
+    assert list(pg_store.records("t1")) == written
+    assert [r.seq for r in pg_store.records("t1", from_seq=3)] == [3, 4]
+    assert pg_store.head("t1") == written[-1] and pg_store.head("nobody") is None
+    assert log.verify("t1").ok and log.verify("t2").ok
+
+
+def test_postgres_store_refuses_records_that_do_not_extend_the_head(pg_store):
+    log = AuditLog(pg_store, clock=fixed_clock())
+    log.record("t1", entry(1))
+    head = pg_store.head("t1")
+    stale = log._seal("t1", entry(2), T0, None)  # built on the genesis, not the head
+    with pytest.raises(AuditConflict):
+        pg_store.append(stale)
+    fork = log._seal("t1", entry(3), T0, head)
+    pg_store.append(fork)
+    with pytest.raises(AuditConflict):
+        pg_store.append(log._seal("t1", entry(4), T0, head))  # same head again
+    assert [r.seq for r in pg_store.records("t1")] == [1, 2]
+
+
+def test_postgres_store_turns_a_lost_race_into_a_conflict(sqlite_path):
+    """The head check passed, but another writer committed the same seq first."""
+    store = sqlite_store(sqlite_path)
+    log = AuditLog(store, clock=fixed_clock())
+    mine = log._seal("t1", entry(1), T0, None)
+    theirs = log._seal("t1", entry(2), T0, None)
+    store.append(theirs)
+    store._read_head = lambda cursor, tenant: None  # type: ignore[method-assign]  # a stale read
+    with pytest.raises(AuditConflict):
+        store.append(mine)
+    del store._read_head
+    assert list(store.records("t1")) == [theirs]
+    assert AuditLog(store).verify("t1").ok
+
+
+@pytest.mark.parametrize("table", ["audit; DROP TABLE x", "Audit", "1audit", ""])
+def test_postgres_store_refuses_unsafe_table_names(table):
+    from backoffice.audit import PostgresAuditStore
+
+    with pytest.raises(ValueError):
+        PostgresAuditStore(lambda: None, integrity_error=Exception, table=table)  # type: ignore[arg-type]
+
+
+def test_postgres_store_without_a_driver_says_what_is_missing(monkeypatch):
+    import builtins
+
+    from backoffice.audit import AuditError, PostgresAuditStore
+
+    real_import = builtins.__import__
+
+    def no_psycopg(name, *args, **kw):
+        if name == "psycopg":
+            raise ImportError(name)
+        return real_import(name, *args, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", no_psycopg)
+    with pytest.raises(AuditError, match="psycopg"):
+        PostgresAuditStore(lambda: None)  # type: ignore[arg-type]
+
+
+def test_text_that_is_not_valid_unicode_is_still_auditable():
+    """Email headers decoded with surrogateescape used to crash hashing (UnicodeEncodeError)."""
+    store = InMemoryAuditStore()
+    log = AuditLog(store, clock=fixed_clock())
+    raw = b"Fatura \xe7".decode("utf-8", "surrogateescape")
+    r = log.record("t1", entry(extracted_values={"subject": raw, "nul": "a\x00b", "name": "João"}))
+    assert r.body.isascii()  # safe for any database encoding
+    assert r.data()["extracted_values"] == {"subject": raw, "nul": "a\x00b", "name": "João"}
+    assert log.verify("t1").ok
+
+
+def test_tampered_body_with_unencodable_text_is_reported():
+    store, _ = filled(2)
+    records = chain(store)
+    records[1] = forge(records[1], body=records[1].body.replace("system", "sys\udce7em"))
+    report = verify_chain(records, tenant_id="t1")
+    assert (report.problem, report.seq) == (ChainProblem.HASH_MISMATCH, 2)
+
+
+def test_deeply_nested_body_is_reported_not_raised():
+    prev = genesis_hash("t1")
+    body = "[" * 100_000 + "]" * 100_000
+    forged = AuditRecord("t1", 1, body, prev, compute_hash(prev, body))
+    assert verify_chain([forged], tenant_id="t1").problem is ChainProblem.BODY_MISMATCH

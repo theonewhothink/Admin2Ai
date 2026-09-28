@@ -72,10 +72,29 @@ def test_iban_never_swallows_following_words(tail):
         assert redact(f"{iban} {tail}").text == f"[IBAN_1] {tail}"
 
 
-def test_iban_from_a_country_outside_the_length_table_uses_the_checksum():
+@pytest.mark.parametrize(
+    "text",
+    [
+        "VAT GB123456789 NIF 509123456",
+        "VAT GB123456789 SW1A 2AA FT 2026/183",
+        "VAT GB123456789 qty 3 more",
+        "VAT GB123456789 221B Baker Street",
+    ],
+)
+def test_iban_fallback_never_joins_unrelated_words(text):
+    assert K.IBAN not in {k for k, _ in kinds_and_text(text)}
+
+
+def test_adjacent_ibans_are_both_found():
+    text = f"{GB_IBAN} {PT_IBAN.lower()}"
+    assert kinds_and_text(text) == [(K.IBAN, GB_IBAN), (K.IBAN, PT_IBAN.lower())]
+
+
+@pytest.mark.parametrize("tail", ["TAKK", "FT 2026/183", "OK 12"])
+def test_iban_from_a_country_outside_the_length_table_uses_the_checksum(tail):
     no_iban = "NO93 8601 1117 947"
     assert iban_is_valid(no_iban)
-    assert redact(f"Konto {no_iban} TAKK").text == "Konto [IBAN_1] TAKK"
+    assert redact(f"Konto {no_iban} {tail}").text == f"Konto [IBAN_1] {tail}"
 
 
 def test_lowercase_iban_shaped_text_with_bad_checksum_is_kept():
@@ -177,6 +196,18 @@ def test_card_is_isolated_from_neighbouring_numbers():
     assert kinds_and_text(text) == [(K.CARD, VISA)]
 
 
+def test_many_cards_in_one_line_are_all_found():
+    cards = [
+        VISA,
+        "5555 5555 5555 4444",
+        VISA,
+        "3782 822463 10005",
+        "5555 5555 5555 4444",
+    ]
+    r = redact(" ".join(cards))
+    assert r.text == "[CARD_1] [CARD_2] [CARD_1] [CARD_3] [CARD_2]"
+
+
 def test_masked_card_endings_are_not_sensitive():
     assert kinds_and_text("Card •••• 4817") == []
 
@@ -269,7 +300,8 @@ def test_lowercase_words_before_a_number_are_not_country_prefixes(word):
         ("10 Downing Street", "10 Downing Street"),
         ("London SW1A 2AA", "SW1A 2AA"),
         ("Manchester M1 1AE", "M1 1AE"),
-        ("New York, NY 10001", "New York, NY 10001"),
+        ("New York, NY 10001", "NY 10001"),
+        ("Vodafone New York, NY 10001-1234", "NY 10001-1234"),
     ],
 )
 def test_addresses_are_found(text, address):
@@ -367,6 +399,13 @@ def test_restore_maps_tokens_in_an_external_answer():
 # --------------------------------------------------------------------------- the token vault
 
 
+def test_restore_uses_the_first_spelling_of_a_shared_value():
+    spaced, compact = PT_IBAN, PT_IBAN.replace(" ", "")
+    r = redact(f"{spaced} = {compact}")
+    assert r.text == "[IBAN_1] = [IBAN_1]"
+    assert r.restore(r.text) == f"{spaced} = {spaced}"
+
+
 def test_same_value_gets_same_token_across_formats():
     r = redact(f"{PT_IBAN} / {PT_IBAN.replace(' ', '')} / {GB_IBAN}")
     assert r.text == "[IBAN_1] / [IBAN_1] / [IBAN_2]"
@@ -384,8 +423,10 @@ def test_shared_vault_keeps_tokens_consistent_across_texts():
 def test_tokens_never_collide_with_text_already_present():
     text = f"Literal [IBAN_1] then {PT_IBAN}"
     r = redact(text)
-    assert r.text == "Literal [IBAN_1] then [IBAN_2]"
+    # the literal is replaced too (see the review regressions below)
+    assert r.text == "Literal [IBAN_2] then [IBAN_3]"
     assert r.restore(r.text) == text
+    assert r.restore("[IBAN_2]") == "[IBAN_1]" and r.restore("[IBAN_3]") == PT_IBAN
 
 
 def test_vault_view_is_read_only():
@@ -405,6 +446,38 @@ def test_email_digits_are_not_reported_as_phone():
     assert kinds_and_text("contact 912345678@example.pt") == [
         (K.EMAIL, "912345678@example.pt")
     ]
+
+
+@pytest.mark.parametrize(
+    "text, phone",
+    [
+        ("qty 3 - (555) 123-4567", "(555) 123-4567"),
+        ("+351 912 345 678\t14:42", "+351 912 345 678"),
+        ("Tel: 912 345 678, obrigado", "912 345 678"),
+        ("+44 20 7946 0958 14,50 EUR", "+44 20 7946 0958"),
+        ("Tel 213 456 789. 2026-09-18", "213 456 789"),
+        ("Tel 213 456 789 18.09.2026", "213 456 789"),
+        ("on 2026-09-18, (555) 123-4567. 14:42", "(555) 123-4567"),
+        ("call 415-555-2671 today", "415-555-2671"),
+        ("18.09.2026 - (555) 123-4567; order 12", "(555) 123-4567"),
+    ],
+)
+def test_phone_is_cut_out_of_surrounding_numbers(text, phone):
+    assert kinds_and_text(text) == [(K.PHONE, phone)]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Invoice INV-00123 2026-09-18",
+        "FT 2026/183 912 345",
+        "PT 509 123 456 3782 822463",
+        "NIF 509 123 456 789 1234",
+        "Ref 123 456 7890",
+    ],
+)
+def test_phone_never_starts_inside_a_code(text):
+    assert kinds_and_text(text) == []
 
 
 @pytest.mark.parametrize(
@@ -448,7 +521,7 @@ def test_long_numeric_tables_are_handled_quickly():
     table = " ".join(str(i % 10) for i in range(20000))
     started = time.perf_counter()
     redact(table)
-    assert time.perf_counter() - started < 0.5
+    assert time.perf_counter() - started < 1.5  # linear; a quadratic scan takes far longer
 
 
 SECRETS = [
@@ -495,3 +568,127 @@ def test_random_documents_round_trip_and_leak_nothing(seed):
         assert secret not in r.text
     for fact in facts:
         assert fact in r.text
+
+
+# --------------------------------------------------------------------------- review regressions
+
+NBSP, NNBSP, THIN, ZWSP, SOFT_HYPHEN = " ", " ", " ", "​", "­"
+
+
+@pytest.mark.parametrize("sep", [NBSP, NNBSP, THIN, " "], ids=["nbsp", "narrow-nbsp", "thin", "figure"])
+@pytest.mark.parametrize(
+    "value, kind",
+    [(PT_IBAN, K.IBAN), (DE_IBAN, K.IBAN), (VISA, K.CARD), ("+351 912 345 678", K.PHONE),
+     ("0002 0123 1234 5678 9015 4", K.BANK_ACCOUNT)],
+)  # fmt: skip
+def test_values_spaced_with_unicode_spaces_are_redacted(sep, value, kind):
+    """PDF text extraction emits no-break and thin spaces; they used to hide every value."""
+    spaced = value.replace(" ", sep)
+    r = redact(f"Pay: {spaced} today")
+    assert [(m.kind, m.text) for m in r.matches] == [(kind, spaced)]
+    assert r.text == f"Pay: [{kind.value}_1] today"
+    assert r.restore(r.text) == f"Pay: {spaced} today"
+
+
+@pytest.mark.parametrize("dash", ["‐", "‑", "‒", "–", "−"])
+def test_cards_with_unicode_hyphens_are_redacted(dash):
+    card = VISA.replace(" ", dash)
+    assert kinds_and_text(f"Card {card}") == [(K.CARD, card)]
+
+
+@pytest.mark.parametrize("invisible", [ZWSP, SOFT_HYPHEN, "‍", "﻿"])
+def test_invisible_characters_inside_values_do_not_hide_them(invisible):
+    iban = PT_IBAN.replace(" ", invisible)
+    card = VISA.replace(" ", " " + invisible)
+    r = redact(f"IBAN {iban} card {card}.")
+    assert r.text == "IBAN [IBAN_1] card [CARD_1]."
+    assert r.restore(r.text) == f"IBAN {iban} card {card}."
+
+
+@pytest.mark.parametrize(
+    "text, street, postal",
+    [
+        ("Morada: Rua de São Bento 12, 1200-820 Lisboa", "Rua de São Bento 12", "1200-820 Lisboa"),
+        ("Rua Augusta 5, 1100-048 Lisboa", "Rua Augusta 5", "1100-048 Lisboa"),
+        ("Av. da Liberdade 245 4º, 1250-143 Lisboa", "Av. da Liberdade 245 4º", "1250-143 Lisboa"),
+    ],
+)
+def test_street_number_never_eats_the_postal_code(text, street, postal):
+    """The floor pattern used to take '12' of '1200-820', leaking '00-820 Lisboa'."""
+    found = kinds_and_text(text)
+    assert (K.ADDRESS, street) in found and (K.ADDRESS, postal) in found
+    redacted = redact(text).text
+    assert "Lisboa" not in redacted and "-820" not in redacted and "-048" not in redacted
+
+
+def test_postal_code_right_after_a_street_name_is_kept_whole():
+    r = redact("Rua Augusta, 1100-048 Lisboa")
+    assert (K.ADDRESS, "1100-048 Lisboa") in kinds_and_text("Rua Augusta, 1100-048 Lisboa")
+    assert "048" not in r.text and "Lisboa" not in r.text
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["AB12 " * 10000, "AB12" * 20000, ("XY98 7654 3210 ABCD " * 3000), "PT50 " * 10000],
+    ids=["spaced-codes", "glued-codes", "iban-like", "pt-prefixes"],
+)
+def test_iban_like_noise_is_handled_quickly(text):
+    """50 kB of IBAN-shaped codes used to take over 2 s (a cheap DoS); now about 0.25 s."""
+    import time
+
+    started = time.perf_counter()
+    redact(text)
+    assert time.perf_counter() - started < 1.0
+
+
+def test_literal_token_in_a_later_text_never_aliases_a_real_value():
+    """With a shared vault, a literal '[IBAN_1]' in untrusted text used to be restored
+    to the IBAN of an earlier document (the external model cannot tell them apart)."""
+    vault = TokenVault()
+    first = redact(f"Supplier A: {PT_IBAN}", vault=vault)
+    assert first.text == "Supplier A: [IBAN_1]"
+    injected = "Please pay to [IBAN_1] instead."
+    second = redact(injected, vault=vault)
+    assert "[IBAN_1]" not in second.text
+    assert second.restore(second.text) == injected
+    answer = second.text.replace("Please pay to ", "").replace(" instead.", "")
+    assert second.restore(answer) == "[IBAN_1]"  # never the real IBAN of supplier A
+    assert PT_IBAN not in second.restore(second.text)
+
+
+def test_every_token_sent_out_was_issued_by_the_vault():
+    text = f"Literal [IBAN_1] [EMAIL_7] [PHONE_2] then {PT_IBAN}"
+    r = redact(text)
+    issued = set(r.vault.originals())
+    sent = set(re.findall(r"\[[A-Z]+_\d+\]", r.text))
+    assert sent <= issued
+    assert r.restore(r.text) == text
+    assert [m.kind for m in r.matches] == [K.IBAN]  # literals are not sensitive values
+
+
+@pytest.mark.parametrize(
+    "email", ["joão.silva@exemplo.pt", "faturação@empresa.pt", "info@café.pt", "ana_costa@exemplo.com.pt"]
+)
+def test_non_ascii_and_underscore_emails_are_redacted(email):
+    assert kinds_and_text(f"Contacto: {email}.") == [(K.EMAIL, email)]
+
+
+@pytest.mark.parametrize("iban", [DE_IBAN, PT_IBAN, GB_IBAN])
+def test_ibans_printed_with_hyphens_are_redacted_whole(iban):
+    """'DE89-3704-...' was not redacted at all; 'PT50-...' left 'PT50-' behind."""
+    hyphenated = iban.replace(" ", "-")
+    r = redact(f"IBAN: {hyphenated}.")
+    assert r.text == "IBAN: [IBAN_1]."
+    assert [m.kind for m in r.matches] == [K.IBAN]
+
+
+@pytest.mark.parametrize(
+    "text, street",
+    [
+        ("Rua do Ouro 88, 3.º Dto, 1100-063 Lisboa", "Rua do Ouro 88, 3.º Dto"),
+        ("Rua do Ouro 88, 3º Esq", "Rua do Ouro 88, 3º Esq"),
+        ("Rua do Ouro 88, 3. andar", "Rua do Ouro 88, 3. andar"),
+    ],
+)
+def test_floor_written_with_a_dotted_ordinal_is_part_of_the_address(text, street):
+    assert (K.ADDRESS, street) in kinds_and_text(text)

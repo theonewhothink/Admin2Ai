@@ -109,4 +109,4 @@ def test_link_unknown_code_only_matters_with_a_registry():
 
 
 def test_atcud_mandatory_date():
-    assert ATCUD_MANDATORY_FROM == date(2023, 1, 1)
+    assert date(2023, 1, 1) == ATCUD_MANDATORY_FROM

@@ -1,0 +1,45 @@
+From: Payments <pay@supplier-pay.example>
+To: Ana Silva <ana@padaria-exemplo.pt>
+Subject: Payment advice
+Date: Thu, 24 Sep 2026 09:15:00 +0100
+Message-ID: <odd-1@supplier-pay.example>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="===============2382458822114583566=="
+
+--===============2382458822114583566==
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+See attached.
+
+--===============2382458822114583566==
+Content-Type: application/pdf
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="invoice.pdf"
+MIME-Version: 1.0
+
+PGh0bWw+PGJvZHk+PGZvcm0gYWN0aW9uPSdodHRwczovL3guZXhhbXBsZS9sb2dpbic+PGlucHV0
+IHR5cGU9J3Bhc3N3b3JkJz48L2Zvcm0+PC9ib2R5PjwvaHRtbD4=
+
+--===============2382458822114583566==
+Content-Type: application/octet-stream
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="original.eml"
+MIME-Version: 1.0
+
+RnJvbTogVWJlciBSZWNlaXB0cyA8bm9yZXBseUB1YmVyLmNvbT4NClRvOiBBbmEgU2lsdmEgPGFu
+YUBwYWRhcmlhLWV4ZW1wbG8ucHQ+DQpTdWJqZWN0OiBPcmlnaW5hbCBpbnZvaWNlDQpEYXRlOiBU
+aHUsIDI0IFNlcCAyMDI2IDA5OjE1OjAwICswMTAwDQpNZXNzYWdlLUlEOiA8dWJlci0xQHViZXIu
+Y29tPg0KQ29udGVudC1UeXBlOiB0ZXh0L3BsYWluOyBjaGFyc2V0PSJ1dGYtOCINCkNvbnRlbnQt
+VHJhbnNmZXItRW5jb2Rpbmc6IDdiaXQNCk1JTUUtVmVyc2lvbjogMS4wDQoNClRoYW5rcyBmb3Ig
+cmlkaW5nLiBUb3RhbDogRVVSIDEyLjMwDQo=
+
+--===============2382458822114583566==
+Content-Type: text/calendar
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="invite.ics"
+MIME-Version: 1.0
+
+QkVHSU46VkNBTEVOREFSDQpFTkQ6VkNBTEVOREFSDQo=
+
+--===============2382458822114583566==--

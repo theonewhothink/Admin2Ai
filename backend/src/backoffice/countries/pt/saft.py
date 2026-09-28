@@ -16,8 +16,9 @@ import csv
 import io
 import re
 import xml.etree.ElementTree as ET
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Literal
@@ -32,11 +33,14 @@ from backoffice.domain.models import (
     Quality,
 )
 
-from .atcud import ATCUD, ATCUDError, parse_atcud, parse_document_number
+from .atcud import ATCUD, ATCUD_NOT_APPLICABLE, ATCUDError, parse_atcud, parse_document_number
 from .documents import CANCELLED_STATUS, get_document_type, preferred_code
 from .nif import normalize_nif
 
-DEFAULT_MAX_BYTES = 256 * 1024 * 1024
+# ElementTree holds the whole file in memory (several times its size), so the
+# default stays well above any SME's monthly SAF-T but far from exhausting a
+# worker. Callers with a known larger file can pass ``max_bytes``.
+DEFAULT_MAX_BYTES = 64 * 1024 * 1024
 _TOLERANCE = Decimal("0.01")
 _ZERO = Decimal("0.00")
 _DECIMAL = re.compile(r"^-?[0-9]+(?:\.[0-9]+)?$")
@@ -45,6 +49,13 @@ _ISO_DATE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 # already-invoiced ("F") documents.
 _EXCLUDED_FROM_TOTALS = frozenset({CANCELLED_STATUS, "F"})
 _STRUCTURED_CONFIDENCE = 0.97
+# Totals that contradict the file's own lines are still reported, at the
+# lowest confidence verification treats as a deliberate reading, next to the
+# recomputed value: the disagreement becomes a CONFLICT, never a pick (§19).
+_INCONSISTENT_CONFIDENCE = 0.40
+_ARITHMETIC_CONFIDENCE = 0.95
+_CENT = Decimal("0.01")
+_HALF_CENT = Decimal("0.005")
 
 
 class SaftError(CountryPackError, ValueError):
@@ -75,6 +86,12 @@ def _refuse(kind: str) -> Callable[..., None]:
     return handler
 
 
+def _refuse_external_entity(
+    _context: str, _base: str | None, _system_id: str | None, _public_id: str | None
+) -> int:
+    raise SaftSecurityError("external entity is not allowed in SAF-T files")
+
+
 def parse_xml_safely(data: bytes | str, *, max_bytes: int = DEFAULT_MAX_BYTES) -> ET.Element:
     """Parse XML into an ElementTree with namespace prefixes stripped.
 
@@ -97,7 +114,7 @@ def parse_xml_safely(data: bytes | str, *, max_bytes: int = DEFAULT_MAX_BYTES) -
     parser.StartDoctypeDeclHandler = _refuse("DOCTYPE")
     parser.EntityDeclHandler = _refuse("entity declaration")
     parser.UnparsedEntityDeclHandler = _refuse("entity declaration")
-    parser.ExternalEntityRefHandler = _refuse("external entity")
+    parser.ExternalEntityRefHandler = _refuse_external_entity
     parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
     parser.buffer_text = True
     try:
@@ -155,7 +172,33 @@ class SaftInvoice:
     foreign_amount: Decimal | None
     tax_bases: tuple[SaftTaxBase, ...]
     line_count: int
-    problems: tuple[str, ...]
+    lines_net: Decimal  # sum of the lines, in the document's own sense
+    lines_vat: Decimal  # VAT implied by the lines' rates, rounded to the cent
+    problems: tuple[str, ...]  # technical descriptions, not owner-facing
+
+    @property
+    def totals_consistent(self) -> bool:
+        """GrossTotal equals NetTotal + TaxPayable (to the cent)."""
+        return abs(self.net_total + self.tax_payable - self.gross_total) <= _TOLERANCE
+
+    @property
+    def lines_consistent(self) -> bool:
+        """NetTotal equals the sum of the lines (to the cent)."""
+        return abs(self.lines_net - self.net_total) <= _TOLERANCE
+
+    @property
+    def taxes_consistent(self) -> bool:
+        """TaxPayable - stamp duty equals the VAT implied by the lines' rates.
+
+        Software may round VAT per line, so up to half a cent per line of
+        drift (plus one cent) is accepted.
+        """
+        allowed = _TOLERANCE + _HALF_CENT * self.line_count
+        return abs(self.vat_total - self.lines_vat) <= allowed
+
+    @property
+    def consistent(self) -> bool:
+        return self.totals_consistent and self.lines_consistent and self.taxes_consistent
 
     @property
     def doc_type(self) -> DocumentType:
@@ -281,6 +324,7 @@ def _invoice(el: ET.Element, customers: Mapping[str, Mapping[str, str | None]], 
         raise SaftError(f"{where}: DocumentTotals is missing")
     sign = Decimal(-1) if _doc_sign_is_debit(invoice_type) else Decimal(1)
     bases, stamp, lines_net, line_count = _lines(el, sign, where)
+    lines_vat = _lines_vat(bases)
     customer = customers.get(_text(el, "CustomerID") or "", {})
     net_total = _required_decimal(totals, "NetTotal", where)
     tax_payable = _required_decimal(totals, "TaxPayable", where)
@@ -288,7 +332,7 @@ def _invoice(el: ET.Element, customers: Mapping[str, Mapping[str, str | None]], 
     withholding = [
         _decimal(w.findtext("WithholdingTaxAmount"), where) or _ZERO for w in el.findall("WithholdingTax")
     ]
-    return SaftInvoice(
+    invoice = SaftInvoice(
         invoice_no=invoice_no,
         atcud_raw=_text(el, "ATCUD"),
         invoice_type=invoice_type,
@@ -307,8 +351,19 @@ def _invoice(el: ET.Element, customers: Mapping[str, Mapping[str, str | None]], 
         foreign_amount=_decimal(totals.findtext("Currency/CurrencyAmount"), where),
         tax_bases=bases,
         line_count=line_count,
-        problems=_invoice_problems(net_total, tax_payable, gross_total, lines_net),
+        lines_net=lines_net,
+        lines_vat=lines_vat,
+        problems=(
+            _invoice_problems(net_total, tax_payable, gross_total, lines_net)
+            + _identity_problems(invoice_no, invoice_type, _text(el, "ATCUD"))
+        ),
     )
+    if not invoice.taxes_consistent:
+        problems = (*invoice.problems,
+                    f"TaxPayable {tax_payable} minus stamp duty {stamp} differs from the VAT "
+                    f"on the lines {lines_vat}")
+        invoice = replace(invoice, problems=problems)
+    return invoice
 
 
 def _doc_sign_is_debit(invoice_type: str) -> bool:
@@ -321,7 +376,8 @@ def _lines(
     invoice: ET.Element, sign: Decimal, where: str
 ) -> tuple[tuple[SaftTaxBase, ...], Decimal, Decimal, int]:
     groups: dict[tuple[str, str, str, Decimal | None], Decimal] = {}
-    stamp = _ZERO
+    stamp_fixed = _ZERO
+    stamp_rated: dict[Decimal, Decimal] = {}  # IS percentage -> line amounts
     total = _ZERO
     lines = invoice.findall("Line")
     for line in lines:
@@ -339,10 +395,37 @@ def _lines(
             _decimal(tax.findtext("TaxPercentage"), where),
         )
         groups[key] = groups.get(key, _ZERO) + amount
-        if key[0] == "IS":
-            stamp += _decimal(tax.findtext("TaxAmount"), where) or _ZERO
+        if key[0] != "IS":
+            continue
+        # Stamp duty is either a fixed TaxAmount or a percentage of the line.
+        fixed = _decimal(tax.findtext("TaxAmount"), where)
+        if fixed is not None:
+            stamp_fixed += fixed
+        elif key[3]:
+            stamp_rated[key[3]] = stamp_rated.get(key[3], _ZERO) + amount
     bases = tuple(SaftTaxBase(t, r, c, p, amount) for (t, r, c, p), amount in groups.items())
-    return bases, stamp, total, len(lines)
+    return bases, stamp_fixed + _percentage_stamp_duty(stamp_rated), total, len(lines)
+
+
+def _lines_vat(bases: Iterable[SaftTaxBase]) -> Decimal:
+    """VAT the lines' rates imply (IVA only), rounded half-up to the cent."""
+    total = sum(
+        (b.base * b.percentage / 100 for b in bases if b.tax_type == "IVA" and b.percentage),
+        _ZERO,
+    )
+    return total.quantize(_CENT, rounding=ROUND_HALF_UP)
+
+
+def _percentage_stamp_duty(rated: Mapping[Decimal, Decimal]) -> Decimal:
+    """Stamp duty charged as a percentage of the line amounts (e.g. 4% on credit).
+
+    Rounded per rate, half-up to the cent; any rounding drift then shows up
+    in the GrossTotal check instead of being absorbed.
+    """
+    return sum(
+        ((base * pct / 100).quantize(_CENT, rounding=ROUND_HALF_UP) for pct, base in rated.items()),
+        _ZERO,
+    )
 
 
 def _invoice_problems(net: Decimal, tax: Decimal, gross: Decimal, lines_net: Decimal) -> tuple[str, ...]:
@@ -354,8 +437,32 @@ def _invoice_problems(net: Decimal, tax: Decimal, gross: Decimal, lines_net: Dec
     return tuple(problems)
 
 
+def _identity_problems(invoice_no: str, invoice_type: str, atcud_raw: str | None) -> tuple[str, ...]:
+    """Unknown document type, or an ATCUD that does not belong to this InvoiceNo."""
+    problems = []
+    if get_document_type(invoice_type) is None:
+        problems.append(f"InvoiceType {invoice_type} is not a known SAF-T (PT) type")
+    if atcud_raw is None or atcud_raw == ATCUD_NOT_APPLICABLE:
+        return tuple(problems)
+    try:
+        atcud = parse_atcud(atcud_raw)
+    except ATCUDError:
+        problems.append(f"ATCUD {atcud_raw!r} is malformed")
+        return tuple(problems)
+    number = parse_document_number(invoice_no)
+    if atcud.sequence != number.number:
+        problems.append(
+            f"ATCUD sequence {atcud.sequence_text} does not match InvoiceNo {invoice_no}"
+        )
+    return tuple(problems)
+
+
 def _file_problems(section: ET.Element, invoices: tuple[SaftInvoice, ...]) -> tuple[str, ...]:
     problems = []
+    counts = Counter(inv.invoice_no for inv in invoices)
+    problems.extend(
+        f"InvoiceNo {number} appears more than once" for number, n in counts.items() if n > 1
+    )
     entries = _text(section, "NumberOfEntries")
     if entries is not None and entries.isdigit() and int(entries) != len(invoices):
         problems.append(f"NumberOfEntries {entries} but {len(invoices)} invoices found")
@@ -433,26 +540,64 @@ def _optional_date(el: ET.Element, path: str) -> date | None:
 
 
 def saft_invoice_observations(
-    invoice: SaftInvoice, header: SaftHeader, evidence_id: str
+    invoice: SaftInvoice,
+    header: SaftHeader,
+    evidence_id: str,
+    *,
+    include_cancelled: bool = False,
 ) -> list[NamedObservation]:
-    """Field observations (method=STRUCTURED_XML) for one SAF-T invoice."""
+    """Field observations (method=STRUCTURED_XML) for one SAF-T invoice.
+
+    A cancelled invoice evidences nothing, so it yields no observations unless
+    ``include_cancelled``. When the file's own totals disagree (GrossTotal vs
+    NetTotal + TaxPayable, NetTotal vs the lines, or the VAT vs the lines'
+    rates) the amounts drop to low
+    confidence and the recomputed value is added (method=ARITHMETIC, located
+    on the structured_xml channel so it never counts as independent), so the
+    disagreement surfaces as a CONFLICT instead of being hidden (§19).
+    """
+    if invoice.is_cancelled and not include_cancelled:
+        return []
     where = f"saft:{invoice.invoice_no}"
-    values: list[tuple[CriticalField, object, str]] = [
-        (CriticalField.INVOICE_NUMBER, invoice.invoice_no, "InvoiceNo"),
-        (CriticalField.ISSUE_DATE, invoice.invoice_date, "InvoiceDate"),
-        (CriticalField.NET_AMOUNT, invoice.net_total, "DocumentTotals/NetTotal"),
-        (CriticalField.VAT_AMOUNT, invoice.vat_total, "DocumentTotals/TaxPayable-IS"),
-        (CriticalField.GROSS_AMOUNT, invoice.gross_total, "DocumentTotals/GrossTotal"),
-        (CriticalField.CURRENCY, header.currency, "Header/CurrencyCode"),
+    ids = _STRUCTURED_CONFIDENCE
+    amounts = _STRUCTURED_CONFIDENCE if invoice.consistent else _INCONSISTENT_CONFIDENCE
+    values: list[tuple[CriticalField, object, str, float]] = [
+        (CriticalField.INVOICE_NUMBER, invoice.invoice_no, "InvoiceNo", ids),
+        (CriticalField.ISSUE_DATE, invoice.invoice_date, "InvoiceDate", ids),
+        (CriticalField.NET_AMOUNT, invoice.net_total, "DocumentTotals/NetTotal", amounts),
+        (CriticalField.VAT_AMOUNT, invoice.vat_total, "DocumentTotals/TaxPayable-IS", amounts),
+        (CriticalField.GROSS_AMOUNT, invoice.gross_total, "DocumentTotals/GrossTotal", amounts),
+        (CriticalField.CURRENCY, header.currency, "Header/CurrencyCode", ids),
     ]
     if header.company_tax_id:
-        values.append((CriticalField.SUPPLIER_TAX_ID, header.company_tax_id, "Header/TaxRegistrationNumber"))
+        values.append((CriticalField.SUPPLIER_TAX_ID, header.company_tax_id,
+                       "Header/TaxRegistrationNumber", ids))
     if invoice.customer_tax_id:
-        values.append((CriticalField.CUSTOMER_TAX_ID, invoice.customer_tax_id, "Customer/CustomerTaxID"))
-    return [
+        values.append((CriticalField.CUSTOMER_TAX_ID, invoice.customer_tax_id,
+                       "Customer/CustomerTaxID", ids))
+    observations = [
         NamedObservation(field=f, value=v, source=evidence_id, method=ExtractionMethod.STRUCTURED_XML,
-                         confidence=_STRUCTURED_CONFIDENCE, location=f"{where}/{path}")
-        for f, v, path in values
+                         confidence=c, location=f"{where}/{path}")
+        for f, v, path, c in values
+    ]
+    return observations + _arithmetic_observations(invoice, evidence_id)
+
+
+def _arithmetic_observations(invoice: SaftInvoice, evidence_id: str) -> list[NamedObservation]:
+    """Recomputed totals, only where the file contradicts itself."""
+    derived: list[tuple[CriticalField, Decimal, str]] = []
+    if not invoice.totals_consistent:
+        derived.append((CriticalField.GROSS_AMOUNT, invoice.net_total + invoice.tax_payable,
+                        "NetTotal+TaxPayable"))
+    if not invoice.lines_consistent:
+        derived.append((CriticalField.NET_AMOUNT, invoice.lines_net, "sum(Line)"))
+    if not invoice.taxes_consistent:
+        derived.append((CriticalField.VAT_AMOUNT, invoice.lines_vat, "sum(Line*TaxPercentage)"))
+    return [
+        NamedObservation(field=f, value=v, source=evidence_id, method=ExtractionMethod.ARITHMETIC,
+                         confidence=_ARITHMETIC_CONFIDENCE,
+                         location=f"structured_xml:arithmetic({formula})@saft:{invoice.invoice_no}")
+        for f, v, formula in derived
     ]
 
 
@@ -478,6 +623,8 @@ _STATUS_WORDS = {
     "iso": {Quality.GREEN: "verified", Quality.AMBER: "unconfirmed", Quality.RED: "conflict"},
 }
 _FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+# The period ends up in a file name: keep it to a plain label (no paths).
+_PERIOD = re.compile(r"^[0-9A-Za-z][0-9A-Za-z_-]{0,31}$")
 
 
 @dataclass(frozen=True)
@@ -513,10 +660,14 @@ def ledger_row_from_document(
     atcud: str = "",
     withholding: Decimal | None = None,
 ) -> LedgerRow:
-    """Ledger row for a purchase document (counterparty = supplier)."""
+    """Ledger row for a purchase document (counterparty = supplier).
+
+    A credit note is always negative, whether its amounts arrive as
+    magnitudes (the domain convention) or already signed.
+    """
     if document.issue_date is None or document.gross_amount is None:
         raise ValueError("a ledger row needs an issue date and a gross amount")
-    sign = Decimal(-1) if document.doc_type == DocumentType.CREDIT_NOTE else Decimal(1)
+    credit = document.doc_type == DocumentType.CREDIT_NOTE
     return LedgerRow(
         issued_on=document.issue_date,
         doc_code=_code_for(document),
@@ -524,14 +675,20 @@ def ledger_row_from_document(
         atcud=atcud,
         counterparty_tax_id=document.supplier_tax_id or "",
         counterparty_name=document.supplier_name or "",
-        net=None if document.net_amount is None else document.net_amount * sign,
-        vat=None if document.vat_amount is None else document.vat_amount * sign,
-        gross=document.gross_amount * sign,
+        net=_signed(document.net_amount, credit),
+        vat=_signed(document.vat_amount, credit),
+        gross=_signed(document.gross_amount, credit),
         withholding=withholding,
         currency=document.currency,
         status=document.quality,
         evidence=" ".join(document.evidence_ids),
     )
+
+
+def _signed(value: Decimal | None, credit_note: bool) -> Decimal | None:
+    if value is None:
+        return None
+    return -abs(value) if credit_note else value
 
 
 def _code_for(document: Document) -> str:
@@ -549,12 +706,17 @@ def export_ledger_csv(
     period: str | None = None,
 ) -> LedgerExport:
     """CSV ledger. ``pt``: ';' separator and decimal comma (opens in PT Excel);
-    ``iso``: ',' separator and decimal point. Rows are sorted by date and number.
+    ``iso``: ',' separator and decimal point. Rows are sorted by date and
+    number (then counterparty and evidence, so the output is deterministic).
     Text cells that could be read as spreadsheet formulas are neutralised.
+    ``period`` (e.g. "2026-09") goes into the file name, so it must be a plain
+    label of letters, digits, "-" or "_".
     """
     if dialect not in _HEADERS:
         raise ValueError(f"unknown dialect {dialect!r}")
-    ordered = sorted(rows, key=lambda r: (r.issued_on, r.number))
+    if period is not None and not _PERIOD.match(period):
+        raise ValueError("period must be a short label of letters, digits, '-' or '_'")
+    ordered = sorted(rows, key=_row_order)
     buffer = io.StringIO()
     writer = csv.writer(buffer, delimiter=";" if dialect == "pt" else ",", lineterminator="\r\n")
     writer.writerow(_HEADERS[dialect])
@@ -567,6 +729,11 @@ def export_ledger_csv(
         row_count=len(ordered),
         filename=f"ledger{suffix}-subset-not-saft.csv",
     )
+
+
+def _row_order(row: LedgerRow) -> tuple[object, ...]:
+    return (row.issued_on, row.number, row.counterparty_tax_id, row.doc_code, row.evidence,
+            row.gross)
 
 
 def _cells(row: LedgerRow, dialect: str) -> list[str]:

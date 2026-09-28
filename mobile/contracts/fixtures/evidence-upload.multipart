@@ -1,0 +1,33 @@
+------BackOfficeBoundary000000000000000000000000
+Content-Disposition: form-data; name="sha256"
+
+ee2d14b09b1f174f566d039e4d1c5d6e250feb812d9aa4ca2e595550a2548461
+------BackOfficeBoundary000000000000000000000000
+Content-Disposition: form-data; name="source"
+
+mobile_share
+------BackOfficeBoundary000000000000000000000000
+Content-Disposition: form-data; name="format"
+
+pdf
+------BackOfficeBoundary000000000000000000000000
+Content-Disposition: form-data; name="captured_at"
+
+2026-09-28T10:14:03+01:00
+------BackOfficeBoundary000000000000000000000000
+Content-Disposition: form-data; name="client_item_id"
+
+0b7e0e7c-6a55-4a8e-9b1e-2d0f3c9a1f00
+------BackOfficeBoundary000000000000000000000000
+Content-Disposition: form-data; name="hints"
+
+{"title":"Your invoice is ready"}
+------BackOfficeBoundary000000000000000000000000
+Content-Disposition: form-data; name="file"; filename="vodafone-2026-09.pdf"
+Content-Type: application/pdf
+
+%PDF-1.7
+1 0 obj << /Type /Catalog >> endobj
+%%EOF
+
+------BackOfficeBoundary000000000000000000000000--

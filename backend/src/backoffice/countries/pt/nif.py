@@ -77,7 +77,7 @@ def nif_check_digit(first_eight: str) -> int:
     """Mod-11 check digit for the first 8 digits of a NIF."""
     if len(first_eight) != 8 or not (first_eight.isascii() and first_eight.isdigit()):
         raise ValueError("expected exactly 8 digits")
-    remainder = sum(int(d) * w for d, w in zip(first_eight, _WEIGHTS)) % 11
+    remainder = sum(int(d) * w for d, w in zip(first_eight, _WEIGHTS, strict=True)) % 11
     return 0 if remainder < 2 else 11 - remainder
 
 
@@ -116,7 +116,7 @@ def validate_nif(raw: str, *, allow_placeholder: bool = False) -> TaxIdCheck:
     nif = normalize_nif(text)
     if nif is None:
         digits = re.sub(r"[^0-9]", "", text)
-        if _SHAPE.match(" ".join(text.split())) is None:
+        if not digits or _SHAPE.match(" ".join(text.split())) is None:
             return _invalid(text, None, "characters", "A NIF only has digits. Please check it.")
         return _invalid(
             text, None, "length", f"That NIF has {len(digits)} digits. It needs 9."

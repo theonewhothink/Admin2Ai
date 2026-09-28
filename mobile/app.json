@@ -1,0 +1,84 @@
+{
+  "expo": {
+    "name": "Back Office",
+    "slug": "backoffice",
+    "scheme": "backoffice",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "backgroundColor": "#F7F8F6",
+    "ios": {
+      "bundleIdentifier": "eu.admin2ai.backoffice",
+      "supportsTablet": false
+    },
+    "android": {
+      "package": "eu.admin2ai.backoffice",
+      "allowBackup": false,
+      "blockedPermissions": [
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.RECORD_AUDIO"
+      ]
+    },
+    "plugins": [
+      "expo-router",
+      "expo-font",
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#F7F8F6"
+        }
+      ],
+      [
+        "expo-secure-store",
+        {
+          "configureAndroidBackup": true,
+          "faceIDPermission": false
+        }
+      ],
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "Back Office uses Face ID to keep your business private."
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Back Office uses the camera to scan receipts and invoices.",
+          "microphonePermission": false,
+          "recordAudioAndroid": false
+        }
+      ],
+      [
+        "react-native-document-scanner-plugin",
+        {
+          "cameraPermission": "Back Office uses the camera to scan receipts and invoices."
+        }
+      ],
+      "expo-background-task",
+      [
+        "expo-share-intent",
+        {
+          "iosActivationRules": "SUBQUERY (extensionItems, $extensionItem, SUBQUERY ($extensionItem.attachments, $attachment, ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO \"public.url\" || ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO \"public.plain-text\" || ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO \"public.image\" || ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO \"com.adobe.pdf\" || ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO \"public.email-message\" || ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO \"public.xml\").@count >= 1).@count >= 1",
+          "iosShareExtensionName": "Back Office",
+          "androidIntentFilters": [
+            "text/*",
+            "image/*",
+            "application/pdf",
+            "message/rfc822",
+            "application/xml",
+            "text/xml"
+          ],
+          "androidMultiIntentFilters": [
+            "image/*",
+            "application/pdf"
+          ]
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": false
+    }
+  }
+}

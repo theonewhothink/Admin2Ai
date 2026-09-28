@@ -11,8 +11,13 @@ hashed verbatim together with the previous record's hash::
 
 The first record links to a tenant-specific genesis hash, so a chain cannot be
 transplanted to another tenant. :func:`verify_chain` detects edited, reordered,
-inserted and deleted records. Truncation and wholesale rewrites are detected
-against a checkpoint ``(seq, hash)`` or an expected head kept outside the store.
+inserted and deleted records, and timestamps that go backwards. Truncation and
+wholesale rewrites are detected against a checkpoint ``(seq, hash)`` or an
+expected head kept outside the store. Verification never raises on damaged
+records: it reports the first problem it finds.
+
+Bodies are canonical JSON built from an exact encoding: Decimal as a string,
+timezone-aware datetimes in UTC, enums by value, string keys only.
 """
 
 from __future__ import annotations
@@ -20,8 +25,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
+import re
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -45,6 +53,7 @@ __all__ = [
     "ChainProblem",
     "ChainReport",
     "InMemoryAuditStore",
+    "PostgresAuditStore",
     "canonical_json",
     "compute_hash",
     "genesis_hash",
@@ -69,8 +78,21 @@ def genesis_hash(tenant_id: str) -> str:
     return hashlib.sha256(f"{_GENESIS_PREFIX}{tenant_id}".encode()).hexdigest()
 
 
-def _jsonable(value: Any) -> Any:
-    """``json.dumps`` fallback: exact, deterministic encodings only."""
+def _plain(value: Any) -> Any:
+    """``value`` as plain JSON types, using exact, deterministic encodings only.
+
+    Raises ``TypeError`` for types without one (bytes, objects, non-string
+    keys) and ``ValueError`` for values that cannot be exact (NaN, naive
+    datetimes, keys that collide once encoded).
+    """
+    if isinstance(value, Enum):
+        return _plain(value.value)
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("non-finite number cannot be audited")
+        return value
     if isinstance(value, Decimal):
         if not value.is_finite():
             raise ValueError("non-finite Decimal cannot be audited")
@@ -81,30 +103,48 @@ def _jsonable(value: Any) -> Any:
         return value.astimezone(timezone.utc).isoformat()
     if isinstance(value, date):
         return value.isoformat()
-    if isinstance(value, Enum):
-        return value.value
     if isinstance(value, BaseModel):
-        return value.model_dump(mode="json")
+        return _plain(value.model_dump(mode="python"))
+    if isinstance(value, Mapping):
+        return _plain_mapping(value)
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
     if isinstance(value, (set, frozenset)):
-        return sorted(value, key=repr)
+        items = [_plain(v) for v in value]
+        return sorted(items, key=lambda v: json.dumps(v, sort_keys=True))
     raise TypeError(f"cannot audit value of type {type(value).__name__}")
 
 
+def _plain_mapping(value: Mapping[Any, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, item in value.items():
+        name = key.value if isinstance(key, Enum) else key
+        if not isinstance(name, str):
+            raise TypeError(f"audit keys must be strings, not {type(key).__name__}")
+        if name in out:
+            raise ValueError(f"duplicate audit key {name!r}")
+        out[name] = _plain(item)
+    return out
+
+
 def canonical_json(value: Any) -> str:
-    """Deterministic JSON: sorted keys, no whitespace, no NaN, Decimal as string."""
+    """Deterministic JSON: sorted keys, no whitespace, no NaN, Decimal as string.
+
+    ASCII only (non-ASCII as \\u escapes), so any text, even a lone surrogate
+    from a badly encoded email header, hashes and stores the same everywhere.
+    """
     return json.dumps(
-        value,
-        default=_jsonable,
+        _plain(value),
         sort_keys=True,
         separators=(",", ":"),
-        ensure_ascii=False,
+        ensure_ascii=True,
         allow_nan=False,
     )
 
 
 def compute_hash(prev_hash: str, body: str, key: bytes | None = None) -> str:
-    """Link hash of one record."""
-    message = f"{prev_hash}\n{body}".encode()
+    """Link hash of one record (any text encodes, so damaged records still hash)."""
+    message = f"{prev_hash}\n{body}".encode("utf-8", "surrogatepass")
     if key is None:
         return hashlib.sha256(message).hexdigest()
     return hmac.new(key, message, hashlib.sha256).hexdigest()
@@ -127,12 +167,23 @@ class AuditEntry:
     corrections: Sequence[Any] = ()
 
     def __post_init__(self) -> None:
-        if not self.actor.strip() or not self.action.strip():
+        if not _is_text(self.actor) or not _is_text(self.action):
             raise ValueError("audit entries need an actor and an action")
-        if isinstance(self.evidence_ids, str) or any(
-            not isinstance(e, str) or not e for e in self.evidence_ids
+        for name in ("agent", "model", "parser", "subject_id"):
+            value = getattr(self, name)
+            if value is not None and not _is_text(value):
+                raise ValueError(f"{name} must be a non-blank string or None")
+        if isinstance(self.evidence_ids, (str, bytes)) or any(
+            not _is_text(e) for e in self.evidence_ids
         ):
             raise ValueError("evidence_ids must be a sequence of non-empty strings")
+        # Snapshot the containers so later caller mutation cannot change the entry.
+        object.__setattr__(self, "evidence_ids", tuple(self.evidence_ids))
+        object.__setattr__(self, "extracted_values", dict(self.extracted_values))
+
+
+def _is_text(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
 
 
 @dataclass(frozen=True)
@@ -174,8 +225,8 @@ class AuditStore(Protocol):
     Implementations must be append-only and make ``append`` atomic: it raises
     :class:`AuditConflict` unless ``record`` extends the tenant's current head
     (``seq == head.seq + 1`` and ``prev_hash == head.hash``, or ``seq == 1`` and
-    the genesis hash for an empty chain). A Postgres implementation should use
-    :data:`POSTGRES_SCHEMA`.
+    the genesis hash for an empty chain). :class:`InMemoryAuditStore` and
+    :class:`PostgresAuditStore` (with :data:`POSTGRES_SCHEMA`) implement it.
     """
 
     def head(self, tenant_id: str) -> AuditRecord | None: ...
@@ -187,10 +238,11 @@ class AuditStore(Protocol):
     ) -> Iterator[AuditRecord]: ...
 
 
-# Schema for a Postgres AuditStore. ``body`` is TEXT, not JSONB: JSONB would
+# Schema for :class:`PostgresAuditStore`. ``body`` is TEXT, not JSONB: JSONB would
 # re-serialize the JSON and change the hashed bytes. The primary key and the
 # (tenant_id, prev_hash) uniqueness make concurrent forks impossible; the
-# triggers forbid UPDATE, DELETE and TRUNCATE. Not exercised by the unit tests.
+# triggers forbid UPDATE, DELETE and TRUNCATE. The unit tests run the store's SQL
+# on SQLite with the same keys; this DDL itself (plpgsql) needs a real Postgres.
 POSTGRES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS audit_record (
     tenant_id  TEXT        NOT NULL,
@@ -250,6 +302,124 @@ class InMemoryAuditStore:
         return iter(snapshot[max(from_seq, 1) - 1 :])
 
 
+class PostgresAuditStore:
+    """:class:`AuditStore` on PostgreSQL through a DB-API 2.0 driver (§52, §55).
+
+    ``connect`` returns a context manager yielding a connection, e.g.
+    ``lambda: contextlib.closing(psycopg.connect(dsn))`` or a psycopg_pool
+    ``pool.connection``. Create the table with :data:`POSTGRES_SCHEMA`.
+
+    ``append`` checks the head inside its transaction and relies on the
+    ``(tenant_id, seq)`` primary key and ``(tenant_id, prev_hash)`` uniqueness:
+    a writer that loses a race gets an integrity error, reported as
+    :class:`AuditConflict` so :class:`AuditLog` retries on the new head.
+    ``integrity_error`` defaults to ``psycopg.IntegrityError``; ``placeholder``
+    is ``"%s"`` for psycopg (``"?"`` for qmark drivers).
+    """
+
+    _COLUMNS = "tenant_id, seq, body, prev_hash, hash"
+
+    def __init__(
+        self,
+        connect: Callable[[], AbstractContextManager[Any]],
+        *,
+        integrity_error: type[BaseException] | None = None,
+        placeholder: str = "%s",
+        table: str = "audit_record",
+    ) -> None:
+        if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", table):
+            raise ValueError("table must be a plain lower-case SQL identifier")
+        if placeholder not in ("%s", "?"):
+            raise ValueError("placeholder must be '%s' or '?'")
+        self._connect = connect
+        self._integrity_error = integrity_error or _psycopg_integrity_error()
+        self._p = placeholder
+        self._table = table
+
+    def head(self, tenant_id: str) -> AuditRecord | None:
+        with self._transaction() as cursor:
+            return self._read_head(cursor, tenant_id)
+
+    def append(self, record: AuditRecord) -> None:
+        p = self._p
+        sql = (
+            f"INSERT INTO {self._table} (tenant_id, seq, at, body, prev_hash, hash) "
+            f"VALUES ({p}, {p}, {p}, {p}, {p}, {p})"
+        )
+        at = _head_time(record)
+        if at is None:
+            raise AuditError("record body has no valid timestamp")
+        try:
+            with self._transaction() as cursor:
+                head = self._read_head(cursor, record.tenant_id)
+                expected_seq = head.seq + 1 if head else 1
+                expected_prev = head.hash if head else genesis_hash(record.tenant_id)
+                if record.seq != expected_seq or record.prev_hash != expected_prev:
+                    raise AuditConflict("record does not extend the current head")
+                cursor.execute(
+                    sql,
+                    (record.tenant_id, record.seq, at, record.body, record.prev_hash, record.hash),
+                )
+        except self._integrity_error as exc:
+            raise AuditConflict("another writer extended the chain first") from exc
+
+    def records(self, tenant_id: str, *, from_seq: int = 1) -> Iterator[AuditRecord]:
+        p = self._p
+        sql = (
+            f"SELECT {self._COLUMNS} FROM {self._table} "
+            f"WHERE tenant_id = {p} AND seq >= {p} ORDER BY seq"
+        )
+        with self._transaction() as cursor:
+            cursor.execute(sql, (tenant_id, max(from_seq, 1)))
+            rows = cursor.fetchall()
+        return iter([AuditRecord(*row) for row in rows])
+
+    def _read_head(self, cursor: Any, tenant_id: str) -> AuditRecord | None:
+        cursor.execute(
+            f"SELECT {self._COLUMNS} FROM {self._table} "
+            f"WHERE tenant_id = {self._p} ORDER BY seq DESC LIMIT 1",
+            (tenant_id,),
+        )
+        row = cursor.fetchone()
+        return AuditRecord(*row) if row else None
+
+    def _transaction(self) -> AbstractContextManager[Any]:
+        return _Transaction(self._connect)
+
+
+class _Transaction:
+    """Cursor inside one committed-or-rolled-back transaction."""
+
+    def __init__(self, connect: Callable[[], AbstractContextManager[Any]]) -> None:
+        self._manager = connect()
+        self._conn: Any = None
+
+    def __enter__(self) -> Any:
+        self._conn = self._manager.__enter__()
+        return self._conn.cursor()
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool | None:
+        try:
+            if exc_type is None:
+                self._conn.commit()
+            else:
+                self._conn.rollback()
+        finally:
+            self._manager.__exit__(exc_type, exc, tb)
+        return None
+
+
+def _psycopg_integrity_error() -> type[BaseException]:
+    try:
+        import psycopg  # optional dependency, only for the Postgres store
+    except ImportError as exc:
+        raise AuditError(
+            "PostgresAuditStore needs psycopg, or pass integrity_error= for another driver"
+        ) from exc
+    error: type[BaseException] = psycopg.IntegrityError
+    return error
+
+
 class ChainProblem(str, Enum):
     WRONG_TENANT = "wrong_tenant"
     BAD_SEQUENCE = "bad_sequence"  # a record was deleted, inserted or moved
@@ -260,6 +430,7 @@ class ChainProblem(str, Enum):
     CHECKPOINT_MISMATCH = (
         "checkpoint_mismatch"  # a known (seq, hash) is missing or differs
     )
+    TIME_REVERSED = "time_reversed"  # a record is dated before its predecessor
 
 
 @dataclass(frozen=True)
@@ -287,26 +458,30 @@ def verify_chain(
     continue past it, e.g. written by another process).
     """
     prev = genesis_hash(tenant_id)
+    prev_at: datetime | None = None
     checked = 0
     for expected_seq, record in enumerate(records, start=1):
-        problem = _check_record(record, tenant_id, expected_seq, prev, key)
+        problem, at = _check_record(record, tenant_id, expected_seq, prev, key)
+        if problem is None and prev_at is not None and at is not None and at < prev_at:
+            problem = ChainProblem.TIME_REVERSED, "record is dated before the previous one"
         if problem is None and checkpoint and record.seq == checkpoint[0]:
-            if not hmac.compare_digest(record.hash, checkpoint[1]):
+            if not _same_digest(record.hash, checkpoint[1]):
                 problem = (
                     ChainProblem.CHECKPOINT_MISMATCH,
                     "record differs from the checkpoint",
                 )
         if problem is not None:
             kind, detail = problem
-            return ChainReport(False, checked, prev, kind, record.seq, detail)
-        prev = record.hash
+            seq = record.seq if isinstance(record.seq, int) else None
+            return ChainReport(False, checked, prev, kind, seq, detail)
+        prev, prev_at = record.hash, at
         checked += 1
     if checkpoint and checked < checkpoint[0]:
         return ChainReport(
             False, checked, prev, ChainProblem.CHECKPOINT_MISMATCH, checkpoint[0],
             "chain is shorter than a known checkpoint",
         )  # fmt: skip
-    if expected_head is not None and expected_head != prev:
+    if expected_head is not None and not _same_digest(expected_head, prev):
         return ChainReport(
             False, checked, prev, ChainProblem.HEAD_MISMATCH, None,
             "chain does not end at the expected head",
@@ -314,30 +489,73 @@ def verify_chain(
     return ChainReport(True, checked, prev)
 
 
+_Problem = tuple[ChainProblem, str]
+
+
+def _same_digest(a: object, b: object) -> bool:
+    """Constant-time equality that is simply False for non-text or odd values."""
+    if not isinstance(a, str) or not isinstance(b, str):
+        return False
+    return hmac.compare_digest(a.encode("utf-8", "surrogatepass"), b.encode("utf-8", "surrogatepass"))
+
+
 def _check_record(
     record: AuditRecord, tenant_id: str, expected_seq: int, prev: str, key: bytes | None
-) -> tuple[ChainProblem, str] | None:
+) -> tuple[_Problem | None, datetime | None]:
+    """The record's first problem (if any) and its timestamp. Never raises."""
     if record.tenant_id != tenant_id:
-        return ChainProblem.WRONG_TENANT, "record belongs to another tenant"
-    if record.seq != expected_seq:
-        return (
-            ChainProblem.BAD_SEQUENCE,
-            f"expected seq {expected_seq}, found {record.seq}",
-        )
-    if record.prev_hash != prev:
-        return ChainProblem.BROKEN_LINK, "prev_hash does not match the previous record"
-    if not hmac.compare_digest(compute_hash(prev, record.body, key), record.hash):
-        return ChainProblem.HASH_MISMATCH, "record content does not match its hash"
+        return (ChainProblem.WRONG_TENANT, "record belongs to another tenant"), None
+    if type(record.seq) is not int or record.seq != expected_seq:
+        detail = f"expected seq {expected_seq}, found {record.seq!r}"
+        return (ChainProblem.BAD_SEQUENCE, detail), None
+    if not _same_digest(record.prev_hash, prev):
+        detail = "prev_hash does not match the previous record"
+        return (ChainProblem.BROKEN_LINK, detail), None
+    if not isinstance(record.body, str):
+        return (ChainProblem.BODY_MISMATCH, "body is not text"), None
+    if not _same_digest(compute_hash(prev, record.body, key), record.hash):
+        detail = "record content does not match its hash"
+        return (ChainProblem.HASH_MISMATCH, detail), None
+    return _check_body(record)
+
+
+def _check_body(record: AuditRecord) -> tuple[_Problem | None, datetime | None]:
     try:
         body = json.loads(record.body)
+    except (ValueError, RecursionError):
+        return (ChainProblem.BODY_MISMATCH, "body is not valid JSON"), None
+    if not isinstance(body, dict):
+        return (ChainProblem.BODY_MISMATCH, "body is not a record object"), None
+    seq = body.get("seq")
+    if body.get("tenant_id") != record.tenant_id or type(seq) is not int or seq != record.seq:
+        detail = "body tenant or seq disagrees with the record"
+        return (ChainProblem.BODY_MISMATCH, detail), None
+    at = _parse_at(body.get("at"))
+    if at is None:
+        return (ChainProblem.BODY_MISMATCH, "body has no valid timestamp"), None
+    return None, at
+
+
+def _parse_at(value: object) -> datetime | None:
+    """A timezone-aware timestamp from a body, or None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        at = datetime.fromisoformat(value)
     except ValueError:
-        return ChainProblem.BODY_MISMATCH, "body is not valid JSON"
-    if body.get("tenant_id") != record.tenant_id or body.get("seq") != record.seq:
-        return (
-            ChainProblem.BODY_MISMATCH,
-            "body tenant or seq disagrees with the record",
-        )
-    return None
+        return None
+    return at if at.tzinfo is not None and at.utcoffset() is not None else None
+
+
+def _head_time(head: AuditRecord | None) -> datetime | None:
+    """The head's timestamp; None when there is no head or its body is damaged
+    (verification reports the damage; writing must not stop because of it)."""
+    if head is None:
+        return None
+    try:
+        return _parse_at(json.loads(head.body).get("at"))
+    except (ValueError, TypeError, AttributeError, RecursionError):
+        return None
 
 
 class AuditLog:
@@ -360,6 +578,8 @@ class AuditLog:
     ) -> None:
         if key is not None and len(key) < MIN_KEY_BYTES:
             raise ValueError(f"audit HMAC key must be at least {MIN_KEY_BYTES} bytes")
+        if max_retries < 1:
+            raise ValueError("max_retries must be at least 1")
         self._store = store
         self._clock = clock
         self._key = key
@@ -368,12 +588,19 @@ class AuditLog:
         self._checkpoint_lock = threading.Lock()
 
     def record(self, tenant_id: str, entry: AuditEntry) -> AuditRecord:
-        """Seal ``entry`` as the tenant's next record and append it."""
-        if not tenant_id:
+        """Seal ``entry`` as the tenant's next record and append it.
+
+        The timestamp is taken per attempt and never precedes the head's, so
+        the chain stays in time order even if clocks drift or a race is lost.
+        """
+        if not _is_text(tenant_id):
             raise ValueError("tenant_id is required")
-        at = self._now()
         for _ in range(self._max_retries):
             head = self._store.head(tenant_id)
+            at = self._now()
+            head_at = _head_time(head)
+            if head_at is not None and head_at > at:
+                at = head_at
             record = self._seal(tenant_id, entry, at, head)
             try:
                 self._store.append(record)

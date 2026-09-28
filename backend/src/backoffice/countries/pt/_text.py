@@ -9,17 +9,17 @@ from functools import lru_cache
 # plain ASCII ones. Mapping them keeps string indexes aligned.
 _CHAR_MAP = str.maketrans(
     {
-        " ": " ",  # no-break space
-        " ": " ",  # narrow no-break space (thousands separator)
-        " ": " ",  # thin space
-        " ": " ",  # figure space
+        "\u00a0": " ",  # no-break space
+        "\u202f": " ",  # narrow no-break space (thousands separator)
+        "\u2009": " ",  # thin space
+        "\u2007": " ",  # figure space
         "\t": " ",
-        "‐": "-",
-        "‑": "-",
-        "‒": "-",
-        "–": "-",  # en dash (ATCUD is often typeset with it)
-        "—": "-",
-        "−": "-",  # minus sign
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",  # en dash (ATCUD is often typeset with it)
+        "\u2014": "-",
+        "\u2212": "-",  # minus sign
     }
 )
 

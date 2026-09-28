@@ -8,6 +8,12 @@ external answer can be restored on our side.
 Detection is deliberately biased toward over-redaction, but avoids eating the
 numbers extraction needs (tax ids, invoice numbers, dates, amounts).
 Address and phone patterns are best-effort for Portuguese and English text.
+
+Text from PDFs and OCR often uses no-break or thin spaces, typographic hyphens
+and invisible characters inside numbers; detection runs on a normalized copy
+and reports spans of the original text. Token-shaped text already present in
+the input (``[IBAN_1]``) is itself replaced by a vault token, so every token
+that leaves is one the vault issued and can never alias another value.
 """
 
 from __future__ import annotations
@@ -42,8 +48,9 @@ class PiiMatch:
 
 # --------------------------------------------------------------------------- IBAN
 
-# Fallback lengths used only for IBAN-shaped strings whose checksum fails
-# (typically an OCR misread), so they are still redacted.
+# IBAN lengths by country: they fix where an IBAN ends when words follow it, and
+# let an uppercase, four-grouped IBAN with a failed checksum (typically an OCR
+# misread) still be redacted. Other countries rely on the checksum alone.
 # Source: SWIFT IBAN Registry. verified_as_of: 2026-09 (author knowledge; re-check
 # against the current registry release before extending).
 IBAN_LENGTHS: Mapping[str, int] = MappingProxyType(
@@ -53,8 +60,9 @@ IBAN_LENGTHS: Mapping[str, int] = MappingProxyType(
     }
 )  # fmt: skip
 
+# Groups separated by single spaces or hyphens ("DE89-3704-0044-...").
 _IBAN_CANDIDATE = re.compile(
-    r"(?<![A-Za-z0-9])[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]){11,32}", re.IGNORECASE
+    r"(?<![A-Za-z0-9])[A-Z]{2}\d{2}(?:[ -]?[A-Z0-9]){11,32}", re.IGNORECASE
 )
 
 
@@ -67,32 +75,94 @@ def iban_is_valid(iban: str) -> bool:
     return int("".join(str(int(c, 36)) for c in rearranged)) % 97 == 1
 
 
+def _checksum_ends(candidate: str) -> frozenset[int]:
+    """End offsets at which the compact prefix of ``candidate`` passes mod-97.
+
+    One pass instead of one full check per prefix: the check value is the part
+    after the first four characters followed by those four, so a running
+    remainder of the rest is combined with the head at every end. ``candidate``
+    holds only ASCII letters, digits and spaces.
+    """
+    positions = [i for i, c in enumerate(candidate) if c != " "]
+    if len(positions) < 15:
+        return frozenset()
+    head = "".join(str(int(candidate[i], 36)) for i in positions[:4])
+    head_value, head_scale = int(head), 10 ** len(head)
+    ends: set[int] = set()
+    remainder = 0
+    for count, i in enumerate(positions[4:34], start=5):
+        value = int(candidate[i], 36)
+        remainder = (remainder * (100 if value > 9 else 10) + value) % 97
+        if count >= 15 and (remainder * head_scale + head_value) % 97 == 1:
+            ends.add(i + 1)
+    return frozenset(ends)
+
+
 def _find_ibans(text: str) -> Iterable[tuple[int, int]]:
-    for m in _IBAN_CANDIDATE.finditer(text):
+    pos = 0
+    while m := _IBAN_CANDIDATE.search(text, pos):
         end = _iban_end(m.group())
         if end:
             yield m.start(), m.start() + end
+        # resume right after the IBAN: the candidate may reach into the next one
+        pos = m.start() + (end or 1)
+
+
+def _group_shape(spaced: str) -> tuple[int, ...]:
+    return tuple(len(g) for g in spaced.split(" "))
+
+
+def _iban_shape_ok(shape: tuple[int, ...]) -> bool:
+    """Compact, or spaced with the country code and check digits as the first group."""
+    return len(shape) == 1 or shape[0] == 4
+
+
+def _fours(shape: tuple[int, ...]) -> bool:
+    """Compact, or the standard print format: groups of four, last one shorter."""
+    return len(shape) == 1 or (all(n == 4 for n in shape[:-1]) and 1 <= shape[-1] <= 4)
 
 
 def _iban_end(candidate: str) -> int | None:
     """Where the IBAN at the start of ``candidate`` ends, if there is one.
 
-    The candidate may run into following words ("... 9015 4 EUR"), so:
-    known country: take exactly the registry length (redacted even when the
-    checksum fails, e.g. an OCR misread, if the country code is uppercase);
-    other countries: the longest checksum-valid prefix, preferring word ends.
+    The candidate may run into following words ("... 9015 4 EUR"), so letters
+    must keep the country code's case, and then:
+    known country: exactly the registry length, checksum-valid, or (for an
+    uppercase, four-grouped print, e.g. an OCR misread) the length alone;
+    other countries: the longest checksum-valid prefix, preferring the
+    four-grouped print and then word ends.
     """
-    ends = [i + 1 for i, c in enumerate(candidate) if c != " "][::-1]
+    candidate = candidate.replace("-", " ")  # same length: offsets stay valid
     country = candidate[:2]
+    upper = country.isupper()
+    limit = next(
+        (
+            i
+            for i, c in enumerate(candidate)
+            if not c.isascii() or (c.isalpha() and c.isupper() != upper)
+        ),
+        len(candidate),
+    )
+    candidate = candidate[:limit]
+    ends = [i + 1 for i, c in enumerate(candidate) if c != " "]  # ends[k]: k+1 characters
+    valid = _checksum_ends(candidate)
     expected = IBAN_LENGTHS.get(country.upper())
     if expected:
-        for end in ends:
-            if len(candidate[:end].replace(" ", "")) == expected:
-                valid = iban_is_valid(candidate[:end])
-                return end if valid or country.isupper() else None
-        return None
-    at_word_end = [e for e in ends if e == len(candidate) or candidate[e] == " "]
-    return next((e for e in at_word_end + ends if iban_is_valid(candidate[:e])), None)
+        if len(ends) < expected:
+            return None
+        end = ends[expected - 1]
+        shape = _group_shape(candidate[:end])
+        if _iban_shape_ok(shape) and end in valid:
+            return end
+        return end if upper and _fours(shape) else None
+    ok = [
+        e
+        for e in sorted(valid, reverse=True)
+        if _iban_shape_ok(_group_shape(candidate[:e]))
+    ]
+    at_word_end = [e for e in ok if e == len(candidate) or candidate[e] == " "]
+    printed = [e for e in at_word_end if _fours(_group_shape(candidate[:e]))]
+    return next(iter(printed + at_word_end + ok), None)
 
 
 # --------------------------------------------------------------------------- domestic accounts
@@ -110,13 +180,13 @@ def _checked_digit_spans(
     check: Callable[[str], bool],
     preferred_digits: int | None = None,
 ) -> Iterable[tuple[int, int]]:
-    """Per digit run, the best run of whole groups with a plausible printed
-    grouping (``shape_ok`` on the group lengths, one separator throughout)
-    whose digits pass ``check``.
+    """Runs of whole digit groups with a plausible printed grouping (``shape_ok``
+    on the group lengths, one separator throughout) whose digits pass ``check``.
 
-    Best means ``preferred_digits`` long if possible, else the longest.
-    Neighbouring numbers ("Order 12 4111 1111 1111 1111 2027") are left out.
-    At most ``max_groups`` groups are joined, so long numeric tables stay cheap.
+    Scans each digit run left to right; at each start the best window wins
+    (``preferred_digits`` long if possible, else the longest), so neighbouring
+    numbers ("Order 12 4111 1111 1111 1111 2027") are left out and several
+    values in one run are all found. At most ``max_groups`` groups are joined.
     """
     for run in _DIGIT_RUN.finditer(text):
         chunk = run.group()
@@ -125,24 +195,49 @@ def _checked_digit_spans(
         seps = [""] + [
             chunk[a_end:b_start] for (_, a_end), (b_start, _) in zip(groups, groups[1:])
         ]
-        best: tuple[int, int] | None = None
-        best_key: tuple[bool, int] = (False, -1)
-        for i, (start, _) in enumerate(groups):
-            digits = ""
-            shape: tuple[int, ...] = ()
-            for j, (g_start, end) in enumerate(groups[i : i + max_groups], start=i):
-                if j > i + 1 and seps[j] != seps[i + 1]:
-                    break  # a printed number uses one separator throughout
-                digits += chunk[g_start:end]
-                shape += (end - g_start,)
-                if len(digits) > max_digits:
-                    break
-                if len(digits) >= min_digits and shape_ok(shape) and check(digits):
-                    key = (len(digits) == preferred_digits, end - start)
-                    if key > best_key:
-                        best, best_key = (start, end), key
-        if best:
-            yield run.start() + best[0], run.start() + best[1]
+        i = 0
+        while i < len(groups):
+            best = _best_window(
+                chunk, groups, seps, i, min_digits, max_digits, max_groups,
+                shape_ok, check, preferred_digits,
+            )  # fmt: skip
+            if best is None:
+                i += 1
+                continue
+            end_group, end = best
+            yield run.start() + groups[i][0], run.start() + end
+            i = end_group + 1
+
+
+def _best_window(
+    chunk: str,
+    groups: list[tuple[int, int]],
+    seps: list[str],
+    i: int,
+    min_digits: int,
+    max_digits: int,
+    max_groups: int,
+    shape_ok: Callable[[tuple[int, ...]], bool],
+    check: Callable[[str], bool],
+    preferred_digits: int | None,
+) -> tuple[int, int] | None:
+    """Best valid window starting at group ``i``: (index of last group, end offset)."""
+    best: tuple[int, int] | None = None
+    best_key: tuple[bool, int] = (False, -1)
+    digits = ""
+    shape: tuple[int, ...] = ()
+    for j, (g_start, end) in enumerate(groups[i : i + max_groups], start=i):
+        if j > i + 1 and seps[j] != seps[i + 1]:
+            break  # a printed number uses one separator throughout
+        digits += chunk[g_start:end]
+        shape += (end - g_start,)
+        if len(digits) > max_digits:
+            break
+        if len(digits) >= min_digits and shape_ok(shape) and check(digits):
+            key = (len(digits) == preferred_digits, end)
+            if key > best_key:
+                best, best_key = (j, end), key
+    return best
 
 
 def nib_is_valid(digits: str) -> bool:
@@ -207,9 +302,8 @@ def _find_cards(text: str) -> Iterable[tuple[int, int]]:
 
 # --------------------------------------------------------------------------- email
 
-_EMAIL = re.compile(
-    r"(?<![\w.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b"
-)
+# Unicode letters are allowed on both sides ("joão@café.pt"): over-redaction is safer.
+_EMAIL = re.compile(r"(?<![\w.+-])[\w.%+-]+@[\w-]+(?:\.[\w-]+)*\.[^\W\d_]{2,}\b")
 
 
 def _find_emails(text: str) -> Iterable[tuple[int, int]]:
@@ -218,7 +312,10 @@ def _find_emails(text: str) -> Iterable[tuple[int, int]]:
 
 # --------------------------------------------------------------------------- phone
 
-_PHONE_CANDIDATE = re.compile(r"(?<![\w+])\+?\(?\d[\d \t().-]{5,24}\d(?!\w)")
+# Never starts inside a code such as "INV-00123" or "2026/183".
+_PHONE_CANDIDATE = re.compile(r"(?<![\w+])(?<!\w[-/.])\+?\(?\d[\d \t().-]{5,}\d(?!\w)")
+# The last group belongs to another token: "678 14:42", "678 14,50", "678 23%".
+_GLUED_AFTER = re.compile(r"[:%€/]|[.,]\d")
 _PHONE_KEYWORD = re.compile(
     r"(?i)\b(?:tel|tlf|tlm|telef\w*|telem\w*|phone|mobile|mob|cell|fax|contacto|"
     r"contact|whatsapp|call)\b[^\n\d]{0,6}$"
@@ -232,7 +329,10 @@ _PT_NATIONAL = re.compile(
     r"^(?:[29]\d{2}[ .-]?\d{3}[ .-]?\d{3}|2\d[ .-]\d{3}[ .-]\d{2}[ .-]\d{2})$"
 )
 _UK_NATIONAL = re.compile(r"^0\d{2,4}[ -]?\d{3,4}[ -]?\d{3,4}$")
-_US_NATIONAL = re.compile(r"^\(?\d{3}\)?[ .-]?\d{3}[ .-]\d{4}$")
+# NANP: area code and exchange start with 2-9; "(555) 123-4567" is accepted as written.
+_US_NATIONAL = re.compile(
+    r"^(?:\(\d{3}\)[ .-]?\d{3}|[2-9]\d{2}[ .-][2-9]\d{2})[ .-]\d{4}$"
+)
 _INTL_00 = re.compile(r"^00[1-9]\d{0,2}[ .-]")  # country codes never start with 0
 _DATE_SHAPE = re.compile(
     r"^(?:\d{4}[-./]\d{1,2}[-./]\d{1,2}|\d{1,2}[-./]\d{1,2}[-./]\d{4})(?!\d)"
@@ -241,38 +341,81 @@ _DATE_SHAPE = re.compile(
 
 def _find_phones(text: str) -> Iterable[tuple[int, int]]:
     for m in _PHONE_CANDIDATE.finditer(text):
-        before = text[max(0, m.start() - 30) : m.start()]
-        end = _phone_end(m.group(), before)
-        if end:
-            yield m.start(), m.start() + end
+        yield from _phones_in(text, m)
 
 
-def _phone_end(candidate: str, before: str) -> int | None:
-    """Longest whitespace-bounded prefix that reads as a phone number, so a
-    date or amount printed right after it ("... 0958 18.09.2026") is left out."""
-    ends = [len(candidate)] + [w.start() for w in re.finditer(r"[ \t]+", candidate)][
-        ::-1
-    ]
-    for end in ends:
-        prefix = candidate[:end].rstrip(" \t().-")
-        if prefix and _is_phone(prefix, before):
-            return len(prefix)
-    return None
+_PHONE_MAX_WORDS = 6  # "+351 21 345 67 89" is five
 
 
-def _is_phone(candidate: str, before: str) -> bool:
+def _phones_in(text: str, m: re.Match[str]) -> Iterable[tuple[int, int]]:
+    """Phone numbers among the whitespace-separated words of one candidate.
+
+    Leftmost, longest first, so "qty 3 - (555) 123-4567" and
+    "+351 912 345 678 18.09.2026" yield just the phone number. Windows never
+    include a date, and the digits of a labelled tax id are skipped.
+    """
+    words = [w.span() for w in re.finditer(r"[^ \t]+", m.group())]
+    texts = [m.group()[a:b] for a, b in words]
+    digits = [sum(c.isdigit() for c in t) for t in texts]
+    dates = [bool(_DATE_SHAPE.match(t)) for t in texts]
+    last = len(words) - (1 if _GLUED_AFTER.match(text, m.end()) else 0)
+    i = 0
+    while i < last:
+        start = m.start() + words[i][0]
+        lead = text[start]
+        before = text[max(0, start - 30) : start]
+        if lead != "+" and _TAX_LABEL.search(before):
+            i = _skip_tax_id(digits, i)
+            continue
+        found = None
+        if lead in "+(0123456789":
+            keyword = bool(_PHONE_KEYWORD.search(before))
+            low, high = _phone_digit_range(lead, texts[i], keyword)
+            for j in range(min(last, i + _PHONE_MAX_WORDS), i, -1):
+                if any(dates[i:j]) or not low <= sum(digits[i:j]) <= high:
+                    continue
+                end = m.start() + words[j - 1][0] + len(texts[j - 1].rstrip(".-("))
+                if _is_phone(text[start:end], keyword=keyword):
+                    found = j
+                    yield start, end
+                    break
+        i = found if found else i + 1
+
+
+def _phone_digit_range(lead: str, first_word: str, keyword: bool) -> tuple[int, int]:
+    """How many digits a phone number starting like this can have."""
+    if lead == "+":
+        return 8, 15
+    if keyword:
+        return 7, 15
+    if first_word.startswith("00"):
+        return 10, 17
+    return 9, 11  # PT, UK and US national formats
+
+
+def _skip_tax_id(digits: list[int], i: int) -> int:
+    """Index of the first word after a tax id starting at word ``i`` (9+ digits)."""
+    seen = 0
+    while i < len(digits) and seen < 9:
+        seen += digits[i]
+        i += 1
+    return i
+
+
+def _is_phone(candidate: str, *, keyword: bool) -> bool:
+    """Whether ``candidate`` reads as a phone number (tax labels are checked by
+    the caller). ``keyword``: a word such as "Tel" precedes it."""
     digits = re.sub(r"\D", "", candidate)
     if candidate.startswith("+"):
         return 8 <= len(digits) <= 15 and not digits.startswith("0")
-    if _TAX_LABEL.search(before) or _DATE_SHAPE.match(candidate):
+    if _DATE_SHAPE.match(candidate):
         return False
-    if _PHONE_KEYWORD.search(before):
-        return 7 <= len(digits) <= 17
+    if keyword:
+        return 7 <= len(digits) <= 15  # E.164 maximum
     if digits.startswith("00"):
         return 10 <= len(digits) <= 17 and bool(_INTL_00.match(candidate))
-    has_separator = candidate != digits
-    if not has_separator:
-        return False
+    if candidate == digits:
+        return False  # bare national numbers need a separator or a keyword
     if len(digits) == 9 and _PT_NATIONAL.match(candidate):
         return True
     if len(digits) in (10, 11) and _UK_NATIONAL.match(candidate):
@@ -288,8 +431,10 @@ _PT_STREET = re.compile(
     r"Praceta|Estrada|Estr\.|Alameda|Calçada|Beco|Rotunda|Urbanização|Urb\.|Bairro|"
     r"Quinta|Caminho)"
     rf"[ \t]+{_WORD}(?:[ \t]+{_WORD}){{0,7}}?"
-    r",?[ \t]*(?:n\.?[ \t]?º|nº|n\.|no\.|número)?[ \t]*\d{1,5}[A-Za-z]?\b"
-    r"(?:,?[ \t]*\d{1,2}[ \t]?[ºª°.]?[ \t]*(?:andar|esq\.?|esquerdo|dto\.?|dt\.?|direito|"
+    # house number, then an optional floor; neither may be the start of a
+    # postal code such as "1200-820" (that belongs to the postal pattern)
+    r",?[ \t]*(?:n\.?[ \t]?º|nº|n\.|no\.|número)?[ \t]*\d{1,5}[A-Za-z]?\b(?!-\d)"
+    r"(?:,?[ \t]*\d{1,2}(?![\d-])[ \t]?(?:\.?[ºª°]|\.)?[ \t]*(?:andar|esq\.?|esquerdo|dto\.?|dt\.?|direito|"
     r"frente|frt\.?|[A-D]\b)?)?",
     re.IGNORECASE,
 )
@@ -319,10 +464,9 @@ _US_STATES = (
     "AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|"
     "NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|DC"
 )
-# "City, ST 12345": the city is required so codes like "OR 12345" are left alone.
-_US_STATE_ZIP = re.compile(
-    rf"\b[A-Z][a-z]+(?:[ ][A-Z][a-z]+)*,[ ](?:{_US_STATES})[ ]+\d{{5}}(?:-\d{{4}})?(?![\w-])"
-)
+# "City, ST 12345": state and ZIP after a comma, so "OR 12345" (a quote number)
+# and the words before the city are left alone.
+_US_STATE_ZIP = re.compile(rf"(?<=, )(?:{_US_STATES})[ ]+\d{{5}}(?:-\d{{4}})?(?![\w-])")
 
 
 def _find_addresses(text: str) -> Iterable[tuple[int, int]]:
@@ -368,36 +512,79 @@ _DETECTORS: tuple[tuple[PiiKind, _Finder], ...] = (
 _MASK = "\x00"
 _MAX_PASSES = 3
 
+# Characters that PDF text layers and OCR put where ASCII separators belong.
+_SPACE_LIKE = frozenset(
+    "\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009"
+    "\u200a\u202f\u205f\u3000"
+)
+_DASH_LIKE = frozenset("\u2010\u2011\u2012\u2013\u2212\ufe63\uff0d")
+# Soft hyphen, zero-width space / joiners, word joiner, BOM: dropped entirely.
+_INVISIBLE = frozenset("\u00ad\u200b\u200c\u200d\u2060\ufeff")
+_UNUSUAL = re.compile("[" + "".join(sorted(_SPACE_LIKE | _DASH_LIKE | _INVISIBLE)) + "]")
+
+_Span = tuple[PiiKind, int, int]
+
+
+def _normalized(text: str) -> tuple[str, list[int] | None]:
+    """ASCII-separator copy of ``text`` and, if it differs, each character's original index."""
+    if not _UNUSUAL.search(text):
+        return text, None
+    chars: list[str] = []
+    index: list[int] = []
+    for i, c in enumerate(text):
+        if c in _INVISIBLE:
+            continue
+        chars.append(" " if c in _SPACE_LIKE else "-" if c in _DASH_LIKE else c)
+        index.append(i)
+    return "".join(chars), index
+
 
 def find_pii(text: str, kinds: Iterable[PiiKind] = ALL_KINDS) -> list[PiiMatch]:
-    """Non-overlapping sensitive spans in ``text``, sorted by position."""
+    """Non-overlapping sensitive spans in ``text``, sorted by position.
+
+    Offsets and ``PiiMatch.text`` always refer to the original ``text``.
+    """
     wanted = frozenset(kinds)
+    scanned, index = _normalized(text)
+    matches: list[PiiMatch] = []
+    for kind, start, end in _find_spans(scanned, wanted):
+        if index is not None:
+            start, end = index[start], index[end - 1] + 1
+        matches.append(PiiMatch(kind, start, end, text[start:end]))
+    return matches
+
+
+def _find_spans(text: str, wanted: frozenset[PiiKind]) -> list[_Span]:
     found = _scan(text, wanted)
     for _ in range(_MAX_PASSES - 1):
         if not found:
             break
         masked = _masked(text, found)
-        extra = [m for m in _scan(masked, wanted) if _MASK not in m.text]
+        extra = [
+            (kind, start, end)
+            for kind, start, end in _scan(masked, wanted)
+            if _MASK not in masked[start:end]
+        ]
         if not extra:
             break
-        found = sorted(found + extra, key=lambda m: m.start)
+        found = sorted(found + extra, key=lambda span: span[1])
     return found
 
 
-def _masked(text: str, matches: list[PiiMatch]) -> str:
+def _masked(text: str, spans: list[_Span]) -> str:
     parts: list[str] = []
     cursor = 0
-    for m in matches:
-        parts += [text[cursor : m.start], _MASK * (m.end - m.start)]
-        cursor = m.end
+    for _, start, end in spans:
+        parts += [text[cursor:start], _MASK * (end - start)]
+        cursor = end
     parts.append(text[cursor:])
     return "".join(parts)
 
 
-def _scan(text: str, wanted: frozenset[PiiKind]) -> list[PiiMatch]:
+def _scan(text: str, wanted: frozenset[PiiKind]) -> list[_Span]:
     """One pass of every wanted detector; earlier detectors win overlaps."""
     taken: list[tuple[int, int]] = []  # sorted, non-overlapping
-    found: list[PiiMatch] = []
+    found: list[_Span] = []
     for kind, finder in _DETECTORS:
         if kind not in wanted:
             continue
@@ -405,8 +592,8 @@ def _scan(text: str, wanted: frozenset[PiiKind]) -> list[PiiMatch]:
             if _overlaps(taken, start, end):
                 continue
             bisect.insort(taken, (start, end))
-            found.append(PiiMatch(kind, start, end, text[start:end]))
-    return sorted(found, key=lambda m: m.start)
+            found.append((kind, start, end))
+    return sorted(found, key=lambda span: span[1])
 
 
 def _overlaps(taken: list[tuple[int, int]], start: int, end: int) -> bool:
@@ -434,7 +621,8 @@ class TokenVault:
     """Local, never-transmitted map from placeholder tokens to original values.
 
     The same value always gets the same token within one vault, so an external
-    model can still tell that two mentions refer to the same account.
+    model can still tell that two mentions refer to the same account (§26).
+    Restoring gives back the first spelling seen for that value.
     """
 
     def __init__(self) -> None:
@@ -444,7 +632,19 @@ class TokenVault:
 
     def token_for(self, kind: PiiKind, value: str, *, avoid: str = "") -> str:
         """Token for ``value``; never one that already appears in ``avoid``."""
-        key = (kind, _normalize(kind, value))
+        return self._issue(kind, _normalize(kind, value), value, avoid)
+
+    def _token_for_literal(self, literal: str, *, avoid: str) -> str:
+        """A fresh token standing for token-shaped text found in the input.
+
+        Its key lives in a namespace no normalized value can reach ("\\x00..."),
+        so it never shares a token with a real value.
+        """
+        kind = PiiKind(literal[1:-1].rsplit("_", 1)[0])
+        return self._issue(kind, "\x00" + literal, literal, avoid)
+
+    def _issue(self, kind: PiiKind, normalized: str, value: str, avoid: str) -> str:
+        key = (kind, normalized)
         if key in self._by_key:
             return self._by_key[key]
         n = self._counters.get(kind, 0)
@@ -486,15 +686,31 @@ def redact(
     text: str, *, vault: TokenVault | None = None, kinds: Iterable[PiiKind] = ALL_KINDS
 ) -> Redaction:
     """Replace sensitive spans with tokens (§53). Pass a shared ``vault`` to keep
-    tokens consistent across several texts of one request."""
+    tokens consistent across several texts of one request.
+
+    Token-shaped text already in ``text`` is replaced by a fresh token too (and
+    restored to itself), so an injected "[IBAN_1]" cannot make the external
+    answer restore to a real value from another text. ``matches`` lists only
+    the sensitive values.
+    """
     vault = vault if vault is not None else TokenVault()
     matches = find_pii(text, kinds)
+    taken = [(m.start, m.end) for m in matches]
+    edits: list[tuple[int, int, PiiMatch | None]] = [(m.start, m.end, m) for m in matches]
+    edits += [
+        (*literal.span(), None)
+        for literal in _TOKEN.finditer(text)
+        if not _overlaps(taken, *literal.span())
+    ]
     parts: list[str] = []
     cursor = 0
-    for m in matches:
-        parts.append(text[cursor : m.start])
-        parts.append(vault.token_for(m.kind, m.text, avoid=text))
-        cursor = m.end
+    for start, end, match in sorted(edits, key=lambda e: e[0]):  # tokens numbered in text order
+        if match is None:
+            token = vault._token_for_literal(text[start:end], avoid=text)
+        else:
+            token = vault.token_for(match.kind, match.text, avoid=text)
+        parts += [text[cursor:start], token]
+        cursor = end
     parts.append(text[cursor:])
     return Redaction(text="".join(parts), vault=vault, matches=tuple(matches))
 

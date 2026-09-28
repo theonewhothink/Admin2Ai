@@ -6,6 +6,7 @@ import pytest
 
 from backoffice.domain.lifecycle import (
     ORDER,
+    SIDE_STATES,
     SKIPPABLE,
     IllegalTransition,
     Stage,
@@ -125,10 +126,13 @@ def test_history_records_the_transition_and_copies_evidence():
 
 @pytest.mark.parametrize("quality", [Quality.AMBER, Quality.RED])
 def test_closed_requires_green(quality: Quality):
-    item = walk_to(Stage.CONFIRMED, quality=quality)
+    item = walk_to(Stage.CONFIRMED, quality=Quality.AMBER)
+    if quality is Quality.RED:
+        item.advance(Stage.CONFLICT, actor="verification", evidence_ids=["ev_qr"])
+    stage = item.stage
     with pytest.raises(IllegalTransition, match="GREEN"):
         item.advance(Stage.CLOSED, actor="system", evidence_ids=["ev_bank"])
-    assert item.stage is Stage.CONFIRMED
+    assert (item.stage, item.quality) == (stage, quality)
 
 
 def test_rejected_transition_does_not_leak_quality():
@@ -287,7 +291,10 @@ def test_closed_item_can_be_reopened_by_a_conflict():
     "src", LINEAR[:-1] + [Stage.NEEDS_OWNER, Stage.CONFLICT], ids=lambda s: s.value
 )
 def test_not_required_from_any_open_stage(src: Stage):
-    item = new_item(stage=src) if src not in LINEAR else walk_to(src)
+    if src in LINEAR:
+        item = walk_to(src)
+    else:
+        item = new_item(stage=src, quality=Quality.RED if src is Stage.CONFLICT else Quality.AMBER)
     item.advance(
         Stage.NOT_REQUIRED, actor="expected_evidence", evidence_ids=["ev_internal"]
     )
@@ -312,7 +319,10 @@ def test_not_required_can_be_reopened_and_resumed():
 
 
 def test_is_done_only_for_terminal_states():
-    done = {s for s in Stage if new_item(stage=s).is_done}
+    required = {Stage.CLOSED: Quality.GREEN, Stage.CONFLICT: Quality.RED}
+    done = {
+        s for s in Stage if new_item(stage=s, quality=required.get(s, Quality.AMBER)).is_done
+    }
     assert done == {Stage.CLOSED, Stage.NOT_REQUIRED}
 
 
@@ -336,3 +346,204 @@ def test_legacy_transition_records_without_quality_still_load():
     )
     item.advance(Stage.ACQUIRED, actor="system", evidence_ids=["ev_2"])
     assert item.stage is Stage.ACQUIRED
+
+
+# --------------------------------------------------------------------------- review regressions
+
+
+@pytest.mark.parametrize("dst", ["acquired", Stage.ACQUIRED], ids=["str", "enum"])
+def test_stage_given_as_its_value_is_stored_as_the_enum(dst):
+    """A raw string stage broke downstream ``item.stage is Stage.X`` checks."""
+    item = new_item()
+    item.advance(dst, actor="system", evidence_ids=["ev_1"], quality="verified")  # type: ignore[arg-type]
+    assert item.stage is Stage.ACQUIRED
+    assert item.quality is Quality.GREEN
+    assert item.history[-1].to_stage is Stage.ACQUIRED
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [{"to": "bogus"}, {"to": Stage.ACQUIRED, "quality": "great"}],
+    ids=["unknown-stage", "unknown-quality"],
+)
+def test_unknown_stage_or_quality_is_an_illegal_transition(kw):
+    item = new_item()
+    with pytest.raises(IllegalTransition):
+        item.advance(actor="system", evidence_ids=["ev_1"], **kw)
+    assert snapshot(item) == (Stage.DISCOVERED, Quality.AMBER, 0)
+
+
+def test_a_single_string_is_not_a_list_of_evidence():
+    """'ev_1' used to be split into the 'evidence' ids 'e', 'v', '_', '1'."""
+    item = new_item()
+    with pytest.raises(IllegalTransition, match="list"):
+        item.advance(Stage.ACQUIRED, actor="system", evidence_ids="ev_1")  # type: ignore[arg-type]
+    assert item.history == []
+
+
+@pytest.mark.parametrize("actor", ["", "   ", None])
+def test_every_transition_names_its_actor(actor):
+    item = new_item()
+    with pytest.raises(IllegalTransition, match="actor"):
+        item.advance(Stage.ACQUIRED, actor=actor, evidence_ids=["ev_1"])  # type: ignore[arg-type]
+    assert item.history == []
+
+
+def test_restored_item_resumes_from_its_own_stage_after_a_side_state():
+    """An item loaded at VERIFIED without history used to resume from DISCOVERED."""
+    item = new_item(stage=Stage.VERIFIED)
+    item.advance(Stage.NEEDS_OWNER, actor="system", evidence_ids=["ev_q"])
+    item.advance(Stage.MATCHED, actor="owner", evidence_ids=["ev_a"])
+    assert item.stage is Stage.MATCHED
+    again = new_item(stage=Stage.VERIFIED)
+    again.advance(Stage.NEEDS_OWNER, actor="system", evidence_ids=["ev_q"])
+    with pytest.raises(IllegalTransition, match="cannot skip"):
+        again.advance(Stage.CONFIRMED, actor="owner", evidence_ids=["ev_a"])
+
+
+@pytest.mark.parametrize(
+    "before, raised",
+    [(Quality.RED, Quality.GREEN), (Quality.RED, Quality.AMBER), (Quality.AMBER, Quality.GREEN)],
+)
+def test_asking_the_owner_never_raises_quality(before, raised):
+    """§57: a question is not verification; a RED conflict used to turn GREEN by
+    entering NEEDS_OWNER and then close without any new verified evidence."""
+    item = walk_to(Stage.CONFIRMED, quality=before if before is not Quality.RED else Quality.AMBER)
+    if before is Quality.RED:
+        item.advance(Stage.CONFLICT, actor="verification", evidence_ids=["ev_qr"])
+    snap = snapshot(item)
+    with pytest.raises(IllegalTransition, match="quality"):
+        item.advance(Stage.NEEDS_OWNER, actor="system", evidence_ids=["ev_q"], quality=raised)
+    assert snapshot(item) == snap
+
+
+def test_asking_the_owner_may_lower_quality():
+    item = walk_to(Stage.MATCHED, quality=Quality.GREEN)
+    item.advance(
+        Stage.NEEDS_OWNER, actor="system", evidence_ids=["ev_q"], quality=Quality.AMBER
+    )
+    assert item.quality is Quality.AMBER
+    item.advance(Stage.CONFIRMED, actor="owner", evidence_ids=["ev_a"])
+    with pytest.raises(IllegalTransition, match="GREEN"):
+        item.advance(Stage.CLOSED, actor="system", evidence_ids=["ev_1"])
+
+
+def test_conflict_resolved_through_the_owner_still_needs_green_to_close():
+    item = walk_to(Stage.CONFIRMED)
+    item.advance(Stage.CONFLICT, actor="verification", evidence_ids=["ev_qr"])
+    item.advance(Stage.NEEDS_OWNER, actor="system", evidence_ids=["ev_q"])
+    assert item.quality is Quality.RED
+    with pytest.raises(IllegalTransition, match="GREEN"):
+        item.advance(Stage.CLOSED, actor="owner", evidence_ids=["ev_answer"])
+    item.advance(
+        Stage.CLOSED, actor="owner", evidence_ids=["ev_invoice"], quality=Quality.GREEN
+    )
+    assert item.is_done
+
+
+@pytest.mark.parametrize(
+    "stage, quality",
+    [(Stage.CLOSED, Quality.AMBER), (Stage.CLOSED, Quality.RED), (Stage.CONFLICT, Quality.GREEN),
+     (Stage.CONFLICT, Quality.AMBER)],
+)  # fmt: skip
+def test_stored_items_cannot_break_the_golden_rule(stage, quality):
+    """Loading a CLOSED item that is not GREEN (or a CONFLICT that is not RED) fails."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        new_item(stage=stage, quality=quality)
+    with pytest.raises(ValidationError):
+        TrackedItem.model_validate(
+            {"tenant_id": "t1", "subject_type": "document", "subject_id": "d",
+             "stage": stage.value, "quality": quality.value}
+        )  # fmt: skip
+
+
+def test_item_round_trips_through_json():
+    item = walk_to(Stage.MATCHED)
+    item.advance(Stage.NEEDS_OWNER, actor="system", evidence_ids=["ev_q"])
+    loaded = TrackedItem.model_validate_json(item.model_dump_json())
+    assert loaded == item
+    loaded.advance(Stage.CONFIRMED, actor="owner", evidence_ids=["ev_a"])
+    assert loaded.stage is Stage.CONFIRMED
+
+
+def _resume_is_legal(last: Stage, dst: Stage) -> bool:
+    """From a side state: stay, rewind, or move forward skipping only ACTED."""
+    i, j = LINEAR.index(last), LINEAR.index(dst)
+    return j <= i or all(s in SKIPPABLE for s in LINEAR[i + 1 : j])
+
+
+@pytest.mark.parametrize("side", sorted(SIDE_STATES), ids=lambda s: s.value)
+@pytest.mark.parametrize("last", LINEAR, ids=lambda s: s.value)
+@pytest.mark.parametrize("dst", LINEAR, ids=lambda s: s.value)
+def test_every_resume_from_a_side_state(side: Stage, last: Stage, dst: Stage):
+    item = walk_to(last)
+    item.advance(side, actor="system", evidence_ids=["ev_side"])
+    before = snapshot(item)
+    if _resume_is_legal(last, dst):
+        item.advance(dst, actor="owner", evidence_ids=["ev_answer"], quality=Quality.GREEN)
+        assert item.stage is dst and item.quality is Quality.GREEN
+    else:
+        with pytest.raises(IllegalTransition, match="cannot skip"):
+            item.advance(dst, actor="owner", evidence_ids=["ev_answer"], quality=Quality.GREEN)
+        assert snapshot(item) == before
+
+
+@pytest.mark.parametrize(
+    "src, quality",
+    [
+        (src, q)
+        for src in LINEAR + [Stage.NOT_REQUIRED]
+        for q in Quality
+        if src is not Stage.CLOSED or q is Quality.GREEN  # a closed item is always GREEN
+    ],
+    ids=lambda v: v.value if isinstance(v, Stage) else v.name,
+)
+def test_needs_owner_from_any_stage_keeps_quality(src: Stage, quality: Quality):
+    start = Quality.AMBER if quality is Quality.RED else quality
+    if src is Stage.NOT_REQUIRED:
+        item = walk_to(Stage.ACQUIRED, quality=start)
+        item.advance(Stage.NOT_REQUIRED, actor="system", evidence_ids=["ev_rule"])
+    else:
+        item = walk_to(src, quality=start) if src is not Stage.DISCOVERED else new_item(quality=start)
+    if quality is Quality.RED:  # RED only exists through a conflict
+        item.advance(Stage.CONFLICT, actor="verification", evidence_ids=["ev_qr"])
+    item.advance(Stage.NEEDS_OWNER, actor="system", evidence_ids=["ev_q"])
+    assert (item.stage, item.quality, item.is_done) == (Stage.NEEDS_OWNER, quality, False)
+
+
+def test_a_conflicting_item_cannot_move_on_without_a_new_assessment():
+    """A RED item used to walk on through MATCHED and ACTED (e.g. pay) on conflicting data."""
+    item = walk_to(Stage.VERIFIED)
+    item.advance(Stage.CONFLICT, actor="verification", evidence_ids=["ev_qr"])
+    snap = snapshot(item)
+    for dst in (Stage.VERIFIED, Stage.MATCHED):
+        with pytest.raises(IllegalTransition, match="conflict"):
+            item.advance(dst, actor="system", evidence_ids=["ev_1"])
+        assert snapshot(item) == snap
+    item.advance(Stage.MATCHED, actor="owner", evidence_ids=["ev_answer"], quality=Quality.AMBER)
+    assert (item.stage, item.quality) == (Stage.MATCHED, Quality.AMBER)
+
+
+@pytest.mark.parametrize("dst", LINEAR[1:], ids=lambda s: s.value)
+def test_linear_stages_never_carry_red(dst: Stage):
+    item = walk_to(LINEAR[LINEAR.index(dst) - 1])
+    with pytest.raises(IllegalTransition, match="GREEN" if dst is Stage.CLOSED else "conflict"):
+        item.advance(dst, actor="system", evidence_ids=["ev_1"], quality=Quality.RED)
+
+
+@pytest.mark.parametrize("stage", LINEAR[:-1], ids=lambda s: s.value)
+def test_stored_red_item_on_the_golden_path_is_refused(stage: Stage):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        new_item(stage=stage, quality=Quality.RED)
+
+
+def test_red_may_wait_for_the_owner_or_be_dismissed_as_not_required():
+    item = walk_to(Stage.VERIFIED)
+    item.advance(Stage.CONFLICT, actor="verification", evidence_ids=["ev_qr"])
+    item.advance(Stage.NEEDS_OWNER, actor="system", evidence_ids=["ev_q"])
+    item.advance(Stage.NOT_REQUIRED, actor="owner", evidence_ids=["ev_duplicate"])
+    assert (item.stage, item.quality) == (Stage.NOT_REQUIRED, Quality.RED)

@@ -16,6 +16,8 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date
 
+from backoffice.countries.base import CountryPackError
+
 # ATCUD is mandatory on invoices and other fiscal documents from this date
 # (Decreto-Lei 28/2019 art. 35, after the transitional period that ended on
 # 2022-12-31). Before it, "0" was printed/encoded instead.
@@ -31,12 +33,18 @@ ATCUD_NOT_APPLICABLE = "0"
 _ATCUD = re.compile(r"^([A-Z0-9]{8,})-([0-9]+)$")
 _ATCUD_MAX_LENGTH = 70  # QR field H limit
 
+# An "ATCUD" label is only a label when a colon or a space follows it; a
+# validation code may itself start with those letters.
+_LABEL = re.compile(r"^ATCUD(?:\s*:\s*|\s+)", re.IGNORECASE)
+
 # SAF-T (PT) InvoiceNo / DocumentNumber / PaymentRefNo pattern.
 _DOC_NUMBER = re.compile(r"^([^ ]+) ([^/ ]+)/([0-9]+)$")
 
 
-class ATCUDError(ValueError):
+class ATCUDError(CountryPackError, ValueError):
     """Malformed ATCUD or document number."""
+
+    owner_message = "The document's unique code doesn't look right, so I didn't use it."
 
 
 @dataclass(frozen=True)
@@ -64,9 +72,7 @@ def parse_atcud(raw: str) -> ATCUD:
     """Parse "CSDF7T5H-0035". Surrounding spaces and an "ATCUD:" label are ignored."""
     if not isinstance(raw, str):
         raise ATCUDError("ATCUD must be text")
-    text = raw.strip()
-    if text.upper().startswith("ATCUD"):
-        text = text[5:].lstrip(" :").strip()
+    text = _LABEL.sub("", raw.strip(), count=1).strip()
     if len(text) > _ATCUD_MAX_LENGTH:
         raise ATCUDError(f"ATCUD longer than {_ATCUD_MAX_LENGTH} characters")
     if text == ATCUD_NOT_APPLICABLE:

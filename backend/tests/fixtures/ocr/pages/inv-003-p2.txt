@@ -1,0 +1,4 @@
+Subtotal: 450.00
+VAT: 103.50
+Total: 553.50
+Currency: EUR

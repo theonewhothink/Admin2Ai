@@ -19,6 +19,7 @@ Portuguese number format: "1.492,30" (also "1 492,30" and "1492,30"). A plain
 from __future__ import annotations
 
 import re
+from bisect import bisect_left, insort
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import date
@@ -59,7 +60,7 @@ _AMOUNT = re.compile(
 
 def parse_pt_amount(text: str) -> Decimal | None:
     """"1.492,30" -> Decimal("1492.30"). None when the text is not one amount."""
-    match = _AMOUNT.fullmatch(text.strip()) if isinstance(text, str) else None
+    match = _AMOUNT.fullmatch(clean(text).strip()) if isinstance(text, str) else None
     return _amount_from_match(match) if match else None
 
 
@@ -169,16 +170,24 @@ class _Hit:
 
 
 def _label_hits(folded_line: str) -> list[_Hit]:
-    """Labels on a line; on overlap the longest label wins ("total c/ iva" > "iva")."""
+    """Labels on a line; on overlap the longest label wins ("total c/ iva" > "iva").
+
+    O(h log h) in the number of hits: text comes from untrusted attachments,
+    so a line repeating a label thousands of times must not stall extraction.
+    """
     hits = [
         _Hit(spec, m.start(), m.end()) for spec in _LABELS for m in spec.pattern.finditer(folded_line)
     ]
     hits.sort(key=lambda h: (h.start - h.end, h.start))
-    chosen: list[_Hit] = []
+    starts: list[int] = []  # chosen hits are disjoint; kept sorted by start
+    chosen: dict[int, _Hit] = {}
     for hit in hits:
-        if all(hit.end <= c.start or hit.start >= c.end for c in chosen):
-            chosen.append(hit)
-    return sorted(chosen, key=lambda h: h.start)
+        before = bisect_left(starts, hit.end) - 1  # last chosen hit starting before hit.end
+        if before >= 0 and chosen[starts[before]].end > hit.start:
+            continue
+        insort(starts, hit.start)
+        chosen[hit.start] = hit
+    return [chosen[start] for start in starts]
 
 
 # --------------------------------------------------------------------------- #
@@ -269,7 +278,7 @@ def extract_text_fields(
     folded = [fold(line) for line in lines]
     out = _Builder(source=source, method=method)
 
-    labelled = _labelled_values(lines, folded)
+    labelled = _labelled_values(folded)
     withholding = _single_value(labelled["withholding"])
     gross = labelled["gross"] or ([] if withholding is not None else labelled["payable"])
     out.add_selected(CriticalField.GROSS_AMOUNT, gross)
@@ -280,7 +289,7 @@ def extract_text_fields(
 
     atcud = _find_atcud(lines, folded)
     doc_numbers = _document_numbers(lines, folded, out, atcud)
-    unassigned, final_consumer = _tax_ids(lines, folded, out, known_customer_tax_ids)
+    unassigned, final_consumer = _tax_ids(folded, out, known_customer_tax_ids)
     ibans = _ibans(original, out)
     multibanco = _multibanco(folded, out)
 
@@ -302,7 +311,7 @@ def extract_text_fields(
 # --------------------------------------------------------------------------- #
 
 
-def _labelled_values(lines: list[str], folded: list[str]) -> dict[str, list[_Candidate]]:
+def _labelled_values(folded: list[str]) -> dict[str, list[_Candidate]]:
     found: dict[str, list[_Candidate]] = {s.key: [] for s in _LABELS}
     for index, line in enumerate(folded):
         hits = _label_hits(line)
@@ -347,6 +356,7 @@ def _value_on_next_line(
             continue
         if _label_hits(candidate):
             return None, index + 1
+        value: object | None
         if key in _AMOUNT_KEYS:
             inner = _ONLY_AMOUNT.fullmatch(candidate)
             value = parse_pt_amount(inner.group("a")) if inner else None
@@ -381,7 +391,7 @@ _ATCUD_LABEL = re.compile(r"(?<![a-z])atcud\s*:?\s*([a-z0-9]{8,}-[0-9]+)(?![0-9]
 
 def _find_atcud(lines: list[str], folded: list[str]) -> ATCUD | None:
     found: dict[str, ATCUD] = {}
-    for line, low in zip(lines, folded):
+    for line, low in zip(lines, folded, strict=True):
         for match in _ATCUD_LABEL.finditer(low):
             try:
                 atcud = parse_atcud(line[match.start(1):match.end(1)].upper())
@@ -395,13 +405,13 @@ def _document_numbers(
     lines: list[str], folded: list[str], out: _Builder, atcud: ATCUD | None
 ) -> tuple[str, ...]:
     seen: dict[str, int] = {}
-    for index, (line, low) in enumerate(zip(lines, folded)):
+    for index, (line, low) in enumerate(zip(lines, folded, strict=True)):
         for match in _DOC_NUMBER.finditer(line):
             seen.setdefault(f"{match.group(1)} {match.group(2)}/{match.group(3)}", index + 1)
         for label in _DOC_LABEL.finditer(low):
-            match = _GENERIC_DOC_NUMBER.match(line, label.end())
-            if match:
-                seen.setdefault(f"{match.group(1)} {match.group(2)}/{match.group(3)}", index + 1)
+            generic = _GENERIC_DOC_NUMBER.match(line, label.end())
+            if generic:
+                seen.setdefault(f"{generic.group(1)} {generic.group(2)}/{generic.group(3)}", index + 1)
     numbers = tuple(seen)
     if len(numbers) == 1:
         out.add(CriticalField.INVOICE_NUMBER, numbers[0], _DOC_NUMBER_CONFIDENCE, seen[numbers[0]])
@@ -438,11 +448,17 @@ _ROLE_HEADER = re.compile(
     r"^\s*(?:dados\s+do\s+)?(?P<role>cliente|adquirente|fornecedor|emitente)\s*:?\s*$"
 )
 _FINAL_CONSUMER_WORDS = re.compile(r"(?<![a-z])consumidor\s+final(?![a-z])")
+# "V/ Contribuinte" (vosso: yours = the customer) and "N/ Contribuinte"
+# (nosso: ours = the issuer), a long-standing Portuguese invoice convention.
+_POSSESSIVE_LABEL = re.compile(
+    r"(?<![a-z0-9])(?P<who>[vn])\s*/\s*(?:n\.?\s*[ºo°]\.?\s*(?:de\s+)?)?"
+    r"(?:contribuinte|contrib\.?|nif|nipc)(?![a-z])"
+)
 _CUSTOMER, _SUPPLIER = "customer", "supplier"
 
 
 def _tax_ids(
-    lines: list[str], folded: list[str], out: _Builder, known_customers: Collection[str]
+    folded: list[str], out: _Builder, known_customers: Collection[str]
 ) -> tuple[tuple[str, ...], bool]:
     known = {n for n in (normalize_nif(k) for k in known_customers) if n}
     roles: dict[str, set[str | None]] = {}
@@ -477,8 +493,9 @@ def _nif_matches(folded_line: str) -> list[re.Match[str]]:
 def _role_for(folded: list[str], index: int, context: tuple[int, int]) -> str | None:
     """Role from the words leading to the NIF on its line, else a section header above."""
     before = folded[index][context[0]:context[1]]
-    is_customer = bool(_CUSTOMER_WORDS.search(before))
-    is_supplier = bool(_SUPPLIER_WORDS.search(before))
+    possessive = {m.group("who") for m in _POSSESSIVE_LABEL.finditer(before)}
+    is_customer = bool(_CUSTOMER_WORDS.search(before)) or "v" in possessive
+    is_supplier = bool(_SUPPLIER_WORDS.search(before)) or "n" in possessive
     if is_customer != is_supplier:
         return _CUSTOMER if is_customer else _SUPPLIER
     if is_customer:
@@ -500,28 +517,28 @@ def _assign_roles(
 ) -> tuple[str, ...]:
     customers: list[str] = []
     suppliers: list[str] = []
-    unassigned: list[str] = []
+    unlabelled: list[str] = []
+    contradictory: list[str] = []
     for nif, seen_roles in roles.items():
         labelled = {r for r in seen_roles if r is not None}
-        if nif in known and labelled - {_CUSTOMER}:
-            unassigned.append(nif)  # known customer id labelled as supplier: contradiction
-            continue
-        if nif in known or labelled == {_CUSTOMER}:
+        if (nif in known and labelled - {_CUSTOMER}) or len(labelled) > 1:
+            contradictory.append(nif)  # e.g. a known customer id labelled as supplier
+        elif nif in known or labelled == {_CUSTOMER}:
             customers.append(nif)
         elif labelled == {_SUPPLIER}:
             suppliers.append(nif)
         else:
-            unassigned.append(nif)
+            unlabelled.append(nif)
 
-    if len(customers) == 1 and not suppliers and len(unassigned) == 1:
+    if len(customers) == 1 and not suppliers and not contradictory and len(unlabelled) == 1:
         # A Portuguese invoice must show the supplier's NIF; if the customer is
         # identified, the only other valid NIF is the supplier's.
-        out.add(CriticalField.SUPPLIER_TAX_ID, unassigned[0], _NIF_DEDUCED_CONFIDENCE,
-                first_line[unassigned[0]])
-        unassigned = []
+        out.add(CriticalField.SUPPLIER_TAX_ID, unlabelled[0], _NIF_DEDUCED_CONFIDENCE,
+                first_line[unlabelled[0]])
+        unlabelled = []
     _emit_role(CriticalField.CUSTOMER_TAX_ID, customers, known, first_line, out)
     _emit_role(CriticalField.SUPPLIER_TAX_ID, suppliers, set(), first_line, out)
-    return tuple(unassigned)
+    return tuple(nif for nif in roles if nif in unlabelled or nif in contradictory)
 
 
 def _emit_role(
