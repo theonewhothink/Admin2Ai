@@ -10,7 +10,7 @@ import { useSearchParams } from "next/navigation";
 import { AccountantClientView } from "@/components/accountant/AccountantClientView";
 import { AccountantHomeView } from "@/components/accountant/AccountantHomeView";
 import { ActivityView } from "@/components/ActivityView";
-import { AskClient } from "@/components/ask/AskClient";
+import { ChatClient } from "@/components/ask/ChatClient";
 import { CompaniesView } from "@/components/companies/CompaniesView";
 import { CompanyView } from "@/components/companies/CompanyView";
 import { AuditView } from "@/components/flow/AuditView";
@@ -133,7 +133,7 @@ export function LiveAccountantClient({ id }: { id: string }) {
 export function LiveAsk({ examples }: { examples: string[] }) {
   const q = useSearchParams().get("q");
   const initialQuestion = q && q.trim() ? q.trim().slice(0, 500) : undefined;
-  return <AskClient key={initialQuestion ?? "empty"} initialQuestion={initialQuestion} examples={examples} />;
+  return <ChatClient key={initialQuestion ?? "empty"} initialQuestion={initialQuestion} examples={examples} />;
 }
 
 export function LiveSources() {

@@ -227,7 +227,7 @@ export function SourcesView({ data: initial }: { data: SourcesData }) {
             key={g.id}
             href={`#${g.id}`}
             className="meta"
-            style={{ padding: "4px 10px", borderRadius: 999, background: "var(--card)", textDecoration: "none" }}
+            style={{ padding: "4px 10px", borderRadius: 999, background: "var(--surface)", textDecoration: "none" }}
           >
             {g.title} <span className="tabular">{g.items.length}</span>
           </a>

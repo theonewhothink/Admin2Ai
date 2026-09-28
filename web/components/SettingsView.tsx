@@ -1,5 +1,6 @@
 import { Icon, type IconName } from "@/components/Icon";
 import { Status } from "@/components/ui";
+import { ReportDelivery } from "@/components/documents/ReportDelivery";
 import { owner } from "@/lib/data";
 import type { ConnectionKind, HomeData } from "@/lib/types";
 
@@ -23,6 +24,7 @@ export function SettingsView({ home }: { home: HomeData }) {
       </header>
 
       <div className="stack-6">
+        <ReportDelivery />
         <section aria-labelledby="conn-h">
           <div className="section-head">
             <h2 id="conn-h" className="h2">

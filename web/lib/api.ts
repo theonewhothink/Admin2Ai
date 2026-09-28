@@ -403,3 +403,66 @@ export function addSource(body: Record<string, unknown>): Promise<SourceChange> 
 export function removeSource(id: string): Promise<SourceChange> {
   return sourceWrite(`/api/sources/${encodeURIComponent(id)}/remove`, {});
 }
+
+/* ---------- Chat operator, documents, report delivery, accountant API ---------- */
+
+export interface CallResult<T = Record<string, unknown>> {
+  ok: boolean;
+  status: number;
+  body: T;
+}
+
+/** Plain call to the engine (browser) or the backend (HTTP). No sample fallback: actions need a real engine. */
+export async function call<T = Record<string, unknown>>(method: "GET" | "POST", path: string, body?: unknown): Promise<CallResult<T>> {
+  const offline = { ok: false, status: 503, body: { message: "Connect the backend to use this." } as unknown as T };
+  if (browserEngine) {
+    try {
+      const reply = await engineRequest(method, path, body);
+      return { ok: reply.status === 200, status: reply.status, body: (reply.body ?? {}) as T };
+    } catch {
+      return { ...offline, body: { message: "I couldn't get ready. Reload the page." } as unknown as T };
+    }
+  }
+  if (!hasApi) return offline;
+  try {
+    const res = await fetch(`${API_URL}${path}`, {
+      method,
+      headers: { Accept: "application/json", ...(body !== undefined ? { "Content-Type": "application/json" } : {}) },
+      body: method === "POST" ? JSON.stringify(body ?? {}) : undefined,
+      signal: AbortSignal.timeout(30000),
+    });
+    const parsed: unknown = await res.json().catch(() => ({}));
+    return { ok: res.ok, status: res.status, body: parsed as T };
+  } catch {
+    return { ...offline, body: { message: "I couldn't reach the server. Try again." } as unknown as T };
+  }
+}
+
+export function query(params: Record<string, string | undefined>): string {
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) if (v) q.set(k, v);
+  const s = q.toString();
+  return s ? `?${s}` : "";
+}
+
+/** Save a base64 file returned by the engine as a download. */
+export function saveFile(file: { filename: string; contentType: string; data: string }) {
+  const bin = atob(file.data);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const url = URL.createObjectURL(new Blob([bytes], { type: file.contentType }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = file.filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+export async function download(path: string, method: "GET" | "POST" = "GET", body?: unknown): Promise<string | null> {
+  const r = await call<{ filename: string; contentType: string; data: string; message?: string }>(method, path, body);
+  if (!r.ok || !r.body.data) return r.body.message ?? "I couldn't prepare that file.";
+  saveFile(r.body);
+  return null;
+}

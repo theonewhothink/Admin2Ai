@@ -486,6 +486,10 @@ export function findMonth(companyId: string, month: MonthKey): MonthClose | null
 /* ---------- Ask ---------- */
 
 export const askExamples: string[] = [
+  "Find the Vodafone invoice and send it to marc@contabilidadevidal.pt",
+  "Create a report between 1 September and 30 September",
+  "Summarize all expenses of Adobe in the past 2 years and check for issues",
+  "Send the September report to marc@contabilidadevidal.pt",
   "Is September complete?",
   "Did we pay Vodafone?",
   "Find the invoice for the €800 payment yesterday.",

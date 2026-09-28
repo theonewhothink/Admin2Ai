@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { Suspense } from "react";
-import { AskClient } from "@/components/ask/AskClient";
+import { ChatClient } from "@/components/ask/ChatClient";
 import { LiveAsk } from "@/components/live/pages";
 import { browserEngine } from "@/lib/api";
 import { askExamples } from "@/lib/data";
@@ -11,7 +11,7 @@ function Head() {
   return (
     <header className="page-head">
       <h1 className="h1">Ask</h1>
-      <p className="lead">Anything about your business. I answer from your email, bank and documents, and show you where.</p>
+      <p className="lead">Ask anything or give me a task: find and send documents, build reports, check a supplier. I answer from your email, bank and documents, and nothing is sent until you tap Send.</p>
     </header>
   );
 }
@@ -25,7 +25,7 @@ export default async function AskPage({
     return (
       <div className="container-narrow page">
         <Head />
-        <Suspense fallback={<AskClient examples={askExamples} />}>
+        <Suspense fallback={<ChatClient examples={askExamples} />}>
           <LiveAsk examples={askExamples} />
         </Suspense>
       </div>
@@ -36,7 +36,7 @@ export default async function AskPage({
   return (
     <div className="container-narrow page">
       <Head />
-      <AskClient key={initialQuestion ?? "empty"} initialQuestion={initialQuestion} examples={askExamples} />
+      <ChatClient key={initialQuestion ?? "empty"} initialQuestion={initialQuestion} examples={askExamples} />
     </div>
   );
 }

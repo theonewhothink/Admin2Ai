@@ -18,7 +18,7 @@ const VERSION = process.env.NEXT_PUBLIC_ENGINE_BUILD ?? "dev";
 const JOURNAL_KEY = "admin2ai:engine-journal";
 const JOURNAL_MAX_CHARS = 3_000_000;
 /** Requests that change the engine's state and so must be replayed after a reload. */
-const MUTATING = /^\/api\/(sources(\/[^/]+\/remove)?|needs-you\/[^/]+\/answer|evidence(\/upload)?|receipts|share|connections\/[^/]+\/(stale|reconnect)|accountant\/rules)$/;
+const MUTATING = /^\/api\/(chat(\/outbox\/[^/]+\/send)?|settings\/report|accountant\/api-keys(\/[^/]+\/revoke)?|sources(\/[^/]+\/remove)?|needs-you\/[^/]+\/answer|evidence(\/upload)?|receipts|share|connections\/[^/]+\/(stale|reconnect)|accountant\/rules)$/;
 
 export interface EngineReply {
   status: number;
