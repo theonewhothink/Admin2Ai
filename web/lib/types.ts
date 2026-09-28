@@ -312,6 +312,7 @@ export interface SourceItem {
   lastSeen?: string | null;
   foundIn?: string;
   renewsOn?: string | null;
+  signIn?: string;
 }
 
 export interface SourceGroup {

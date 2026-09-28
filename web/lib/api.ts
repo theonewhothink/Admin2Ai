@@ -352,3 +352,54 @@ export function getSources(): Promise<SourcesData> {
     () => sample.sources,
   );
 }
+
+export interface SourceChange {
+  ok: boolean;
+  message?: string;
+  id?: string;
+  authorizeUrl?: string;
+}
+
+async function sourceWrite(path: string, body: unknown): Promise<SourceChange> {
+  if (browserEngine) {
+    try {
+      const reply = await engineRequest("POST", path, body);
+      const b = isRecord(reply.body) ? reply.body : {};
+      return {
+        ok: reply.status === 200,
+        message: typeof b.message === "string" ? b.message : undefined,
+        id: typeof b.id === "string" ? b.id : undefined,
+      };
+    } catch (err) {
+      warn(path, err);
+      return { ok: false, message: "I couldn't save that. Try again." };
+    }
+  }
+  if (!hasApi) return { ok: false, message: "Connect the backend to add sources." };
+  try {
+    const res = await fetch(`${API_URL}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(body ?? {}),
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    const b: unknown = await res.json().catch(() => ({}));
+    const r = isRecord(b) ? b : {};
+    return {
+      ok: res.ok,
+      message: typeof r.message === "string" ? r.message : undefined,
+      id: typeof r.id === "string" ? r.id : undefined,
+      authorizeUrl: typeof r.authorizeUrl === "string" ? r.authorizeUrl : undefined,
+    };
+  } catch {
+    return { ok: false, message: "I couldn't reach the server. Try again." };
+  }
+}
+
+export function addSource(body: Record<string, unknown>): Promise<SourceChange> {
+  return sourceWrite("/api/sources", body);
+}
+
+export function removeSource(id: string): Promise<SourceChange> {
+  return sourceWrite(`/api/sources/${encodeURIComponent(id)}/remove`, {});
+}

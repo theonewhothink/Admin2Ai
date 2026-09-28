@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from email import policy
 from email.parser import BytesParser
 from typing import Any
@@ -66,8 +67,22 @@ def _multipart(body: bytes, content_type: str) -> tuple[dict[str, str], dict[str
     return fields, file_part
 
 
+def _service_from_env() -> BackOfficeService:
+    """Demo data plus real Google/Microsoft sign-in when their OAuth apps are configured."""
+    svc = BackOfficeService.demo()
+    from backoffice.connectors.authorize import OAuthAuthorizer, app_from_env
+
+    apps = {p: a for p in ("google", "microsoft") if (a := app_from_env(p)) is not None}
+    key = os.environ.get("BACKOFFICE_STATE_KEY", "")
+    base = os.environ.get("BACKOFFICE_API_URL", "http://localhost:8000").rstrip("/")
+    if apps and svc.vault is not None and len(key) >= 32:
+        svc.authorizer = OAuthAuthorizer(apps, svc.vault, redirect_uri=f"{base}/api/oauth/callback",
+                                         state_key=key.encode())
+    return svc
+
+
 def create_app(service: BackOfficeService | None = None) -> FastAPI:
-    svc = service if service is not None else BackOfficeService.demo()
+    svc = service if service is not None else _service_from_env()
     app = FastAPI(title="Back Office", version="0.1.0", docs_url=None, redoc_url=None)
     app.state.service = svc
     app.add_middleware(
@@ -80,6 +95,21 @@ def create_app(service: BackOfficeService | None = None) -> FastAPI:
         if len(data) > MAX_UPLOAD_BYTES + 1024 * 1024:
             return None
         return data
+
+    @app.get("/api/oauth/callback")
+    async def oauth_callback(code: str = "", state: str = "", error: str = "") -> Any:
+        """Where Google/Microsoft send the owner back after consent (connectors/authorize.py)."""
+        from fastapi.responses import RedirectResponse
+
+        web = os.environ.get("BACKOFFICE_WEB_URL", "http://localhost:3000").rstrip("/")
+        if error or svc.authorizer is None:
+            return RedirectResponse(f"{web}/sources/?signin=failed")
+        try:
+            done = svc.authorizer.complete(code, state)
+        except Exception:
+            return RedirectResponse(f"{web}/sources/?signin=failed")
+        svc.finish_sign_in(done["connection_id"])
+        return RedirectResponse(f"{web}/sources/?signin=done")
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:

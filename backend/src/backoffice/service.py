@@ -31,6 +31,7 @@ from backoffice.domain.lifecycle import Stage
 from backoffice.domain.models import DocumentType, SourceKind
 from backoffice.evidence import SharePayload, UploadRequest
 from backoffice.fraud import mask_iban, normalize_iban
+from backoffice.fraud.iban import is_valid_iban
 from backoffice.language import connector_problem, greeting, since_phrase, status_headline
 from backoffice.learning import (
     Answer,
@@ -45,12 +46,34 @@ from backoffice.learning import (
 from backoffice.orchestrator import (
     TZ,
     DocumentRecord,
+    Account,
+    ConnectorState,
     NeedsYouRecord,
     Orchestrator,
+    Relationship,
     TxRecord,
 )
+from backoffice.domain.models import Supplier
 
 __all__ = ["BackOfficeService", "ServiceError"]
+
+BANK_CONSENT_DAYS = 180  # PSD2 access consent (RTS Art. 10, as amended 2022): renew at most every 180 days
+_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_SLUG = re.compile(r"[^a-z0-9]+")
+
+
+def _default_vault() -> Any:
+    """An in-process vault with a random key when the crypto library is present; None in the browser."""
+    try:
+        import os
+
+        from backoffice.connectors.vault import LocalKeyProvider, TokenVault
+
+        keys = LocalKeyProvider.from_env() if os.environ.get("BACKOFFICE_VAULT_KEY") else LocalKeyProvider(os.urandom(32))
+        TokenVault(keys).store("probe", "probe", "probe", {"x": 1})
+        return TokenVault(keys)
+    except Exception:
+        return None
 
 ANSWER_FALLBACK = ("I could not find a clear answer to that yet. Try asking about a supplier, a payment, "
                    "or a month — for example, “Did we pay Vodafone?”")
@@ -82,8 +105,12 @@ def _iso(value: date | datetime | None) -> str | None:
 class BackOfficeService:
     """The owner's back office for one tenant, in memory."""
 
-    def __init__(self, orchestrator: Orchestrator) -> None:
+    def __init__(self, orchestrator: Orchestrator, *, vault: Any = None, authorizer: Any = None) -> None:
         self.orchestrator = orchestrator
+        # Sign-in secrets live only in the vault (connectors/vault.py), never in the repository.
+        self.vault = vault if vault is not None else _default_vault()
+        self.authorizer = authorizer
+        self.sign_in: dict[str, dict[str, Any]] = {}
 
     @classmethod
     def demo(cls) -> BackOfficeService:
@@ -305,8 +332,239 @@ class BackOfficeService:
             ("lenders", "Loans", "Repayments are matched to loan statements.", rel("lender")),
             ("government", "Tax and government", "Letters, deadlines and payments.", rel("government")),
         ]
+        for _, _, _, items in groups:
+            for item in items:
+                label = self._sign_in_label(item["id"])
+                if label is None and item.get("status") in ("healthy", "stale"):
+                    bank = next((c for c in self.repo.connectors.values()
+                                 if c.kind == "bank" and item.get("name", "").startswith(c.name)), None)
+                    label = (self._sign_in_label(bank.id) if bank else None) or \
+                        "Demo connection: no real sign-in was made."
+                if label:
+                    item["signIn"] = label
         return {"groups": [{"id": g, "title": t, "description": d, "items": items} for g, t, d, items in groups],
                 "companies": [{"id": cid, "name": n} for cid, n in names.items()]}
+
+    # ----------------------------------------------------------------- Adding and removing sources
+
+    def _slug(self, prefix: str, name: str) -> str:
+        base = f"{prefix}-" + (_SLUG.sub("-", name.lower()).strip("-") or "x")[:40]
+        taken = {*self.repo.connectors, *self.repo.accounts, *self.repo.suppliers,
+                 *(r.id for r in self.repo.relationships)}
+        slug, n = base, 2
+        while slug in taken:
+            slug, n = f"{base}-{n}", n + 1
+        return slug
+
+    def _company(self, company_id: Any, *, required: bool = True) -> str | None:
+        if company_id in (None, "", "all"):
+            if required:
+                raise ServiceError(400, "Choose which company this belongs to.")
+            return None
+        if company_id not in self.repo.companies:
+            raise ServiceError(400, "I don't know that company.")
+        return str(company_id)
+
+    @staticmethod
+    def _text(body: Mapping[str, Any], key: str, message: str, *, required: bool = True, limit: int = 120) -> str:
+        value = body.get(key)
+        value = value.strip() if isinstance(value, str) else ""
+        if required and not value:
+            raise ServiceError(400, message)
+        if len(value) > limit:
+            raise ServiceError(400, "That is too long.")
+        return value
+
+    def _sign_in_label(self, source_id: str) -> str | None:
+        info = self.sign_in.get(source_id)
+        if not info:
+            return None
+        if info.get("consent_until"):
+            until = info["consent_until"]
+            return (f"Bank consent until {until.day} {until.strftime('%B %Y')}. "
+                    "I will remind you a week before; banks require this every 180 days.")
+        if info.get("pending"):
+            return "Waiting for you to finish signing in."
+        if info.get("stored"):
+            return "Signed in. Access renews automatically; no need to reconnect."
+        return "Demo connection: no real sign-in was made."
+
+    def add_source(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        if not isinstance(body, Mapping):
+            raise ServiceError(400, "Tell me what to add.")
+        kind = body.get("kind")
+        handler = {
+            "email": self._add_email, "bank": self._add_bank, "card": self._add_card, "supplier": self._add_supplier,
+            "insurance": self._add_relationship, "investment": self._add_relationship,
+            "loan": self._add_relationship, "government": self._add_relationship,
+        }.get(kind if isinstance(kind, str) else "")
+        if handler is None:
+            raise ServiceError(400, "I can add email, bank accounts, cards, suppliers, insurance, investments, "
+                                    "loans and government offices.")
+        result = handler(body)
+        self.orchestrator.log("discovery", "source_added", subject_id=result["id"], values={"kind": kind})
+        self.orchestrator.run()
+        return {"ok": True, **result}
+
+    def _add_email(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        address = self._text(body, "address", "Which email address?").lower()
+        if not _EMAIL.match(address):
+            raise ServiceError(400, "That doesn't look like an email address.")
+        if any(c.kind == "email" and c.account.lower() == address for c in self.repo.connectors.values()):
+            raise ServiceError(409, f"{address} is already connected.")
+        provider = body.get("provider") or "google"
+        if provider not in ("google", "microsoft", "imap"):
+            raise ServiceError(400, "Choose Google, Microsoft or another provider.")
+        company = self._company(body.get("companyId"), required=False)
+        company_ids = (company,) if company else tuple(self.repo.companies)
+        cid = self._slug("mail", address)
+        now = self._now()
+        name = {"google": "Gmail", "microsoft": "Outlook", "imap": "Email"}[provider]
+        secret_stored = False
+        if provider == "imap":
+            host = self._text(body, "host", "Which mail server? For example imap.example.com.")
+            password = body.get("password")
+            if not isinstance(password, str) or not password:
+                raise ServiceError(400, "Enter the app password for this mailbox.")
+            if self.vault is not None:
+                self.vault.store(self.repo.tenant_id, cid, "imap",
+                                 {"host": host, "username": address, "password": password})
+                secret_stored = True
+            name = f"Email ({host})"
+        authorize_url = None
+        if provider in ("google", "microsoft") and self.authorizer is not None:
+            try:
+                authorize_url = self.authorizer.begin(provider, self.repo.tenant_id, cid, login_hint=address)
+            except Exception:
+                authorize_url = None
+        pending = authorize_url is not None
+        self.repo.add_connector(ConnectorState(
+            id=cid, name=name, kind="email", account=address, company_ids=company_ids, healthy=not pending,
+            covered_from=None if pending else now - timedelta(days=90),
+            covered_until=None if pending else now, last_synced_at=None if pending else now))
+        self.sign_in[cid] = {"provider": provider, "stored": secret_stored, "pending": pending}
+        if not pending:
+            self.orchestrator.activity(now, "checked", f"Connected {address} and read the last 90 days.",
+                                       company if company else None)
+        out: dict[str, Any] = {"id": cid, "message": "Almost done. Finish signing in." if pending else
+                               f"Done. I now read {address}."}
+        if authorize_url:
+            out["authorizeUrl"] = authorize_url
+        return out
+
+    def _add_bank(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        bank = self._text(body, "bank", "Which bank?")
+        company = self._company(body.get("companyId"))
+        iban_raw = self._text(body, "iban", "", required=False, limit=42)
+        iban = normalize_iban(iban_raw) if iban_raw else None
+        if iban_raw and not (iban and is_valid_iban(iban)):
+            raise ServiceError(400, "That IBAN doesn't look right. Check the digits.")
+        if iban and any(a.iban == iban for a in self.repo.accounts.values()):
+            raise ServiceError(409, "That account is already connected.")
+        aid = self._slug("acct", f"{bank} {(iban or '')[-4:]}")
+        self.repo.add_account(Account(id=aid, bank=bank, holder_id=company, iban=iban))
+        entity = self.repo.companies[company]
+        if iban and iban not in entity.own_ibans:
+            entity.own_ibans.append(iban)
+        now = self._now()
+        existing = next((c for c in self.repo.connectors.values() if c.kind == "bank" and c.name == bank), None)
+        if existing:
+            if company not in existing.company_ids:
+                existing.company_ids = (*existing.company_ids, company)
+            cid = existing.id
+        else:
+            cid = self._slug("bank", bank)
+            self.repo.add_connector(ConnectorState(
+                id=cid, name=bank, kind="bank", account=entity.name, company_ids=(company,), healthy=True,
+                covered_from=now - timedelta(days=90), covered_until=now, last_synced_at=now))
+        until = (now + timedelta(days=BANK_CONSENT_DAYS)).date()
+        self.sign_in[aid] = self.sign_in[cid] = {"provider": "open_banking", "consent_until": until}
+        self.orchestrator.activity(now, "checked", f"Connected {bank} for {entity.name} and imported 90 days.",
+                                   company)
+        return {"id": aid, "message": f"Done. {bank} is connected for {entity.name}."}
+
+    def _add_card(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        last4 = self._text(body, "last4", "The last 4 digits of the card.", limit=4)
+        if not re.fullmatch(r"\d{4}", last4):
+            raise ServiceError(400, "Enter exactly the last 4 digits.")
+        if any(a.card_last4 == last4 for a in self.repo.accounts.values()):
+            raise ServiceError(409, "That card is already here.")
+        bank = self._text(body, "bank", "Which bank issued the card?")
+        company = self._company(body.get("companyId"))
+        aid = self._slug("card", last4)
+        self.repo.add_account(Account(id=aid, bank=bank, holder_id=company, card_last4=last4,
+                                      owned=not bool(body.get("personal"))))
+        return {"id": aid, "message": f"Done. I will match card •••• {last4} to receipts."}
+
+    def _add_supplier(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        name = self._text(body, "name", "What is the supplier called?")
+        if any(s.name.lower() == name.lower() for s in self.repo.suppliers.values()):
+            raise ServiceError(409, f"{name} is already a supplier.")
+        tax_id = self._text(body, "taxId", "", required=False, limit=20) or None
+        email = self._text(body, "email", "", required=False) or None
+        if email and not _EMAIL.match(email):
+            raise ServiceError(400, "That doesn't look like an email address.")
+        sid = self._slug("sup", name)
+        self.repo.add_supplier(Supplier(
+            id=sid, tenant_id=self.repo.tenant_id, name=name, aliases=[name.upper()], tax_id=tax_id,
+            email_domains=[email.split("@", 1)[1].lower()] if email else [], contact_email=email))
+        return {"id": sid, "message": f"Done. I will look for {name} in email and payments."}
+
+    def _add_relationship(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        kind = {"loan": "lender"}.get(body["kind"], body["kind"])
+        name = self._text(body, "name", "What is it called?")
+        company = self._company(body.get("companyId"))
+        detail = self._text(body, "detail", "", required=False, limit=160)
+        renews = body.get("renewsOn")
+        renews_on = None
+        if renews:
+            try:
+                renews_on = date.fromisoformat(str(renews))
+            except ValueError:
+                raise ServiceError(400, "Use a date like 2027-01-15.") from None
+        rid = self._slug("rel", name)
+        self.repo.relationships.append(Relationship(rid, kind, name, company, detail or "Added by you",
+                                                    "Added by you", renews_on=renews_on))
+        return {"id": rid, "message": f"Done. I will watch for {name}."}
+
+    def finish_sign_in(self, connection_id: str) -> None:
+        """The provider confirmed consent and the vault holds the refresh token: start reading."""
+        c = self.repo.connectors.get(connection_id)
+        if c is None:
+            return
+        now = self._now()
+        c.healthy, c.covered_from, c.covered_until, c.last_synced_at = True, now - timedelta(days=90), now, now
+        self.sign_in[connection_id] = {**self.sign_in.get(connection_id, {}), "pending": False, "stored": True}
+        self.orchestrator.activity(now, "checked", f"Connected {c.account}.")
+        self.orchestrator.run()
+
+    def remove_source(self, source_id: str) -> dict[str, Any]:
+        repo = self.repo
+        name = None
+        signed_in = source_id in repo.connectors or source_id in repo.accounts
+        if source_id in repo.connectors:
+            c = repo.connectors.pop(source_id)
+            name = c.account if c.kind == "email" else c.name
+        elif source_id in repo.accounts:
+            a = repo.accounts.pop(source_id)
+            name = a.label
+        elif source_id in repo.suppliers:
+            name = repo.suppliers.pop(source_id).name
+        else:
+            for r in list(repo.relationships):
+                if r.id == source_id:
+                    repo.relationships.remove(r)
+                    name = r.name
+        if name is None:
+            raise ServiceError(404, "I can't find that source.")
+        self.sign_in.pop(source_id, None)
+        if self.vault is not None:
+            self.vault.delete(repo.tenant_id, source_id)  # stored sign-in is destroyed with the source
+        self.orchestrator.log("discovery", "source_removed", subject_id=source_id)
+        self.orchestrator.run()
+        if signed_in:
+            return {"ok": True, "message": f"Removed {name}. I no longer read it and its sign-in is deleted."}
+        return {"ok": True, "message": f"Removed {name}."}
 
     # ----------------------------------------------------------------- Companies
 
@@ -1085,6 +1343,8 @@ class BackOfficeService:
                                            captured_at=b.get("captured_at") or b.get("capturedAt"))),
             ("POST", r("/api/share"), lambda b: self.share(b)),
             ("GET", r("/api/sources"), lambda b: self.sources()),
+            ("POST", r("/api/sources"), lambda b: self.add_source(b or {})),
+            ("POST", r(f"/api/sources/{seg}/remove"), lambda b, sid: self.remove_source(sid)),
             ("GET", r("/api/connections"), lambda b: self.connections()),
             ("POST", r(f"/api/connections/{seg}/stale"), lambda b, i: self.mark_connection_stale(i)),
             ("POST", r(f"/api/connections/{seg}/reconnect"), lambda b, i: self.reconnect(i)),

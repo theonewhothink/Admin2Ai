@@ -1,5 +1,9 @@
+"use client";
+
+import { useState } from "react";
 import { Icon, type IconName } from "@/components/Icon";
 import { Status } from "@/components/ui";
+import { addSource, getSources, removeSource } from "@/lib/api";
 import type { SourceItem, SourceStatus, SourcesData } from "@/lib/types";
 
 const groupIcon: Record<string, IconName> = {
@@ -12,6 +16,18 @@ const groupIcon: Record<string, IconName> = {
   investments: "flag",
   lenders: "document",
   government: "document",
+};
+
+/** Which "add" form each group opens (the accountant is invited from onboarding). */
+const addKind: Record<string, string> = {
+  email: "email",
+  banks: "bank",
+  cards: "card",
+  suppliers: "supplier",
+  insurance: "insurance",
+  investments: "investment",
+  lenders: "loan",
+  government: "government",
 };
 
 const statusLabel: Record<SourceStatus, { tone: "good" | "attention" | "risk"; label: string } | null> = {
@@ -33,26 +49,186 @@ function extra(item: SourceItem): string {
   return parts.join(" · ");
 }
 
-export function SourcesView({ data }: { data: SourcesData }) {
-  const connected = data.groups
-    .filter((g) => ["email", "banks", "cards", "accountant"].includes(g.id))
-    .reduce((n, g) => n + g.items.length, 0);
-  const learned = data.groups
-    .filter((g) => !["email", "banks", "cards", "accountant"].includes(g.id))
-    .reduce((n, g) => n + g.items.length, 0);
+const CONNECTED = ["email", "banks", "cards", "accountant"];
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <label style={{ display: "grid", gap: 6 }}>
+      <span className="label">{label}</span>
+      {children}
+    </label>
+  );
+}
+
+function AddForm({
+  kind,
+  companies,
+  onDone,
+  onCancel,
+}: {
+  kind: string;
+  companies: SourcesData["companies"];
+  onDone: (message: string) => void;
+  onCancel: () => void;
+}) {
+  const [v, setV] = useState<Record<string, string>>({ provider: "google", companyId: kind === "email" ? "" : companies[0]?.id ?? "" });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const set = (k: string) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => setV({ ...v, [k]: e.target.value });
+  const text = (k: string, label: string, props: React.InputHTMLAttributes<HTMLInputElement> = {}) => (
+    <Field label={label}>
+      <input className="input" value={v[k] ?? ""} onChange={set(k)} {...props} />
+    </Field>
+  );
+  const company = (optional: boolean) => (
+    <Field label="Company">
+      <select className="input" value={v.companyId ?? ""} onChange={set("companyId")}>
+        {optional ? <option value="">All companies</option> : null}
+        {companies.map((c) => (
+          <option key={c.id} value={c.id}>
+            {c.name}
+          </option>
+        ))}
+      </select>
+    </Field>
+  );
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    const body: Record<string, unknown> = { kind, ...v };
+    if (kind !== "email") delete body.provider;
+    const result = await addSource(body);
+    setBusy(false);
+    if (result.authorizeUrl) {
+      window.location.assign(result.authorizeUrl); // provider consent; comes back signed in
+      return;
+    }
+    if (!result.ok) {
+      setError(result.message ?? "I couldn't add that.");
+      return;
+    }
+    onDone(result.message ?? "Done.");
+  }
+
+  return (
+    <form onSubmit={submit} className="card card-pad" style={{ display: "grid", gap: 16, marginTop: 12 }}>
+      {kind === "email" ? (
+        <>
+          <Field label="Provider">
+            <select className="input" value={v.provider} onChange={set("provider")}>
+              <option value="google">Google (Gmail, Workspace)</option>
+              <option value="microsoft">Microsoft (Outlook, 365)</option>
+              <option value="imap">Other provider (IMAP)</option>
+            </select>
+          </Field>
+          {text("address", "Email address", { type: "email", required: true, placeholder: "invoices@yourcompany.pt" })}
+          {v.provider === "imap" ? (
+            <>
+              {text("host", "Mail server", { required: true, placeholder: "imap.yourcompany.pt" })}
+              {text("password", "App password", { type: "password", required: true, autoComplete: "new-password" })}
+            </>
+          ) : null}
+          {company(true)}
+          <p className="meta">
+            {v.provider === "imap"
+              ? "The password is encrypted and only used to read this mailbox."
+              : "You sign in once with your provider. I keep an encrypted, read-only sign-in and renew it myself."}
+          </p>
+        </>
+      ) : null}
+      {kind === "bank" ? (
+        <>
+          {text("bank", "Bank", { required: true, placeholder: "Novo Banco" })}
+          {text("iban", "IBAN (optional)", { placeholder: "PT50 …", inputMode: "text" })}
+          {company(false)}
+          <p className="meta">Banks require you to confirm access every 180 days. I remind you a week before.</p>
+        </>
+      ) : null}
+      {kind === "card" ? (
+        <>
+          {text("last4", "Last 4 digits", { required: true, inputMode: "numeric", maxLength: 4, pattern: "\\d{4}" })}
+          {text("bank", "Issued by", { required: true, placeholder: "Revolut" })}
+          {company(false)}
+        </>
+      ) : null}
+      {kind === "supplier" ? (
+        <>
+          {text("name", "Supplier", { required: true })}
+          {text("taxId", "Tax number (optional)")}
+          {text("email", "Invoice email (optional)", { type: "email" })}
+        </>
+      ) : null}
+      {["insurance", "investment", "loan", "government"].includes(kind) ? (
+        <>
+          {text("name", "Name", { required: true })}
+          {text("detail", "What it is (optional)", { placeholder: kind === "insurance" ? "Car insurance · €40 a month" : "" })}
+          {kind === "insurance" ? text("renewsOn", "Renews on (optional)", { type: "date" }) : null}
+          {company(false)}
+        </>
+      ) : null}
+      {error ? (
+        <p role="alert" style={{ color: "var(--risk)" }}>
+          {error}
+        </p>
+      ) : null}
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <button className="btn btn-primary" type="submit" disabled={busy}>
+          {busy ? "Adding…" : kind === "email" && v.provider !== "imap" ? "Sign in and connect" : "Add"}
+        </button>
+        <button className="btn btn-quiet" type="button" onClick={onCancel}>
+          Cancel
+        </button>
+      </div>
+    </form>
+  );
+}
+
+export function SourcesView({ data: initial }: { data: SourcesData }) {
+  const [data, setData] = useState(initial);
+  const [adding, setAdding] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  async function refresh(message: string) {
+    setAdding(null);
+    setNotice(message);
+    setData(await getSources());
+  }
+
+  async function remove(item: SourceItem) {
+    if (!window.confirm(`Remove ${item.name}? I will stop reading it and delete its sign-in.`)) return;
+    const result = await removeSource(item.id);
+    await refresh(result.message ?? (result.ok ? "Removed." : "I couldn't remove that."));
+  }
+
+  const count = (ids: string[], inside: boolean) =>
+    data.groups.filter((g) => ids.includes(g.id) === inside).reduce((n, g) => n + g.items.length, 0);
 
   return (
     <div className="container-narrow page">
       <header className="page-head">
         <h1 className="h1">Sources</h1>
         <p className="lead">
-          {connected} connections I read from, and {learned} companies and organisations I have learned about.
+          {count(CONNECTED, true)} connections I read from, and {count(CONNECTED, false)} companies and organisations I have
+          learned about. Add anything I should search.
         </p>
       </header>
 
+      {notice ? (
+        <p role="status" className="card card-pad" style={{ marginBottom: 24 }}>
+          {notice}
+        </p>
+      ) : null}
+
       <nav aria-label="Jump to" style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 24 }}>
         {data.groups.map((g) => (
-          <a key={g.id} href={`#${g.id}`} className="meta" style={{ padding: "4px 10px", borderRadius: 999, background: "var(--card)", textDecoration: "none" }}>
+          <a
+            key={g.id}
+            href={`#${g.id}`}
+            className="meta"
+            style={{ padding: "4px 10px", borderRadius: 999, background: "var(--card)", textDecoration: "none" }}
+          >
             {g.title} <span className="tabular">{g.items.length}</span>
           </a>
         ))}
@@ -65,26 +241,52 @@ export function SourcesView({ data }: { data: SourcesData }) {
               <h2 id={`${g.id}-h`} className="h2">
                 {g.title}
               </h2>
-              <span className="meta">{g.description}</span>
+              {addKind[g.id] ? (
+                <button className="btn btn-quiet" type="button" onClick={() => setAdding(adding === g.id ? null : g.id)}>
+                  + Add
+                </button>
+              ) : null}
             </div>
+            <p className="meta" style={{ marginBottom: 12 }}>
+              {g.description}
+            </p>
+            {adding === g.id ? (
+              <AddForm kind={addKind[g.id] ?? ""} companies={data.companies} onDone={refresh} onCancel={() => setAdding(null)} />
+            ) : null}
             {g.items.length === 0 ? (
               <p className="card card-pad meta">Nothing yet.</p>
             ) : (
-              <ul className="card list">
+              <ul className="card list" style={{ marginTop: adding === g.id ? 12 : 0 }}>
                 {g.items.map((item) => {
                   const s = statusLabel[item.status];
                   const more = extra(item);
                   return (
-                    <li key={item.id} className="list-row">
-                      <Icon name={groupIcon[g.id] ?? "document"} size={20} style={{ color: "var(--text-2)", flexShrink: 0 }} />
+                    <li key={item.id} className="list-row" style={{ alignItems: "flex-start" }}>
+                      <Icon name={groupIcon[g.id] ?? "document"} size={20} style={{ color: "var(--text-2)", flexShrink: 0, marginTop: 2 }} />
                       <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 2 }}>
                         <span style={{ fontWeight: 600, overflowWrap: "anywhere" }}>{item.name}</span>
                         <span className="meta" style={{ overflowWrap: "anywhere" }}>
                           {[item.company, item.detail].filter(Boolean).join(" · ")}
                         </span>
-                        {more ? <span className="meta" style={{ overflowWrap: "anywhere" }}>{more}</span> : null}
+                        {more ? (
+                          <span className="meta" style={{ overflowWrap: "anywhere" }}>
+                            {more}
+                          </span>
+                        ) : null}
+                        {item.signIn ? (
+                          <span className="meta" style={{ overflowWrap: "anywhere" }}>
+                            {item.signIn}
+                          </span>
+                        ) : null}
                       </span>
-                      {s ? <Status tone={s.tone} label={s.label} /> : null}
+                      <span style={{ display: "grid", justifyItems: "end", gap: 4 }}>
+                        {s ? <Status tone={s.tone} label={s.label} /> : null}
+                        {g.id !== "accountant" ? (
+                          <button className="btn btn-quiet" type="button" onClick={() => void remove(item)} aria-label={`Remove ${item.name}`}>
+                            Remove
+                          </button>
+                        ) : null}
+                      </span>
                     </li>
                   );
                 })}
