@@ -108,3 +108,8 @@
     opacity: 1;
   }
 }
+
+.sample {
+  margin-top: var(--s-2);
+  font-size: 14px;
+}

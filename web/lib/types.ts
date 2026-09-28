@@ -141,6 +141,8 @@ export type NeedsYouItem = NeedsYouChoiceItem | NeedsYouApprovalItem;
 
 export interface AnswerResult {
   ok: boolean;
+  /** What the engine said, in plain language, when it has something to say. */
+  message?: string;
 }
 
 /* ---------- Activity ---------- */

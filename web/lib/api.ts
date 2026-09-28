@@ -1,17 +1,26 @@
 /**
- * Data access. Every call tries the backend at NEXT_PUBLIC_API_URL first and
- * falls back to the sample data in ./data.ts when the variable is unset, the
- * request fails, times out, or returns something unexpected. Pages therefore
- * always render, with or without a backend.
+ * Data access. Three modes:
+ *
+ * - NEXT_PUBLIC_ENGINE=browser: every call goes to the real Python engine
+ *   running in the browser (./engine.ts). Used by the static GitHub Pages site.
+ * - NEXT_PUBLIC_API_URL set: every call goes to the backend over HTTP.
+ * - Neither: the sample data in ./data.ts.
+ *
+ * Whatever the mode, a call that fails, times out, or returns something
+ * unexpected falls back to the sample data, so pages always render.
  *
  * Safe to import from both Server and Client Components.
  */
 import { unstable_rethrow } from "next/navigation";
 import * as sample from "./data";
+import { browserEngine, engineRequest } from "./engine";
 import type {
+  AccountantClientDetail,
+  AccountantClientRow,
   ActivityFeed,
   AnswerResult,
   AskAnswer,
+  AuditResult,
   CompanySummary,
   HomeData,
   MonthClose,
@@ -24,6 +33,11 @@ const TIMEOUT_MS = 4000;
 
 /** True when a backend URL is configured. */
 export const hasApi = API_URL !== "";
+
+/** True when pages show data computed by the engine (over HTTP or in the browser), not sample data. */
+export const liveData = hasApi || browserEngine;
+
+export { browserEngine };
 
 type Guard<T> = (value: unknown) => T | null;
 
@@ -39,13 +53,45 @@ function arrayFrom(v: unknown, key: string): unknown[] | null {
 }
 
 function warn(path: string, reason: unknown) {
-  if (process.env.NODE_ENV !== "production") {
+  if (process.env.NODE_ENV !== "production" || browserEngine) {
     const message = reason instanceof Error ? reason.message : String(reason);
     console.warn(`[api] ${path}: using sample data (${message})`);
   }
 }
 
-async function request<T>(path: string, init: RequestInit, guard: Guard<T>, fallback: () => T): Promise<T> {
+/** Ask the in-browser engine. On the server (static build time) there is no engine: use the sample. */
+async function viaEngine<T>(
+  method: string,
+  path: string,
+  body: unknown,
+  guard: Guard<T>,
+  fallback: () => T,
+  notFound?: { value: T },
+): Promise<T> {
+  if (typeof window === "undefined") return fallback();
+  try {
+    const reply = await engineRequest(method, path, body);
+    // The engine knows its own data: "not found" is an answer, not a reason to show sample data.
+    if (reply.status === 404 && notFound) return notFound.value;
+    if (reply.status !== 200) throw new Error(`HTTP ${reply.status}`);
+    const value = guard(reply.body);
+    if (value === null) throw new Error("unexpected response shape");
+    return value;
+  } catch (err) {
+    warn(path, err);
+    return fallback();
+  }
+}
+
+async function request<T>(
+  path: string,
+  init: RequestInit,
+  guard: Guard<T>,
+  fallback: () => T,
+  engineBody?: unknown,
+  engineNotFound?: { value: T },
+): Promise<T> {
+  if (browserEngine) return viaEngine(init.method ?? "GET", path, engineBody, guard, fallback, engineNotFound);
   if (!hasApi) return fallback();
   try {
     const res = await fetch(`${API_URL}${path}`, {
@@ -143,6 +189,8 @@ export function getMonth(companyId: string, month: MonthKey): Promise<MonthClose
     { method: "GET" },
     (v) => (isRecord(v) && typeof v.month === "string" && (v.status === "open" || v.status === "closed") ? (v as unknown as MonthClose) : null),
     () => sample.findMonth(companyId, month),
+    undefined,
+    { value: null },
   );
 }
 
@@ -150,11 +198,35 @@ export function getMonth(companyId: string, month: MonthKey): Promise<MonthClose
 
 const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** A write to the in-browser engine. `ok` is false when the engine refused it; `message` says why. */
+async function engineWrite(path: string, body: unknown): Promise<AnswerResult> {
+  try {
+    const reply = await engineRequest("POST", path, body);
+    const message = isRecord(reply.body) && typeof reply.body.message === "string" ? reply.body.message : undefined;
+    return { ok: reply.status === 200, message };
+  } catch (err) {
+    warn(path, err);
+    return { ok: false };
+  }
+}
+
+async function toBase64(file: Blob): Promise<string> {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(binary);
+}
+
 /**
  * Record the owner's answer to a needs-you item.
  * Phase 0: without a reachable backend the answer is accepted locally.
  */
 export async function answerNeedsYou(id: string, optionId: string, remember: boolean): Promise<AnswerResult> {
+  if (browserEngine) {
+    return engineWrite(`/api/needs-you/${encodeURIComponent(id)}/answer`, { option_id: optionId, remember });
+  }
   if (!hasApi) {
     await pause(450);
     return { ok: true };
@@ -210,11 +282,19 @@ export async function ask(question: string): Promise<AskAnswer> {
         ? { answer: v.answer, evidence: Array.isArray(v.evidence) ? (v.evidence as AskAnswer["evidence"]) : [] }
         : null,
     () => sampleAnswer(question),
+    { question },
   );
 }
 
 /** Upload a receipt or invoice. Phase 0: accepted locally without a backend. */
 export async function uploadEvidence(file: File): Promise<AnswerResult> {
+  if (browserEngine) {
+    return engineWrite("/api/evidence", {
+      filename: file.name,
+      contentType: file.type || null,
+      dataBase64: await toBase64(file),
+    });
+  }
   if (!hasApi) {
     await pause(600 + Math.min(file.size / 2000, 900));
     return { ok: true };
@@ -224,8 +304,41 @@ export async function uploadEvidence(file: File): Promise<AnswerResult> {
   return request<AnswerResult>("/api/evidence", { method: "POST", body }, () => ({ ok: true }), () => ({ ok: true }));
 }
 
-/* ---------- Sample-only (no endpoint yet) ---------- */
+/* ---------- Audit and accountant (sample data unless the browser engine runs) ---------- */
 
-export const getAudit = async () => sample.audit;
-export const getAccountantClients = async () => sample.accountantClients;
-export const getAccountantClient = async (id: string) => sample.accountantClientDetail(id);
+export async function getAudit(): Promise<AuditResult> {
+  if (!browserEngine) return sample.audit;
+  return viaEngine<AuditResult>(
+    "GET",
+    "/api/audit",
+    undefined,
+    (v) => (isRecord(v) && typeof v.companyName === "string" && Array.isArray(v.findings) ? (v as unknown as AuditResult) : null),
+    () => sample.audit,
+  );
+}
+
+export async function getAccountantClients(): Promise<AccountantClientRow[]> {
+  if (!browserEngine) return sample.accountantClients;
+  return viaEngine<AccountantClientRow[]>(
+    "GET",
+    "/api/accountant/clients",
+    undefined,
+    (v) => {
+      const list = arrayFrom(v, "clients");
+      return list ? list.filter((c): c is AccountantClientRow => isRecord(c) && typeof c.id === "string") : null;
+    },
+    () => sample.accountantClients,
+  );
+}
+
+export async function getAccountantClient(id: string): Promise<AccountantClientDetail | null> {
+  if (!browserEngine) return sample.accountantClientDetail(id);
+  return viaEngine<AccountantClientDetail | null>(
+    "GET",
+    `/api/accountant/clients/${encodeURIComponent(id)}`,
+    undefined,
+    (v) => (isRecord(v) && typeof v.id === "string" && Array.isArray(v.evidence) ? (v as unknown as AccountantClientDetail) : null),
+    () => sample.accountantClientDetail(id),
+    { value: null },
+  );
+}

@@ -1,7 +1,7 @@
 "use client";
 
 import { useId, useRef, useState } from "react";
-import { uploadEvidence } from "@/lib/api";
+import { browserEngine, uploadEvidence } from "@/lib/api";
 import { Icon } from "./Icon";
 import styles from "./scan.module.css";
 
@@ -10,6 +10,8 @@ interface Upload {
   name: string;
   size: number;
   state: "sending" | "received" | "failed";
+  /** What happened, in the engine's words. */
+  message?: string;
 }
 
 function formatSize(bytes: number): string {
@@ -18,7 +20,14 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-const ACCEPT = "image/*,application/pdf";
+const ACCEPT = "image/*,application/pdf,text/plain,.txt,.xml,.eml,.csv";
+const EXTRA = /\.(txt|xml|eml|csv)$/i;
+const SAMPLE = `${process.env.NEXT_PUBLIC_BASE_PATH ?? ""}/samples/edp-invoice-qr.txt`;
+
+/** Photos, PDFs, and the text formats invoices also come in (QR text, e-invoice XML, emails, bank CSV). */
+function accepted(f: File): boolean {
+  return f.type.startsWith("image/") || f.type === "application/pdf" || f.type.startsWith("text/") || EXTRA.test(f.name);
+}
 
 export function ScanDropzone() {
   const [uploads, setUploads] = useState<Upload[]>([]);
@@ -28,15 +37,29 @@ export function ScanDropzone() {
   const cameraInput = useRef<HTMLInputElement>(null);
   const hintId = useId();
 
+  const send = (file: File) => {
+    const id = ++counter.current;
+    setUploads((prev) => [{ id, name: file.name, size: file.size, state: "sending" }, ...prev]);
+    void uploadEvidence(file).then((res) => {
+      setUploads((prev) =>
+        prev.map((u) => (u.id === id ? { ...u, state: res.ok ? "received" : "failed", message: res.message } : u)),
+      );
+    });
+  };
+
   const handle = (files: FileList | null) => {
     if (!files || files.length === 0) return;
-    const list = Array.from(files).filter((f) => f.type.startsWith("image/") || f.type === "application/pdf");
-    for (const file of list) {
-      const id = ++counter.current;
-      setUploads((prev) => [{ id, name: file.name, size: file.size, state: "sending" }, ...prev]);
-      void uploadEvidence(file).then((res) => {
-        setUploads((prev) => prev.map((u) => (u.id === id ? { ...u, state: res.ok ? "received" : "failed" } : u)));
-      });
+    Array.from(files).filter(accepted).forEach(send);
+  };
+
+  const [sampleBusy, setSampleBusy] = useState(false);
+  const trySample = async () => {
+    setSampleBusy(true);
+    try {
+      const res = await fetch(SAMPLE);
+      if (res.ok) send(new File([await res.blob()], "edp-invoice-qr.txt", { type: "text/plain" }));
+    } finally {
+      setSampleBusy(false);
     }
   };
 
@@ -61,7 +84,7 @@ export function ScanDropzone() {
         </span>
         <p className={styles.dropTitle}>Drop receipts or invoices here</p>
         <p className="meta" id={hintId}>
-          Photos or PDFs. As many as you like.
+          Photos, PDFs or invoice files. As many as you like.
         </p>
         <div className={styles.dropActions}>
           <button type="button" className={`btn btn-primary ${styles.cameraBtn}`} onClick={() => cameraInput.current?.click()}>
@@ -72,6 +95,11 @@ export function ScanDropzone() {
             Choose files
           </button>
         </div>
+        {browserEngine ? (
+          <button type="button" className={`link-quiet ${styles.sample}`} onClick={() => void trySample()} disabled={sampleBusy}>
+            No receipt to hand? Try a sample EDP invoice.
+          </button>
+        ) : null}
         <input
           ref={fileInput}
           type="file"
@@ -117,10 +145,10 @@ export function ScanDropzone() {
                 ) : u.state === "received" ? (
                   <>
                     <Icon name="check" size={16} strokeWidth={2.2} />
-                    Received. I’ll take it from here.
+                    {u.message ?? "Received. I’ll take it from here."}
                   </>
                 ) : (
-                  "Didn’t arrive. Try again."
+                  (u.message ?? "Didn’t arrive. Try again.")
                 )}
               </span>
             </li>

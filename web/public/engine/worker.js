@@ -25,7 +25,9 @@ from backoffice.service import BackOfficeService
 
 _service = BackOfficeService.demo()
 
-def _call(method, path, body):
+def _call(method, path, body=None):
+    if not isinstance(body, str):
+        body = None  # JS null/undefined arrive as jsnull; bodies are sent as JSON text
     status, payload = _service.dispatch(method, path, body)
     return json.dumps({"status": status, "body": payload}, default=str)
 
@@ -42,7 +44,7 @@ function reply(id, status, body) {
 }
 
 function run(method, path, body) {
-  const text = call(method, path, body === undefined || body === null ? null : JSON.stringify(body));
+  const text = body === undefined || body === null ? call(method, path) : call(method, path, JSON.stringify(body));
   return JSON.parse(text);
 }
 

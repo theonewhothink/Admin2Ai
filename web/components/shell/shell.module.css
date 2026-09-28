@@ -231,7 +231,8 @@
 
 .main {
   min-height: calc(100dvh - var(--header-h));
-  padding-bottom: calc(var(--bottom-nav-h) + env(safe-area-inset-bottom) + var(--s-2));
+  /* Room for the bottom bar plus the Scan button that rises above it, so the last card stays visible. */
+  padding-bottom: calc(var(--bottom-nav-h) + env(safe-area-inset-bottom) + var(--s-6));
 }
 
 @media (min-width: 900px) {
@@ -248,9 +249,8 @@
   right: 0;
   bottom: 0;
   z-index: 40;
-  background: rgba(255, 255, 255, 0.92);
-  backdrop-filter: saturate(1.4) blur(16px);
-  -webkit-backdrop-filter: saturate(1.4) blur(16px);
+  /* Opaque: page content must not show through the bar. */
+  background: var(--surface);
   box-shadow: 0 -1px 0 var(--line);
   padding-bottom: env(safe-area-inset-bottom);
 }

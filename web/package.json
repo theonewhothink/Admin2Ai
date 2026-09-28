@@ -7,7 +7,11 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "next typegen && tsc --noEmit",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "engine:fetch": "bash ../backend/scripts/fetch_pyodide.sh public/pyodide",
+    "engine:bundle": "python3 ../backend/scripts/bundle_engine.py public/engine/backoffice.zip",
+    "build:pages": "npm run engine:fetch && npm run engine:bundle && NEXT_PUBLIC_ENGINE=browser NEXT_PUBLIC_BASE_PATH=/Admin2Ai next build",
+    "dev:engine": "npm run engine:fetch && npm run engine:bundle && NEXT_PUBLIC_ENGINE=browser next dev"
   },
   "dependencies": {
     "geist": "^1.7.2",

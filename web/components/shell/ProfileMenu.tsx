@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useEffect, useId, useRef, useState } from "react";
 import { Icon, type IconName } from "@/components/Icon";
+import { browserEngine, resetEngine } from "@/lib/engine";
 import { resetAnswered } from "@/lib/resolved-store";
 import type { Owner } from "@/lib/types";
 import styles from "./shell.module.css";
@@ -97,6 +98,11 @@ export function ProfileMenu({ owner, sampleData }: { owner: Owner; sampleData: b
               onClick={() => {
                 resetAnswered();
                 close();
+                if (browserEngine) {
+                  // The engine forgets this visit's changes and starts again from the demo.
+                  resetEngine();
+                  window.location.reload();
+                }
               }}
             >
               <Icon name="swap" size={18} />
@@ -112,7 +118,11 @@ export function ProfileMenu({ owner, sampleData }: { owner: Owner; sampleData: b
             </Link>
           </li>
         </ul>
-        {sampleData ? <div className={styles.menuFoot}>Showing sample data</div> : null}
+        {browserEngine ? (
+          <div className={styles.menuFoot}>Demo business. Everything is worked out here in your browser.</div>
+        ) : sampleData ? (
+          <div className={styles.menuFoot}>Showing sample data</div>
+        ) : null}
       </div>
     </div>
   );
