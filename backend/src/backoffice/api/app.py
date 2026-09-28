@@ -78,6 +78,13 @@ def _service_from_env() -> BackOfficeService:
     if apps and svc.vault is not None and len(key) >= 32:
         svc.authorizer = OAuthAuthorizer(apps, svc.vault, redirect_uri=f"{base}/api/oauth/callback",
                                          state_key=key.encode())
+    from backoffice.mailer import mailer_from_env
+
+    svc.mailer = mailer_from_env()
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        from backoffice.assistant import ClaudeBrain
+
+        svc.brain = ClaudeBrain(svc.assistant)
     return svc
 
 
@@ -110,6 +117,42 @@ def create_app(service: BackOfficeService | None = None) -> FastAPI:
             return RedirectResponse(f"{web}/sources/?signin=failed")
         svc.finish_sign_in(done["connection_id"])
         return RedirectResponse(f"{web}/sources/?signin=done")
+
+    def _bearer(request: Request) -> bool:
+        auth = request.headers.get("authorization", "")
+        return auth.lower().startswith("bearer ") and svc.api_authorize(auth[7:].strip())
+
+    @app.get("/api/v1/documents")
+    async def v1_documents(request: Request) -> JSONResponse:
+        """Accountant API (§28): list documents. Query: company, from, to, supplier, q."""
+        if not _bearer(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return JSONResponse(svc.documents_list(dict(request.query_params)))
+
+    @app.get("/api/v1/documents/{document_id}/file")
+    async def v1_document_file(document_id: str, request: Request) -> Any:
+        from fastapi.responses import Response
+
+        if not _bearer(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        f = svc.assistant.document_file(document_id)
+        if f is None:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        return Response(f[2], media_type=f[1], headers={"Content-Disposition": f'attachment; filename="{f[0]}"'})
+
+    @app.get("/api/v1/export")
+    async def v1_export(request: Request) -> Any:
+        from fastapi.responses import Response
+
+        if not _bearer(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        q = dict(request.query_params)
+        try:
+            name, data, _ = svc.assistant.export_zip(company_id=q.get("company", ""),
+                                                     date_from=svc._date_arg(q, "from"), date_to=svc._date_arg(q, "to"))
+        except Exception:
+            return JSONResponse({"error": "bad_request", "message": "Use dates like 2026-09-30."}, status_code=400)
+        return Response(data, media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:

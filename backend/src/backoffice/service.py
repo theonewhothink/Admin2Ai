@@ -527,6 +527,167 @@ class BackOfficeService:
                                                     "Added by you", renews_on=renews_on))
         return {"id": rid, "message": f"Done. I will watch for {name}."}
 
+    # ----------------------------------------------------------------- Chat operator
+
+    @property
+    def assistant(self):  # type: ignore[no-untyped-def]
+        if getattr(self, "_assistant", None) is None:
+            from backoffice.assistant import Operator
+
+            self._assistant = Operator(self)
+        return self._assistant
+
+    def chat(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        message = body.get("message") if isinstance(body, Mapping) else None
+        if not isinstance(message, str) or not message.strip():
+            raise ServiceError(400, "Write what you need.")
+        if len(message) > 4000:
+            raise ServiceError(400, "That is too long. Try a shorter request.")
+        history = body.get("history") if isinstance(body.get("history"), list) else []
+        from backoffice.assistant import ClaudeBrain, RuleBrain
+
+        brain = getattr(self, "brain", None)
+        try:
+            if brain is not None:
+                return brain.handle(message, history)
+            return RuleBrain(self.assistant).handle(message)
+        except ValueError as exc:
+            raise ServiceError(400, str(exc)) from None
+        except Exception:
+            if brain is not None:  # the model is unavailable: fall back to the rules
+                return RuleBrain(self.assistant).handle(message)
+            raise
+
+    def chat_send(self, message_id: str, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        op = self.assistant
+        msg = op.outbox.get(message_id)
+        if msg is None:
+            raise ServiceError(404, "I can't find that email.")
+        if isinstance(body, Mapping) and body.get("cancel"):
+            if msg.status == "draft":
+                msg.status = "cancelled"
+            return {"ok": True, "status": msg.status, "message": "Cancelled. Nothing was sent."}
+        msg = op.send(message_id)
+        return {"ok": True, "status": msg.status, "message": msg.delivery}
+
+    def report_file(self, report_id: str) -> dict[str, Any]:
+        r = self.assistant.reports.get(report_id)
+        if r is None:
+            raise ServiceError(404, "I can't find that report.")
+        return {"filename": r["filename"], "contentType": "text/csv",
+                "data": base64.b64encode(r["csv"].encode()).decode()}
+
+    # ----------------------------------------------------------------- Documents (repository for the accountant)
+
+    @staticmethod
+    def _date_arg(body: Mapping[str, Any] | None, key: str) -> date | None:
+        v = (body or {}).get(key)
+        if not v:
+            return None
+        try:
+            return date.fromisoformat(str(v))
+        except ValueError:
+            raise ServiceError(400, "Use dates like 2026-09-30.") from None
+
+    def documents_list(self, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        b = body or {}
+        items = self.assistant.documents(query=str(b.get("q", "")), supplier=str(b.get("supplier", "")),
+                                         company_id=str(b.get("company", "")),
+                                         date_from=self._date_arg(b, "from"), date_to=self._date_arg(b, "to"))
+        return {"items": items, "companies": [{"id": c, "name": e.name} for c, e in self.repo.companies.items()],
+                "total": len(items)}
+
+    def document_download(self, document_id: str) -> dict[str, Any]:
+        f = self.assistant.document_file(document_id)
+        if f is None:
+            raise ServiceError(404, "I can't find that document.")
+        return {"filename": f[0], "contentType": f[1], "data": base64.b64encode(f[2]).decode()}
+
+    def documents_export(self, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        b = body or {}
+        name, data, count = self.assistant.export_zip(company_id=str(b.get("company", "")),
+                                                      date_from=self._date_arg(b, "from"),
+                                                      date_to=self._date_arg(b, "to"))
+        return {"filename": name, "contentType": "application/zip", "count": count,
+                "data": base64.b64encode(data).decode()}
+
+    # ----------------------------------------------------------------- Monthly report delivery
+
+    def _report_settings(self) -> dict[str, Any]:
+        if getattr(self, "_report_cfg", None) is None:
+            acct = self.repo.accountant
+            self._report_cfg = {
+                "recipients": ([{"email": acct.email, "name": acct.person, "role": "Accountant"}] if acct else []),
+                "day": 3, "format": "zip", "includeDocuments": True,
+                "companies": list(self.repo.companies), "copyOwner": True,
+            }
+        return self._report_cfg
+
+    def report_settings(self, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        cfg = self._report_settings()
+        if body:
+            recipients = body.get("recipients", cfg["recipients"])
+            if not isinstance(recipients, list) or len(recipients) > 20:
+                raise ServiceError(400, "Add up to 20 recipients.")
+            clean = []
+            for r in recipients:
+                email = (r.get("email") if isinstance(r, Mapping) else "") or ""
+                if not _EMAIL.match(email.strip()):
+                    raise ServiceError(400, f"“{email}” doesn't look like an email address.")
+                clean.append({"email": email.strip().lower(), "name": str(r.get("name") or "")[:80],
+                              "role": str(r.get("role") or "")[:40]})
+            day = body.get("day", cfg["day"])
+            if not isinstance(day, int) or not 1 <= day <= 10:
+                raise ServiceError(400, "Choose a working day between 1 and 10.")
+            fmt = body.get("format", cfg["format"])
+            if fmt not in ("zip", "csv"):
+                raise ServiceError(400, "Choose ZIP (documents and ledger) or CSV (ledger only).")
+            companies = [c for c in body.get("companies", cfg["companies"]) if c in self.repo.companies]
+            cfg.update(recipients=clean, day=day, format=fmt, companies=companies,
+                       includeDocuments=bool(body.get("includeDocuments", cfg["includeDocuments"])),
+                       copyOwner=bool(body.get("copyOwner", cfg["copyOwner"])))
+            self.orchestrator.log("closure", "report_settings_changed", values={"recipients": len(clean)})
+        names = {c: e.name for c, e in self.repo.companies.items()}
+        who = ", ".join(r["email"] for r in cfg["recipients"]) or "nobody yet"
+        return {**cfg, "companyNames": names, "ownerEmail": self.repo.owner.email,
+                "summary": f"On working day {cfg['day']} of each month I send the closed month to {who}."}
+
+    # ----------------------------------------------------------------- Accountant API keys (§28)
+
+    def _keys(self) -> dict[str, dict[str, Any]]:
+        if getattr(self, "_api_keys", None) is None:
+            self._api_keys = {}
+        return self._api_keys
+
+    def api_keys(self) -> dict[str, Any]:
+        return {"keys": [{k: v for k, v in rec.items() if k != "hash"} for rec in self._keys().values()]}
+
+    def api_key_create(self, body: Mapping[str, Any] | None) -> dict[str, Any]:
+        import hashlib
+        import secrets
+
+        name = str((body or {}).get("name") or "Accounting system").strip()[:60]
+        secret = "bo_live_" + secrets.token_urlsafe(24)
+        kid = f"key_{len(self._keys()) + 1:03d}"
+        self._keys()[kid] = {"id": kid, "name": name, "prefix": secret[:12], "createdAt": self._now().isoformat(),
+                             "hash": hashlib.sha256(secret.encode()).hexdigest(), "scope": "documents:read"}
+        return {"ok": True, "id": kid, "key": secret,
+                "message": "Copy this key now. I only show it once; I store a fingerprint, not the key."}
+
+    def api_key_revoke(self, key_id: str) -> dict[str, Any]:
+        if self._keys().pop(key_id, None) is None:
+            raise ServiceError(404, "I can't find that key.")
+        return {"ok": True, "message": "Revoked. Anything using it stops working now."}
+
+    def api_authorize(self, secret: str | None) -> bool:
+        import hashlib
+        import hmac
+
+        if not secret:
+            return False
+        digest = hashlib.sha256(secret.encode()).hexdigest()
+        return any(hmac.compare_digest(digest, r["hash"]) for r in self._keys().values())
+
     def finish_sign_in(self, connection_id: str) -> None:
         """The provider confirmed consent and the vault holds the refresh token: start reading."""
         c = self.repo.connectors.get(connection_id)
@@ -1288,9 +1449,14 @@ class BackOfficeService:
         with a plain message, never a stack trace (§48, §70).
         """
         method = (method or "GET").upper()
-        path = unquote((path or "/").split("?", 1)[0]).rstrip("/") or "/"
+        raw_path, _, query = (path or "/").partition("?")
+        path = unquote(raw_path).rstrip("/") or "/"
         try:
             body = _body(body_json)
+            if not body and query:
+                from urllib.parse import parse_qsl
+
+                body = dict(parse_qsl(query))
             for verb, pattern, handler in self._routes():
                 m = pattern.fullmatch(path)
                 if m is None:
@@ -1343,6 +1509,17 @@ class BackOfficeService:
                                            captured_at=b.get("captured_at") or b.get("capturedAt"))),
             ("POST", r("/api/share"), lambda b: self.share(b)),
             ("GET", r("/api/sources"), lambda b: self.sources()),
+            ("POST", r("/api/chat"), lambda b: self.chat(b or {})),
+            ("POST", r(f"/api/chat/outbox/{seg}/send"), lambda b, mid: self.chat_send(mid, b)),
+            ("GET", r(f"/api/reports/{seg}/file"), lambda b, rid: self.report_file(rid)),
+            ("GET", r("/api/documents"), lambda b: self.documents_list(b)),
+            ("POST", r("/api/documents/export"), lambda b: self.documents_export(b)),
+            ("GET", r(f"/api/documents/{seg}/file"), lambda b, did: self.document_download(did)),
+            ("GET", r("/api/settings/report"), lambda b: self.report_settings()),
+            ("POST", r("/api/settings/report"), lambda b: self.report_settings(b or {})),
+            ("GET", r("/api/accountant/api-keys"), lambda b: self.api_keys()),
+            ("POST", r("/api/accountant/api-keys"), lambda b: self.api_key_create(b)),
+            ("POST", r(f"/api/accountant/api-keys/{seg}/revoke"), lambda b, kid: self.api_key_revoke(kid)),
             ("POST", r("/api/sources"), lambda b: self.add_source(b or {})),
             ("POST", r(f"/api/sources/{seg}/remove"), lambda b, sid: self.remove_source(sid)),
             ("GET", r("/api/connections"), lambda b: self.connections()),
