@@ -1,0 +1,13 @@
+EDP Comercial - Comercialização de Energia, S.A.
+NIF: 501000100
+Fatura n.º FT EDP2026/558120
+ATCUD: EDPQ7K2M-558120
+Data de emissão: 18/09/2026
+Data de vencimento: 19/09/2026
+Cliente: Hazel Tree Interiores, Lda.
+NIF: 516123459
+Eletricidade - estúdio, agosto/setembro
+Base tributável (23%): 52,11
+IVA 23%: 11,99
+Total: 64,10 €
+Código QR: A:501000100*B:516123459*C:PT*D:FT*E:N*F:20260918*G:FT EDP2026/558120*H:EDPQ7K2M-558120*I1:PT*I7:52.11*I8:11.99*N:11.99*O:64.10*Q:e1Dk*R:1422
