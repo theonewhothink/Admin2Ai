@@ -32,3 +32,4 @@ ocr_desired_count    = 1
 ocr_cpu              = 2048
 ocr_memory           = 8192
 log_retention_days   = 30
+# alarm_email = "<on-call address>" # receives CloudWatch alarms

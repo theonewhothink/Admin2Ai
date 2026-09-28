@@ -18,7 +18,12 @@ reported, never silently dropped.
 from __future__ import annotations
 
 import io
-import lzma
+try:  # lzma is an optional stdlib module in some builds (e.g. Pyodide)
+    import lzma
+
+    _LZMA_ERRORS: tuple[type[BaseException], ...] = (lzma.LZMAError,)
+except ImportError:  # pragma: no cover
+    _LZMA_ERRORS = ()
 import stat
 import struct
 import zipfile
@@ -267,7 +272,7 @@ def _read_bounded(archive: zipfile.ZipFile, info: zipfile.ZipInfo, budget: _Budg
                 _check_ratio(len(out), info.compress_size, limits)
     except NotImplementedError:
         raise _MemberRejected(SkipReason.UNSUPPORTED) from None
-    except (zipfile.BadZipFile, zlib.error, lzma.LZMAError, EOFError, OSError, ValueError, struct.error):
+    except (zipfile.BadZipFile, zlib.error, *_LZMA_ERRORS, EOFError, OSError, ValueError, struct.error):
         raise _MemberRejected(SkipReason.CORRUPT) from None
     finally:
         # Decompression work counts against the budget even when rejected.

@@ -48,18 +48,27 @@ export class QueueRunner {
     };
   }
 
-  /** Drain now. Overlapping calls are coalesced into one follow-up run. */
+  /**
+   * Drain now. Overlapping calls are coalesced: a kick that arrives while a
+   * drain is running asks for exactly one follow-up drain, and the returned
+   * promise settles only after that follow-up has finished (so callers never
+   * observe a half-rescheduled runner).
+   */
   kick(): Promise<DrainReport | null> {
     if (this.inFlight) {
       this.rerun = true;
       return this.inFlight;
     }
-    this.inFlight = this.run().finally(() => {
-      this.inFlight = null;
-      if (this.rerun && !this.stopped) {
+    this.inFlight = (async () => {
+      let report: DrainReport | null;
+      do {
         this.rerun = false;
-        void this.kick();
-      }
+        report = await this.run();
+      } while (this.rerun && !this.stopped);
+      return report;
+    })().finally(() => {
+      this.inFlight = null;
+      this.rerun = false;
     });
     return this.inFlight;
   }

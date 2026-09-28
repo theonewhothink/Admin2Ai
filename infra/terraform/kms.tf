@@ -72,6 +72,24 @@ data "aws_iam_policy_document" "messaging_key" {
       values   = [local.account_id]
     }
   }
+
+  # CloudWatch alarms publish to the encrypted alarm topic (monitoring.tf).
+  statement {
+    sid       = "CloudWatchAlarmsUseKey"
+    actions   = ["kms:Decrypt", "kms:GenerateDataKey*"]
+    resources = ["*"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudwatch.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [local.account_id]
+    }
+  }
 }
 
 resource "aws_kms_key" "messaging" {

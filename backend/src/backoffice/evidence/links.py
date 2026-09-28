@@ -39,7 +39,10 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
-import httpx
+try:  # httpx is only needed to fetch links; the browser build (Pyodide) has none.
+    import httpx
+except ImportError:  # pragma: no cover - exercised by the no-network import check
+    httpx = None  # type: ignore[assignment]
 
 from backoffice.domain.models import EvidenceFormat, SourceKind, utcnow
 
@@ -561,7 +564,7 @@ class _Run:
     deadline: float
     chain: list[RedirectHop] = field(default_factory=list)
     visited: dict[str, int] = field(default_factory=dict)
-    cookies: httpx.Cookies = field(default_factory=httpx.Cookies)
+    cookies: httpx.Cookies = field(default_factory=lambda: httpx.Cookies())
     hops: int = 0
     followed_document: bool = False
 

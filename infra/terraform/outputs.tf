@@ -66,3 +66,8 @@ output "kms_keys" {
     dr        = aws_kms_key.dr.arn
   }
 }
+
+output "alarm_topic_arn" {
+  description = "SNS topic that receives every CloudWatch alarm."
+  value       = aws_sns_topic.alarms.arn
+}

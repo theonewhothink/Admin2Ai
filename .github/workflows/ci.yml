@@ -53,6 +53,7 @@ jobs:
 
       - run: npm ci
       - run: npm run typecheck
+      - run: npm run lint
       - run: npm run build
         env:
           NEXT_TELEMETRY_DISABLED: "1"
@@ -67,19 +68,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # hashFiles() is only allowed in step conditions, not in a job-level
+      # `if`: every step after checkout is skipped until the mobile app has a
+      # lockfile (npm ci needs one).
       - uses: actions/setup-node@v4
+        if: hashFiles('mobile/package-lock.json') != ''
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: mobile/package-lock.json
 
       - run: npm ci
+        if: hashFiles('mobile/package-lock.json') != ''
       - run: npx tsc --noEmit
+        if: hashFiles('mobile/package-lock.json') != ''
+      - run: npm test
+        if: hashFiles('mobile/package-lock.json') != ''
 
   sql:
-    name: SQL migrations (PostgreSQL 16 + pgvector)
+    name: SQL migrations standalone (psql, PostgreSQL 16 + pgvector)
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 15
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -114,6 +123,35 @@ jobs:
             echo "::endgroup::"
           done
 
+  db:
+    name: Database (migration runner, PostgreSQL 16 + pgvector)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: backoffice
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d backoffice"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: backoffice
+      PYTHONPATH: db
+      MIGRATION_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/backoffice
+    steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -123,23 +161,28 @@ jobs:
       - name: Install
         run: pip install -e "./backend[dev]"
 
-      - name: Schema invariants (RLS, no floats, append-only history, roles)
-        env:
-          PYTHONPATH: db
-          MIGRATION_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/backoffice
-        run: python -m backoffice_db check
+      - name: Lint migration files
+        run: python -m backoffice_db lint
 
-      - name: Migration runner on a fresh database (bookkeeping, idempotence)
-        env:
-          PYTHONPATH: db
-          MIGRATION_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/runner_check
+      # The runner applies db/migrations in version order, each in its own
+      # transaction, and records checksums so edited migrations are caught.
+      - name: Apply db/migrations in order (runner)
+        run: python -m backoffice_db migrate
+
+      - name: Runner is idempotent
         run: |
           set -euo pipefail
-          createdb runner_check
-          python -m backoffice_db migrate
-          python -m backoffice_db migrate | grep -q "nothing to apply"
+          python -m backoffice_db migrate | tee migrate-again.log
+          grep -q "nothing to apply" migrate-again.log
           python -m backoffice_db status
-          python -m backoffice_db check
+
+      - name: Schema invariants (RLS, no floats, append-only history, roles)
+        run: python -m backoffice_db check
+
+      - name: Service login can be created
+        env:
+          APP_DB_PASSWORD: ci-only-app-password
+        run: python -m backoffice_db ensure-login backoffice_api --member-of backoffice_app
 
       - name: Database behaviour tests (isolation, immutability, golden rule, pgvector)
         working-directory: backend

@@ -25,3 +25,4 @@ api_desired_count    = 2
 api_max_count        = 6
 worker_desired_count = 2
 ocr_desired_count    = 1
+# alarm_email = "<on-call address>" # receives CloudWatch alarms

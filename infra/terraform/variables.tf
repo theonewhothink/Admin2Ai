@@ -289,6 +289,12 @@ variable "log_retention_days" {
   }
 }
 
+variable "alarm_email" {
+  description = "Engineering on-call address subscribed to the alarm topic (confirm the subscription email once). Null subscribes nobody."
+  type        = string
+  default     = null
+}
+
 variable "tags" {
   description = "Extra tags for every resource."
   type        = map(string)

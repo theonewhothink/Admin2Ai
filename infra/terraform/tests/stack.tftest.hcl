@@ -40,6 +40,9 @@ mock_provider "aws" {
       url = "https://sqs.eu-south-2.amazonaws.com/123456789012/mock"
     }
   }
+  mock_resource "aws_sns_topic" {
+    defaults = { arn = "arn:aws:sns:eu-south-2:123456789012:mock-alarms" }
+  }
   mock_resource "aws_cloudwatch_log_group" {
     defaults = { arn = "arn:aws:logs:eu-south-2:123456789012:log-group:mock" }
   }
@@ -180,6 +183,21 @@ run "production_defaults" {
     condition     = length(aws_iam_role_policy.exec) == 0
     error_message = "ECS Exec is off unless enabled"
   }
+
+  assert {
+    condition     = length(aws_cloudwatch_metric_alarm.dlq_not_empty) == length(aws_sqs_queue.dlq) + 1
+    error_message = "every dead-letter queue (including the event bus one) needs an alarm"
+  }
+
+  assert {
+    condition     = length(aws_cloudwatch_metric_alarm.service_no_tasks) == 3 && length(aws_cloudwatch_metric_alarm.redis_memory) == 2
+    error_message = "api, worker and ocr, and each cache node, must be watched"
+  }
+
+  assert {
+    condition     = aws_sns_topic.alarms.kms_master_key_id == aws_kms_key.messaging.arn && length(aws_sns_topic_subscription.alarm_email) == 0
+    error_message = "the alarm topic is KMS-encrypted and has no subscriber unless alarm_email is set"
+  }
 }
 
 run "staging_can_be_smaller" {
@@ -209,6 +227,11 @@ run "staging_can_be_smaller" {
   assert {
     condition     = aws_elasticache_replication_group.main.num_cache_clusters == 1
     error_message = "single cache node without Multi-AZ"
+  }
+
+  assert {
+    condition     = length(aws_cloudwatch_metric_alarm.redis_memory) == 1
+    error_message = "one memory alarm per cache node"
   }
 }
 
