@@ -25,6 +25,7 @@ from ..orchestrator import (
     Orchestrator,
     OwnerProfile,
     PortalDocument,
+    Relationship,
     Repository,
     local_datetime,
 )
@@ -100,6 +101,29 @@ def _setup(repo: Repository) -> None:
         covered_until=local_datetime(date(2026, 10, 1), 18, 20),
         last_synced_at=local_datetime(date(2026, 10, 1), 18, 20)))
     repo.accountant = ACCOUNTANT
+
+    # Ongoing relationships learned from the 90-day history (§6, §24).
+    R = Relationship
+    repo.relationships += [
+        R("rel-fidelidade", "insurance", "Fidelidade", "hazel-tree", "Liability insurance · €38.20 a month",
+          "Policy email and monthly direct debit", renews_on=date(2027, 1, 15)),
+        R("rel-allianz", "insurance", "Allianz", "company-b", "Commercial property insurance · €612.00 a year",
+          "Renewal letter in email", renews_on=date(2026, 11, 30)),
+        R("rel-ageas", "insurance", "Ageas", "company-c", "Health insurance for 2 people · €74.80 a month",
+          "Monthly direct debit", renews_on=date(2027, 3, 1)),
+        R("rel-spv", "investment", "Alfama Property SPV", "company-c", "100% owned · holds the studio lease",
+          "Shareholder resolution in email"),
+        R("rel-fund", "investment", "Indexa Global Equity Fund", "hazel-tree",
+          "Monthly contribution of €500.00", "Bank transfers and fund statements"),
+        R("rel-ppr", "investment", "Retirement savings plan (PPR)", "company-b",
+          "Quarterly contribution of €750.00", "Bank transfers"),
+        R("rel-at", "government", "Autoridade Tributária", "hazel-tree", "VAT and withholding for all three companies",
+          "Tax letters and payments"),
+        R("rel-ss", "government", "Segurança Social", "company-b", "Monthly contributions",
+          "Payment references in email"),
+        R("rel-loan", "lender", "Millennium BCP loan", "hazel-tree", "Equipment loan · €310.00 a month until 2028",
+          "Loan statement and direct debit"),
+    ]
 
     # What Laura allowed at onboarding (§25 "automatic if authorized").
     granted = START - timedelta(days=90)

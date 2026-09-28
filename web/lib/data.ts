@@ -19,6 +19,7 @@ import type {
   NeedsYouItem,
   OneTapQuestion,
   Owner,
+  SourcesData,
 } from "./types";
 
 export const SAMPLE_TODAY = "2026-10-02";
@@ -722,3 +723,288 @@ export function accountantClientDetail(id: string): AccountantClientDetail | nul
       : { state: "partial", ready: row.complete, total: 100, note: `${row.complete}% of the month is ready to export.` },
   };
 }
+
+/** Connected sources and what I have learned (mirrors GET /api/sources on the demo data). */
+export const sources: SourcesData = {
+  "groups": [
+    {
+      "id": "email",
+      "title": "Email",
+      "description": "Where invoices, letters and receipts arrive.",
+      "items": [
+        {
+          "id": "gmail",
+          "name": "laura@hazeltree.pt",
+          "company": "All companies",
+          "detail": "Gmail",
+          "status": "healthy",
+          "lastSyncedAt": "2026-10-02T09:12:00+01:00"
+        }
+      ]
+    },
+    {
+      "id": "banks",
+      "title": "Bank accounts",
+      "description": "Every payment in and out is checked against evidence.",
+      "items": [
+        {
+          "id": "mbcp-ht",
+          "name": "Millennium BCP •••• 0265",
+          "company": "Hazel Tree",
+          "detail": "PT50 •••• 0265",
+          "status": "healthy"
+        },
+        {
+          "id": "mbcp-cc",
+          "name": "Millennium BCP •••• 3382",
+          "company": "Company C",
+          "detail": "PT50 •••• 3382",
+          "status": "healthy"
+        },
+        {
+          "id": "cgd-b",
+          "name": "Caixa Geral de Depósitos •••• 3007",
+          "company": "Company B",
+          "detail": "PT50 •••• 3007",
+          "status": "healthy"
+        }
+      ]
+    },
+    {
+      "id": "cards",
+      "title": "Cards",
+      "description": "Card spending is matched to receipts.",
+      "items": [
+        {
+          "id": "card-5530",
+          "name": "Card •••• 5530",
+          "company": "Hazel Tree",
+          "detail": "Millennium BCP",
+          "status": "healthy"
+        },
+        {
+          "id": "card-7702",
+          "name": "Card •••• 7702",
+          "company": "Company B",
+          "detail": "Caixa Geral de Depósitos",
+          "status": "healthy"
+        },
+        {
+          "id": "card-2291",
+          "name": "Card •••• 2291",
+          "company": "Company C",
+          "detail": "Millennium BCP",
+          "status": "healthy"
+        },
+        {
+          "id": "card-4817",
+          "name": "Card •••• 4817",
+          "company": "Company C",
+          "detail": "Millennium BCP · personal card used for business",
+          "status": "healthy"
+        }
+      ]
+    },
+    {
+      "id": "accountant",
+      "title": "Accountant",
+      "description": "Receives the monthly package and asks questions here.",
+      "items": [
+        {
+          "id": "accountant",
+          "name": "Contabilidade Vidal",
+          "company": "All companies",
+          "detail": "marc@contabilidadevidal.pt",
+          "status": "healthy",
+          "lastSyncedAt": "2026-10-01T18:20:00+01:00"
+        }
+      ]
+    },
+    {
+      "id": "suppliers",
+      "title": "Suppliers",
+      "description": "Recognised from invoices and payments.",
+      "items": [
+        {
+          "id": "sup-adobe",
+          "name": "Adobe",
+          "company": "Company C",
+          "detail": "1 document · 1 payment",
+          "lastSeen": "2026-09-22",
+          "status": "known"
+        },
+        {
+          "id": "sup-edp",
+          "name": "EDP",
+          "company": "Hazel Tree",
+          "detail": "0 documents · 1 payment",
+          "lastSeen": "2026-09-19",
+          "status": "known"
+        },
+        {
+          "id": "sup-ikea",
+          "name": "IKEA",
+          "company": "Company C",
+          "detail": "1 document · 1 payment",
+          "lastSeen": "2026-09-29",
+          "status": "known"
+        },
+        {
+          "id": "sup-landlord",
+          "name": "Marta Gonçalves",
+          "company": "Hazel Tree",
+          "detail": "1 document · 1 payment · bank details on file",
+          "lastSeen": "2026-09-01",
+          "status": "known"
+        },
+        {
+          "id": "sup-predial",
+          "name": "Predial Alfama",
+          "company": "Company B",
+          "detail": "1 document · 1 payment · bank details on file",
+          "lastSeen": "2026-09-01",
+          "status": "known"
+        },
+        {
+          "id": "sup-uber",
+          "name": "Uber",
+          "company": "Company B, Hazel Tree",
+          "detail": "2 documents · 2 payments",
+          "lastSeen": "2026-09-15",
+          "status": "known"
+        },
+        {
+          "id": "sup-vodafone",
+          "name": "Vodafone",
+          "company": "Hazel Tree",
+          "detail": "2 documents · 1 payment · bank details on file",
+          "lastSeen": "2026-09-02",
+          "status": "hold"
+        }
+      ]
+    },
+    {
+      "id": "insurance",
+      "title": "Insurance",
+      "description": "Policies found in email and payments. I watch the renewal dates.",
+      "items": [
+        {
+          "id": "rel-fidelidade",
+          "name": "Fidelidade",
+          "company": "Hazel Tree",
+          "detail": "Liability insurance · €38.20 a month",
+          "foundIn": "Policy email and monthly direct debit",
+          "renewsOn": "2027-01-15",
+          "status": "known"
+        },
+        {
+          "id": "rel-allianz",
+          "name": "Allianz",
+          "company": "Company B",
+          "detail": "Commercial property insurance · €612.00 a year",
+          "foundIn": "Renewal letter in email",
+          "renewsOn": "2026-11-30",
+          "status": "known"
+        },
+        {
+          "id": "rel-ageas",
+          "name": "Ageas",
+          "company": "Company C",
+          "detail": "Health insurance for 2 people · €74.80 a month",
+          "foundIn": "Monthly direct debit",
+          "renewsOn": "2027-03-01",
+          "status": "known"
+        }
+      ]
+    },
+    {
+      "id": "investments",
+      "title": "Investments",
+      "description": "Holdings and regular contributions.",
+      "items": [
+        {
+          "id": "rel-spv",
+          "name": "Alfama Property SPV",
+          "company": "Company C",
+          "detail": "100% owned · holds the studio lease",
+          "foundIn": "Shareholder resolution in email",
+          "renewsOn": null,
+          "status": "known"
+        },
+        {
+          "id": "rel-fund",
+          "name": "Indexa Global Equity Fund",
+          "company": "Hazel Tree",
+          "detail": "Monthly contribution of €500.00",
+          "foundIn": "Bank transfers and fund statements",
+          "renewsOn": null,
+          "status": "known"
+        },
+        {
+          "id": "rel-ppr",
+          "name": "Retirement savings plan (PPR)",
+          "company": "Company B",
+          "detail": "Quarterly contribution of €750.00",
+          "foundIn": "Bank transfers",
+          "renewsOn": null,
+          "status": "known"
+        }
+      ]
+    },
+    {
+      "id": "lenders",
+      "title": "Loans",
+      "description": "Repayments are matched to loan statements.",
+      "items": [
+        {
+          "id": "rel-loan",
+          "name": "Millennium BCP loan",
+          "company": "Hazel Tree",
+          "detail": "Equipment loan · €310.00 a month until 2028",
+          "foundIn": "Loan statement and direct debit",
+          "renewsOn": null,
+          "status": "known"
+        }
+      ]
+    },
+    {
+      "id": "government",
+      "title": "Tax and government",
+      "description": "Letters, deadlines and payments.",
+      "items": [
+        {
+          "id": "rel-at",
+          "name": "Autoridade Tributária",
+          "company": "Hazel Tree",
+          "detail": "VAT and withholding for all three companies",
+          "foundIn": "Tax letters and payments",
+          "renewsOn": null,
+          "status": "known"
+        },
+        {
+          "id": "rel-ss",
+          "name": "Segurança Social",
+          "company": "Company B",
+          "detail": "Monthly contributions",
+          "foundIn": "Payment references in email",
+          "renewsOn": null,
+          "status": "known"
+        }
+      ]
+    }
+  ],
+  "companies": [
+    {
+      "id": "hazel-tree",
+      "name": "Hazel Tree"
+    },
+    {
+      "id": "company-b",
+      "name": "Company B"
+    },
+    {
+      "id": "company-c",
+      "name": "Company C"
+    }
+  ]
+};

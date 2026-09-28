@@ -337,6 +337,19 @@ class BankRow:
 
 
 @dataclass
+class Relationship:
+    """A counterparty the business has an ongoing relationship with, found in its sources (§6, §24)."""
+
+    id: str
+    kind: str  # "insurance" | "investment" | "government" | "lender"
+    name: str
+    company_id: str
+    detail: str
+    found_in: str  # where it was learned from, in plain words
+    renews_on: date | None = None
+
+
+@dataclass
 class DocumentRecord:
     document: Document
     evidence_ids: list[str]
@@ -535,6 +548,7 @@ class Repository:
         self.audit_store = InMemoryAuditStore()
         self.audit = AuditLog(self.audit_store, clock=self.clock.now)
         self.history_pairs: list[tuple[str, str]] = []
+        self.relationships: list[Relationship] = []
         self.history_transactions: list[Transaction] = []
         self.portal: dict[str, PortalDocument] = {}
         self.pending_links: list[str] = []

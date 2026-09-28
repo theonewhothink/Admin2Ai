@@ -297,3 +297,31 @@ export interface AccountantClientDetail extends AccountantClientRow {
     note: string;
   };
 }
+
+/* ---------- Sources (GET /api/sources) ---------- */
+
+export type SourceStatus = "healthy" | "stale" | "not_connected" | "known" | "hold";
+
+export interface SourceItem {
+  id: string;
+  name: string;
+  company: string;
+  detail: string;
+  status: SourceStatus;
+  lastSyncedAt?: string | null;
+  lastSeen?: string | null;
+  foundIn?: string;
+  renewsOn?: string | null;
+}
+
+export interface SourceGroup {
+  id: string;
+  title: string;
+  description: string;
+  items: SourceItem[];
+}
+
+export interface SourcesData {
+  groups: SourceGroup[];
+  companies: { id: string; name: string }[];
+}

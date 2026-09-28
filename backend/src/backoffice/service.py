@@ -239,6 +239,75 @@ class BackOfficeService:
         self.orchestrator.run()
         return {"ok": True, "connection": next(x for x in self.connections()["connections"] if x["id"] == c.id)}
 
+    # ----------------------------------------------------------------- Sources
+
+    def sources(self) -> dict[str, Any]:
+        """Everything the system is connected to or has learned about, grouped for the owner."""
+        repo = self.repo
+        names = {cid: e.name for cid, e in repo.companies.items()}
+        conns = {c["id"]: c for c in self.connections()["connections"]}
+
+        def conn(kind: str) -> list[dict[str, Any]]:
+            return [c for c in conns.values() if c["kind"] == kind]
+
+        def bank_status(bank: str) -> str:
+            for c in conn("bank"):
+                if c["name"] == bank:
+                    return c["status"]
+            return "not_connected"
+
+        accounts = [
+            {"id": a.id, "name": f"{a.bank} •••• {(a.iban or '')[-4:]}", "company": names.get(a.holder_id, ""),
+             "detail": a.iban[:4] + " •••• " + a.iban[-4:] if a.iban else "", "status": bank_status(a.bank)}
+            for a in repo.accounts.values() if a.iban
+        ]
+        cards = [
+            {"id": a.id, "name": f"Card •••• {a.card_last4}", "company": names.get(a.holder_id, ""),
+             "detail": a.bank + ("" if a.owned else " · personal card used for business"),
+             "status": bank_status(a.bank)}
+            for a in repo.accounts.values() if a.card_last4
+        ]
+        suppliers = []
+        for s in repo.suppliers.values():
+            keys = {k.upper() for k in [s.name, *s.aliases]}
+            docs = [d for d in repo.documents.values() if d.supplier_id == s.id]
+            txs = [t for t in repo.transactions.values() if any(k in t.tx.counterparty.upper() for k in keys)]
+            companies = sorted({names.get(t.holder_id, "") for t in txs} - {""})
+            last = max([t.tx.booked_on for t in txs], default=None)
+            parts = [f"{len(docs)} document" + ("" if len(docs) == 1 else "s"),
+                     f"{len(txs)} payment" + ("" if len(txs) == 1 else "s")]
+            if s.known_ibans:
+                parts.append("bank details on file")
+            suppliers.append({"id": s.id, "name": s.name, "company": ", ".join(companies),
+                              "detail": " · ".join(parts),
+                              "lastSeen": last.isoformat() if last else None,
+                              "status": "hold" if any(d.on_hold and not d.hold_released for d in docs) else "known"})
+        suppliers.sort(key=lambda x: x["name"].lower())
+
+        def rel(kind: str) -> list[dict[str, Any]]:
+            return [{"id": r.id, "name": r.name, "company": names.get(r.company_id, ""), "detail": r.detail,
+                     "foundIn": r.found_in, "renewsOn": r.renews_on.isoformat() if r.renews_on else None,
+                     "status": "known"} for r in repo.relationships if r.kind == kind]
+
+        groups = [
+            ("email", "Email", "Where invoices, letters and receipts arrive.",
+             [{"id": c["id"], "name": c["account"], "company": "All companies", "detail": c["name"],
+               "status": c["status"], "lastSyncedAt": c.get("lastSyncedAt")} for c in conn("email")]),
+            ("banks", "Bank accounts", "Every payment in and out is checked against evidence.", accounts),
+            ("cards", "Cards", "Card spending is matched to receipts.", cards),
+            ("accountant", "Accountant", "Receives the monthly package and asks questions here.",
+             [{"id": c["id"], "name": c["name"], "company": "All companies", "detail": c["account"],
+               "status": c["status"], "lastSyncedAt": c.get("lastSyncedAt")} for c in conn("accountant")]),
+            ("suppliers", "Suppliers", "Recognised from invoices and payments.", suppliers),
+            ("insurance", "Insurance", "Policies found in email and payments. I watch the renewal dates.",
+             rel("insurance")),
+            ("investments", "Investments", "Holdings and regular contributions.", rel("investment")),
+            ("lenders", "Loans", "Repayments are matched to loan statements.", rel("lender")),
+            ("government", "Tax and government", "Letters, deadlines and payments.", rel("government")),
+        ]
+        return {"groups": [{"id": g, "title": t, "description": d, "items": items} for g, t, d, items in groups],
+                "companies": [{"id": cid, "name": n} for cid, n in names.items()]}
+
     # ----------------------------------------------------------------- Companies
 
     def companies(self) -> dict[str, Any]:
@@ -1015,6 +1084,7 @@ class BackOfficeService:
                                            source=b.get("source") or "mobile_scan",
                                            captured_at=b.get("captured_at") or b.get("capturedAt"))),
             ("POST", r("/api/share"), lambda b: self.share(b)),
+            ("GET", r("/api/sources"), lambda b: self.sources()),
             ("GET", r("/api/connections"), lambda b: self.connections()),
             ("POST", r(f"/api/connections/{seg}/stale"), lambda b, i: self.mark_connection_stale(i)),
             ("POST", r(f"/api/connections/{seg}/reconnect"), lambda b, i: self.reconnect(i)),

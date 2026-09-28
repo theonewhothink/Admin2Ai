@@ -17,6 +17,7 @@ import { AuditView } from "@/components/flow/AuditView";
 import { HomeView } from "@/components/home/HomeView";
 import { NeedsYouList } from "@/components/needs/NeedsYouList";
 import { SettingsView } from "@/components/SettingsView";
+import { SourcesView } from "@/components/SourcesView";
 import {
   getAccountantClient,
   getAccountantClients,
@@ -27,6 +28,7 @@ import {
   getHome,
   getMonth,
   getNeedsYou,
+  getSources,
 } from "@/lib/api";
 import type { MonthKey } from "@/lib/types";
 import { Loading } from "./Loading";
@@ -132,4 +134,10 @@ export function LiveAsk({ examples }: { examples: string[] }) {
   const q = useSearchParams().get("q");
   const initialQuestion = q && q.trim() ? q.trim().slice(0, 500) : undefined;
   return <AskClient key={initialQuestion ?? "empty"} initialQuestion={initialQuestion} examples={examples} />;
+}
+
+export function LiveSources() {
+  const data = useData(getSources);
+  if (!data) return <Loading />;
+  return <SourcesView data={data} />;
 }

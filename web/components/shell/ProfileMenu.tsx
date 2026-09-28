@@ -15,6 +15,7 @@ interface MenuLink {
 }
 
 const main: MenuLink[] = [
+  { href: "/sources", label: "Sources", icon: "link" },
   { href: "/settings", label: "Settings", icon: "settings" },
   { href: "/scan", label: "Add documents", icon: "upload" },
   { href: "/accountant", label: "Accountant workspace", icon: "users" },

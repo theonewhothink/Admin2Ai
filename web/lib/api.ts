@@ -26,6 +26,7 @@ import type {
   MonthClose,
   MonthKey,
   NeedsYouItem,
+  SourcesData,
 } from "./types";
 
 const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "").replace(/\/+$/, "");
@@ -340,5 +341,14 @@ export async function getAccountantClient(id: string): Promise<AccountantClientD
     (v) => (isRecord(v) && typeof v.id === "string" && Array.isArray(v.evidence) ? (v as unknown as AccountantClientDetail) : null),
     () => sample.accountantClientDetail(id),
     { value: null },
+  );
+}
+
+export function getSources(): Promise<SourcesData> {
+  return request<SourcesData>(
+    "/api/sources",
+    { method: "GET" },
+    (v) => (isRecord(v) && Array.isArray(v.groups) ? (v as unknown as SourcesData) : null),
+    () => sample.sources,
   );
 }
