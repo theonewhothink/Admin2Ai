@@ -9,6 +9,14 @@
  * Every change the visitor makes (answers, uploads, …) is kept in
  * sessionStorage and replayed when the engine starts again, so a reload keeps
  * their progress for the rest of the visit.
+ *
+ * Starting Python in the browser takes seconds (tens of seconds on slower
+ * machines). The demo it starts from never changes, so the build also writes
+ * its first answers to public/engine/snapshot.json
+ * (backend/scripts/snapshot_engine.py). Until the engine is ready, and only
+ * while the visitor has changed nothing, reads are answered from that
+ * snapshot; the engine keeps starting in the background and answers
+ * everything after that.
  */
 
 export const browserEngine = process.env.NEXT_PUBLIC_ENGINE === "browser";
@@ -45,6 +53,9 @@ let ready: Promise<EngineInfo> | null = null;
 let nextId = 1;
 let state: EngineState = { phase: "idle" };
 const pending = new Map<number, (reply: EngineReply) => void>();
+let snapshot: Promise<Record<string, EngineReply>> | null = null;
+/** Set once this page has sent a change: from then on only the engine answers. */
+let changed = false;
 const listeners = new Set<() => void>();
 
 function setState(next: EngineState) {
@@ -91,6 +102,7 @@ export function resetEngine() {
   worker?.terminate();
   worker = null;
   ready = null;
+  changed = false;
   pending.clear();
   setState({ phase: "idle" });
 }
@@ -143,8 +155,33 @@ export function startEngine(): Promise<EngineInfo> {
   return ready;
 }
 
+function loadSnapshot(): Promise<Record<string, EngineReply>> {
+  snapshot ??= fetch(`${BASE_PATH}/engine/snapshot.json?v=${encodeURIComponent(VERSION)}`)
+    .then((r) => (r.ok ? r.json() : null))
+    .then((data: unknown) => {
+      const replies = data && typeof data === "object" ? (data as { replies?: unknown }).replies : null;
+      return replies && typeof replies === "object" ? (replies as Record<string, EngineReply>) : {};
+    })
+    .catch(() => ({}));
+  return snapshot;
+}
+
+/** The engine's first answer to a read, while it is still starting and nothing has changed. */
+async function fromSnapshot(method: string, path: string, body: unknown): Promise<EngineReply | null> {
+  if (method !== "GET" || (body !== undefined && body !== null)) return null;
+  if (changed || state.phase === "ready" || state.phase === "failed" || readJournal().length > 0) return null;
+  void startEngine(); // keep starting in the background
+  const known = (await loadSnapshot())[path];
+  // State may have moved on while the snapshot loaded: read it again.
+  if (!known || changed || engineState().phase === "ready") return null;
+  return { status: known.status, body: structuredClone(known.body) };
+}
+
 /** Send one request to the engine. Resolves with the engine's status and JSON body. */
 export async function engineRequest(method: string, path: string, body?: unknown): Promise<EngineReply> {
+  const early = await fromSnapshot(method, path, body);
+  if (early) return early;
+  if (method !== "GET") changed = true;
   await startEngine();
   const w = worker;
   if (!w) throw new Error("engine stopped");

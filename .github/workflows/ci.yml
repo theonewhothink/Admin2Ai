@@ -2,7 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # main plus the claude/* working branches (the default branch is one of them).
+    branches: [main, "claude/**"]
   pull_request:
 
 permissions:

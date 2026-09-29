@@ -9,3 +9,4 @@ npm-debug.log*
 # In-browser engine (built by `npm run build:pages`, never committed)
 /public/pyodide/
 /public/engine/backoffice.zip
+/public/engine/snapshot.json

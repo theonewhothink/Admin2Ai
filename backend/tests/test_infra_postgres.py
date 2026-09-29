@@ -189,7 +189,8 @@ def test_catalog_check_catches_unsafe_schema_changes(server: Server) -> None:
 def test_status_is_clean_and_rerun_is_a_no_op(db: PsqlExecutor, has_vector: bool) -> None:
     current = status(db, load_migrations())
     assert current.ok
-    expected_pending = () if has_vector else ("0005",)
+    # Without pgvector the runner stops at 0005, so it and every later migration stay pending.
+    expected_pending = () if has_vector else tuple(m.version for m in load_migrations() if m.version >= "0005")
     assert tuple(m.version for m in current.pending) == expected_pending
     if has_vector:
         assert migrate(db, load_migrations()) == ()
