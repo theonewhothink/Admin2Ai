@@ -1,9 +1,10 @@
+import { ChatDrawer } from "@/components/ask/ChatDrawer";
 import { LiveBottomNav, LiveHeader } from "@/components/live/LiveShell";
 import { AppHeader } from "@/components/shell/AppHeader";
 import { BottomNav } from "@/components/shell/BottomNav";
 import styles from "@/components/shell/shell.module.css";
 import { browserEngine, getNeedsYou, liveData } from "@/lib/api";
-import { owner } from "@/lib/data";
+import { askExamples, owner } from "@/lib/data";
 
 export default async function AppLayout({ children }: { children: React.ReactNode }) {
   if (browserEngine) {
@@ -14,6 +15,7 @@ export default async function AppLayout({ children }: { children: React.ReactNod
           {children}
         </main>
         <LiveBottomNav />
+        <ChatDrawer examples={askExamples} />
       </>
     );
   }
@@ -26,6 +28,7 @@ export default async function AppLayout({ children }: { children: React.ReactNod
         {children}
       </main>
       <BottomNav needsIds={needsIds} />
+      <ChatDrawer examples={askExamples} />
     </>
   );
 }

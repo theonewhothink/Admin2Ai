@@ -8,12 +8,18 @@ Two brains, one set of tools:
 
 * :class:`ClaudeBrain` (server, when ``ANTHROPIC_API_KEY`` is set): Claude
   plans with tool use over the tools below.
+* The browser chat (web/lib/claude.ts, when the owner adds their own
+  Anthropic key): the same loop in the browser; it reads ``SYSTEM`` and
+  ``TOOLS`` from ``GET /api/chat/tools`` and runs each tool with
+  ``POST /api/chat/tool``, so both brains share :func:`run_tool`.
 * :class:`RuleBrain` (always available, also in the browser build): a
   deterministic parser for the common requests.
 
-Tools only read evidence or *prepare* actions. Anything that leaves the
-business (an email) becomes a draft the owner confirms with one tap (§25:
-external communication needs the owner); nothing is sent by the model.
+Tools read evidence, *prepare* actions, record answers the owner gave in the
+chat, and keep the owner's task list. Anything that leaves the business (an
+email) becomes a draft the owner confirms with one tap (§25: external
+communication needs the owner); nothing is sent by the model, no money moves,
+and changed bank details are only ever confirmed by the owner (§26).
 """
 
 from __future__ import annotations
@@ -31,7 +37,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:  # pragma: no cover
     from backoffice.service import BackOfficeService
 
-__all__ = ["Operator", "OutboxMessage", "RuleBrain", "ClaudeBrain", "TOOLS"]
+__all__ = ["CHANGING_TOOLS", "ClaudeBrain", "Operator", "OutboxMessage", "OwnerTask", "RuleBrain", "SYSTEM", "TOOLS",
+           "run_tool"]
 
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 _MONTHS = {m: i for i, m in enumerate(
@@ -62,6 +69,19 @@ class OutboxMessage:
     delivery: str = ""
 
 
+@dataclass
+class OwnerTask:
+    """Something the owner asked to be reminded of or to keep track of."""
+
+    id: str
+    title: str
+    due: date | None = None
+    company_id: str = ""
+    status: str = "open"  # open -> done
+    created_at: str = ""
+    done_at: str | None = None
+
+
 # ----------------------------------------------------------------------------- tools
 
 
@@ -72,6 +92,7 @@ class Operator:
         self.svc = service
         self.outbox: dict[str, OutboxMessage] = {}
         self.reports: dict[str, dict[str, Any]] = {}
+        self.tasks: dict[str, OwnerTask] = {}
         self._seq = 0
 
     @property
@@ -298,6 +319,39 @@ class Operator:
                                        f"Sent “{msg.subject}” to {', '.join(msg.to)}.")
         return msg
 
+    # -- tasks ----------------------------------------------------------------
+
+    def task_dict(self, t: OwnerTask) -> dict[str, Any]:
+        return {"id": t.id, "title": t.title, "due": t.due.isoformat() if t.due else None,
+                "companyId": t.company_id or None, "company": self._company(t.company_id) or None,
+                "status": t.status, "createdAt": t.created_at, "doneAt": t.done_at}
+
+    def add_task(self, title: str, due: date | None = None, company_id: str = "") -> dict[str, Any]:
+        title = " ".join(str(title or "").split())[:200]
+        if not title:
+            raise ValueError("Tell me what the task is.")
+        if company_id and company_id not in self.repo.companies:
+            raise ValueError("I don't know that company.")
+        t = OwnerTask(id=self._id("task"), title=title, due=due, company_id=company_id,
+                      created_at=self.svc._now().isoformat())
+        self.tasks[t.id] = t
+        return self.task_dict(t)
+
+    def list_tasks(self, include_done: bool = False) -> list[dict[str, Any]]:
+        items = [t for t in self.tasks.values() if include_done or t.status == "open"]
+        # Open first, then by due date (no date last), then in the order they were added.
+        items.sort(key=lambda t: (t.status != "open", t.due is None, t.due or date.max, t.id))
+        return [self.task_dict(t) for t in items]
+
+    def complete_task(self, task_id: str) -> dict[str, Any]:
+        t = self.tasks.get(task_id)
+        if t is None:
+            raise KeyError(task_id)
+        if t.status != "done":
+            t.status = "done"
+            t.done_at = self.svc._now().isoformat()
+        return self.task_dict(t)
+
 
 # ----------------------------------------------------------------------------- date parsing
 
@@ -360,6 +414,57 @@ def _reply(text: str, cards: list[dict[str, Any]] | None = None) -> dict[str, An
     return {"reply": text, "cards": cards or []}
 
 
+_WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+_DUE = re.compile(
+    r"\s*\b(?:(?:on|by|before|until|for)\s+)?(?:(?P<rel>today|tonight|tomorrow)"
+    r"|(?:next\s+)?(?P<wd>monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+    r"|(?P<abs>\d{4}-\d{2}-\d{2}|\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}"
+    r"|\d{1,2}(?:st|nd|rd|th)?\s+[a-z]+(?:\s+\d{4})?|[a-z]+\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s*\d{4})?))\b[.!]?\s*$")
+
+
+def _due(text: str, today: date) -> tuple[date | None, str]:
+    """A due date at the end of a task ("… on Friday", "… by 5 October"), and the text without it."""
+    m = _DUE.search(text.lower())
+    if not m:
+        return None, text
+    due: date | None = None
+    if m["rel"]:
+        due = today if m["rel"] in ("today", "tonight") else today + timedelta(days=1)
+    elif m["wd"]:
+        ahead = (_WEEKDAYS.index(m["wd"]) - today.weekday()) % 7
+        due = today + timedelta(days=ahead or 7)
+    elif m["abs"]:
+        try:
+            due = _parse_day(m["abs"], today)
+        except ValueError:
+            due = None
+    if due is None:
+        return None, text
+    return due, text[: m.start()].rstrip(" ,")
+
+
+def _task_title(text: str) -> str:
+    t = text.strip().rstrip(".!")
+    return t[:1].upper() + t[1:]
+
+
+def _tasks_card(items: list[dict[str, Any]]) -> dict[str, Any]:
+    return {"type": "tasks", "items": items}
+
+
+_ADD_TASK = re.compile(
+    r"^\s*(?:please\s+)?(?:(?:can you\s+)?remind me\s+(?:to\s+)?|(?:add|create|make|new)\s+(?:a\s+)?(?:new\s+)?"
+    r"(?:task|to-?do|reminder)\s*(?:to\s+|:|-)?\s*|(?:task|to-?do)\s*:\s*)(?P<what>.+)$", re.I)
+_DONE_TASK = re.compile(
+    r"^\s*(?:mark\s+(?:the\s+)?(?:task\s+)?(?P<a>.+?)\s+(?:as\s+)?(?:done|complete|completed|finished)"
+    r"|tick off\s+(?:the\s+)?(?:task\s+)?(?P<c>.+?)"
+    r"|(?:done|finished|completed?)\s*[:\-]\s*(?P<b>.+))\s*[.!]?\s*$", re.I)
+_LIST_TASKS = re.compile(r"\b(?:my|open|all|the)\s+(?:tasks|to-?dos|reminders)\b|^\s*(?:tasks|to-?dos|reminders|"
+                         r"to-?do list|task list)\s*\??\s*$", re.I)
+_PAY = re.compile(r"^\s*(?:please\s+)?(?:pay|transfer|wire|send money|make (?:a|the) payment)\b", re.I)
+_HELLO = re.compile(r"^\s*(?:hi|hello|hey|ol[aá]|good (?:morning|afternoon|evening)|what can you do|help)\b", re.I)
+
+
 class RuleBrain:
     """Deterministic understanding of the common requests. No model, no network."""
 
@@ -374,10 +479,51 @@ class RuleBrain:
                     return s.name
         return None
 
+    def _tasks(self, t: str, today: date) -> dict[str, Any] | None:
+        op = self.op
+        if m := _ADD_TASK.match(t):
+            due, what = _due(m["what"], today)
+            if not what.strip():
+                return _reply("Tell me what the task is.")
+            task = op.add_task(_task_title(what), due)
+            when = f" for {_d(due)}" if due else ""
+            return _reply(f"Added to your tasks{when}: {task['title']}.", [_tasks_card(op.list_tasks())])
+        if m := _DONE_TASK.match(t):
+            words = set(re.findall(r"[a-z0-9]{3,}", (m["a"] or m["b"] or m["c"] or "").lower())) - {"the", "task"}
+            open_tasks = [x for x in op.tasks.values() if x.status == "open"]
+            scored = sorted(((len(words & set(re.findall(r"[a-z0-9]{3,}", x.title.lower()))), x.id) for x in open_tasks),
+                            reverse=True)
+            if not scored or scored[0][0] == 0:
+                return _reply("I can't find an open task like that.", [_tasks_card(op.list_tasks())] if open_tasks else [])
+            done = op.complete_task(scored[0][1])
+            return _reply(f"Done: {done['title']}.", [_tasks_card(op.list_tasks())] if op.list_tasks() else [])
+        if _LIST_TASKS.search(t):
+            items = op.list_tasks()
+            if not items:
+                return _reply("You have no open tasks. Say “remind me to …” to add one.")
+            return _reply(f"You have {len(items)} open task{'s' if len(items) != 1 else ''}.", [_tasks_card(items)])
+        return None
+
     def handle(self, message: str) -> dict[str, Any]:
         op, t = self.op, message.strip()
         low = t.lower()
         today = op.svc._today()
+
+        if (answer := self._tasks(t, today)) is not None:
+            return answer
+        if _PAY.match(t):
+            text = ("I don't move money. You make payments from your bank; I check the invoice and the bank details "
+                    "first and tell you if something looks wrong.")
+            held = [n for n in op.svc.needs_you()["items"] if n.get("kind") == "approval"]
+            if held:
+                text += f" {held[0]['merchant']}'s payment is on hold until you confirm it in Needs you."
+            return _reply(text, [{"type": "evidence", "items": [
+                {"label": f"{n['merchant']} · {n.get('eyebrow', 'Needs you')}", "id": f"needs:{n['id']}"} for n in held]}]
+                if held else [])
+        if _HELLO.match(t):
+            return _reply("Hello. Ask me about your companies, payments, invoices or suppliers, or give me a task: "
+                          "“Find the Vodafone invoice and send it to marc@…”, “Summarise Adobe for the past year”, "
+                          "“Remind me to call the accountant on Friday”.")
         emails = _EMAIL.findall(t)
         wants_send = bool(emails) and bool(re.search(r"\b(send|email|mail|forward|share)\b", low))
 
@@ -454,38 +600,72 @@ def _draft_card(msg: OutboxMessage) -> dict[str, Any]:
             "attachments": msg.attachments, "status": msg.status}
 
 
-# The same tools, described for Claude (server brain).
+# The tools the model can use (the server brain, and the browser chat via /api/chat/tool).
+_S = {"type": "string"}
+_DATE = {"type": "string", "description": "ISO date, YYYY-MM-DD"}
 TOOLS: list[dict[str, Any]] = [
+    {"name": "business_status", "description": "Overview right now: each company's month-end status, what needs "
+     "the owner (with question ids and options), payments due soon, connection problems and what was handled "
+     "recently. Start here for general questions.",
+     "input_schema": {"type": "object", "properties": {}, "additionalProperties": False}},
+    {"name": "month_status", "description": "Month-end detail for one company: completeness, what is missing and "
+     "why, with evidence. Month is YYYY-MM.",
+     "input_schema": {"type": "object", "properties": {"company_id": _S, "month": _S},
+                      "required": ["company_id", "month"], "additionalProperties": False}},
+    {"name": "recent_activity", "description": "What the operator did recently (documents collected, invoices "
+     "recovered, questions answered), newest first.",
+     "input_schema": {"type": "object", "properties": {"limit": {"type": "integer"}}, "additionalProperties": False}},
+    {"name": "connections_status", "description": "Health of connected email, banks, cards and other sources.",
+     "input_schema": {"type": "object", "properties": {}, "additionalProperties": False}},
     {"name": "search_documents", "description": "Find invoices, receipts and other documents in the evidence store. "
-     "All filters optional. Dates are ISO (YYYY-MM-DD).",
+     "All filters optional.",
      "input_schema": {"type": "object", "properties": {
-         "query": {"type": "string"}, "supplier": {"type": "string"}, "company_id": {"type": "string"},
-         "date_from": {"type": "string"}, "date_to": {"type": "string"}, "amount": {"type": "number"}},
-         "additionalProperties": False}},
+         "query": _S, "supplier": _S, "company_id": _S, "date_from": _DATE, "date_to": _DATE,
+         "amount": {"type": "number"}}, "additionalProperties": False}},
     {"name": "supplier_summary", "description": "Spending with one supplier over a period, by month, plus issues "
      "(price increases, payments without invoice, duplicate invoices, changed bank details).",
-     "input_schema": {"type": "object", "properties": {
-         "supplier": {"type": "string"}, "date_from": {"type": "string"}, "date_to": {"type": "string"}},
-         "required": ["supplier"], "additionalProperties": False}},
+     "input_schema": {"type": "object", "properties": {"supplier": _S, "date_from": _DATE, "date_to": _DATE},
+                      "required": ["supplier"], "additionalProperties": False}},
     {"name": "period_report", "description": "Build a spending report for a period (optionally one company). "
      "Returns a report id that can be attached to an email.",
-     "input_schema": {"type": "object", "properties": {
-         "date_from": {"type": "string"}, "date_to": {"type": "string"}, "company_id": {"type": "string"}},
-         "required": ["date_from", "date_to"], "additionalProperties": False}},
+     "input_schema": {"type": "object", "properties": {"date_from": _DATE, "date_to": _DATE, "company_id": _S},
+                      "required": ["date_from", "date_to"], "additionalProperties": False}},
     {"name": "draft_email", "description": "Prepare an email with document or report attachments. It is NOT sent: "
      "the owner reviews it and taps Send.",
      "input_schema": {"type": "object", "properties": {
-         "to": {"type": "array", "items": {"type": "string"}}, "subject": {"type": "string"},
-         "body": {"type": "string"},
-         "document_ids": {"type": "array", "items": {"type": "string"}},
-         "report_ids": {"type": "array", "items": {"type": "string"}}},
+         "to": {"type": "array", "items": _S}, "subject": _S, "body": _S,
+         "document_ids": {"type": "array", "items": _S}, "report_ids": {"type": "array", "items": _S}},
          "required": ["to", "subject", "body"], "additionalProperties": False}},
+    {"name": "answer_question", "description": "Record the owner's answer to one of the open questions from "
+     "business_status (for example which company a payment belongs to). Use ONLY when the owner has clearly "
+     "given the answer in this conversation. Payment approvals and changed bank details can never be answered "
+     "here: the owner confirms those in Needs you.",
+     "input_schema": {"type": "object", "properties": {
+         "question_id": _S, "option_id": _S,
+         "remember": {"type": "boolean", "description": "Apply the same answer to future similar payments"}},
+         "required": ["question_id", "option_id"], "additionalProperties": False}},
+    {"name": "create_task", "description": "Add a task or reminder to the owner's task list.",
+     "input_schema": {"type": "object", "properties": {"title": _S, "due_date": _DATE, "company_id": _S},
+                      "required": ["title"], "additionalProperties": False}},
+    {"name": "list_tasks", "description": "The owner's tasks (open ones unless include_done).",
+     "input_schema": {"type": "object", "properties": {"include_done": {"type": "boolean"}},
+                      "additionalProperties": False}},
+    {"name": "complete_task", "description": "Mark one of the owner's tasks as done.",
+     "input_schema": {"type": "object", "properties": {"task_id": _S}, "required": ["task_id"],
+                      "additionalProperties": False}},
 ]
 
-SYSTEM = ("You are the back-office operator for a small business. Be short, calm and precise; plain language, "
-          "no accounting jargon. Answer only from tool results, never from memory, and cite document numbers. "
-          "Money is in euros. Emails are only drafted; tell the owner to tap Send. If data does not cover the "
-          "period asked, say which period it covers.")
+SYSTEM = ("You are the back-office operator for a small business owner: an excellent financial administrator. "
+          "Be short, calm and precise; plain language, no accounting jargon, never chatty. Answer only from tool "
+          "results, never from memory, and cite document numbers and amounts. Money is in euros. "
+          "You can: look things up, prepare reports, draft emails (the owner taps Send), record the owner's "
+          "answers to open questions, and keep the owner's task list. You never move money, never approve "
+          "payments or changed bank details, and never send anything yourself; say so plainly when asked. "
+          "If data does not cover the period asked, say which period it covers. When something is done, say "
+          "“Done.” and what changed.")
+
+# Tools that change something: the browser keeps and replays them (web/lib/engine.ts).
+CHANGING_TOOLS = frozenset({"period_report", "draft_email", "answer_question", "create_task", "complete_task"})
 
 
 def _iso(v: Any) -> date | None:
@@ -495,10 +675,101 @@ def _iso(v: Any) -> date | None:
         return None
 
 
+def run_tool(op: Operator, name: str, args: dict[str, Any], cards: list[dict[str, Any]]) -> Any:
+    """Run one tool against the engine. Raises ValueError/KeyError with a message the model can act on."""
+    svc = op.svc
+    if name == "business_status":
+        home = svc.home()
+        needs = []
+        for n in svc.needs_you()["items"]:
+            item = {"question_id": n["id"], "kind": n.get("kind"), "merchant": n.get("merchant"),
+                    "amount": n.get("amount"), "date": n.get("date"),
+                    "question": n.get("question") or n.get("title"),
+                    "owner_must_confirm_in_needs_you": n.get("kind") == "approval"}
+            if n.get("kind") != "approval":
+                item["options"] = [{"option_id": o["id"], "label": o["label"]} for o in n.get("options", [])]
+            needs.append(item)
+        companies = [{"company_id": c["id"], "name": c["name"], "status": c.get("statusLabel"),
+                      "detail": c.get("detail"), "current_month": c.get("currentMonth")}
+                     for c in svc.companies()["companies"]]
+        return {"today": svc._today().isoformat(), "headline": home.get("status") or home.get("headline"),
+                "companies": companies, "needs_owner": needs, "due_soon": home.get("dueSoon"),
+                "handled_recently": home.get("handled"), "open_tasks": op.list_tasks()}
+    if name == "month_status":
+        m = svc.month(str(args.get("company_id", "")), str(args.get("month", "")))
+        if m is None:
+            raise ValueError("No month-end data for that company and month.")
+        return m
+    if name == "recent_activity":
+        limit = max(1, min(int(args.get("limit") or 15), 50))
+        return svc.activity()["items"][:limit]
+    if name == "connections_status":
+        return svc.connections()
+    if name == "search_documents":
+        amount = Decimal(str(args["amount"])) if args.get("amount") is not None else None
+        docs = op.documents(query=args.get("query", ""), supplier=args.get("supplier", ""),
+                            company_id=args.get("company_id", ""), date_from=_iso(args.get("date_from")),
+                            date_to=_iso(args.get("date_to")), amount=amount)
+        if docs:
+            cards.append({"type": "documents", "items": docs[:5]})
+        return docs[:20]
+    if name == "supplier_summary":
+        s = op.supplier_summary(args["supplier"], date_from=_iso(args.get("date_from")),
+                                date_to=_iso(args.get("date_to")))
+        cards.append({"type": "summary", **s})
+        return s
+    if name == "period_report":
+        a, b = _iso(args.get("date_from")), _iso(args.get("date_to"))
+        if not a or not b:
+            raise ValueError("dates must be YYYY-MM-DD")
+        r = op.period_report(a, b, args.get("company_id", ""))
+        cards.append({"type": "report", **{k: v for k, v in r.items() if k != "csv"}})
+        return {k: v for k, v in r.items() if k != "csv"}
+    if name == "draft_email":
+        att = [{"kind": "document", "id": i, "name": (op.document_file(i) or (i,))[0]}
+               for i in args.get("document_ids", []) if i in op.repo.documents]
+        att += [{"kind": "report", "id": i, "name": op.reports[i]["filename"]}
+                for i in args.get("report_ids", []) if i in op.reports]
+        msg = op.draft_email(list(args["to"]), args["subject"], args["body"], att)
+        cards.append(_draft_card(msg))
+        return {"draft_id": msg.id, "status": "waiting for the owner to tap Send"}
+    if name == "answer_question":
+        qid, option = str(args.get("question_id", "")), str(args.get("option_id", ""))
+        item = next((n for n in svc.needs_you()["items"] if n["id"] == qid), None)
+        if item is None:
+            raise ValueError("That question is not open any more.")
+        if item.get("kind") == "approval":
+            cards.append({"type": "evidence", "items": [{"label": f"{item.get('merchant')} · confirm in Needs you",
+                                                         "id": f"needs:{qid}"}]})
+            raise ValueError("This needs the owner's own confirmation in Needs you (payment approvals and changed "
+                             "bank details are never answered in chat).")
+        return svc.answer(qid, option, bool(args.get("remember", False)))
+    if name == "create_task":
+        due = _iso(args.get("due_date"))
+        if args.get("due_date") and due is None:
+            raise ValueError("due_date must be YYYY-MM-DD")
+        task = op.add_task(str(args.get("title", "")), due, str(args.get("company_id") or ""))
+        cards.append(_tasks_card(op.list_tasks()))
+        return task
+    if name == "list_tasks":
+        items = op.list_tasks(include_done=bool(args.get("include_done", False)))
+        if items:
+            cards.append(_tasks_card(items))
+        return items
+    if name == "complete_task":
+        try:
+            task = op.complete_task(str(args.get("task_id", "")))
+        except KeyError:
+            raise ValueError("No task with that id. Use list_tasks.") from None
+        cards.append(_tasks_card(op.list_tasks(include_done=True)))
+        return task
+    raise ValueError(f"unknown tool {name}")
+
+
 class ClaudeBrain:
     """Claude with tool use over :class:`Operator` (manual loop, server only)."""
 
-    MODEL = "claude-opus-5"
+    MODEL = "claude-sonnet-5-5"
 
     def __init__(self, op: Operator, client: Any = None, max_turns: int = 8) -> None:
         self.op = op
@@ -510,36 +781,7 @@ class ClaudeBrain:
         self.max_turns = max_turns
 
     def _run(self, name: str, args: dict[str, Any], cards: list[dict[str, Any]]) -> Any:
-        op = self.op
-        if name == "search_documents":
-            amount = Decimal(str(args["amount"])) if args.get("amount") is not None else None
-            docs = op.documents(query=args.get("query", ""), supplier=args.get("supplier", ""),
-                                company_id=args.get("company_id", ""), date_from=_iso(args.get("date_from")),
-                                date_to=_iso(args.get("date_to")), amount=amount)
-            if docs:
-                cards.append({"type": "documents", "items": docs[:5]})
-            return docs[:20]
-        if name == "supplier_summary":
-            s = op.supplier_summary(args["supplier"], date_from=_iso(args.get("date_from")),
-                                    date_to=_iso(args.get("date_to")))
-            cards.append({"type": "summary", **s})
-            return s
-        if name == "period_report":
-            a, b = _iso(args["date_from"]), _iso(args["date_to"])
-            if not a or not b:
-                raise ValueError("dates must be YYYY-MM-DD")
-            r = op.period_report(a, b, args.get("company_id", ""))
-            cards.append({"type": "report", **{k: v for k, v in r.items() if k != "csv"}})
-            return {k: v for k, v in r.items() if k != "csv"}
-        if name == "draft_email":
-            att = [{"kind": "document", "id": i, "name": (op.document_file(i) or (i,))[0]}
-                   for i in args.get("document_ids", []) if i in op.repo.documents]
-            att += [{"kind": "report", "id": i, "name": op.reports[i]["filename"]}
-                    for i in args.get("report_ids", []) if i in op.reports]
-            msg = op.draft_email(list(args["to"]), args["subject"], args["body"], att)
-            cards.append(_draft_card(msg))
-            return {"draft_id": msg.id, "status": "waiting for the owner to tap Send"}
-        raise ValueError(f"unknown tool {name}")
+        return run_tool(self.op, name, args, cards)
 
     def handle(self, message: str, history: list[dict[str, str]] | None = None) -> dict[str, Any]:
         messages: list[dict[str, Any]] = [

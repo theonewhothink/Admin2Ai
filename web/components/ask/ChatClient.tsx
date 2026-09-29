@@ -1,11 +1,12 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState, useSyncExternalStore } from "react";
 import { Icon } from "@/components/Icon";
 import { call, download } from "@/lib/api";
+import { askClaude, claudeKey, looksLikeKey, setClaudeKey, subscribeClaudeKey } from "@/lib/claude";
 import { evidenceHref } from "@/lib/evidence";
-import { formatMoney } from "@/lib/format";
+import { formatDayShort, formatMoney } from "@/lib/format";
 
 /* Cards returned by POST /api/chat (backend/src/backoffice/assistant.py). */
 interface DocItem {
@@ -17,8 +18,16 @@ interface DocItem {
   company: string;
   status: string;
 }
+interface TaskItem {
+  id: string;
+  title: string;
+  due: string | null;
+  company: string | null;
+  status: string;
+}
 type Card =
   | { type: "documents"; items: DocItem[] }
+  | { type: "tasks"; items: TaskItem[] }
   | { type: "evidence"; items: { id: string; label: string }[] }
   | {
       type: "report";
@@ -137,9 +146,48 @@ function EmailDraft({ card }: { card: Extract<Card, { type: "email" }> }) {
   );
 }
 
+function Tasks({ items }: { items: TaskItem[] }) {
+  const [list, setList] = useState(items);
+  const [note, setNote] = useState<string | null>(null);
+  async function done(id: string) {
+    const r = await call<{ task?: TaskItem; message?: string }>("POST", `/api/tasks/${encodeURIComponent(id)}/done`, {});
+    const task = r.body.task;
+    if (r.ok && task) setList((prev) => prev.map((t) => (t.id === id ? task : t)));
+    else setNote(r.body.message ?? "I couldn't update that task.");
+  }
+  return (
+    <ul className="card list" aria-label="Tasks">
+      {list.map((t) => {
+        const open = t.status === "open";
+        return (
+          <li key={t.id} className="list-row">
+            {open ? (
+              <button className="btn btn-quiet" type="button" onClick={() => void done(t.id)} aria-label={`Mark “${t.title}” as done`}>
+                <Icon name="check" size={16} />
+              </button>
+            ) : (
+              <Icon name="checkCircle" size={20} style={{ color: "var(--good)", flexShrink: 0, margin: "0 10px" }} />
+            )}
+            <span style={{ flex: 1, minWidth: 0, display: "grid" }}>
+              <span style={{ fontWeight: 600, overflowWrap: "anywhere", textDecoration: open ? undefined : "line-through", color: open ? undefined : "var(--text-2)" }}>
+                {t.title}
+              </span>
+              {t.due || t.company ? (
+                <span className="meta">{[t.due ? `Due ${formatDayShort(t.due)}` : null, t.company].filter(Boolean).join(" · ")}</span>
+              ) : null}
+            </span>
+          </li>
+        );
+      })}
+      {note ? <li className="list-row meta">{note}</li> : null}
+    </ul>
+  );
+}
+
 function CardView({ card }: { card: Card }) {
   const [note, setNote] = useState<string | null>(null);
   if (card.type === "documents") return <Documents items={card.items} />;
+  if (card.type === "tasks") return <Tasks items={card.items} />;
   if (card.type === "email") return <EmailDraft card={card} />;
   if (card.type === "evidence") {
     return (
@@ -223,13 +271,114 @@ function CardView({ card }: { card: Card }) {
   );
 }
 
-export function ChatClient({ initialQuestion, examples }: { initialQuestion?: string; examples: string[] }) {
+const noKey = () => null;
+
+/** Who answers: Claude with the owner's own key, or the built-in rules. Lets the owner add or remove the key. */
+function BrainSettings({ open, onToggle, compact }: { open: boolean; onToggle: () => void; compact: boolean }) {
+  const key = useSyncExternalStore(subscribeClaudeKey, claudeKey, noKey);
+  const [draft, setDraft] = useState("");
+  const [note, setNote] = useState<string | null>(null);
+  const inputId = useId();
+  function save() {
+    if (!looksLikeKey(draft)) {
+      setNote("That doesn’t look like an Anthropic key. It starts with sk-ant-.");
+      return;
+    }
+    setNote(setClaudeKey(draft) ? null : "This browser won’t keep the key. Check that site data is allowed.");
+    setDraft("");
+    if (open) onToggle();
+  }
+  return (
+    <div style={{ display: "grid", gap: 8 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+        <span className="meta" style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+          <span aria-hidden="true" style={{ width: 8, height: 8, borderRadius: 4, background: key ? "var(--good-dot)" : "var(--text-3)" }} />
+          {key ? "Answers by Claude" : compact ? "Basic answers" : "Basic answers. Connect Claude to ask anything."}
+        </span>
+        <button className="btn btn-quiet" type="button" onClick={onToggle} aria-expanded={open}>
+          {key ? "Settings" : "Connect Claude"}
+        </button>
+      </div>
+      {open ? (
+        <div className="card card-pad" style={{ display: "grid", gap: 8 }}>
+          {key ? (
+            <>
+              <p>Claude answers with your Anthropic key, saved in this browser.</p>
+              <div>
+                <button
+                  className="btn btn-secondary"
+                  type="button"
+                  onClick={() => {
+                    setClaudeKey(null);
+                    onToggle();
+                  }}
+                >
+                  Remove key
+                </button>
+              </div>
+            </>
+          ) : (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                save();
+              }}
+              style={{ display: "grid", gap: 8 }}
+            >
+              <label htmlFor={inputId}>Your Anthropic API key</label>
+              <input
+                id={inputId}
+                className="input"
+                type="password"
+                autoComplete="off"
+                spellCheck={false}
+                placeholder="sk-ant-…"
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+              />
+              <p className="meta">
+                Kept only in this browser and sent only to Anthropic. Create one at{" "}
+                <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noreferrer">
+                  console.anthropic.com
+                </a>
+                . Usage is billed to your Anthropic account.
+              </p>
+              <div>
+                <button className="btn btn-primary" type="submit" disabled={!draft.trim()}>
+                  Save key
+                </button>
+              </div>
+            </form>
+          )}
+          {note ? (
+            <p role="status" className="meta">
+              {note}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+export function ChatClient({
+  initialQuestion,
+  examples,
+  compact = false,
+}: {
+  initialQuestion?: string;
+  examples: string[];
+  /** Inside the chat panel: fewer examples and the message box pinned to the panel's bottom. */
+  compact?: boolean;
+}) {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [value, setValue] = useState("");
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const nextId = useRef(1);
   const started = useRef(false);
   const end = useRef<HTMLDivElement>(null);
   const busy = turns.some((t) => t.pending);
+  const inputId = useId();
 
   const send = useCallback(
     (text: string) => {
@@ -240,9 +389,18 @@ export function ChatClient({ initialQuestion, examples }: { initialQuestion?: st
       const history = turns.filter((t) => !t.pending).map((t) => ({ role: t.role, content: t.text }));
       setTurns((prev) => [...prev, { id: uid, role: "user", text: message }, { id: aid, role: "assistant", text: "", pending: true }]);
       setValue("");
+      const finish = (reply: string, cards: Card[]) =>
+        setTurns((prev) => prev.map((t) => (t.id === aid ? { ...t, text: reply, cards, pending: false } : t)));
+      const key = claudeKey();
+      if (key) {
+        void askClaude<Card>(key, message, history).then((r) => {
+          finish(r.reply, r.cards);
+          if (r.keyProblem) setSettingsOpen(true);
+        });
+        return;
+      }
       void call<{ reply?: string; cards?: Card[]; message?: string }>("POST", "/api/chat", { message, history }).then((r) => {
-        const reply = r.ok ? r.body.reply ?? "Done." : r.body.message ?? "I couldn't do that. Try again.";
-        setTurns((prev) => prev.map((t) => (t.id === aid ? { ...t, text: reply, cards: r.body.cards ?? [], pending: false } : t)));
+        finish(r.ok ? (r.body.reply ?? "Done.") : (r.body.message ?? "I couldn't do that. Try again."), r.body.cards ?? []);
       });
     },
     [turns],
@@ -261,13 +419,13 @@ export function ChatClient({ initialQuestion, examples }: { initialQuestion?: st
 
   return (
     <div style={{ display: "grid", gap: 16 }}>
+      <BrainSettings open={settingsOpen} onToggle={() => setSettingsOpen((o) => !o)} compact={compact} />
+
       {turns.length === 0 ? (
-        <section className="stack-2" aria-labelledby="ex-h">
-          <h2 id="ex-h" className="meta">
-            Ask a question or give me a task
-          </h2>
+        <section className="stack-2" aria-label="Examples">
+          <p className="meta">Ask a question or give me a task</p>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-            {examples.map((q) => (
+            {(compact ? examples.slice(0, 5) : examples).map((q) => (
               <button key={q} type="button" className="chip" onClick={() => send(q)}>
                 {q}
               </button>
@@ -289,13 +447,14 @@ export function ChatClient({ initialQuestion, examples }: { initialQuestion?: st
                 padding: "10px 14px",
                 borderRadius: 16,
                 overflowWrap: "anywhere",
+                whiteSpace: "pre-wrap",
               }}
             >
               {t.text}
             </p>
           ) : (
             <div key={t.id} style={{ display: "grid", gap: 12 }}>
-              <p style={{ overflowWrap: "anywhere" }}>{t.pending ? "Working on it…" : t.text}</p>
+              <p style={{ overflowWrap: "anywhere", whiteSpace: "pre-wrap" }}>{t.pending ? "Working on it…" : t.text}</p>
               {(t.cards ?? []).map((c, i) => (
                 <CardView key={`${t.id}-${i}`} card={c} />
               ))}
@@ -311,20 +470,21 @@ export function ChatClient({ initialQuestion, examples }: { initialQuestion?: st
           send(value);
         }}
         className="card"
-        style={{ display: "flex", gap: 8, padding: 8, position: "sticky", bottom: 96 }}
+        style={{ display: "flex", gap: 8, padding: 8, position: "sticky", bottom: compact ? 0 : 96 }}
       >
-        <label htmlFor="chat-input" className="sr-only">
+        <label htmlFor={inputId} className="sr-only">
           Message
         </label>
         <input
-          id="chat-input"
+          id={inputId}
           className="input"
           style={{ flex: 1, border: "none" }}
-          placeholder="Find an invoice, send a report, summarise a supplier…"
+          placeholder="Ask anything or give me a task…"
           value={value}
           onChange={(e) => setValue(e.target.value)}
           autoFocus={!initialQuestion}
           autoComplete="off"
+          maxLength={4000}
         />
         <button className="btn btn-primary" type="submit" disabled={busy || !value.trim()} aria-label="Send message">
           <Icon name="arrowRight" size={18} />

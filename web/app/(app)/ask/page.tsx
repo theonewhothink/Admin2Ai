@@ -11,7 +11,7 @@ function Head() {
   return (
     <header className="page-head">
       <h1 className="h1">Ask</h1>
-      <p className="lead">Ask anything or give me a task: find and send documents, build reports, check a supplier. I answer from your email, bank and documents, and nothing is sent until you tap Send.</p>
+      <p className="lead">Ask anything or give me a task: find and send documents, build reports, check a supplier, keep your to-do list. I answer from your email, bank and documents. Nothing is sent until you tap Send, and I never move money.</p>
     </header>
   );
 }

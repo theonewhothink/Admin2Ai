@@ -130,4 +130,85 @@ def test_claude_brain_runs_tools_and_only_drafts(svc):
     out = brain.handle("Send the Vodafone invoice to m@x.pt")
     assert out["reply"] == "Drafted. Tap Send."
     assert [c["type"] for c in out["cards"]] == ["documents", "email"]
-    assert calls[0]["model"] == "claude-opus-5" and all(o.status == "draft" for o in svc.assistant.outbox.values())
+    assert calls[0]["model"] == "claude-sonnet-5-5" and all(o.status == "draft" for o in svc.assistant.outbox.values())
+
+
+def test_rule_chat_keeps_the_owners_tasks(svc):
+    added = chat(svc, "Remind me to call the accountant on Friday")
+    assert added["reply"] == "Added to your tasks for 9 Oct 2026: Call the accountant."  # demo today: Fri 2 Oct
+    assert added["cards"][0]["type"] == "tasks"
+    chat(svc, "add a task: renew the car insurance by 15 October")
+    chat(svc, "Task: check Uber receipts")
+    listed = chat(svc, "what are my tasks?")
+    assert listed["reply"] == "You have 3 open tasks."
+    assert [t["title"] for t in listed["cards"][0]["items"]] == [
+        "Call the accountant", "Renew the car insurance", "Check Uber receipts"]  # by due date, undated last
+    assert chat(svc, "mark call the accountant as done")["reply"] == "Done: Call the accountant."
+    assert chat(svc, "done: something else entirely")["reply"] == "I can't find an open task like that."
+    tasks = svc.dispatch("GET", "/api/tasks", None)[1]["tasks"]
+    assert [t["status"] for t in tasks] == ["open", "open", "done"]
+
+
+def test_rule_chat_never_moves_money_and_says_hello(svc):
+    pay = chat(svc, "Pay the Vodafone invoice")
+    assert pay["reply"].startswith("I don't move money.") and "Vodafone's payment is on hold" in pay["reply"]
+    assert pay["cards"][0]["items"][0]["id"] == "needs:nd_vodafone_iban"
+    assert chat(svc, "hello")["reply"].startswith("Hello.")
+
+
+def test_task_endpoints_validate(svc):
+    ok = svc.dispatch("POST", "/api/tasks", {"title": "  Send  the lease  ", "due": "2026-10-09", "companyId": "hazel-tree"})
+    assert ok[0] == 200 and ok[1]["task"]["title"] == "Send the lease" and ok[1]["task"]["company"] == "Hazel Tree"
+    for bad in ({"title": ""}, {"title": "x", "due": "Friday"}, {"title": "x", "companyId": "nope"}):
+        assert svc.dispatch("POST", "/api/tasks", bad)[0] == 400
+    tid = ok[1]["task"]["id"]
+    assert svc.dispatch("POST", f"/api/tasks/{tid}/done", {})[1]["task"]["status"] == "done"
+    assert svc.dispatch("POST", "/api/tasks/nope/done", {})[0] == 404
+
+
+def tool(svc, name, **args):
+    status, body = svc.dispatch("POST", "/api/chat/tool", {"name": name, "input": args})
+    assert status == 200, body
+    return body
+
+
+def test_browser_chat_gets_instructions_and_every_tool(svc):
+    status, body = svc.dispatch("GET", "/api/chat/tools", None)
+    assert status == 200 and body["model"] == "claude-sonnet-5-5" and body["today"] == "2026-10-02"
+    names = {t["name"] for t in body["tools"]}
+    assert {"business_status", "answer_question", "create_task", "draft_email"} <= names
+    assert "never move money" in body["system"]
+    assert svc.dispatch("POST", "/api/chat/tool", {"name": "rm_rf", "input": {}})[0] == 400
+
+
+def test_browser_chat_tools_act_within_the_owners_limits(svc):
+    status = tool(svc, "business_status")["result"]
+    held = {n["question_id"]: n for n in status["needs_owner"]}
+    assert held["nd_vodafone_iban"]["owner_must_confirm_in_needs_you"] is True
+    assert "options" not in held["nd_vodafone_iban"]  # nothing for the model to pick
+
+    # Changed bank details: never answered from the chat, and nothing changes.
+    refused = tool(svc, "answer_question", question_id="nd_vodafone_iban", option_id="confirmed_by_phone")
+    assert refused["isError"] and "Needs you" in refused["result"]
+    assert refused["cards"][0]["items"][0]["id"] == "needs:nd_vodafone_iban"
+    assert any(n["id"] == "nd_vodafone_iban" for n in svc.needs_you()["items"])
+
+    # A plain question the owner answered in the chat: recorded.
+    done = tool(svc, "answer_question", question_id="nd_ikea_418", option_id="entity:hazel-tree", remember=True)
+    assert not done["isError"] and done["result"]["ok"]
+    assert all(n["id"] != "nd_ikea_418" for n in svc.needs_you()["items"])
+
+    task = tool(svc, "create_task", title="Call Vodafone about the new IBAN", due_date="2026-10-05")
+    assert task["result"]["due"] == "2026-10-05" and task["cards"][0]["type"] == "tasks"
+    assert tool(svc, "create_task", title="x", due_date="Monday")["isError"]
+    assert tool(svc, "complete_task", task_id=task["result"]["id"])["result"]["status"] == "done"
+    assert tool(svc, "complete_task", task_id="nope")["isError"]
+
+    month = tool(svc, "month_status", company_id="hazel-tree", month="2026-09")["result"]
+    assert month["month"] == "2026-09"
+    assert tool(svc, "month_status", company_id="nope", month="2026-09")["isError"]
+    assert tool(svc, "recent_activity", limit=2)["result"].__len__() == 2
+    assert "connections" in tool(svc, "connections_status")["result"]
+    draft = tool(svc, "draft_email", to=["m@x.pt"], subject="Hi", body="Hello")
+    assert svc.assistant.outbox[draft["result"]["draft_id"]].status == "draft"
+    assert tool(svc, "draft_email", to=["not-an-email"], subject="Hi", body="Hello")["isError"]

@@ -1,0 +1,98 @@
+/* The chat on every page (ChatDrawer). */
+
+.launcher {
+  position: fixed;
+  right: var(--s-3);
+  bottom: var(--s-3);
+  z-index: 45;
+  /* Phones have the Ask tab in the bottom bar. */
+  display: none;
+  align-items: center;
+  gap: var(--s-1);
+  min-height: 48px;
+  padding: 0 var(--s-2) 0 14px;
+  border: 0;
+  border-radius: var(--r-pill);
+  background: var(--ink);
+  color: var(--on-ink);
+  font: inherit;
+  font-weight: 600;
+  box-shadow: var(--shadow-raised);
+  cursor: pointer;
+  transition: background var(--t-fast) var(--ease), transform var(--t-fast) var(--ease);
+}
+
+.launcher:hover {
+  background: var(--ink-hover);
+}
+
+.launcher:active {
+  transform: scale(0.98);
+}
+
+.launcher:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 3px;
+}
+
+.panel {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  animation: slideIn var(--t-slow) var(--ease);
+}
+
+.panel[hidden] {
+  display: none;
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-1);
+  min-height: var(--header-h);
+  padding: 0 var(--s-1) 0 var(--gutter);
+  padding-top: env(safe-area-inset-top);
+  background: var(--surface);
+  box-shadow: 0 1px 0 var(--line);
+}
+
+.body {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: var(--s-2) var(--gutter) calc(var(--s-2) + env(safe-area-inset-bottom));
+}
+
+@media (min-width: 900px) {
+  .launcher {
+    display: inline-flex;
+  }
+
+  .panel {
+    inset: 0 0 0 auto;
+    width: min(460px, 100vw);
+    box-shadow: -1px 0 0 var(--line), -16px 0 40px rgba(16, 24, 40, 0.08);
+  }
+}
+
+@keyframes slideIn {
+  from {
+    transform: translateX(24px);
+    opacity: 0;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .panel {
+    animation: none;
+  }
+}

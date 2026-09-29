@@ -558,6 +558,49 @@ class BackOfficeService:
                 return RuleBrain(self.assistant).handle(message)
             raise
 
+    def chat_tools(self) -> dict[str, Any]:
+        """What the browser chat needs to run Claude itself: instructions, tools, today and the model."""
+        from backoffice.assistant import SYSTEM, TOOLS, ClaudeBrain
+
+        return {"system": SYSTEM, "tools": TOOLS, "today": self._today().isoformat(), "model": ClaudeBrain.MODEL}
+
+    def chat_tool(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Run one tool for the browser chat. Tool failures come back as results the model can recover from."""
+        from backoffice.assistant import TOOLS, run_tool
+
+        name = body.get("name")
+        args = body.get("input") if isinstance(body.get("input"), Mapping) else {}
+        if not isinstance(name, str) or name not in {t["name"] for t in TOOLS}:
+            raise ServiceError(400, "Unknown tool.")
+        cards: list[dict[str, Any]] = []
+        try:
+            result = run_tool(self.assistant, name, dict(args), cards)
+        except ServiceError as exc:
+            return {"isError": True, "result": exc.message, "cards": cards}
+        except (ValueError, KeyError, TypeError) as exc:
+            return {"isError": True, "result": str(exc)[:500] or "That did not work.", "cards": cards}
+        return {"isError": False, "result": json.loads(json.dumps(result, default=str)), "cards": cards}
+
+    def task_create(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        due_raw = body.get("due")
+        try:
+            due = date.fromisoformat(str(due_raw)) if due_raw else None
+        except ValueError:
+            raise ServiceError(400, "The date must look like 2026-10-09.") from None
+        try:
+            task = self.assistant.add_task(str(body.get("title") or ""), due,
+                                           str(body.get("companyId") or body.get("company_id") or ""))
+        except ValueError as exc:
+            raise ServiceError(400, str(exc)) from None
+        return {"task": task, "tasks": self.assistant.list_tasks()}
+
+    def task_done(self, task_id: str) -> dict[str, Any]:
+        try:
+            task = self.assistant.complete_task(task_id)
+        except KeyError:
+            raise ServiceError(404, "I can't find that task.") from None
+        return {"task": task, "tasks": self.assistant.list_tasks()}
+
     def chat_send(self, message_id: str, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
         op = self.assistant
         msg = op.outbox.get(message_id)
@@ -1510,6 +1553,11 @@ class BackOfficeService:
             ("POST", r("/api/share"), lambda b: self.share(b)),
             ("GET", r("/api/sources"), lambda b: self.sources()),
             ("POST", r("/api/chat"), lambda b: self.chat(b or {})),
+            ("GET", r("/api/chat/tools"), lambda b: self.chat_tools()),
+            ("POST", r("/api/chat/tool"), lambda b: self.chat_tool(b or {})),
+            ("GET", r("/api/tasks"), lambda b: {"tasks": self.assistant.list_tasks(include_done=True)}),
+            ("POST", r("/api/tasks"), lambda b: self.task_create(b or {})),
+            ("POST", r(f"/api/tasks/{seg}/done"), lambda b, tid: self.task_done(tid)),
             ("POST", r(f"/api/chat/outbox/{seg}/send"), lambda b, mid: self.chat_send(mid, b)),
             ("GET", r(f"/api/reports/{seg}/file"), lambda b, rid: self.report_file(rid)),
             ("GET", r("/api/documents"), lambda b: self.documents_list(b)),
