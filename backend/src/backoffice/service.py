@@ -558,6 +558,12 @@ class BackOfficeService:
                 return RuleBrain(self.assistant).handle(message)
             raise
 
+    def pipeline(self) -> dict[str, Any]:
+        """What the system is doing: every item's journey along the golden rule (Diagram page)."""
+        from backoffice.pipeline import build_pipeline
+
+        return build_pipeline(self)
+
     def chat_tools(self) -> dict[str, Any]:
         """What the browser chat needs to run Claude itself: instructions, tools, today and the model."""
         from backoffice.assistant import SYSTEM, TOOLS, ClaudeBrain
@@ -1578,6 +1584,7 @@ class BackOfficeService:
             ("POST", r("/api/accountant/rules"),
              lambda b: self.accountant_rule(_field(b, "text"), str(b.get("scope") or "client"))),
             ("GET", r("/api/audit"), lambda b: self.audit()),
+            ("GET", r("/api/pipeline"), lambda b: self.pipeline()),
         )
 
 

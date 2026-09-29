@@ -88,4 +88,4 @@ The tokens live at the top of `app/globals.css`:
 - When the backend is set but a POST fails, the UI still reports success so the demo keeps flowing. Change this before production.
 - These pages use sample data only because the backend has no endpoints for them yet: onboarding lookups and connections, the audit, the accountant workspace, and settings' "Things I remember".
 - The greeting comes from the data (`HomeData.greeting`). The backend should produce it in the user's time zone.
-- Times are shown in Europe/Madrid.
+- Times are shown in Europe/Lisbon, the same time zone as the engine (Portugal pack).

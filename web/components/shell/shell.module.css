@@ -70,9 +70,18 @@
   border-radius: 10px;
   font-size: 15px;
   font-weight: 500;
+  white-space: nowrap;
   color: var(--text-2);
   transition: color var(--t-fast) var(--ease), background-color var(--t-fast) var(--ease),
     box-shadow var(--t-fast) var(--ease);
+}
+
+/* Narrower computers: tighter links so every item fits on one line. */
+@media (min-width: 900px) and (max-width: 1099px) {
+  .topLink {
+    padding: 8px 9px;
+    font-size: 14px;
+  }
 }
 
 .topLink:hover {

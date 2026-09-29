@@ -13,6 +13,7 @@ import { ActivityView } from "@/components/ActivityView";
 import { ChatClient } from "@/components/ask/ChatClient";
 import { CompaniesView } from "@/components/companies/CompaniesView";
 import { CompanyView } from "@/components/companies/CompanyView";
+import { DiagramView } from "@/components/diagram/DiagramView";
 import { AuditView } from "@/components/flow/AuditView";
 import { HomeView } from "@/components/home/HomeView";
 import { NeedsYouList } from "@/components/needs/NeedsYouList";
@@ -28,9 +29,10 @@ import {
   getHome,
   getMonth,
   getNeedsYou,
+  getPipeline,
   getSources,
 } from "@/lib/api";
-import type { MonthKey } from "@/lib/types";
+import type { MonthKey, Pipeline } from "@/lib/types";
 import { Loading } from "./Loading";
 import { useData } from "./useData";
 
@@ -140,4 +142,26 @@ export function LiveSources() {
   const data = useData(getSources);
   if (!data) return <Loading />;
   return <SourcesView data={data} />;
+}
+
+export function LiveDiagram() {
+  const data = useData(getPipeline);
+  if (!data) return <Loading narrow={false} />;
+  return (
+    <>
+      <DiagramLead data={data} />
+      <DiagramView data={data} />
+    </>
+  );
+}
+
+export function DiagramLead({ data }: { data: Pipeline }) {
+  const s = data.summary;
+  return (
+    <p className="lead" style={{ marginBottom: 24 }}>
+      {s.items} items so far: {s.closed} closed with proof, {s.open} in progress
+      {s.waiting ? `, ${s.waiting} waiting for you` : ""}
+      {s.notRequired ? `, ${s.notRequired} that need no document` : ""}.
+    </p>
+  );
 }

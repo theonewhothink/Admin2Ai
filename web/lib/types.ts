@@ -326,3 +326,63 @@ export interface SourcesData {
   groups: SourceGroup[];
   companies: { id: string; name: string }[];
 }
+
+/* ---------- Diagram (GET /api/pipeline, backend/src/backoffice/pipeline.py) ---------- */
+
+export interface PipelineStage {
+  id: string;
+  label: string;
+  description: string;
+  now: number;
+  passed?: number;
+}
+
+export interface PipelineStep {
+  stage: string;
+  label: string;
+  agent: string;
+  agentLabel: string;
+  at: string;
+  note: string;
+  evidence: number;
+}
+
+export interface PipelineItem {
+  id: string;
+  kind: "payment" | "document" | string;
+  title: string;
+  detail: string;
+  amount: number | null;
+  currency: string;
+  date: string | null;
+  company: string | null;
+  stage: string;
+  stageLabel: string;
+  quality: "verified" | "likely" | "conflict" | string;
+  open: boolean;
+  source: string;
+  reason: string;
+  updatedAt: string | null;
+  href?: string;
+  journey: PipelineStep[];
+}
+
+export interface Pipeline {
+  today: string;
+  summary: {
+    items: number;
+    open: number;
+    closed: number;
+    waiting: number;
+    conflicts: number;
+    notRequired: number;
+    openDeadlines: number;
+    steps: number;
+  };
+  stages: PipelineStage[];
+  side: PipelineStage[];
+  sources: { id: string; label: string; count: number }[];
+  agents: { id: string; label: string; description: string; count: number; unit: string }[];
+  outputs: { id: string; label: string; items: { label: string; detail: string; tone: string; href?: string }[] }[];
+  items: PipelineItem[];
+}

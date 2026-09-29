@@ -26,6 +26,7 @@ import type {
   MonthClose,
   MonthKey,
   NeedsYouItem,
+  Pipeline,
   SourcesData,
 } from "./types";
 
@@ -303,6 +304,18 @@ export async function uploadEvidence(file: File): Promise<AnswerResult> {
   const body = new FormData();
   body.append("file", file);
   return request<AnswerResult>("/api/evidence", { method: "POST", body }, () => ({ ok: true }), () => ({ ok: true }));
+}
+
+/* ---------- Diagram: what the engine is doing (engine or backend only; no sample) ---------- */
+
+function isPipeline(v: unknown): Pipeline | null {
+  return isRecord(v) && Array.isArray(v.stages) && Array.isArray(v.items) && isRecord(v.summary) ? (v as unknown as Pipeline) : null;
+}
+
+/** Null when there is no engine or backend to ask: the diagram shows real work only, never sample data. */
+export async function getPipeline(): Promise<Pipeline | null> {
+  if (!browserEngine && !hasApi) return null;
+  return request<Pipeline | null>("/api/pipeline", { method: "GET" }, isPipeline, () => null);
 }
 
 /* ---------- Audit and accountant (sample data unless the browser engine runs) ---------- */

@@ -13,6 +13,7 @@ export const desktopNav: NavItem[] = [
   { href: "/documents", label: "Documents", icon: "document" },
   { href: "/sources", label: "Sources", icon: "link" },
   { href: "/activity", label: "Activity", icon: "activity" },
+  { href: "/diagram", label: "Diagram", icon: "flow" },
   { href: "/ask", label: "Ask", icon: "ask" },
 ];
 

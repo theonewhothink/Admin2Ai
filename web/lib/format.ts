@@ -44,7 +44,7 @@ const timeFormat = new Intl.DateTimeFormat("en-GB", {
   hour: "2-digit",
   minute: "2-digit",
   hour12: false,
-  timeZone: "Europe/Madrid",
+  timeZone: "Europe/Lisbon",
 });
 
 /** 29 September */
@@ -73,18 +73,18 @@ export function formatMonthYear(key: MonthKey): string {
   return monthYear.format(utcDate(`${key}-01`));
 }
 
-/** 09:12 (Madrid time) */
+/** 09:12 (Lisbon time, like the engine) */
 export function formatTime(isoDateTime: string): string {
   return timeFormat.format(new Date(isoDateTime));
 }
 
-/** Calendar day (YYYY-MM-DD) of a timestamp, in Madrid time. */
+/** Calendar day (YYYY-MM-DD) of a timestamp, in Lisbon time. */
 export function localDay(isoDateTime: string): ISODate {
   const parts = new Intl.DateTimeFormat("en-CA", {
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
-    timeZone: "Europe/Madrid",
+    timeZone: "Europe/Lisbon",
   }).format(new Date(isoDateTime));
   return parts;
 }
