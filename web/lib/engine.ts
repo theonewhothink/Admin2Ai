@@ -19,9 +19,10 @@
  * everything after that.
  */
 
-export const browserEngine = process.env.NEXT_PUBLIC_ENGINE === "browser";
+import { BASE_PATH, browserEngine } from "./mode";
 
-const BASE_PATH = (process.env.NEXT_PUBLIC_BASE_PATH ?? "").replace(/\/+$/, "");
+export { browserEngine };
+
 const VERSION = process.env.NEXT_PUBLIC_ENGINE_BUILD ?? "dev";
 const JOURNAL_KEY = "admin2ai:engine-journal";
 const JOURNAL_MAX_CHARS = 3_000_000;

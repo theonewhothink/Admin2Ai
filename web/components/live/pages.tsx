@@ -1,10 +1,12 @@
 "use client";
 
 /**
- * Pages as they run on the static site (NEXT_PUBLIC_ENGINE=browser): the data
- * is loaded in the browser from the in-browser engine, then handed to the same
- * views the server renders in the other modes.
+ * Pages as they run when the data loads in the browser: on the static site
+ * (NEXT_PUBLIC_ENGINE=browser) from the in-browser engine, and in production
+ * from the API with the owner's session. The data is handed to the same views
+ * the server renders in the other modes.
  */
+import dynamic from "next/dynamic";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { AccountantClientView } from "@/components/accountant/AccountantClientView";
@@ -18,6 +20,7 @@ import { AuditView } from "@/components/flow/AuditView";
 import { HomeView } from "@/components/home/HomeView";
 import { NeedsYouList } from "@/components/needs/NeedsYouList";
 import { SettingsView } from "@/components/SettingsView";
+import { useSession } from "@/components/session/context";
 import { SourcesView } from "@/components/SourcesView";
 import {
   getAccountantClient,
@@ -32,6 +35,8 @@ import {
   getPipeline,
   getSources,
 } from "@/lib/api";
+import { production } from "@/lib/mode";
+import { ownerFrom } from "@/lib/owner";
 import type { MonthKey, Pipeline } from "@/lib/types";
 import { Loading } from "./Loading";
 import { useData } from "./useData";
@@ -108,9 +113,15 @@ export function LiveCompany({ id }: { id: string }) {
   return <CompanyView company={data.company} monthKey={data.monthKey} month={data.month} />;
 }
 
+// Production only: loaded on demand so the demo never ships account code in its pages.
+const AccountSection = dynamic(() => import("@/components/auth/AccountSection").then((m) => m.AccountSection));
+
 export function LiveSettings() {
   const home = useData(getHome);
-  return home ? <SettingsView home={home} /> : <Loading />;
+  const session = useSession();
+  if (!home) return <Loading />;
+  if (!production) return <SettingsView home={home} />;
+  return <SettingsView home={home} who={session ? ownerFrom(session) : null} account={<AccountSection />} />;
 }
 
 export function LiveAudit() {

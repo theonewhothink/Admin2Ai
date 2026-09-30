@@ -7,11 +7,12 @@
  *   in the visitor's own browser on the fixed demo business, so nothing
  *   private is behind it.
  * - With a backend: admins only. The role comes from the signed-in session
- *   (`viewerRole`). Until sign-in exists there is no session, so the dashboard
- *   stays closed. The backend's counterpart is `admin_only()` in
- *   backend/src/backoffice/internal.py, which marks every /api/internal/ path.
+ *   (`viewerRole`, GET /api/auth/me). Without a session the dashboard stays
+ *   closed. The server enforces the same rule on every /api/internal/ path
+ *   (admin role required in production mode).
  */
-import { browserEngine } from "./engine";
+import { browserEngine } from "./mode";
+import type { Session } from "./owner";
 
 export type Role = "owner" | "accountant" | "admin";
 
@@ -20,7 +21,8 @@ export function canOpenInternal(role: Role | null): boolean {
   return role === "admin";
 }
 
-/** The signed-in person's role, or null when nobody is signed in (always, until sign-in exists). */
-export function viewerRole(): Role | null {
-  return null;
+/** The signed-in person's role, or null when nobody is signed in. */
+export function viewerRole(session: Session | null): Role | null {
+  const role = session?.role;
+  return role === "owner" || role === "accountant" || role === "admin" ? role : null;
 }

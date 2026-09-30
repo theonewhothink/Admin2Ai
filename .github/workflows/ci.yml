@@ -59,6 +59,20 @@ jobs:
         env:
           NEXT_TELEMETRY_DISABLED: "1"
 
+      # Production mode (sign-in on): builds again and drives Chromium through
+      # sign-in, sign-up, onboarding and Settings → Account against a mock of
+      # the production API contract (tests/e2e.py; data comes from the engine).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Production mode in a browser
+        run: |
+          pip install "playwright==1.56.0" pydantic
+          python -m playwright install --with-deps chromium
+          python tests/e2e.py production
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+
   mobile:
     name: Mobile (Expo, TypeScript)
     runs-on: ubuntu-24.04

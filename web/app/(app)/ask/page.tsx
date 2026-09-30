@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { Suspense } from "react";
 import { ChatClient } from "@/components/ask/ChatClient";
 import { LiveAsk } from "@/components/live/pages";
-import { browserEngine } from "@/lib/api";
+import { clientRendered } from "@/lib/api";
 import { askExamples } from "@/lib/data";
 
 export const metadata: Metadata = { title: "Ask" };
@@ -21,7 +21,7 @@ export default async function AskPage({
 }: {
   searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
 }) {
-  if (browserEngine) {
+  if (clientRendered) {
     return (
       <div className="container-narrow page">
         <Head />

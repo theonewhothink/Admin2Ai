@@ -8,7 +8,7 @@ import styles from "./flow.module.css";
 
 const STEPS = ["Account", "Company", "Email", "Bank", "Accountant", "Start"] as const;
 
-type Pending = "idle" | "working" | "done";
+export type Pending = "idle" | "working" | "done";
 
 /** Small helper: flips idle → working → done after a pause. */
 function useFakeTask(ms: number) {
@@ -90,7 +90,7 @@ interface StepProps {
   onNext: () => void;
 }
 
-function StepHead({ headingRef, title, text }: { headingRef: StepProps["headingRef"]; title: string; text: string }) {
+export function StepHead({ headingRef, title, text }: { headingRef: StepProps["headingRef"]; title: string; text: string }) {
   return (
     <div className={styles.stepHead}>
       <h1 ref={headingRef} tabIndex={-1} className="h1">
@@ -101,7 +101,7 @@ function StepHead({ headingRef, title, text }: { headingRef: StepProps["headingR
   );
 }
 
-function ProviderButton({
+export function ProviderButton({
   icon,
   label,
   sub,

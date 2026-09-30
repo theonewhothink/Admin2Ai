@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { call } from "@/lib/api";
 import { formatDayShort, formatTime } from "@/lib/format";
+import { production } from "@/lib/mode";
 import type { Connection } from "@/lib/types";
 import { Icon } from "./Icon";
 import styles from "./ConnectionBanner.module.css";
@@ -14,10 +16,50 @@ const what: Record<Connection["kind"], string> = {
   accountant: "Your accountant’s inbox",
 };
 
+/**
+ * Production: ask the API to reconnect. It either answers with a consent page
+ * to open (authorizeUrl / redirectUrl) or says the connection works again.
+ * Never shows "connected again" unless the API said so.
+ */
+async function reconnectForReal(id: string): Promise<{ ok: boolean; go?: string; message?: string }> {
+  const r = await call<{ authorizeUrl?: string; redirectUrl?: string; message?: string }>(
+    "POST",
+    `/api/connections/${encodeURIComponent(id)}/reconnect`,
+    {},
+  );
+  const go = r.body.authorizeUrl ?? r.body.redirectUrl;
+  if (r.ok && typeof go === "string" && /^https?:\/\//.test(go)) return { ok: true, go };
+  return { ok: r.ok, message: r.ok ? undefined : (r.body.message ?? "I couldn’t reconnect it. Try again in a moment.") };
+}
+
 export function ConnectionBanner({ connection }: { connection: Connection }) {
   const [phase, setPhase] = useState<Phase>("stale");
+  const [problem, setProblem] = useState<string | null>(null);
+
+  const reconnect = async () => {
+    setPhase("connecting");
+    setProblem(null);
+    if (!production) return; // The demo reconnects on a timer (below).
+    const r = await reconnectForReal(connection.id);
+    if (r.go) {
+      window.location.assign(r.go);
+      return;
+    }
+    if (r.ok) setPhase("done");
+    else {
+      setPhase("stale");
+      setProblem(r.message ?? null);
+    }
+  };
 
   useEffect(() => {
+    if (production) {
+      if (phase === "done") {
+        const t = setTimeout(() => setPhase("gone"), 2600);
+        return () => clearTimeout(t);
+      }
+      return;
+    }
     if (phase === "connecting") {
       const t = setTimeout(() => setPhase("done"), 1100);
       return () => clearTimeout(t);
@@ -46,13 +88,14 @@ export function ConnectionBanner({ connection }: { connection: Connection }) {
           ) : (
             <p className={styles.text}>
               <strong>{connection.name} needs reconnecting.</strong> {what[connection.kind]} has not synced since {since}.
+              {problem ? <> {problem}</> : null}
             </p>
           )}
           {phase === "stale" || phase === "connecting" ? (
             <button
               type="button"
               className={`btn btn-secondary ${styles.action}`}
-              onClick={() => setPhase("connecting")}
+              onClick={() => void reconnect()}
               disabled={phase === "connecting"}
             >
               {phase === "connecting" ? "Reconnecting…" : "Reconnect"}

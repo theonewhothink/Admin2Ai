@@ -4,7 +4,7 @@ import { Suspense } from "react";
 import { CompanyView } from "@/components/companies/CompanyView";
 import { Loading } from "@/components/live/Loading";
 import { LiveCompany } from "@/components/live/pages";
-import { browserEngine, getCompanies, getCompany, getMonth } from "@/lib/api";
+import { browserEngine, clientRendered, getCompanies, getCompany, getMonth, production } from "@/lib/api";
 
 type Props = {
   params: Promise<{ id: string }>;
@@ -18,13 +18,15 @@ export async function generateStaticParams() {
 }
 
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
+  // Production data needs the owner's session, which only the browser has.
+  if (production) return { title: "Your business" };
   const { id } = await params;
   const company = await getCompany(id);
   return { title: company?.name ?? "Company" };
 }
 
 export default async function CompanyPage({ params, searchParams }: Props) {
-  if (browserEngine) {
+  if (clientRendered) {
     const { id } = await params;
     return (
       <Suspense fallback={<Loading />}>

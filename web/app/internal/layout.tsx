@@ -1,5 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import { AdminShell } from "@/components/internal/AdminShell";
+import { SessionProvider } from "@/components/session/SessionProvider";
+import { production } from "@/lib/mode";
 
 /** The team's internal dashboard ("Admin OS"). Never indexed; admin-only once sign-in exists. */
 export const metadata: Metadata = {
@@ -13,5 +15,7 @@ export const viewport: Viewport = {
 };
 
 export default function InternalLayout({ children }: { children: React.ReactNode }) {
-  return <AdminShell>{children}</AdminShell>;
+  const shell = <AdminShell>{children}</AdminShell>;
+  // Production: the signed-in session decides (admins only); without one, sign in first.
+  return production ? <SessionProvider>{shell}</SessionProvider> : shell;
 }

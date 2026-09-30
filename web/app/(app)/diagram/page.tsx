@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { DiagramView } from "@/components/diagram/DiagramView";
 import { DiagramLead, LiveDiagram } from "@/components/live/pages";
-import { browserEngine, getPipeline } from "@/lib/api";
+import { clientRendered, getPipeline } from "@/lib/api";
 
 export const metadata: Metadata = { title: "Diagram" };
 
@@ -15,7 +15,7 @@ function Head() {
 }
 
 export default async function DiagramPage() {
-  if (browserEngine) {
+  if (clientRendered) {
     return (
       <div className="container page">
         <Head />

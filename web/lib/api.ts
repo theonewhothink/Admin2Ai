@@ -1,20 +1,27 @@
 /**
- * Data access. Three modes:
+ * Data access. The mode is decided in ./mode.ts:
  *
- * - NEXT_PUBLIC_ENGINE=browser: every call goes to the real Python engine
- *   running in the browser (./engine.ts). Used by the static GitHub Pages site.
- * - NEXT_PUBLIC_API_URL set: every call goes to the backend over HTTP.
- * - Neither: the sample data in ./data.ts.
+ * - demo (NEXT_PUBLIC_ENGINE=browser): every call goes to the real Python
+ *   engine running in the browser (./engine.ts). The static GitHub Pages site.
+ * - production (NEXT_PUBLIC_API_URL + NEXT_PUBLIC_REQUIRE_SIGNIN=1): every call
+ *   goes to the backend from the browser with the session cookie
+ *   (credentials: "include"), and state-changing calls carry the CSRF header
+ *   `X-Requested-With: admin2ai`. A 401 sends the owner to /signin?next=….
+ *   Nothing ever falls back to sample data: a failed read throws ApiError
+ *   (the page shows "This page didn't load."), a failed write says so.
+ * - api (NEXT_PUBLIC_API_URL only): the backend over HTTP, no sign-in.
+ * - sample: the sample data in ./data.ts.
  *
- * Whatever the mode, a call that fails, times out, or returns something
- * unexpected falls back to the sample data, so pages always render.
+ * Outside production, a call that fails, times out, or returns something
+ * unexpected falls back to the sample data, so the demo always renders.
  *
  * Safe to import from both Server and Client Components.
  */
 import { unstable_rethrow } from "next/navigation";
 import * as sample from "./data";
-import { browserEngine, engineRequest } from "./engine";
+import { engineRequest } from "./engine";
 import type { InternalOperations, InternalOverview } from "./internal-types";
+import { API_URL, BASE_PATH, browserEngine, clientRendered, production } from "./mode";
 import type {
   AccountantClientDetail,
   AccountantClientRow,
@@ -31,8 +38,9 @@ import type {
   SourcesData,
 } from "./types";
 
-const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "").replace(/\/+$/, "");
 const TIMEOUT_MS = 4000;
+/** Production reads can wait a little longer than the demo's quick fallback. */
+const PRODUCTION_TIMEOUT_MS = 15000;
 
 /** True when a backend URL is configured. */
 export const hasApi = API_URL !== "";
@@ -40,12 +48,137 @@ export const hasApi = API_URL !== "";
 /** True when pages show data computed by the engine (over HTTP or in the browser), not sample data. */
 export const liveData = hasApi || browserEngine;
 
-export { browserEngine };
+export { browserEngine, clientRendered, production };
 
 type Guard<T> = (value: unknown) => T | null;
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/* ---------- Production transport: session cookie, CSRF header, 401 → sign in ---------- */
+
+/** A production call that could not give an answer. `message` is plain language, safe to show. */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+export const OFFLINE_MESSAGE = "I couldn’t reach the server. Check your connection and try again.";
+const SERVER_MESSAGE = "Something went wrong on our side. Try again in a moment.";
+
+/**
+ * One request to the backend. In production it sends the session cookie
+ * (credentials: "include") and, on anything but GET/HEAD, the CSRF header the
+ * API requires for cookie sessions. Rejects only when the network fails.
+ */
+export function apiFetch(path: string, init: RequestInit = {}, timeoutMs = production ? PRODUCTION_TIMEOUT_MS : TIMEOUT_MS): Promise<Response> {
+  const method = (init.method ?? "GET").toUpperCase();
+  const headers: Record<string, string> = { Accept: "application/json", ...((init.headers as Record<string, string> | undefined) ?? {}) };
+  if (production && method !== "GET" && method !== "HEAD") headers["X-Requested-With"] = "admin2ai";
+  return fetch(`${API_URL}${path}`, {
+    cache: "no-store",
+    ...init,
+    method,
+    headers,
+    ...(production ? { credentials: "include" as const } : {}),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+}
+
+/** The sign-in page, coming back to `next` afterwards. */
+export function signInHref(next?: string): string {
+  const back = next && next !== "/" ? `?next=${encodeURIComponent(next)}` : "";
+  return `/signin${back}`;
+}
+
+/** The current in-app location (without the base path), for ?next=. */
+export function currentPath(): string {
+  if (typeof window === "undefined") return "/";
+  const { pathname, search, hash } = window.location;
+  const path = BASE_PATH && pathname.startsWith(BASE_PATH) ? pathname.slice(BASE_PATH.length) || "/" : pathname;
+  return `${path}${search}${hash}`;
+}
+
+/**
+ * The session is missing or expired: go to sign-in and come back here after.
+ * Never resolves in the browser (the page is leaving), so no half-loaded
+ * screen flashes; on the server it throws.
+ */
+export function toSignIn(): Promise<never> {
+  if (typeof window === "undefined") throw new ApiError("Sign in to continue.", 401);
+  const here = currentPath();
+  // Called from data loaders, outside React: a full page load also drops everything the expired session loaded.
+  // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+  if (!/^\/sign(in|up)(\/|\?|#|$)/.test(here)) window.location.assign(`${BASE_PATH}${signInHref(here)}`);
+  return new Promise<never>(() => undefined);
+}
+
+/** The server's own plain-language message, or one of ours by status. Never a stack trace. */
+export async function errorMessage(res: Response, fallback = SERVER_MESSAGE): Promise<string> {
+  let message: unknown;
+  try {
+    const body: unknown = await res.clone().json();
+    message = isRecord(body) ? body.message : undefined;
+  } catch {
+    message = undefined;
+  }
+  if (typeof message === "string" && message.trim() && message.length <= 300 && !/traceback|exception|\n\s+at\s/i.test(message)) {
+    return message.trim();
+  }
+  if (res.status === 429) return "Too many attempts. Wait a few minutes, then try again.";
+  if (res.status >= 500) return SERVER_MESSAGE;
+  return fallback;
+}
+
+/** A production read: data, or ApiError. 401 goes to sign-in. */
+async function productionRead<T>(path: string, init: RequestInit, guard: Guard<T>, notFound?: { value: T }): Promise<T> {
+  let res: Response;
+  try {
+    res = await apiFetch(path, init);
+  } catch {
+    throw new ApiError(OFFLINE_MESSAGE, 0);
+  }
+  if (res.status === 401) return toSignIn();
+  if (res.status === 404 && notFound) return notFound.value;
+  if (!res.ok) throw new ApiError(await errorMessage(res), res.status);
+  let parsed: unknown;
+  try {
+    const text = await res.text();
+    parsed = text ? JSON.parse(text) : {};
+  } catch {
+    throw new ApiError(SERVER_MESSAGE, res.status);
+  }
+  const value = guard(parsed);
+  if (value === null) throw new ApiError(SERVER_MESSAGE, res.status);
+  return value;
+}
+
+/** A production write: `{ ok, message }`, never pretending. 401 goes to sign-in. */
+async function productionWrite(
+  path: string,
+  init: RequestInit,
+  timeoutMs?: number,
+): Promise<AnswerResult & { body: Record<string, unknown> }> {
+  let res: Response;
+  try {
+    res = await apiFetch(path, init, timeoutMs);
+  } catch {
+    return { ok: false, message: OFFLINE_MESSAGE, body: {} };
+  }
+  if (res.status === 401) return toSignIn();
+  const parsed: unknown = await res
+    .clone()
+    .json()
+    .catch(() => ({}));
+  const body = isRecord(parsed) ? parsed : {};
+  if (!res.ok) return { ok: false, message: await errorMessage(res, "I couldn’t save that. Try again."), body };
+  return { ok: true, message: typeof body.message === "string" ? body.message : undefined, body };
 }
 
 /** Accept either a bare array or `{ [key]: [...] }`. */
@@ -95,14 +228,10 @@ async function request<T>(
   engineNotFound?: { value: T },
 ): Promise<T> {
   if (browserEngine) return viaEngine(init.method ?? "GET", path, engineBody, guard, fallback, engineNotFound);
+  if (production) return productionRead(path, init, guard, engineNotFound);
   if (!hasApi) return fallback();
   try {
-    const res = await fetch(`${API_URL}${path}`, {
-      cache: "no-store",
-      ...init,
-      headers: { Accept: "application/json", ...(init.headers ?? {}) },
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    });
+    const res = await apiFetch(path, init);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const text = await res.text();
     const parsed: unknown = text ? JSON.parse(text) : {};
@@ -230,6 +359,14 @@ export async function answerNeedsYou(id: string, optionId: string, remember: boo
   if (browserEngine) {
     return engineWrite(`/api/needs-you/${encodeURIComponent(id)}/answer`, { option_id: optionId, remember });
   }
+  if (production) {
+    const { ok, message } = await productionWrite(`/api/needs-you/${encodeURIComponent(id)}/answer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ option_id: optionId, remember }),
+    });
+    return { ok, message };
+  }
   if (!hasApi) {
     await pause(450);
     return { ok: true };
@@ -269,6 +406,21 @@ function sampleAnswer(question: string): AskAnswer {
 }
 
 export async function ask(question: string): Promise<AskAnswer> {
+  if (production) {
+    try {
+      return await productionRead<AskAnswer>(
+        "/api/ask",
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question }) },
+        (v) =>
+          isRecord(v) && typeof v.answer === "string"
+            ? { answer: v.answer, evidence: Array.isArray(v.evidence) ? (v.evidence as AskAnswer["evidence"]) : [] }
+            : null,
+      );
+    } catch (err) {
+      // Never an invented answer: say plainly that there is none.
+      return { answer: err instanceof ApiError ? err.message : SERVER_MESSAGE, evidence: [] };
+    }
+  }
   if (!hasApi) {
     await pause(700);
     return sampleAnswer(question);
@@ -298,12 +450,16 @@ export async function uploadEvidence(file: File): Promise<AnswerResult> {
       dataBase64: await toBase64(file),
     });
   }
+  const body = new FormData();
+  body.append("file", file);
+  if (production) {
+    const { ok, message } = await productionWrite("/api/evidence", { method: "POST", body }, 120000);
+    return { ok, message };
+  }
   if (!hasApi) {
     await pause(600 + Math.min(file.size / 2000, 900));
     return { ok: true };
   }
-  const body = new FormData();
-  body.append("file", file);
   return request<AnswerResult>("/api/evidence", { method: "POST", body }, () => ({ ok: true }), () => ({ ok: true }));
 }
 
@@ -348,41 +504,40 @@ export async function getInternalOperations(limit?: number): Promise<InternalOpe
 
 /* ---------- Audit and accountant (sample data unless the browser engine runs) ---------- */
 
+const isAudit: Guard<AuditResult> = (v) =>
+  isRecord(v) && typeof v.companyName === "string" && Array.isArray(v.findings) ? (v as unknown as AuditResult) : null;
+
 export async function getAudit(): Promise<AuditResult> {
+  if (production) return productionRead("/api/audit", { method: "GET" }, isAudit);
   if (!browserEngine) return sample.audit;
   return viaEngine<AuditResult>(
     "GET",
     "/api/audit",
     undefined,
-    (v) => (isRecord(v) && typeof v.companyName === "string" && Array.isArray(v.findings) ? (v as unknown as AuditResult) : null),
+    isAudit,
     () => sample.audit,
   );
 }
 
+const isClients: Guard<AccountantClientRow[]> = (v) => {
+  const list = arrayFrom(v, "clients");
+  return list ? list.filter((c): c is AccountantClientRow => isRecord(c) && typeof c.id === "string") : null;
+};
+
+const isClient: Guard<AccountantClientDetail | null> = (v) =>
+  isRecord(v) && typeof v.id === "string" && Array.isArray(v.evidence) ? (v as unknown as AccountantClientDetail) : null;
+
 export async function getAccountantClients(): Promise<AccountantClientRow[]> {
+  if (production) return productionRead("/api/accountant/clients", { method: "GET" }, isClients);
   if (!browserEngine) return sample.accountantClients;
-  return viaEngine<AccountantClientRow[]>(
-    "GET",
-    "/api/accountant/clients",
-    undefined,
-    (v) => {
-      const list = arrayFrom(v, "clients");
-      return list ? list.filter((c): c is AccountantClientRow => isRecord(c) && typeof c.id === "string") : null;
-    },
-    () => sample.accountantClients,
-  );
+  return viaEngine<AccountantClientRow[]>("GET", "/api/accountant/clients", undefined, isClients, () => sample.accountantClients);
 }
 
 export async function getAccountantClient(id: string): Promise<AccountantClientDetail | null> {
+  const path = `/api/accountant/clients/${encodeURIComponent(id)}`;
+  if (production) return productionRead(path, { method: "GET" }, isClient, { value: null });
   if (!browserEngine) return sample.accountantClientDetail(id);
-  return viaEngine<AccountantClientDetail | null>(
-    "GET",
-    `/api/accountant/clients/${encodeURIComponent(id)}`,
-    undefined,
-    (v) => (isRecord(v) && typeof v.id === "string" && Array.isArray(v.evidence) ? (v as unknown as AccountantClientDetail) : null),
-    () => sample.accountantClientDetail(id),
-    { value: null },
-  );
+  return viaEngine<AccountantClientDetail | null>("GET", path, undefined, isClient, () => sample.accountantClientDetail(id), { value: null });
 }
 
 export function getSources(): Promise<SourcesData> {
@@ -418,12 +573,12 @@ async function sourceWrite(path: string, body: unknown): Promise<SourceChange> {
   }
   if (!hasApi) return { ok: false, message: "Connect the backend to add sources." };
   try {
-    const res = await fetch(`${API_URL}${path}`, {
+    const res = await apiFetch(path, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body ?? {}),
-      signal: AbortSignal.timeout(TIMEOUT_MS),
     });
+    if (production && res.status === 401) return toSignIn();
     const b: unknown = await res.json().catch(() => ({}));
     const r = isRecord(b) ? b : {};
     return {
@@ -433,7 +588,7 @@ async function sourceWrite(path: string, body: unknown): Promise<SourceChange> {
       authorizeUrl: typeof r.authorizeUrl === "string" ? r.authorizeUrl : undefined,
     };
   } catch {
-    return { ok: false, message: "I couldn't reach the server. Try again." };
+    return { ok: false, message: OFFLINE_MESSAGE };
   }
 }
 
@@ -466,16 +621,20 @@ export async function call<T = Record<string, unknown>>(method: "GET" | "POST", 
   }
   if (!hasApi) return offline;
   try {
-    const res = await fetch(`${API_URL}${path}`, {
-      method,
-      headers: { Accept: "application/json", ...(body !== undefined ? { "Content-Type": "application/json" } : {}) },
-      body: method === "POST" ? JSON.stringify(body ?? {}) : undefined,
-      signal: AbortSignal.timeout(30000),
-    });
+    const res = await apiFetch(
+      path,
+      {
+        method,
+        headers: body !== undefined ? { "Content-Type": "application/json" } : {},
+        body: method === "POST" ? JSON.stringify(body ?? {}) : undefined,
+      },
+      30000,
+    );
+    if (production && res.status === 401) return toSignIn();
     const parsed: unknown = await res.json().catch(() => ({}));
     return { ok: res.ok, status: res.status, body: parsed as T };
   } catch {
-    return { ...offline, body: { message: "I couldn't reach the server. Try again." } as unknown as T };
+    return { ...offline, body: { message: OFFLINE_MESSAGE } as unknown as T };
   }
 }
 

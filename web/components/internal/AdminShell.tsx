@@ -8,6 +8,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useId, useRef, useState } from "react";
+import { useSession } from "@/components/session/context";
 import { canOpenInternal, viewerRole } from "@/lib/internal-access";
 import { AdminIcon, type AdminIconName } from "./icons";
 import { useOverview } from "./store";
@@ -207,7 +208,8 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
   const menuButton = useRef<HTMLButtonElement>(null);
   const drawerRef = useRef<HTMLDivElement>(null);
   const pathname = usePathname();
-  const allowed = canOpenInternal(viewerRole());
+  const session = useSession();
+  const allowed = canOpenInternal(viewerRole(session));
 
   // Close the phone menu when the page changes.
   const [lastPath, setLastPath] = useState(pathname);

@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { AccountantClientView } from "@/components/accountant/AccountantClientView";
 import { LiveAccountantClient } from "@/components/live/pages";
-import { browserEngine, getAccountantClient, getAccountantClients, getCompanies } from "@/lib/api";
+import { browserEngine, clientRendered, getAccountantClient, getAccountantClients, getCompanies, production } from "@/lib/api";
 
 type Props = { params: Promise<{ clientId: string }> };
 
@@ -14,6 +14,8 @@ export async function generateStaticParams() {
 }
 
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
+  // Production data needs the signed-in session, which only the browser has.
+  if (production) return { title: "Client" };
   const { clientId } = await params;
   const client = await getAccountantClient(clientId);
   return { title: client?.name ?? "Client" };
@@ -21,7 +23,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
 
 export default async function AccountantClientPage({ params }: Props) {
   const { clientId } = await params;
-  if (browserEngine) return <LiveAccountantClient id={clientId} />;
+  if (clientRendered) return <LiveAccountantClient id={clientId} />;
   const client = await getAccountantClient(clientId);
   if (!client) notFound();
   return <AccountantClientView client={client} />;

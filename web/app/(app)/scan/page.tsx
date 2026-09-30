@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Icon } from "@/components/Icon";
 import { ScanDropzone } from "@/components/ScanDropzone";
 import { owner } from "@/lib/data";
+import { production } from "@/lib/mode";
 
 export const metadata: Metadata = { title: "Add a receipt" };
 
@@ -19,13 +20,16 @@ export default function ScanPage() {
 
       <ScanDropzone />
 
-      <div className="notice" style={{ marginTop: "var(--s-3)" }}>
-        <Icon name="mail" size={20} style={{ color: "var(--text-2)", marginTop: 2 }} />
-        <p>
-          You can also forward receipts by email to <span className="mono">{inbox}</span>. Most of the time you won’t
-          need to: I already collect them from your inbox.
-        </p>
-      </div>
+      {/* The forwarding address below is the sample owner's; production has no per-owner inbox address yet. */}
+      {production ? null : (
+        <div className="notice" style={{ marginTop: "var(--s-3)" }}>
+          <Icon name="mail" size={20} style={{ color: "var(--text-2)", marginTop: 2 }} />
+          <p>
+            You can also forward receipts by email to <span className="mono">{inbox}</span>. Most of the time you won’t
+            need to: I already collect them from your inbox.
+          </p>
+        </div>
+      )}
     </div>
   );
 }

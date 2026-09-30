@@ -2,7 +2,8 @@ import { Icon, type IconName } from "@/components/Icon";
 import { Status } from "@/components/ui";
 import { ReportDelivery } from "@/components/documents/ReportDelivery";
 import { owner } from "@/lib/data";
-import type { ConnectionKind, HomeData } from "@/lib/types";
+import { production } from "@/lib/mode";
+import type { ConnectionKind, HomeData, Owner } from "@/lib/types";
 
 const kindIcon: Record<ConnectionKind, IconName> = { email: "mail", bank: "bank", accountant: "users" };
 
@@ -13,14 +14,20 @@ const remembered = [
   "Adobe is software for Company C.",
 ];
 
-export function SettingsView({ home }: { home: HomeData }) {
+/**
+ * `who` is the signed-in owner in production (the sample owner elsewhere);
+ * `account` is the production-only Account section (export, delete).
+ */
+export function SettingsView({ home, who = owner, account }: { home: HomeData; who?: Owner | null; account?: React.ReactNode }) {
   return (
     <div className="container-narrow page">
       <header className="page-head">
         <h1 className="h1">Settings</h1>
-        <p className="lead">
-          {owner.fullName} · {owner.email}
-        </p>
+        {who ? (
+          <p className="lead">
+            {who.fullName} · {who.email}
+          </p>
+        ) : null}
       </header>
 
       <div className="stack-6">
@@ -45,22 +52,25 @@ export function SettingsView({ home }: { home: HomeData }) {
           </ul>
         </section>
 
-        <section aria-labelledby="rules-h">
-          <div className="section-head">
-            <h2 id="rules-h" className="h2">
-              Things I remember
-            </h2>
-            <span className="meta">From your answers</span>
-          </div>
-          <ul className="card list">
-            {remembered.map((r) => (
-              <li key={r} className="list-row">
-                <Icon name="bookmark" size={18} style={{ color: "var(--text-2)" }} />
-                <span style={{ flex: 1 }}>{r}</span>
-              </li>
-            ))}
-          </ul>
-        </section>
+        {/* Example rules: real customers never see another business's answers. */}
+        {production ? null : (
+          <section aria-labelledby="rules-h">
+            <div className="section-head">
+              <h2 id="rules-h" className="h2">
+                Things I remember
+              </h2>
+              <span className="meta">From your answers</span>
+            </div>
+            <ul className="card list">
+              {remembered.map((r) => (
+                <li key={r} className="list-row">
+                  <Icon name="bookmark" size={18} style={{ color: "var(--text-2)" }} />
+                  <span style={{ flex: 1 }}>{r}</span>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
 
         <section aria-labelledby="notify-h">
           <div className="section-head">
@@ -83,6 +93,7 @@ export function SettingsView({ home }: { home: HomeData }) {
             </label>
           </div>
         </section>
+        {account}
       </div>
     </div>
   );

@@ -9,7 +9,7 @@ import { ProfileMenu } from "./ProfileMenu";
 import { desktopNav, isActive } from "./nav-items";
 import styles from "./shell.module.css";
 
-export function AppHeader({ needsIds, owner, sampleData }: { needsIds: string[]; owner: Owner; sampleData: boolean }) {
+export function AppHeader({ needsIds, owner, sampleData }: { needsIds: string[]; owner?: Owner; sampleData: boolean }) {
   const pathname = usePathname();
   return (
     <header className={styles.header}>
