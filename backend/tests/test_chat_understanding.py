@@ -483,3 +483,33 @@ def test_claude_brain_uses_spending_summary(svc):
     assert out["reply"] == "€242.29 in August." and [c["type"] for c in out["cards"]] == ["spending"]
     result = next(m for m in seen[1]["messages"] if isinstance(m["content"], list) and m["role"] == "user")["content"][0]
     assert result["type"] == "tool_result" and "242.29" in result["content"]
+
+
+# --- Regression: an unrelated question never gets the previous topic's answer -------------------------
+
+def _conversation(svc, questions):
+    history, replies = [], []
+    for q in questions:
+        status, body = svc.dispatch("POST", "/api/chat", {"message": q, "history": history})
+        assert status == 200, body
+        replies.append(body["reply"])
+        history += [{"role": "user", "content": q}, {"role": "assistant", "content": body["reply"]}]
+    return replies
+
+
+def test_unrelated_questions_after_a_topic_get_the_honest_fallback():
+    svc = BackOfficeService.demo()
+    replies = _conversation(svc, ["is september closed?", "what's the weather in porto",
+                                  "who won the football yesterday"])
+    assert "Company C needs one answer" in replies[0]
+    for reply in replies[1:]:
+        assert reply.startswith("I can't answer that from your records."), reply
+        assert "€" not in reply and "closed" not in reply.split(".")[0]
+
+
+def test_follow_up_chain_keeps_each_change():
+    svc = BackOfficeService.demo()
+    replies = _conversation(svc, ["what are my august expenses?", "and in september?", "what about company c?"])
+    assert replies[0].startswith("You spent €242.29 in August")
+    assert replies[1].startswith("You spent €5,024.53 in September")
+    assert replies[2].startswith("Company C spent") and "in September" in replies[2]  # not August

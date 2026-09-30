@@ -776,6 +776,30 @@ _HELP = re.compile(r"^(?:help|help me|what can you do|what do you do|how does th
 _THANKS = re.compile(r"^(?:(?:thanks?|thank you|thx|ty|cheers|obrigad[oa]|great|perfect|ok|okay|cool|nice|"
                      r"got it|brilliant|excellent|awesome|super|lovely|good|fine)(?: (?:a lot|so much|very much|"
                      r"again|for (?:that|this|the help|your help)|you))*[\s!.]*)+$")
+# Words an elliptical follow-up may carry besides names, periods and categories:
+# "and in September?", "what about Company C?", "same for last year", "e em agosto?".
+_FOLLOW_FILLER = frozenset("""
+and what about how same for also now then in on at of the a an it its that this those these them one ones
+please only just by from to with is are was were did do does was so ok okay again too as well or vs versus
+compared compare than last previous next this past year years month months quarter week weeks day days
+e em no na nos nas de do da dos das para o a os as tambem mesmo e sobre ano mes semana
+""".split())
+
+
+def unrelated_words(text: str, vocab: Vocabulary) -> set[str]:
+    """Content words in ``text`` that are not names, periods, categories, amounts or follow-up filler.
+
+    An elliptical follow-up ("and in August?", "what about Adobe?") has none;
+    "what is the weather in Porto?" has "weather", so it is a new question,
+    never the previous one again.
+    """
+    names = {w for vs in (*vocab.companies.values(), *vocab.suppliers.values(), *vocab.categories.values())
+             for v in vs for w in v.split()}
+    words = re.findall(r"[a-z]+", text)
+    known = _FOLLOW_FILLER | names | set(_EN) | set(_PT) | {m[:3] for m in _EN} | _KEYWORDS
+    return {w for w in words if len(w) > 1 and w not in known}
+
+
 _FOLLOW_UP = re.compile(r"^(?:and|what about|how about|and what about|and how about|same for|and for|also|now|"
                         r"then|e|e em|e no|e na)\b")
 
@@ -853,7 +877,10 @@ def understand(message: str, vocab: Vocabulary, today: date) -> Understanding:
     follow_up = bool(_FOLLOW_UP.match(t))
     u = Understanding("unknown", 0.0, slots, t, scores, follow_up=follow_up)
     if not ranked or ranked[0][1] < THRESHOLD:
-        u.intent, u.score = ("clarify", ranked[0][1] if ranked else 0.0) if not slots.empty() else ("unknown", 0.0)
+        # Only names or a period and nothing else ("August?"): ask which question. With other words
+        # the owner asked something I don't do ("who won the football yesterday?"): say so instead.
+        vague = not slots.empty() and not (unrelated_words(t, vocab) and not ranked)
+        u.intent, u.score = ("clarify", ranked[0][1] if ranked else 0.0) if vague else ("unknown", 0.0)
         if u.intent == "clarify":
             u.options = _slot_options(slots)
             u.clarify = _slot_question(slots, vocab, today)

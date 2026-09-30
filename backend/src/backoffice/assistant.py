@@ -46,6 +46,7 @@ from backoffice.understanding import (
     month_period,
     period_between,
     understand,
+    unrelated_words,
 )
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -573,33 +574,55 @@ class RuleBrain:
         return answer
 
     def _with_history(self, u: Understanding, history: list[dict[str, str]] | None) -> Understanding:
-        """Follow-ups ("and in August?", "what about Company C?") and answers to a clarifying question."""
+        """Follow-ups ("and in August?", "what about Company C?") and answers to a clarifying question.
+
+        Only an elliptical message borrows from earlier turns: one with nothing in it
+        but names, periods, categories and filler. "What is the weather in Porto?"
+        after "is September closed?" is a new question and never gets the old answer.
+        """
         if not history or u.intent in ("greeting", "thanks", "help"):
             return u
         turns = [h for h in history if isinstance(h, dict) and isinstance(h.get("content"), str)]
-        users = [h["content"] for h in turns if h.get("role") == "user"][-3:]
+        users = [h["content"] for h in turns if h.get("role") == "user"][-4:]
         replies = [h["content"] for h in turns if h.get("role") == "assistant"]
         asked_back = bool(replies) and replies[-1].rstrip().endswith("?")
-        if not users or not (u.intent in ("clarify", "unknown") or u.follow_up or asked_back):
+        if not users:
             return u
-        for text in reversed(users):
-            older = understand(text, self.vocab, self.today)
-            if older.intent in ("greeting", "thanks", "help", "unknown"):
-                continue
+        if asked_back:  # the owner answers the question I asked ("the first one", "spending")
+            older = understand(users[-1], self.vocab, self.today)
             if older.intent == "clarify":
-                if not asked_back:
-                    continue
                 pick = self._pick(u, older.options)
-                if pick is None:
-                    return u
-                return replace(u, intent=pick, score=max(u.score, 0.6), slots=u.slots.merged_from(older.slots))
-            if u.intent in ("clarify", "unknown"):
-                # "is it closed?" after a spending question: the weak reading of this message wins over the old one.
-                weak = max(u.scores, key=lambda k: u.scores[k]) if u.scores else older.intent
-                return replace(u, intent=weak, score=max(u.scores.get(weak, 0.0), older.score),
-                               slots=u.slots.merged_from(older.slots))
-            return replace(u, slots=u.slots.merged_from(older.slots))
-        return u
+                if pick is not None:
+                    return replace(u, intent=pick, score=max(u.score, 0.6), slots=u.slots.merged_from(older.slots))
+        if not (u.intent in ("clarify", "unknown") or u.follow_up) or unrelated_words(u.text, self.vocab):
+            return u
+        ctx = self._thread(users)
+        if ctx is None:
+            return u
+        if u.intent in ("clarify", "unknown"):
+            # "is it closed?" after a spending question: this message's own weak reading wins over the old one.
+            weak = max(u.scores, key=lambda k: u.scores[k]) if u.scores else ctx.intent
+            return replace(u, intent=weak, score=max(u.scores.get(weak, 0.0), ctx.score),
+                           slots=u.slots.merged_from(ctx.slots))
+        return replace(u, slots=u.slots.merged_from(ctx.slots))
+
+    def _thread(self, users: list[str]) -> Understanding | None:
+        """The question the conversation is about, with each follow-up's changes applied in order."""
+        ctx: Understanding | None = None
+        for text in users:
+            older = understand(text, self.vocab, self.today)
+            if older.intent in ("greeting", "thanks", "help"):
+                continue
+            if unrelated_words(older.text, self.vocab) and older.intent in ("clarify", "unknown"):
+                ctx = None  # an unrelated question breaks the thread
+            elif older.intent not in ("clarify", "unknown") and not older.follow_up:
+                ctx = older
+            elif ctx is not None:
+                intent = ctx.intent if older.intent in ("clarify", "unknown") else older.intent
+                ctx = replace(ctx, intent=intent, slots=older.slots.merged_from(ctx.slots))
+            elif older.intent not in ("clarify", "unknown"):
+                ctx = older
+        return ctx
 
     @staticmethod
     def _pick(u: Understanding, options: tuple[str, ...]) -> str | None:
