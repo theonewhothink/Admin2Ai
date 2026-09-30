@@ -40,6 +40,7 @@ __all__ = [
     "HardApproval",
     "VerificationChannel",
     "beneficiary_proposals",
+    "new_beneficiary_ibans",
     "trust_iban",
 ]
 
@@ -116,6 +117,30 @@ def _refusal(supplier: Supplier, iban: str, approval: HardApproval | None) -> st
     if normalize_iban(approval.iban) != normalize_iban(iban):
         return "approval_for_another_iban"
     return None
+
+
+def new_beneficiary_ibans(
+    supplier: Supplier | None, ibans: Iterable[str | None], *, own_ibans: Iterable[str] = ()
+) -> tuple[str, ...]:
+    """The bank accounts in ``ibans`` a payment to this supplier would go to that its profile does not trust.
+
+    Every one of them is a new beneficiary: whatever brought it (the first copy of an invoice, a later copy that
+    adds bank details, an answer choosing between two copies) it goes through the fraud checks and is held for
+    the owner's out-of-band verification (:func:`trust_iban`); nothing here trusts it. The business's own
+    accounts are never a supplier's beneficiary. Invalid numbers are returned as written (never trusted).
+    Normalized, in order, without repeats.
+    """
+    trusted = {normalize_iban(i) for i in (supplier.known_ibans if supplier is not None else []) if i}
+    own = {normalize_iban(i) for i in own_ibans if i}
+    out: list[str] = []
+    for raw in ibans:
+        if not raw or not str(raw).strip():
+            continue
+        iban = normalize_iban(str(raw))
+        if iban in own or iban in trusted or iban in out:
+            continue
+        out.append(iban)
+    return tuple(out)
 
 
 def trust_iban(

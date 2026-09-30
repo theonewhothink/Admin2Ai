@@ -596,9 +596,13 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
             label = "Google" if provider == "google" else "Microsoft"
             raise AuthError(503, "unavailable", f"{label} sign-in is not set up on this server yet.")
         if address:
+            body: dict[str, Any] = {"kind": "email", "provider": provider, "address": address}
+            # A shared, delegated or alias mailbox read through the owner's own sign-in (checklist O2).
+            for name in ("mailbox", "signInAs"):
+                if request.query_params.get(name):
+                    body[name] = request.query_params[name].strip()
             status, out = await run_in_threadpool(manager.command, principal.tenant.id, principal.user.id, "POST",
-                                                  "/api/sources", {"kind": "email", "provider": provider,
-                                                                   "address": address})
+                                                  "/api/sources", body)
             url = out.get("authorizeUrl") if status == 200 else None
             return RedirectResponse(url or f"{web}/sources/?signin=failed", status_code=302)
         pending = f"mail-{provider}-{secrets.token_hex(6)}"

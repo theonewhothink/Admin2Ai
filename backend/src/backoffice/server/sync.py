@@ -99,6 +99,9 @@ class _Connection:
     healthy: bool
     saved: Mapping[str, Any] | None  # the connector state the last sync recorded
     ibans: Mapping[str, str]  # our bank accounts by IBAN (banks only)
+    # Whose mailbox it reads (checklist O2): "shared" or "delegated" (Microsoft 365 through /users/{address}; a
+    # Google mailbox delegated to the signed-in account), "alias" (Gmail: only mail delivered to the address).
+    mailbox: str = "own"
 
     @property
     def key(self) -> str:
@@ -267,6 +270,9 @@ class SyncWorker:
             report.skipped.append(c.key)
             return
         state = self._state(c, meta.provider)
+        if c.kind == "email" and meta.expires_at is not None and state.auth_expires_at != meta.expires_at:
+            # An OAuth grant with a stated end: the state the sync records carries it (the owner is reminded, R4).
+            state = state.model_copy(update={"auth_expires_at": meta.expires_at})
         if state.reconnect_required:  # waiting for the owner to reconnect (they were told)
             report.skipped.append(c.key)
             return
@@ -457,15 +463,21 @@ class SyncWorker:
         from backoffice.connectors.base import ReconnectRequired
         from backoffice.connectors.oauth import OAuthClientConfig, OAuthRefresher
 
-        from backoffice.connectors.microsoft import GRAPH_MAIL_SCOPES, GraphMailConfig, MicrosoftMailConnector
+        from backoffice.connectors.microsoft import (
+            GRAPH_MAIL_SCOPES,
+            GRAPH_SHARED_MAIL_SCOPES,
+            GraphMailConfig,
+            MicrosoftMailConnector,
+        )
 
+        shared = c.mailbox in ("shared", "delegated")  # another mailbox, read with the signed-in user's access (O2)
         cached = self._tokens.get(c.key)
         if cached is not None and cached[0] == meta.version:
             tokens = cached[1]
         else:
             if not self.vault.open(c.tenant_id, c.id).get("refresh_token"):
                 raise ReconnectRequired(f"{provider}_no_refresh_token")
-            scopes = GRAPH_MAIL_SCOPES if provider == "microsoft" else ()
+            scopes = (GRAPH_SHARED_MAIL_SCOPES if shared else GRAPH_MAIL_SCOPES) if provider == "microsoft" else ()
             refresher = OAuthRefresher(OAuthClientConfig(app.client_id, app.client_secret, app.token_url, scopes=scopes),
                                        client=self.http_client, provider=provider, clock=self.now)
             tokens = self.vault.token_provider(c.tenant_id, c.id, refresher)  # rotations are saved in the vault
@@ -473,10 +485,13 @@ class SyncWorker:
         if provider == "google":
             from backoffice.connectors.gmail import GmailConfig, GmailConnector
 
-            return GmailConnector(tokens, client=self.http_client, config=GmailConfig(history_window=self.history),
-                                  clock=self.now)
+            config = GmailConfig(history_window=self.history,
+                                 user_id=c.account if c.mailbox == "delegated" else None,
+                                 delivered_to=c.account if c.mailbox == "alias" else None)
+            return GmailConnector(tokens, client=self.http_client, config=config, clock=self.now)
         return MicrosoftMailConnector(tokens, client=self.http_client,
-                                      config=GraphMailConfig(history_window=self.history), clock=self.now)
+                                      config=GraphMailConfig(history_window=self.history,
+                                                             mailbox=c.account if shared else None), clock=self.now)
 
     def _bank_connector(self, c: _Connection) -> Any:
         from backoffice.connectors.open_banking import BankSyncConfig, OpenBankingConnector
@@ -513,5 +528,6 @@ def _connections(tenant_id: str, svc: Any) -> list[_Connection]:
         if c.kind not in ("email", "bank") or (svc.sign_in.get(c.id) or {}).get("pending"):
             continue
         out.append(_Connection(tenant_id, c.id, c.kind, c.name, c.account, c.healthy,
-                               svc.sync_states.get(c.id), ibans if c.kind == "bank" else {}))
+                               svc.sync_states.get(c.id), ibans if c.kind == "bank" else {},
+                               str((svc.sign_in.get(c.id) or {}).get("mailbox") or "own")))
     return out

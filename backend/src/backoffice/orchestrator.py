@@ -107,7 +107,7 @@ from backoffice.closure import (
     satisfy,
 )
 from backoffice.closure.month import EXPECTED_INVOICE
-from backoffice.closure.obligations import VerificationCondition, grant_agency
+from backoffice.closure.obligations import VerificationCondition, grant_agency, pack_vocabulary
 from backoffice.fx_differences import record_exchange_differences
 from backoffice.countries.foreign import IssuerProfile, detect_issuer, read_foreign_text
 from backoffice.deposits import (
@@ -203,7 +203,9 @@ from backoffice.fraud import (
     assess,
     email_domain,
     find_ibans,
+    is_valid_iban,
     mask_iban,
+    new_beneficiary_ibans,
     normalize_iban,
     registrable_domain,
     trust_iban,
@@ -609,6 +611,10 @@ class DocumentRecord:
     fraud: FraudAssessment | None = None
     on_hold: bool = False  # a fraud hard stop: never matched, paid or closed without the owner
     hold_released: bool = False
+    # Held for bank details that arrived after its payment was already proven and closed (a later copy that adds
+    # or changes them, checklist Q4): the new account is blocked until the owner verifies it, but the payment made
+    # before it appeared stays proven (the auditor does not reopen it).
+    late_bank_hold: bool = False
     matched_tx_ids: list[str] = field(default_factory=list)
     retrieved: bool = False  # fetched by the system from a link or portal (§9)
     # Field-level verification (§18): every critical field's value, quality, reasons and the
@@ -1395,6 +1401,10 @@ class Repository:
 
     def pack_for(self, company_id: str | None) -> CompanyPack:
         return company_pack(self.company_country(company_id))
+
+    def account_countries(self) -> dict[str, str]:
+        """Each bank account's (or card's) company's country: its pack's wording reads the account's lines (§49)."""
+        return {a.id: self.company_country(a.holder_id) for a in self.accounts.values()}
 
     def ownership(self) -> OwnershipBook:
         return OwnershipBook(
@@ -2220,19 +2230,25 @@ class FraudAgent(_Agent):
 
     name = "fraud"
 
-    def check(self, record: DocumentRecord) -> FraudAssessment:
+    def check(self, record: DocumentRecord, *, later_copy: bool = False, sender: str | None = None,
+              message_text: str | None = None) -> FraudAssessment:
+        """Every §26 check on a supplier document. ``later_copy``: its bank details came with a later copy of it
+        (or the owner's choice between two copies), delivered by ``sender`` with ``message_text`` (that copy's
+        email) rather than the first copy's: they are judged exactly like a first copy's (checklist Q4)."""
         supplier = self.repo.suppliers.get(record.supplier_id or "")
         history = [
             d.document for d in self.repo.documents.values()
             if d.id != record.id and d.supplier_id and d.supplier_id == record.supplier_id and not d.on_hold
         ]
+        delivered_by = record.sender if sender is None and not later_copy else sender
         # A receipt one of your employees passes on (their reply, their forward) did not come from the supplier:
         # their address is not a changed supplier domain. Every other check still runs (backoffice.staff).
-        sender = None if self.o.staff.employee_by_email(record.sender) is not None else record.sender
+        sender = None if self.o.staff.employee_by_email(delivered_by) is not None else delivered_by
+        text = record.message_text if message_text is None and not later_copy else (message_text or "")
         result = assess(FraudCase(
             entities=self.repo.entities, supplier=supplier, document=record.document,
             history=sorted(history, key=lambda d: (d.issue_date or date.min, d.id)),
-            sender=sender, message_text=record.message_text,
+            sender=sender, message_text=text, iban_on_later_copy=later_copy,
         ))
         self.log("assess", subject_id=record.id, evidence_ids=record.evidence_ids,
                  values={"hard_stop": result.hard_stop},
@@ -2334,7 +2350,8 @@ class ReconciliationAgent(_Agent):
         """The expected-evidence rules with what was learned (J7) and the employees known from payslips (J3)."""
         return ExpectedEvidenceEngine(entities=self.repo.entities, suppliers=self.repo.resolver(),
                                       overrides=_LearnedExpectations(self.repo),
-                                      employee_ibans=sorted(self.repo.payroll_employees))
+                                      employee_ibans=sorted(self.repo.payroll_employees),
+                                      account_countries=self.repo.account_countries())
 
     def classify(self, records: Sequence[TxRecord]) -> None:
         if not records:
@@ -2480,7 +2497,8 @@ class ReconciliationAgent(_Agent):
         confirmed = self.o.bank_confirmations(txs, pool)
         result = reconcile(
             [r.tx for r in sorted(txs, key=lambda r: r.id)],
-            [d.document.model_copy(update={"quality": Quality.GREEN}) if d.id in confirmed else d.document
+            [d.document.model_copy(update={"quality": Quality.GREEN})
+             if d.id in confirmed and self.o.addressed_elsewhere(d) is None else d.document
              for d in sorted(pool, key=lambda d: d.id)],
             suppliers=repo.resolver(), own_tax_ids=own, expectations=decisions, document_balances=balances,
         )
@@ -3289,13 +3307,9 @@ class ObligationAgent(_Agent):
     # ------------------------------------------------------------------ each company's country (§49)
 
     def vocabulary(self) -> dict[str, tuple[str, ...]] | None:
-        """The letter wording of the business's companies' countries (their packs), added to the core's
-        English and Portuguese; None when their packs add nothing (a Portuguese business)."""
-        merged: dict[str, tuple[str, ...]] = {}
-        for country in self.repo.countries():
-            for name, phrases in company_pack(country).obligation_vocabulary().items():
-                merged[name] = tuple(dict.fromkeys((*merged.get(name, ()), *phrases)))
-        return merged or None
+        """The letter wording of the business's companies' countries (their packs, §49), added to the core's
+        English; None when their packs add nothing (the letter is then read in its company's country's)."""
+        return pack_vocabulary(self.repo.countries()) or None
 
     def calendar(self, now: datetime) -> list[ObligationRecord]:
         """Obligations a company's country sets by the calendar, with no letter (Spain's quarterly VAT return,
@@ -5982,7 +5996,8 @@ class StagedPaymentsAgent(_Agent):
                         rec.not_for_document_ids.append(other)
             needs.status, needs.answer, needs.answered_at = "answered", option.id, now
             if needs.kind == "deposit_refund":  # an ordinary payment after all: it needs its own invoice
-                engine = ExpectedEvidenceEngine(entities=repo.entities, suppliers=repo.resolver())
+                engine = ExpectedEvidenceEngine(entities=repo.entities, suppliers=repo.resolver(),
+                                                account_countries=repo.account_countries())
                 rec.decision = engine.classify(rec.tx)
             self.o.advance(item, Stage.UNDERSTOOD, [rec.evidence_id, answer_ev], agent=self.name, actor=owner,
                            note="Not linked, as you said.")
@@ -6516,7 +6531,7 @@ class AuditorAgent(_Agent):
             return None
         if item.subject_type == "document":
             doc = repo.documents[item.subject_id]
-            if doc.on_hold:
+            if doc.on_hold and not doc.late_bank_hold:
                 return "This document is on hold."
             if doc.supporting:
                 return "A document that is not an invoice cannot close anything."
@@ -6544,7 +6559,9 @@ class AuditorAgent(_Agent):
                 return None  # a disputed card payment, proven by what it is linked to (I7)
             return "The payment has lost its document."
         docs = [repo.documents.get(d) for d in rec.document_ids]
-        if any(d is None or d.on_hold or d.document.quality is not Quality.GREEN for d in docs):
+        # A hold on bank details that appeared after this payment was proven blocks only the new account.
+        if any(d is None or (d.on_hold and not d.late_bank_hold) or d.document.quality is not Quality.GREEN
+               for d in docs):
             return "The document for this payment no longer checks out."
         if any(d is not None and d.supporting for d in docs):
             return "A document that is not an invoice cannot close a payment."
@@ -7895,7 +7912,8 @@ class Orchestrator:
             supplier = known_supplier  # names no tax number: the known supplier whose address sent it
         existing = self._duplicate_of(values, extracted.doc_type, supplier.id if supplier else None)
         if existing is not None:
-            return self._merge_duplicate(existing, extracted, report)
+            return self._merge_duplicate(existing, extracted, report, sender=sender, message_text=message_text,
+                                         at=at)
         copy = None if owner_says_separate or extracted.statement is not None else self.captures.near_copy(
             values, extracted.doc_type, supplier.id if supplier else None, extracted.text, sales)
         if copy is not None and not set(extracted.evidence_ids) <= set(copy.evidence_ids):
@@ -7906,7 +7924,7 @@ class Orchestrator:
                 self.documents.log("same_document_proven", subject_id=copy.id,
                                    evidence_ids=[*copy.evidence_ids, *extracted.evidence_ids],
                                    response={"rule": f"same {proven}"})
-                return self._merge_duplicate(copy, extracted, report)
+                return self._merge_duplicate(copy, extracted, report, sender=sender, message_text=message_text, at=at)
             self.captures.ask_same(copy, parts, extracted.evidence_ids, at=at, origin=origin, retrieved=retrieved,
                                    options={"sender": sender, "message_text": message_text, "body": body,
                                             "recipients": recipients, "shared_link": shared_link,
@@ -7948,6 +7966,7 @@ class Orchestrator:
             billing_address=extracted.billing_address, country=extracted.home,
         )
         self.repo.documents[doc_id] = record
+        quality = self._buyer_checked(record)  # addressed to a tax number none of your companies has: never GREEN
         self._classify_sensitive(record, extracted.text, message_text, self._filename(extracted.evidence_ids))
         evidence = extracted.evidence_ids
         self.advance(item, Stage.ACQUIRED, evidence, agent="discovery", note="Document received.")
@@ -8039,8 +8058,16 @@ class Orchestrator:
                 return rec
         return None
 
-    def _merge_duplicate(self, record: DocumentRecord, extracted: _Extracted, report: IngestReport) -> DocumentRecord:
-        """The same invoice again (another copy or channel): its observations join, nothing is duplicated."""
+    def _merge_duplicate(self, record: DocumentRecord, extracted: _Extracted, report: IngestReport, *,
+                         sender: str | None = None, message_text: str = "",
+                         at: datetime | None = None) -> DocumentRecord:
+        """The same invoice again (another copy or channel): its observations join, nothing is duplicated.
+
+        Bank details are never slipped in silently (checklist Q4): a copy whose bank details differ from the
+        ones on file is a conflict (one plain question); a copy that adds bank details the first copy lacked
+        puts them on the invoice and through every fraud check, exactly like a first copy's. An account the
+        supplier was never paid into is held for the owner's verification by phone (§25, §26).
+        """
         new = [e for e in extracted.evidence_ids if e not in record.evidence_ids]
         if not new:
             report.document_ids.append(record.id)
@@ -8060,12 +8087,26 @@ class Orchestrator:
                 if getattr(record.document, name) is None and (value := read(settled.get(name))) is not None}
         if "supplier_tax_id" in gaps and record.issuer is not None and record.issuer.is_foreign:
             gaps["supplier_tax_id"] = qualified_tax_id(gaps["supplier_tax_id"], record.issuer.country)
+        added_iban = None
+        if record.document.iban is None and not record.sales:
+            added_iban = _text(settled.get("iban")) or next(
+                (_text(o.value) for o in extracted.observations.get("iban", []) if _text(o.value)), None)
+            if added_iban is not None and assessment.fields.get("iban") is not None and \
+                    assessment.fields["iban"].quality is Quality.RED:
+                added_iban = None  # two different accounts on the copies: the conflict question below asks
+        if added_iban is not None:
+            gaps["iban"] = normalize_iban(added_iban) if is_valid_iban(added_iban) else added_iban
         record.document = record.document.model_copy(update={"quality": assessment.quality,
                                                              "evidence_ids": record.evidence_ids, **gaps})
         record.reasons = assessment.reasons
         record.checks = assessment.verified_fields
-        self.documents.log("merge_duplicate", subject_id=record.id, evidence_ids=new)
+        self._buyer_checked(record)
+        self.documents.log("merge_duplicate", subject_id=record.id, evidence_ids=new,
+                           values={"bank_details_added": mask_iban(gaps["iban"])} if "iban" in gaps else None)
         report.document_ids.append(record.id)
+        if added_iban is not None:
+            self._check_new_bank_details(record, at or self.repo.clock.now(), new, report, sender=sender,
+                                         message_text=message_text)
         if assessment.quality is Quality.RED and not record.on_hold:
             now = self.repo.clock.now()
             item = self.repo.items[record.item_id]
@@ -8077,9 +8118,37 @@ class Orchestrator:
                 report.message = f"Got it. I need one answer from you: {needs.prompt}"
         return record
 
+    def _check_new_bank_details(self, record: DocumentRecord, at: datetime, evidence_ids: Sequence[str],
+                                report: IngestReport | None = None, *, sender: str | None = None,
+                                message_text: str = "") -> bool:
+        """Bank details that joined a document after it was first read (a later copy, the owner's choice between
+        two copies) go through the same fraud checks as a first copy's (§26, checklist Q4). A new beneficiary is
+        held for the owner's verification; nothing is ever trusted here. Returns True when it was held."""
+        if record.sales:
+            return False
+        supplier = self.repo.suppliers.get(record.supplier_id or "")
+        own = [i for e in self.repo.entities for i in e.own_ibans]
+        untrusted = new_beneficiary_ibans(supplier, [record.document.iban], own_ibans=own)
+        record.fraud = self.fraud.check(record, later_copy=True, sender=sender, message_text=message_text)
+        self.fraud.log("bank_details_added", subject_id=record.id, evidence_ids=list(evidence_ids),
+                       values={"iban": mask_iban(record.document.iban or ""), "new_beneficiary": bool(untrusted)},
+                       response={"hard_stop": record.fraud.hard_stop})
+        if not record.fraud.hard_stop or record.on_hold:
+            return False
+        item = self.repo.items[record.item_id]
+        # The payment already made and proven before these bank details appeared stays proven: only the new
+        # account is blocked (the auditor keeps the closed payment closed).
+        record.late_bank_hold = item.stage is Stage.CLOSED
+        self._hold(record, at)
+        if report is not None:
+            who = display_name(record.document.supplier_name)
+            report.message = f"Got it. I put the {who} payment on hold: {record.fraud.owner_message}"
+        return True
+
     def _hold(self, record: DocumentRecord, at: datetime) -> None:
         repo = self.repo
         record.on_hold = True
+        record.hold_released = False  # held again (new bank details after an earlier release): blocked until verified
         item = repo.items[record.item_id]
         who = display_name(record.document.supplier_name)
         self.advance(item, Stage.NEEDS_OWNER, record.evidence_ids, agent="fraud",
@@ -8090,9 +8159,14 @@ class Orchestrator:
             id=needs_id, kind="approval", subject_type="document", subject_id=record.id, item_id=item.id,
             company_id=company, created_at=at, why=tuple(s.owner_line for s in record.fraud.signals if s.hard_stop)
             if record.fraud else ())
-        self.activity(at, "protected", f"Put the {who} payment on hold. The bank details on the invoice changed."
-                      if self._iban_changed(record) else f"Put the {who} payment on hold. Something on the invoice "
-                      "does not look right.", company, evidence_ids=record.evidence_ids)
+        new_account = bool(record.fraud and record.fraud.of_kind(SignalKind.NEW_PAYMENT_RECIPIENT))
+        if self._iban_changed(record):
+            line = f"Put the {who} payment on hold. The bank details on the invoice changed."
+        elif new_account:
+            line = f"Put the {who} payment on hold. The invoice asks to be paid into an account you have not paid before."
+        else:
+            line = f"Put the {who} payment on hold. Something on the invoice does not look right."
+        self.activity(at, "protected", line, company, evidence_ids=record.evidence_ids)
 
     # ----------------------------------------------------------------- sources that disagree (§19, §37)
 
@@ -8169,6 +8243,28 @@ class Orchestrator:
         record.document = record.document.model_copy(update=update)
         record.reasons = assessment.reasons
         record.checks = assessment.verified_fields
+        self._buyer_checked(record)
+
+    def addressed_elsewhere(self, record: DocumentRecord) -> str | None:
+        """The buyer's tax number a purchase document shows when it is none of the business's companies' (checklist
+        F6); None when it names one of them, names no buyer, or is the business's own sale. Our own numbers are
+        compared with their country, so the same digits from another country are not taken for us."""
+        tax = record.document.customer_tax_id
+        if record.sales or not tax:
+            return None
+        ours = any(same_tax_id(qualified_tax_id(e.tax_id, e.country), tax) for e in self.repo.entities if e.tax_id)
+        return None if ours else tax
+
+    def _buyer_checked(self, record: DocumentRecord) -> Quality:
+        """A document addressed to another company is never verified for yours (§3, F6): at most AMBER, with the
+        reason in plain words. Its fraud check holds its payment; nothing closes on it. Returns its quality."""
+        other = self.addressed_elsewhere(record)
+        if other is None or record.document.quality is not Quality.GREEN:
+            return record.document.quality
+        record.document = record.document.model_copy(update={"quality": Quality.AMBER})
+        record.reasons = (f"It is addressed to another company (tax number {' '.join(other.split())}), not one of "
+                          "yours.",)
+        return Quality.AMBER
 
     # ----------------------------------------------------------------- which company, large purchases, cash
 
@@ -9507,6 +9603,7 @@ class Orchestrator:
         doc.document = doc.document.model_copy(update={"quality": assessment.quality})
         doc.reasons = assessment.reasons
         doc.checks = assessment.verified_fields
+        self._buyer_checked(doc)
         if doc.document.entity_id is None and rec.tx.entity_id:
             doc.document = doc.document.model_copy(update={"entity_id": rec.tx.entity_id})
 
@@ -9967,8 +10064,16 @@ class Orchestrator:
             needs.status = "answered"
             needs.answer = option_id
             needs.answered_at = now
-            self.advance(item, Stage.CONFLICT, [*record.evidence_ids, answer_ev], agent="fraud",
-                         actor=f"{OWNER_ACTOR}:{repo.owner.email}", note="Kept blocked by the owner.")
+            if record.late_bank_hold and self._resumes_closed(record):
+                # Already paid and proven before the new bank details appeared: the invoice stays closed, the new
+                # account stays blocked (the hold remains: nothing is ever paid into it).
+                self.advance(item, Stage.CLOSED, [*record.evidence_ids, answer_ev], agent="fraud",
+                             actor=f"{OWNER_ACTOR}:{repo.owner.email}", quality=Quality.GREEN,
+                             note="Kept blocked by the owner. The invoice was already paid; its new bank details "
+                                  "are not used.")
+            else:
+                self.advance(item, Stage.CONFLICT, [*record.evidence_ids, answer_ev], agent="fraud",
+                             actor=f"{OWNER_ACTOR}:{repo.owner.email}", note="Kept blocked by the owner.")
             self.activity(now, "protected", f"Kept the {who} payment blocked.", needs.company_id,
                           evidence_ids=[answer_ev])
             request, reason = self._request_correction(record, needs.company_id, answer_ev, now)
@@ -10012,11 +10117,34 @@ class Orchestrator:
         needs.status = "answered"
         needs.answer = option_id
         needs.answered_at = now
+        if record.late_bank_hold and self._resumes_closed(record):
+            # Paid and proven before its new bank details appeared: it resumes closed.
+            record.late_bank_hold = False
+            self.advance(item, Stage.CLOSED, [*record.evidence_ids, answer_ev], agent="fraud",
+                         actor=f"{OWNER_ACTOR}:{repo.owner.email}", quality=Quality.GREEN,
+                         note="New bank details confirmed by the owner by phone. The invoice was already paid.")
+            self.activity(now, "protected", f"You confirmed {who}'s new bank details by phone. This invoice was "
+                          "already paid.", needs.company_id, evidence_ids=[answer_ev])
+            return AnswerOutcome(ok=True, message=f"Done. {who}'s new account is confirmed. This invoice was already "
+                                                  "paid.")
+        record.late_bank_hold = False
         self.advance(item, Stage.UNDERSTOOD, [*record.evidence_ids, answer_ev], agent="fraud",
                      actor=f"{OWNER_ACTOR}:{repo.owner.email}", note="New bank details confirmed by the owner by phone.")
+        if self.addressed_elsewhere(record) is not None:
+            # The call verified the account, not who the invoice is for: it is never counted or paid for you (F6).
+            self.activity(now, "protected", f"You confirmed {who}'s new bank details by phone. The invoice is "
+                          "addressed to another company, so it stays open until a corrected one arrives.",
+                          needs.company_id, evidence_ids=[answer_ev])
+            return AnswerOutcome(ok=True, message="Done. The account is confirmed. The invoice is addressed to another "
+                                                  "company, so I won't count or pay it until a corrected one arrives.")
         self.activity(now, "protected", f"You confirmed {who}'s new bank details by phone. The payment can go ahead.",
                       needs.company_id, evidence_ids=[answer_ev])
         return AnswerOutcome(ok=True, message="Done. The payment will go to the new account.")
+
+    def _resumes_closed(self, record: DocumentRecord) -> bool:
+        """An invoice that was closed on its evidence before new bank details put it on hold, and still checks out."""
+        item = self.repo.items[record.item_id]
+        return record.document.quality is Quality.GREEN and any(t.to_stage is Stage.CLOSED for t in item.history)
 
     def _request_correction(self, record: DocumentRecord, company_id: str, answer_ev: str,
                             now: datetime) -> tuple[OutgoingMessage | None, str]:
@@ -10093,6 +10221,7 @@ class Orchestrator:
             record.owner_values[name] = FieldObservation(
                 value=value, source=answer_ev, method=ExtractionMethod.HUMAN, confidence=1.0,
                 location="owner answer: " + option.label)
+        iban_before = normalize_iban(record.document.iban) if record.document.iban else None
         assessment = self.verification.assess(record.observations, record.document.doc_type, subject_id=record.id,
                                               evidence_ids=[*record.evidence_ids, answer_ev],
                                               owner=record.owner_values, issuer=record.issuer, country=record.country)
@@ -10106,8 +10235,14 @@ class Orchestrator:
             return AnswerOutcome(ok=True, message=f"Thanks. I still need one more answer.{ask}")
         self.advance(item, Stage.UNDERSTOOD, [*record.evidence_ids, answer_ev], agent="verification", actor=owner,
                      quality=assessment.quality, note=f"You said: {option.label}.")
-        return AnswerOutcome(ok=True, message=f"Done. I will use {option.label.split(', as ')[0]} for the {who} "
-                                              "invoice.")
+        chosen = f"Done. I will use {option.label.split(', as ')[0]} for the {who} invoice."
+        iban_after = normalize_iban(record.document.iban) if record.document.iban else None
+        if iban_after is not None and iban_after != iban_before and \
+                self._check_new_bank_details(record, now, [answer_ev]):
+            # Choosing which copy is right is not verifying a new beneficiary: that is a call to a number on file.
+            return AnswerOutcome(ok=True, message=f"{chosen} Its bank account is one you have not paid before, so "
+                                                  "the payment is on hold until you confirm it by phone.")
+        return AnswerOutcome(ok=True, message=chosen)
 
     def _answer_company(self, needs: NeedsYouRecord, option_id: str, answer_ev: str, now: datetime) -> AnswerOutcome:
         """The owner said which of their companies carries a payment whose invoice names another (§51).

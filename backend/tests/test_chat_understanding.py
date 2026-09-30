@@ -306,6 +306,8 @@ def test_ask_endpoint_shares_the_understanding_and_stays_read_only(svc):
     assert "€5,024.53" in spent["answer"]
     assert spent["evidence"] and all(e.keys() == {"label", "id"} for e in spent["evidence"])
     for e in spent["evidence"]:
+        if e["id"].startswith("month:"):  # "and N more": the month view that lists the rest (T9)
+            continue
         svc.repo.evidence(e["id"])
     refused = ask("send the vodafone invoice to a@b.pt")
     assert "in the chat" in refused["answer"] and not svc.assistant.outbox

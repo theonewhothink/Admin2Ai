@@ -130,7 +130,10 @@ class OAuthAuthorizer:
     def _derived_verifier(self, nonce: str) -> str:
         return _b64(hmac.new(self._key, b"pkce:" + nonce.encode(), hashlib.sha256).digest())
 
-    def begin(self, provider: str, tenant_id: str, connection_id: str, login_hint: str | None = None) -> str:
+    def begin(self, provider: str, tenant_id: str, connection_id: str, login_hint: str | None = None,
+              scopes: tuple[str, ...] = ()) -> str:
+        """The consent URL. ``scopes`` are asked for besides the app's own (a Microsoft 365 shared mailbox needs
+        ``Mail.Read.Shared``, checklist O2)."""
         app = self._apps.get(provider)
         if app is None:
             raise AuthorizationError(f"{provider} sign-in is not configured")
@@ -148,7 +151,7 @@ class OAuthAuthorizer:
         state = f"{body}.{_b64(hmac.new(self._key, body.encode(), hashlib.sha256).digest())}"
         params = {
             "client_id": app.client_id, "redirect_uri": self._redirect, "response_type": "code",
-            "scope": " ".join(app.scopes), "state": state, "code_challenge": challenge,
+            "scope": " ".join(dict.fromkeys((*app.scopes, *scopes))), "state": state, "code_challenge": challenge,
             "code_challenge_method": "S256", **dict(app.extra),
         }
         if login_hint:
@@ -194,8 +197,14 @@ class OAuthAuthorizer:
         refresh = token.get("refresh_token")
         if not refresh:
             raise AuthorizationError("the provider did not allow offline access")
+        from datetime import datetime, timezone
+
+        from .oauth import grant_end  # lazy: needs httpx
+
+        # A grant given for a limited time says when it ends: kept with it, so the owner is reminded (R4).
+        ends = grant_end(token, datetime.fromtimestamp(self._clock(), tz=timezone.utc))
         self._vault.store(payload["t"], payload["c"], payload["p"],
-                          {"refresh_token": refresh, "scope": token.get("scope", "")})
+                          {"refresh_token": refresh, "scope": token.get("scope", "")}, expires_at=ends)
         done = {"tenant_id": payload["t"], "connection_id": payload["c"], "provider": payload["p"]}
         email = _id_token_email(token.get("id_token"))
         if email:

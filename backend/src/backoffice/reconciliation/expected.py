@@ -32,6 +32,12 @@ Identity-based decisions (IBAN, bank flags, learned overrides, a resolved
 supplier) are GREEN; wording-based ones are AMBER (§57): they steer where to
 look, they never close anything.
 
+The wording is read per country (§49): the core holds English and the wording of
+countries no pack covers yet (HMRC, URSSAF, FINANZAMT ...); a country's own bank words
+(Portugal's "PAG ESTADO IVA", "TAXA TURISTICA", "PREST EMPRESTIMO"; Spain's "AEAT",
+"IMPUESTO", "SEG SOCIAL") live in its pack (``CompanyPack.bank_wording``). A bank line is
+read with its account's company's country's wording (``account_countries``), else its
+company's, else the business's companies'. Tax offices any pack names count on every line.
 The wording tables are bank-statement conventions, not legal facts. They were
 compiled from public naming of the institutions and have NOT been verified
 against live bank feeds (verified_as_of: never). Extend them as feeds are seen.
@@ -44,6 +50,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
+from backoffice.countries import BankWording
 from backoffice.domain.models import (
     DocumentType,
     LegalEntity,
@@ -66,12 +73,7 @@ from .suppliers import SupplierMatch, SupplierResolver, normalize_descriptor
 
 __all__ = [
     "ACCEPTED_DOCUMENT_TYPES",
-    "BANK_FEE_PHRASES",
-    "LOAN_PHRASES",
-    "PAYROLL_WORDS",
-    "GRANT_PHRASES",
-    "TAX_AUTHORITY_PHRASES",
-    "TOURIST_TAX_PHRASES",
+    "CORE_BANK_WORDING",
     "EvidenceExpectation",
     "EvidenceProvider",
     "ExpectationDecision",
@@ -79,6 +81,7 @@ __all__ = [
     "ExpectedEvidenceEngine",
     "InMemoryExpectationOverrides",
     "LearnedExpectation",
+    "bank_wording",
 ]
 
 
@@ -150,116 +153,57 @@ ACCEPTED_DOCUMENT_TYPES: dict[EvidenceExpectation, frozenset[DocumentType]] = {
 # --------------------------------------------------------------------------- wording tables
 # Consecutive folded words (accents removed, uppercase). Unverified conventions.
 
-TAX_AUTHORITY_PHRASES: tuple[str, ...] = (
-    # Portugal
-    "AUTORIDADE TRIBUTARIA",
-    "AUTORIDADE TRIBUTARIA E ADUANEIRA",
-    "PAGAMENTO AO ESTADO",
-    "PAGAMENTOS AO ESTADO",
-    "PAG AO ESTADO",
-    "PAG ESTADO",
-    "SEGURANCA SOCIAL",
-    "SEG SOCIAL",
-    "INSTITUTO DE GESTAO FINANCEIRA DA SEGURANCA SOCIAL",
-    "IGFSS",
-    # United Kingdom
-    "HMRC",
-    "HM REVENUE",
-    # Spain
-    "AGENCIA TRIBUTARIA",
-    "AEAT",
-    "TESORERIA GENERAL DE LA SEGURIDAD SOCIAL",
-    "TGSS",
-    # France / Italy / Germany / Ireland
-    "DGFIP",
-    "URSSAF",
-    "AGENZIA DELLE ENTRATE",
-    "DELEGA F24",
-    "FINANZAMT",
-    "REVENUE COMMISSIONERS",
+# English, and the countries no pack covers yet: every bank line is read with these. A country's own words
+# ("PAG ESTADO IVA", "AEAT") come from its pack (backoffice.countries, BankWording).
+CORE_BANK_WORDING = BankWording(
+    tax_authorities=(
+        # United Kingdom
+        "HMRC",
+        "HM REVENUE",
+        # France / Italy / Germany / Ireland
+        "DGFIP",
+        "URSSAF",
+        "AGENZIA DELLE ENTRATE",
+        "DELEGA F24",
+        "FINANZAMT",
+        "REVENUE COMMISSIONERS",
+    ),
+    state_words=frozenset({"HMRC"}),
+    # The tourist tax paid to the municipality (a local fee, checklist X26).
+    tourist_tax=("TOURIST TAX", "CITY TAX"),
+    # Grants and subsidies paid to the business (checklist X30). ("GRANT" alone is also a name, e.g. an audit
+    # firm: only "GRANT PAYMENT" counts.)
+    grants=("SUBSIDY", "GRANT PAYMENT"),
+    bank_fees=(
+        "BANK FEE",
+        "BANK CHARGE",
+        "BANK CHARGES",
+        "SERVICE CHARGE",
+        "ACCOUNT FEE",
+        "MONTHLY FEE",
+        "INTEREST",
+        "OVERDRAFT",
+        "FRAIS BANCAIRES",
+    ),
+    payroll_words=frozenset({"SALARY", "SALARIES", "PAYROLL", "WAGES", "GEHALT", "SALAIRE", "STIPENDIO"}),
+    loans=("LOAN REPAYMENT", "LOAN"),
 )
 
-# Portuguese tax abbreviations only count next to a word naming the state as payee
-# ('PAG ESTADO IVA'), because on their own they collide with ordinary words.
-TAX_WORDS: frozenset[str] = frozenset({"IVA", "IRC", "IRS", "IMI", "IUC", "IMT"})
-STATE_WORDS: frozenset[str] = frozenset(
-    {"ESTADO", "AT", "IMPOSTO", "IMPOSTOS", "FINANCAS", "TRIBUTARIA", "HMRC"}
-)
 
-# The municipal tourist tax paid to the municipality (a local fee, checklist X26).
-TOURIST_TAX_PHRASES: tuple[str, ...] = (
-    "TAXA TURISTICA",
-    "TAXAS TURISTICAS",
-    "TAXA MUNICIPAL TURISTICA",
-    "TAX MUN TURISTICA",
-    "TOURIST TAX",
-    "CITY TAX",
-)
+def bank_wording(countries: Iterable[str] = ()) -> BankWording:
+    """The core's wording with the packs' of ``countries`` (every company country's when none is given).
 
-# Grants and subsidies paid to the business (checklist X30): the agencies and the words that mean a grant.
-# ("GRANT" alone is also a name, e.g. an audit firm: only "GRANT PAYMENT" counts.)
-GRANT_PHRASES: tuple[str, ...] = (
-    "IFAP",
-    "PEPAC",
-    "PORTUGAL 2030",
-    "PT2030",
-    "COMPETE 2030",
-    "RECUPERAR PORTUGAL",
-    "IAPMEI",
-    "FUNDO AMBIENTAL",
-    "SUBSIDIO",
-    "SUBSIDIOS",
-    "SUBVENCAO",
-    "SUBSIDY",
-    "GRANT PAYMENT",
-)
+    A country no complete pack covers adds nothing: its lines are read with the core's words."""
+    from backoffice.countries import CountryPackError, company_countries, company_pack
 
-# Payroll allowances ("subsídio de férias"): never a grant.
-_PAYROLL_ALLOWANCES: tuple[str, ...] = ("SUBSIDIO DE FERIAS", "SUBSIDIO DE NATAL", "SUBSIDIO DE REFEICAO",
-                                        "SUBSIDIO DE ALIMENTACAO")
+    wording = CORE_BANK_WORDING
+    for country in dict.fromkeys(c.upper() for c in (tuple(countries) or company_countries()) if c):
+        try:
+            wording = wording.merged(company_pack(country).bank_wording())
+        except CountryPackError:
+            continue
+    return wording
 
-BANK_FEE_PHRASES: tuple[str, ...] = (
-    "COMISSAO",
-    "COMISSOES",
-    "COM MANUTENCAO",
-    "MANUTENCAO DE CONTA",
-    "MANUTENCAO CONTA",
-    "DESPESAS DE MANUTENCAO",
-    "IMPOSTO DO SELO",  # stamp duty the bank charges on its own fees and interest
-    "IMPOSTO SELO",
-    "IMP SELO",
-    "JUROS",
-    "BANK FEE",
-    "BANK CHARGE",
-    "BANK CHARGES",
-    "SERVICE CHARGE",
-    "ACCOUNT FEE",
-    "MONTHLY FEE",
-    "INTEREST",
-    "OVERDRAFT",
-    "COMISION",
-    "COMISIONES",
-    "INTERESES",
-    "FRAIS BANCAIRES",
-)
-
-PAYROLL_WORDS: frozenset[str] = frozenset(
-    {"SALARIO", "SALARIOS", "VENCIMENTO", "VENCIMENTOS", "ORDENADO", "ORDENADOS",
-     "REMUNERACAO", "REMUNERACOES", "SALARY", "SALARIES", "PAYROLL", "WAGES", "NOMINA",
-     "NOMINAS", "SUELDO", "GEHALT", "SALAIRE", "STIPENDIO"}
-)  # fmt: skip
-
-LOAN_PHRASES: tuple[str, ...] = (
-    "PRESTACAO EMPRESTIMO",
-    "PREST EMPRESTIMO",
-    "AMORTIZACAO EMPRESTIMO",
-    "EMPRESTIMO",
-    "MUTUO",
-    "LOAN REPAYMENT",
-    "LOAN",
-    "PRESTAMO",
-    "CUOTA PRESTAMO",
-)
 
 # --------------------------------------------------------------------------- results
 
@@ -374,7 +318,9 @@ class ExpectedEvidenceEngine:
 
     ``entities`` supply the business's own IBANs and names; ``employee_ibans``
     marks salary transfers; ``bank_metadata`` adds declared facts (card present,
-    card repayment). All inputs are injected; nothing is fetched.
+    card repayment). ``account_countries`` gives each bank account's company's
+    country: its pack's bank wording reads the account's lines (§49). All inputs
+    are injected; nothing is fetched.
     """
 
     entities: Sequence[LegalEntity] = ()
@@ -382,6 +328,7 @@ class ExpectedEvidenceEngine:
     overrides: ExpectationOverrides | None = None
     employee_ibans: Iterable[str] = ()
     bank_metadata: Mapping[str, BankMetadata] = field(default_factory=dict)
+    account_countries: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._own_ibans: dict[str, str] = {}
@@ -394,6 +341,25 @@ class ExpectedEvidenceEngine:
             )
         )
         self._employees = frozenset(normalize_iban(i) for i in self.employee_ibans if i)
+        self._entity_countries = {e.id: e.country for e in self.entities if e.country}
+        self._business_countries = tuple(dict.fromkeys(
+            e.country for e in sorted(self.entities, key=lambda e: e.id) if e.country))
+        # Tax offices named outright count on every line, whichever country's pack names them ('AEAT' paid by a
+        # Portuguese company is still a tax payment).
+        everywhere = bank_wording()
+        self._authorities = everywhere.tax_authorities
+        self._authority_names = everywhere.authority_names
+        self._wordings: dict[tuple[str, ...], BankWording] = {}
+
+    def wording(self, tx: Transaction) -> BankWording:
+        """The words ``tx`` is read with: its account's company's country's, else its company's, else the
+        business's companies' (every company country's when the business has none yet)."""
+        country = self.account_countries.get(tx.account_id) or self._entity_countries.get(tx.entity_id or "")
+        countries = (country,) if country else self._business_countries
+        wording = self._wordings.get(countries)
+        if wording is None:
+            wording = self._wordings[countries] = bank_wording(countries)
+        return wording
 
     def classify_all(
         self, transactions: Iterable[Transaction]
@@ -407,7 +373,8 @@ class ExpectedEvidenceEngine:
         meta = self.bank_metadata.get(tx.id, NO_METADATA)
         supplier = self.suppliers.resolve_transaction(tx)
         text = f"{tx.counterparty} {tx.description}"
-        tax = _tax_wording(tx, text)
+        wording = self.wording(tx)
+        tax = self._tax_wording(tx, text, wording)
         for rule in (
             lambda: self._learned(tx, supplier.key),
             lambda: self._nothing_moved(tx),
@@ -419,15 +386,15 @@ class ExpectedEvidenceEngine:
             lambda: self._payout(tx),
             # 'PAGAMENTO AO ESTADO IMPOSTO DO SELO' is tax, not a bank charge.
             lambda: self._tax(tx, tax == "strong"),
-            lambda: self._tourist_tax(tx, text),
-            lambda: self._grant(tx, text),
-            lambda: self._bank_fee(tx, text, worded=False),
+            lambda: self._tourist_tax(tx, text, wording),
+            lambda: self._grant(tx, text, wording),
+            lambda: self._bank_fee(tx, text, wording, worded=False),
             # 'PREST EMPRESTIMO CAPITAL E JUROS' is a loan instalment, not a charge.
-            lambda: self._loan(tx, text),
+            lambda: self._loan(tx, text, wording),
             # 'IMPOSTO SELO S/ COMISSAO' is the bank's own charge.
-            lambda: self._bank_fee(tx, text, worded=True),
+            lambda: self._bank_fee(tx, text, wording, worded=True),
             lambda: self._tax(tx, tax == "weak"),
-            lambda: self._payroll(tx, text, supplier),
+            lambda: self._payroll(tx, text, supplier, wording),
         ):
             decision = rule()
             if decision is not None:
@@ -527,7 +494,7 @@ class ExpectedEvidenceEngine:
         )
 
     def _bank_fee(
-        self, tx: Transaction, text: str, *, worded: bool
+        self, tx: Transaction, text: str, wording: BankWording, *, worded: bool
     ) -> ExpectationDecision | None:
         """Declared by the bank (GREEN) or, when ``worded``, recognised by wording (AMBER)."""
         declared = tx.kind == TransactionKind.FEE
@@ -535,7 +502,7 @@ class ExpectedEvidenceEngine:
             if declared or not (
                 not tx.counterparty_iban
                 and not is_card_purchase(tx)
-                and phrase_in(text, BANK_FEE_PHRASES)
+                and phrase_in(text, wording.bank_fees)
             ):
                 return None
         elif not declared:
@@ -566,9 +533,9 @@ class ExpectedEvidenceEngine:
             "tax_wording",
         )
 
-    def _tourist_tax(self, tx: Transaction, text: str) -> ExpectationDecision | None:
+    def _tourist_tax(self, tx: Transaction, text: str, wording: BankWording) -> ExpectationDecision | None:
         """The tourist tax paid to the municipality: its notice or payment proof covers it (wording: AMBER)."""
-        if tx.amount >= 0 or is_card_purchase(tx) or not phrase_in(text, TOURIST_TAX_PHRASES):
+        if tx.amount >= 0 or is_card_purchase(tx) or not phrase_in(text, wording.tourist_tax):
             return None
         return self._decide(
             tx, EvidenceExpectation.TAX_NOTICE_OR_PROOF,
@@ -576,11 +543,11 @@ class ExpectedEvidenceEngine:
             "tourist_tax",
         )  # fmt: skip
 
-    def _grant(self, tx: Transaction, text: str) -> ExpectationDecision | None:
+    def _grant(self, tx: Transaction, text: str, wording: BankWording) -> ExpectationDecision | None:
         """Money in from a grant or subsidy: the agency's letter covers it, never an invoice (wording: AMBER)."""
-        if tx.amount <= 0 or is_card_purchase(tx) or not phrase_in(text, GRANT_PHRASES):
+        if tx.amount <= 0 or is_card_purchase(tx) or not phrase_in(text, wording.grants):
             return None
-        if phrase_in(text, _PAYROLL_ALLOWANCES):
+        if phrase_in(text, wording.payroll_allowances):
             return None  # a payroll allowance, never a grant
         return self._decide(
             tx, EvidenceExpectation.TAX_NOTICE_OR_PROOF,
@@ -588,7 +555,7 @@ class ExpectedEvidenceEngine:
         )  # fmt: skip
 
     def _payroll(
-        self, tx: Transaction, text: str, supplier: SupplierMatch
+        self, tx: Transaction, text: str, supplier: SupplierMatch, wording: BankWording
     ) -> ExpectationDecision | None:
         """Employee IBANs are certain. Wording only counts on a plain transfer to
         someone who is not a known supplier ('VENCIMENTO' also means 'due date')."""
@@ -606,7 +573,7 @@ class ExpectedEvidenceEngine:
         if (
             plain_transfer
             and not supplier.is_known
-            and set(tokens(text)) & PAYROLL_WORDS
+            and set(tokens(text)) & wording.payroll_words
         ):
             reason = "This looks like a salary. Payroll records cover it."
             return self._decide(
@@ -618,8 +585,8 @@ class ExpectedEvidenceEngine:
             )
         return None
 
-    def _loan(self, tx: Transaction, text: str) -> ExpectationDecision | None:
-        if is_card_purchase(tx) or not phrase_in(text, LOAN_PHRASES):
+    def _loan(self, tx: Transaction, text: str, wording: BankWording) -> ExpectationDecision | None:
+        if is_card_purchase(tx) or not phrase_in(text, wording.loans):
             return None
         reason = (
             "Loan money received. The loan statement covers it."
@@ -633,6 +600,15 @@ class ExpectedEvidenceEngine:
             Quality.AMBER,
             "loan_wording",
         )
+
+    def _tax_wording(self, tx: Transaction, text: str, wording: BankWording) -> str | None:
+        """'strong' (an authority is named), 'weak' (tax word next to a state word), or None."""
+        if phrase_in(text, self._authorities) or " ".join(tokens(tx.counterparty)) in self._authority_names:
+            return "strong"
+        words = set(tokens(fold(text)))
+        if words & wording.tax_words and words & wording.state_words:
+            return "weak"
+        return None
 
     def _money_in(
         self, tx: Transaction, supplier: SupplierMatch
@@ -688,16 +664,6 @@ class ExpectedEvidenceEngine:
 def _sentence(text: str) -> str:
     """End ``text`` with exactly one period ('..., S.A.' keeps its own)."""
     return text if text.endswith(".") else f"{text}."
-
-
-def _tax_wording(tx: Transaction, text: str) -> str | None:
-    """'strong' (an authority is named), 'weak' (tax word next to a state word), or None."""
-    if phrase_in(text, TAX_AUTHORITY_PHRASES) or tokens(tx.counterparty) == ["AT"]:
-        return "strong"
-    words = set(tokens(fold(text)))
-    if words & TAX_WORDS and words & STATE_WORDS:
-        return "weak"
-    return None
 
 
 def _in_shop(meta: BankMetadata, supplier: SupplierMatch) -> bool:

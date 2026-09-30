@@ -257,6 +257,10 @@ class TokenVault:
         secret = self.open(tenant_id, connection_id)
 
         def on_rotate(token: OAuthToken) -> None:
-            self.update(tenant_id, connection_id, {"refresh_token": token.refresh_token})
+            record = self.update(tenant_id, connection_id, {"refresh_token": token.refresh_token})
+            if token.refresh_expires_at is not None and token.refresh_expires_at != record.expires_at:
+                # The provider stated when this grant ends: kept with it (the owner is reminded a week before).
+                self.store(tenant_id, connection_id, record.provider, self.open(tenant_id, connection_id),
+                           expires_at=token.refresh_expires_at)
 
         return RefreshingTokenProvider(refresher, secret["refresh_token"], on_rotate=on_rotate, clock=self._clock)

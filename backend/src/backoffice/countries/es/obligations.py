@@ -1,9 +1,10 @@
 """What Spanish letters say, and the deadlines Spain's calendar sets (§24 for Spain).
 
-**Wording** (folded phrases by category, added to the core's English and Portuguese ones by
-:mod:`backoffice.closure.obligations`): the Agencia Tributaria and the Seguridad Social, "plazo",
-"importe a ingresar", "modelo 303", "justificante de presentación"... Unverified letter
-conventions (verified_as_of: never); extend as letters are seen.
+**Wording** (folded phrases by category, read with the core's English ones by
+:mod:`backoffice.closure.obligations` for letters to Spanish companies): the Agencia Tributaria and the
+Seguridad Social, "plazo", "importe a ingresar", "modelo 303", "justificante de presentación", the month
+names, "en el plazo de 10 días hábiles", "recargo"... Unverified letter conventions (verified_as_of: never);
+extend as letters are seen.
 
 **Quarterly VAT return (modelo 303)**: every company that charges IVA files it each quarter, from
 the 1st to the 20th of April, July and October, and from the 1st to the 30th of January for the
@@ -25,6 +26,11 @@ __all__ = ["VAT_RETURN_TITLE", "VOCABULARY", "quarterly_vat_return", "vat_return
 
 VAT_RETURN_TITLE = "Quarterly VAT return (modelo 303)"
 _VAT_RETURN = "vat_return"
+
+_MONTHS = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre",
+           "noviembre", "diciembre")
+_ABBREVIATIONS = {"ene": 1, "feb": 2, "mar": 3, "abr": 4, "may": 5, "jun": 6, "jul": 7, "ago": 8, "sep": 9,
+                  "sept": 9, "oct": 10, "nov": 11, "dic": 12}
 
 VOCABULARY: Mapping[str, tuple[str, ...]] = MappingProxyType({
     "issuer:tax_authority": ("agencia tributaria", "agencia estatal de administracion tributaria", "aeat",
@@ -76,6 +82,21 @@ VOCABULARY: Mapping[str, tuple[str, ...]] = MappingProxyType({
                         "solicitud de pago"),
     "grant_paid": ("pago", "abonado", "abonada", "concedida", "concedido", "transferencia", "ingreso"),
     "title:vat_return": (VAT_RETURN_TITLE,),
+    # What the letter says may happen, by the core's English label.
+    "consequence:a fine": ("sancion", "sanciones", "multa", "multas"),
+    "consequence:interest": ("intereses", "intereses de demora"),
+    "consequence:a late fee": ("recargo", "recargo de apremio", "recargo por declaracion extemporanea"),
+    "consequence:suspension": ("suspension", "bloqueo"),
+    "consequence:cancellation": ("cancelacion", "anulacion", "resolucion del contrato"),
+    "consequence:legal action": ("via de apremio", "providencia de apremio", "embargo", "procedimiento judicial"),
+    # Dates ("30 de octubre de 2026"), relative deadlines ("en el plazo de 10 días hábiles") and payment
+    # references ("número de justificante: 303 123 456 789").
+    **{f"month:{i}": (name,) for i, name in enumerate(_MONTHS, start=1)},
+    "month:9": ("septiembre", "setiembre"),
+    **{f"month_abbr:{i}": tuple(a for a, n in _ABBREVIATIONS.items() if n == i) for i in range(1, 13)},
+    "relative_lead": ("plazo de", "en el plazo de", "dentro de"),
+    "relative_days": ("dias habiles", "dias naturales", "dias"),
+    "reference_label": ("referencia", "referencia de pago", "numero de referencia", "numero de justificante"),
 })  # fmt: skip
 
 

@@ -16,7 +16,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import httpx
 
@@ -32,6 +32,7 @@ __all__ = [
     "OAuthToken",
     "RefreshingTokenProvider",
     "TokenProvider",
+    "grant_end",
     "microsoft_token_url",
 ]
 
@@ -74,6 +75,9 @@ class OAuthToken:
     expires_at: datetime
     refresh_token: str | None = field(default=None, repr=False)
     scope: str | None = None
+    # When the grant itself ends, if the provider states it (``refresh_token_expires_in``): the owner is asked to
+    # sign in again a week before (checklist R4). None: no stated end.
+    refresh_expires_at: datetime | None = None
 
 
 class OAuthRefresher:
@@ -141,7 +145,19 @@ class OAuthRefresher:
             expires_at=self._clock() + timedelta(seconds=max(lifetime, 0)),
             refresh_token=str(payload.get("refresh_token") or previous_refresh),
             scope=payload.get("scope"),
+            refresh_expires_at=grant_end(payload, self._clock()),
         )
+
+
+def grant_end(payload: Any, now: datetime) -> datetime | None:
+    """When an OAuth grant ends, from a token response's ``refresh_token_expires_in`` (seconds; Google states it
+    for grants given for a limited time, Microsoft for some kinds of app). None when the provider does not say."""
+    value = payload.get("refresh_token_expires_in") if isinstance(payload, dict) else None
+    try:
+        seconds = int(str(value))
+    except (TypeError, ValueError):
+        return None
+    return now + timedelta(seconds=seconds) if seconds > 0 else None
 
 
 class RefreshingTokenProvider:

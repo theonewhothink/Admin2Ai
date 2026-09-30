@@ -80,6 +80,10 @@ from backoffice.purchases import CAPITAL_ASSET_FLAG, possible_capital_asset
 __all__ = ["BackOfficeService", "ServiceError"]
 
 BANK_CONSENT_DAYS = 180  # PSD2 access consent (RTS Art. 10, as amended 2022): renew at most every 180 days
+# A connection whose access ends on a known date (a bank consent, an OAuth grant with a known lifetime) is announced
+# this many days before (checklist R4): on Home ("Coming up"), in Needs you, and with one push in production.
+ACCESS_WARNING_DAYS = 7
+_RENEW = "renew_"  # Needs-you id of a connection whose access ends soon: renew_<connection id>
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _SLUG = re.compile(r"[^a-z0-9]+")
 # Needs-You questions shown as one plain choice with the engine's own prompt and options (§37).
@@ -144,6 +148,15 @@ def _default_vault() -> Any:
         return None
 
 
+# Whose mailbox a connection reads (checklist O2): the kinds each provider allows besides the account's own, and the
+# connection's name for each.
+_MAILBOX_KINDS: dict[str, tuple[str, ...]] = {"microsoft": ("shared", "delegated"), "google": ("delegated", "alias")}
+_MAILBOX_NAMES: dict[tuple[str, str], str] = {
+    ("microsoft", "shared"): "Outlook shared mailbox", ("microsoft", "delegated"): "Outlook delegated mailbox",
+    ("google", "delegated"): "Gmail delegated mailbox", ("google", "alias"): "Gmail alias",
+}
+
+
 class ServiceError(Exception):
     """A request the service refuses; ``status`` is the HTTP status, ``message`` owner-safe."""
 
@@ -163,6 +176,15 @@ def _num(value: Decimal | None) -> int | float | None:
 
 def _iso(value: date | datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
+
+
+def _as_date(value: Any) -> date:
+    """A date kept in sign-in state (a date, or its ISO text after a round trip)."""
+    if isinstance(value, datetime):
+        return value.astimezone(TZ).date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value)[:10])
 
 
 class BackOfficeService:
@@ -441,6 +463,7 @@ class BackOfficeService:
         month = self._current_month()
         needs = self._open_needs()
         stale = self._stale_connectors()
+        renewals = self.access_notices()  # a sign-in that ends within a week is one thing to do (R4)
         risk = sum(1 for n in needs if n.kind == "approval")
         statuses = [self._status(c, month) for c in sorted(self.repo.companies)]
         done = sum((s.weighted_done if not s.closed else s.weighted_total) for s in statuses)
@@ -453,8 +476,8 @@ class BackOfficeService:
             percent = 0
         return {
             "greeting": greeting(now.astimezone(TZ)),
-            "headline": status_headline(len(needs) + len(stale), risk),
-            "needsYouCount": len(needs) + len(stale),
+            "headline": status_headline(len(needs) + len(stale) + len(renewals), risk),
+            "needsYouCount": len(needs) + len(stale) + len(renewals),
             "dueSoon": self._due_soon(),
             "currentMonth": {"key": str(month), "label": month.name, "percentClosed": percent},
             "companies": self.companies()["companies"],
@@ -477,6 +500,12 @@ class BackOfficeService:
                 "note": "On hold until you confirm the new bank details." if self.orchestrator._iban_changed(doc)
                 else "On hold until you check the invoice.",
                 "tone": "risk", "href": f"/needs-you#{n.id}",
+            })
+        for notice in self.access_notices():  # a sign-in that ends within a week (R4)
+            items.append({
+                "id": f"due_{_RENEW}{notice['id']}", "title": notice["title"], "companyName": notice["companyName"],
+                "due": notice["until"], "note": notice["note"], "tone": notice["tone"],
+                "href": f"/needs-you#{_RENEW}{notice['id']}",
             })
         open_obligations = [o.obligation for o in self.repo.obligations.values() if not o.satisfied_by]
         for due in due_soon(open_obligations, today, within_days=21):
@@ -548,6 +577,7 @@ class BackOfficeService:
 
     def connections(self) -> dict[str, Any]:
         now = self._now()
+        notices = {n["id"]: n for n in self.access_notices()}
         out = []
         kind_source = {"email": SourceKind.EMAIL, "bank": SourceKind.BANK, "accountant": SourceKind.ACCOUNTANT}
         for c in self.repo.connectors.values():
@@ -561,6 +591,9 @@ class BackOfficeService:
                 entry["message"] = f"{problem.title} {problem.detail}"
                 if self.real_sources:
                     entry.update(self._reconnect_state(c))
+            elif (notice := notices.get(c.id)) is not None:  # still connected, but not for long (R4)
+                entry["renewBy"] = notice["until"]
+                entry["message"] = notice["note"]
             out.append(entry)
         return {"connections": out}
 
@@ -621,8 +654,10 @@ class BackOfficeService:
             label = "Google" if provider == "google" else "Microsoft"
             url = None
             if self.authorizer is not None:
+                hint, scopes = self.consent_request(provider, c.account, info)
                 try:
-                    url = self.authorizer.begin(provider, self.repo.tenant_id, c.id, login_hint=c.account)
+                    url = self.authorizer.begin(provider, self.repo.tenant_id, c.id, login_hint=hint,
+                                                **({"scopes": scopes} if scopes else {}))
                 except Exception:
                     url = None
             if not url:
@@ -766,6 +801,15 @@ class BackOfficeService:
                     "I will remind you a week before; banks require this every 180 days.")
         if info.get("pending"):
             return "Waiting for you to finish signing in."
+        kind = info.get("mailbox")
+        if info.get("access_until") and not info.get("pending"):
+            until = _as_date(info["access_until"])
+            return (f"Signed in. This sign-in ends on {until.day} {until.strftime('%B %Y')}. "
+                    "I will remind you a week before.")
+        if info.get("stored") and kind in ("shared", "delegated", "alias"):
+            who = f" as {info['signInAs']}" if info.get("signInAs") else ""
+            read = "only the mail sent to this address" if kind == "alias" else "this mailbox with your access"
+            return f"Signed in{who}. I read {read}."
         if info.get("stored"):
             return "Signed in. Access renews automatically; no need to reconnect."
         return "Demo connection: no real sign-in was made."
@@ -797,11 +841,13 @@ class BackOfficeService:
         provider = body.get("provider") or "google"
         if provider not in ("google", "microsoft", "imap"):
             raise ServiceError(400, "Choose Google, Microsoft or another provider.")
+        options = self._mailbox_options(provider, address, body)
         company = self._company(body.get("companyId"), required=False)
         company_ids = (company,) if company else tuple(self.repo.companies)
         cid = self._slug("mail", address)
         now = self._now()
         name = {"google": "Gmail", "microsoft": "Outlook", "imap": "Email"}[provider]
+        name = _MAILBOX_NAMES.get((provider, options.get("mailbox", "own")), name)
         secret_stored = False
         if provider == "imap":
             host = self._text(body, "host", "Which mail server? For example imap.example.com.")
@@ -815,8 +861,10 @@ class BackOfficeService:
             name = f"Email ({host})"
         authorize_url = None
         if provider in ("google", "microsoft") and self.authorizer is not None:
+            hint, scopes = self.consent_request(provider, address, options)
             try:
-                authorize_url = self.authorizer.begin(provider, self.repo.tenant_id, cid, login_hint=address)
+                authorize_url = self.authorizer.begin(provider, self.repo.tenant_id, cid, login_hint=hint,
+                                                      **({"scopes": scopes} if scopes else {}))
             except Exception:
                 authorize_url = None
         pending = authorize_url is not None
@@ -825,7 +873,7 @@ class BackOfficeService:
             id=cid, name=name, kind="email", account=address, company_ids=company_ids, healthy=not pending,
             covered_from=now - timedelta(days=90) if simulated else None,
             covered_until=now if simulated else None, last_synced_at=now if simulated else None))
-        self.sign_in[cid] = {"provider": provider, "stored": secret_stored, "pending": pending}
+        self.sign_in[cid] = {"provider": provider, "stored": secret_stored, "pending": pending, **options}
         if simulated:
             self.orchestrator.milestone("email_connected")
             self.orchestrator.activity(now, "checked", f"Connected {address} and read the last 90 days.",
@@ -836,11 +884,61 @@ class BackOfficeService:
                 self.orchestrator.connection_reading(cid)
             self.orchestrator.activity(now, "checked", f"Connected {address}. I'm reading the last 90 days now.",
                                        company if company else None)
-        out: dict[str, Any] = {"id": cid, "message": "Almost done. Finish signing in." if pending else
-                               f"Done. I now read {address}."}
+        kind = options.get("mailbox", "own")
+        if pending and kind in ("shared", "delegated"):
+            message = f"Almost done. Sign in with your own account that can open {address}."
+        elif pending and kind == "alias":
+            message = f"Almost done. Sign in to the Google account {address} belongs to."
+        else:
+            message = "Almost done. Finish signing in." if pending else f"Done. I now read {address}."
+        out: dict[str, Any] = {"id": cid, "message": message}
         if authorize_url:
             out["authorizeUrl"] = authorize_url
         return out
+
+    @staticmethod
+    def _mailbox_options(provider: str, address: str, body: Mapping[str, Any]) -> dict[str, str]:
+        """Whose mailbox a connection reads (checklist O2), configured per mailbox: the signed-in account's own
+        (the default); a Microsoft 365 shared mailbox, or one delegated to the signed-in user ("shared",
+        "delegated": read through /users/{address} with their delegated access); a Google mailbox delegated to
+        the signed-in account where Google allows it ("delegated"); or an alias of the signed-in Google mailbox,
+        of which only the mail delivered to the alias is read ("alias"). ``signInAs``: the account that signs in."""
+        kind = body.get("mailbox") or "own"
+        if kind not in ("own", "shared", "delegated", "alias"):
+            raise ServiceError(400, "Say whose mailbox this is: yours, a shared one, one delegated to you, or an "
+                                    "alias of yours.")
+        if kind == "own":
+            return {}
+        if kind not in _MAILBOX_KINDS.get(provider, ()):
+            raise ServiceError(400, {
+                "imap": "For this mailbox, add it with its own address and app password.",
+                "microsoft": "With Microsoft, I can read a shared mailbox, or one delegated to you, through your own "
+                             "sign-in.",
+                "google": "With Google, I can read a mailbox delegated to you, or an alias of your own mailbox.",
+            }[provider])
+        options = {"mailbox": str(kind)}
+        signer = body.get("signInAs")
+        if signer not in (None, ""):
+            signer = str(signer).strip().lower()
+            if not _EMAIL.match(signer) or len(signer) > 254:
+                raise ServiceError(400, "The account you sign in with doesn't look like an email address.")
+            if signer == address:
+                raise ServiceError(400, "Sign in with your own account, not the shared mailbox itself.")
+            options["signInAs"] = signer
+        return options
+
+    @staticmethod
+    def consent_request(provider: str, address: str, options: Mapping[str, Any]) -> tuple[str | None, tuple[str, ...]]:
+        """(login hint, extra scopes) for signing in to read this mailbox (O2). A shared or delegated Microsoft
+        mailbox needs Mail.Read.Shared; the account that signs in is the owner's own, never the shared mailbox."""
+        kind = options.get("mailbox", "own")
+        hint = options.get("signInAs") or (None if kind in ("shared", "delegated") else address)
+        scopes: tuple[str, ...] = ()
+        if provider == "microsoft" and kind in ("shared", "delegated"):
+            from backoffice.connectors.microsoft import GRAPH_SHARED_MAIL_SCOPE
+
+            scopes = (GRAPH_SHARED_MAIL_SCOPE,)
+        return hint, scopes
 
     def _add_bank(self, body: Mapping[str, Any], *, consent_until: date | None = None) -> dict[str, Any]:
         """A bank account. ``consent_until``: the owner authorised access at the bank (PSD2 consent)."""
@@ -948,8 +1046,17 @@ class BackOfficeService:
             self.orchestrator.activity(self._now(), "checked", f"{c.name} is connected again: {c.account} synced.")
         expires = when("auth_expires_at")
         if c.kind == "bank" and expires is not None:
-            self.sign_in[c.id] = {**self.sign_in.get(c.id, {}), "provider": "open_banking",
-                                  "consent_until": expires.astimezone(TZ).date(), "pending": False}
+            info = self.sign_in.get(c.id, {})
+            until = expires.astimezone(TZ).date()
+            if info.get("consent_until") != until:  # a new consent: a new reminder a week before it ends
+                info = {k: v for k, v in info.items() if k != "warned"}
+            self.sign_in[c.id] = {**info, "provider": "open_banking", "consent_until": until, "pending": False}
+        elif c.kind == "email" and expires is not None:  # an OAuth grant with a known lifetime (R4)
+            info = self.sign_in.get(c.id, {})
+            until = expires.astimezone(TZ).date()
+            if info.get("access_until") != until:
+                info = {k: v for k, v in info.items() if k != "warned"}
+            self.sign_in[c.id] = {**info, "access_until": until}
         if not first:
             return None
         self.orchestrator.connection_read(c.id)  # its first 90 days are in (§6)
@@ -1913,8 +2020,11 @@ class BackOfficeService:
         digest = hashlib.sha256(secret.encode()).hexdigest()
         return any(hmac.compare_digest(digest, r["hash"]) for r in self._keys().values())
 
-    def finish_sign_in(self, connection_id: str) -> None:
-        """The provider confirmed consent and the vault holds the refresh token: start reading."""
+    def finish_sign_in(self, connection_id: str, *, access_until: date | None = None) -> None:
+        """The provider confirmed consent and the vault holds the refresh token: start reading.
+
+        ``access_until``: the day the grant itself ends, when the provider says (a grant with a known lifetime);
+        a week before, the owner is asked to sign in again (R4). None: the grant has no end the provider states."""
         c = self.repo.connectors.get(connection_id)
         if c is None:
             return
@@ -1926,7 +2036,10 @@ class BackOfficeService:
             self._clear_reconnect(connection_id)
         else:
             c.healthy, c.covered_from, c.covered_until, c.last_synced_at = True, now - timedelta(days=90), now, now
-        self.sign_in[connection_id] = {**self.sign_in.get(connection_id, {}), "pending": False, "stored": True}
+        info = {k: v for k, v in self.sign_in.get(connection_id, {}).items() if k not in ("access_until", "warned")}
+        if access_until is not None:
+            info["access_until"] = access_until
+        self.sign_in[connection_id] = {**info, "pending": False, "stored": True}
         if c.kind == "email" and not reconnecting:
             self.orchestrator.milestone("email_connected")
             if self.real_sources and not (self.sync_states.get(connection_id) or {}).get("last_successful_sync"):
@@ -2230,7 +2343,7 @@ class BackOfficeService:
     # ----------------------------------------------------------------- Needs you
 
     def needs_you(self) -> dict[str, Any]:
-        items = []
+        items = [self._renewal_item(notice) for notice in self.access_notices()]  # R4: before a sign-in ends
         for n in self._open_needs():
             if n.kind == "check":
                 items.append(self._check(n))
@@ -2414,13 +2527,20 @@ class BackOfficeService:
         month_name = doc_month.name if doc_month else "this"
         title = next((s.owner_line for s in (doc.fraud.signals if doc.fraud else ()) if s.hard_stop),
                      f"Something on {who}'s invoice does not look right.")
+        late = doc.late_bank_hold  # already paid; the bank details came later (checklist Q4)
+        if late:
+            body = (f"{month_name.capitalize()}’s invoice was already paid. A new copy of it shows a bank account you "
+                    f"have not paid {who} before. I won’t pay anything into it until you confirm it is really {who}.")
+        elif changed:
+            body = (f"The bank account on {month_name}’s invoice is different from the one you have paid before. "
+                    f"I have blocked the payment until you confirm it is really {who}.")
+        else:
+            body = f"I have blocked the payment of {month_name}’s invoice until you confirm it is really {who}."
         return {
             "id": n.id, "kind": "approval", "tone": "risk", "eyebrow": "Payment on hold", "merchant": who,
             "title": title, "amount": _num(d.gross_amount), "currency": d.currency,
             "date": _iso(d.issue_date or doc.received_at.astimezone(TZ).date()), "companyId": n.company_id,
-            "body": (f"The bank account on {month_name}’s invoice is different from the one you have paid before. "
-                     f"I have blocked the payment until you confirm it is really {who}.") if changed else
-                    (f"I have blocked the payment of {month_name}’s invoice until you confirm it is really {who}."),
+            "body": body,
             "facts": facts,
             "why": [*n.why, "Changed bank details are a common way invoice fraud happens. I never release these "
                             "without you."],
@@ -2428,9 +2548,11 @@ class BackOfficeService:
                 "optionLabel": f"Confirm with {who} by phone",
                 "instruction": f"Call {who} {where} Ask them to confirm the account ending in {last4}.",
                 "checkboxLabel": f"I called and {who} confirmed the account ending in {last4}.",
-                "confirmLabel": "They confirmed it. Release the payment.",
+                "confirmLabel": "They confirmed it. Trust this account." if late else
+                "They confirmed it. Release the payment.",
                 "confirmOptionId": "confirmed_by_phone",
-                "confirmedMessage": "Done. The payment will go to the new account.",
+                "confirmedMessage": f"Done. {who}'s new account is confirmed. This invoice was already paid." if late
+                else "Done. The payment will go to the new account.",
             },
             "keepBlocked": {
                 "label": "Keep blocked", "optionId": "keep_blocked",
@@ -2443,6 +2565,8 @@ class BackOfficeService:
     def answer(self, needs_id: str, option_id: str, remember: bool = False, split: Any = None) -> dict[str, Any]:
         if not isinstance(option_id, str) or not option_id.strip():
             raise ServiceError(400, "Please pick one of the options.")
+        if isinstance(needs_id, str) and needs_id.startswith(_RENEW):
+            return self.renew_access(needs_id[len(_RENEW):], option_id)
         try:
             outcome = self.orchestrator.answer(needs_id, option_id, remember=bool(remember), split=split)
         except KeyError:
@@ -2459,6 +2583,115 @@ class BackOfficeService:
         if outcome.resolved_ids:
             result["alsoResolved"] = list(outcome.resolved_ids)
         return result
+
+    # ----------------------------------------------------------------- Sign-ins that end (R4)
+
+    def access_until(self, connection_id: str) -> date | None:
+        """The day a connection's access ends, when it is knowable: a bank consent's end, or an OAuth grant with a
+        known lifetime. None for the rest (an IMAP app password, a Google or Microsoft sign-in without a stated
+        end): for those nothing is promised."""
+        c = self.repo.connectors.get(connection_id)
+        info = self.sign_in.get(connection_id) or {}
+        if c is None or info.get("pending"):
+            return None
+        value = info.get("consent_until") if c.kind == "bank" else info.get("access_until") if c.kind == "email" \
+            else None
+        return _as_date(value) if value else None
+
+    def access_notices(self) -> list[dict[str, Any]]:
+        """Connections whose access ends within a week (or ended while they still look connected): plain words for
+        Home, Needs you and the connections list (R4). Read-only."""
+        today = self._today()
+        out: list[dict[str, Any]] = []
+        for c in sorted(self.repo.connectors.values(), key=lambda c: c.id):
+            until = self.access_until(c.id)
+            if until is None or not c.healthy or (until - today).days > ACCESS_WARNING_DAYS:
+                continue
+            ended = until < today
+            day = day_month(until, today)
+            name = c.name if c.kind == "bank" else c.account
+            what = "keep importing its payments" if c.kind == "bank" else "keep reading it"
+            if c.kind == "bank":
+                title = f"Renew your {c.name} access"
+                note = (f"Your access to {c.name} ended on {day}. Renew it so I can import its payments again."
+                        if ended else f"Your access to {c.name} ends on {day}. Renew it so I {what}.")
+                why = ["Banks ask you to approve access again every 180 days.",
+                       f"After {day} I can't import new payments from it until you do."]
+            else:
+                title = f"Sign in to {c.account} again"
+                note = (f"Access to {c.account} ended on {day}. Sign in again so I can read it again." if ended else
+                        f"Access to {c.account} ends on {day}. Sign in again so I {what}.")
+                why = [f"This sign-in was given until {day}.", f"After {day} I can't read new email there until you "
+                                                              "sign in again."]
+            companies = [self.repo.company_name(i) or i for i in c.company_ids]
+            out.append({"id": c.id, "kind": c.kind, "name": name, "until": until.isoformat(), "ended": ended,
+                        "title": title, "note": note, "why": why, "tone": "risk" if ended else "attention",
+                        "companyId": c.company_ids[0] if len(c.company_ids) == 1 else None,
+                        "companyName": companies[0] if len(companies) == 1 else "All companies"})
+        return out
+
+    def _renewal_item(self, notice: Mapping[str, Any]) -> dict[str, Any]:
+        """A sign-in that ends soon, as one plain choice in Needs you (R4)."""
+        item: dict[str, Any] = {
+            "id": f"{_RENEW}{notice['id']}", "kind": "choice", "tone": notice["tone"],
+            "eyebrow": "Before it ends" if not notice["ended"] else "Access ended", "merchant": notice["name"],
+            "amount": None, "currency": "EUR", "date": notice["until"], "question": notice["note"],
+            "options": [{"id": "renew", "label": "Renew access now" if notice["kind"] == "bank" else "Sign in again"}],
+            "why": list(notice["why"]),
+        }
+        if notice["companyId"]:
+            item["companyId"] = notice["companyId"]
+        return item
+
+    def warn_expiring(self) -> list[str]:
+        """Note, once per end date, each connection whose access ends within a week (R4): the activity says it, and
+        the production server's push goes out when it is first noted (server/notify.py). Called as each recorded
+        change applies, live and on replay alike, so it is part of the tenant's state. Returns the ids noted."""
+        noted: list[str] = []
+        for notice in self.access_notices():
+            info = self.sign_in.get(notice["id"]) or {}
+            if info.get("warned") == notice["until"]:
+                continue
+            self.sign_in[notice["id"]] = {**info, "warned": notice["until"]}
+            company = notice["companyId"]
+            self.orchestrator.activity(self._now(), "checked", f"{notice['note']} I asked you in Needs you.", company)
+            self.orchestrator.log("closure", "access_ends_soon", subject_id=notice["id"],
+                                  values={"until": notice["until"]})
+            noted.append(notice["id"])
+        return noted
+
+    def renew_access(self, connection_id: str, option_id: str) -> dict[str, Any]:
+        """The owner asked to renew a connection's access before it ends (R4). The demo's connections are simulated
+        and renew at once; a real one is renewed where it was given: at the bank, or by signing in again."""
+        c = self.repo.connectors.get(connection_id)
+        notice = next((n for n in self.access_notices() if n["id"] == connection_id), None)
+        if c is None or notice is None:
+            raise ServiceError(404, "I can't find that question any more.")
+        if option_id != "renew":
+            raise ServiceError(400, "Please pick one of the options.")
+        now = self._now()
+        if not self.real_sources:
+            info = {k: v for k, v in (self.sign_in.get(c.id) or {}).items() if k not in ("warned", "access_until")}
+            if c.kind == "bank":
+                until = (now + timedelta(days=BANK_CONSENT_DAYS)).date()
+                info["consent_until"] = until
+                for a in self.repo.accounts.values():  # its accounts show the same consent
+                    if a.bank == c.name and a.id in self.sign_in:
+                        self.sign_in[a.id] = {**self.sign_in[a.id], "consent_until": until}
+                self.sign_in[c.id] = info
+                message = f"Done. {c.name} access is renewed until {day_month(until, self._today())}."
+            else:
+                self.sign_in[c.id] = info  # signed in again: this sign-in states no end
+                message = f"Done. You signed in to {c.account} again."
+            self.orchestrator.activity(now, "checked", message.removeprefix("Done. "), notice["companyId"])
+            self.orchestrator.log("closure", "access_renewed", subject_id=c.id)
+            return {"ok": True, "message": message}
+        if c.kind == "bank":
+            return {"ok": True, "message": f"To renew it, link {c.name} again in Sources. Your bank will ask you to "
+                                           "approve access, and I keep importing from where I was."}
+        label = {"google": "Google", "microsoft": "Microsoft"}.get((self.sign_in.get(c.id) or {}).get("provider"),
+                                                                   "your email provider")
+        return {"ok": True, "message": f"To renew it, sign in to {label} again for {c.account} in Sources."}
 
     # ----------------------------------------------------------------- Cost centers (jobs, properties, vehicles ...)
 

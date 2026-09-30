@@ -196,6 +196,46 @@ class TextReading:
 
 
 @dataclass(frozen=True)
+class BankWording:
+    """How a country's bank statements word payments (§21, §49): consecutive folded words (upper case, no
+    accents), as the core's expected-evidence engine matches them. The engine reads a bank line with the
+    wording of its account's company's country, besides its own (English and the countries no pack covers).
+    Bank-statement conventions, not legal facts: unverified against live feeds (verified_as_of: never).
+
+    ``tax_authorities`` name a tax or social security office outright (any company's line naming one is a tax
+    payment); ``authority_names`` are counterparty names that are one on their own ("AT"). ``tax_words`` are tax
+    abbreviations that count only next to one of the ``state_words`` ("PAG ESTADO IVA"). ``payroll_allowances``
+    are payroll words that are never a grant ("SUBSIDIO DE FERIAS")."""
+
+    tax_authorities: tuple[str, ...] = ()
+    authority_names: frozenset[str] = frozenset()
+    tax_words: frozenset[str] = frozenset()
+    state_words: frozenset[str] = frozenset()
+    tourist_tax: tuple[str, ...] = ()
+    grants: tuple[str, ...] = ()
+    payroll_allowances: tuple[str, ...] = ()
+    bank_fees: tuple[str, ...] = ()
+    payroll_words: frozenset[str] = frozenset()
+    loans: tuple[str, ...] = ()
+
+    def merged(self, other: BankWording) -> BankWording:
+        """This wording and ``other``'s together (phrases in order, without repeats)."""
+
+        def phrases(a: tuple[str, ...], b: tuple[str, ...]) -> tuple[str, ...]:
+            return tuple(dict.fromkeys((*a, *b)))
+
+        return BankWording(
+            tax_authorities=phrases(self.tax_authorities, other.tax_authorities),
+            authority_names=self.authority_names | other.authority_names,
+            tax_words=self.tax_words | other.tax_words, state_words=self.state_words | other.state_words,
+            tourist_tax=phrases(self.tourist_tax, other.tourist_tax), grants=phrases(self.grants, other.grants),
+            payroll_allowances=phrases(self.payroll_allowances, other.payroll_allowances),
+            bank_fees=phrases(self.bank_fees, other.bank_fees),
+            payroll_words=self.payroll_words | other.payroll_words, loans=phrases(self.loans, other.loans),
+        )
+
+
+@dataclass(frozen=True)
 class PeriodicObligation:
     """An obligation a country's calendar sets for a company, with no letter needed (e.g. a quarterly
     VAT return). ``key`` is stable per company and period, so the same obligation is created once."""
@@ -309,8 +349,12 @@ class CompanyPack(CountryPack, Protocol):
 
     ``language`` is the pack's document language ("pt", "es"): a document in another language with
     no issuer country is read as one from abroad. ``title_words`` start lines that are never the
-    supplier's name. ``obligation_vocabulary`` adds the country's letter wording (folded phrases by
-    category, see :mod:`backoffice.closure.obligations`) to the core's English and Portuguese.
+    supplier's name. ``obligation_vocabulary`` is the country's letter wording (folded phrases by
+    category, see :mod:`backoffice.closure.obligations`), read with the core's English: letters are read
+    with the wording of the business's companies' countries. ``bank_wording`` is how its bank statements
+    word taxes, fees, salaries and loans (:class:`BankWording`, read by the expected-evidence engine for
+    the bank lines of that country's companies), and ``parse_amount`` reads an amount the way the country
+    writes it.
     ``public_holidays`` are the country's national public holidays (a working day skips them: the
     monthly accountant package goes on one, backoffice.package_delivery). ``document_code`` is the
     unique code the country's rules print on each fiscal document (Portugal's ATCUD), which proves two
@@ -341,6 +385,14 @@ class CompanyPack(CountryPack, Protocol):
         ...
 
     def obligation_vocabulary(self) -> Mapping[str, tuple[str, ...]]: ...
+
+    def bank_wording(self) -> BankWording:
+        """How the country's bank statements word taxes, fees, salaries, loans, grants and local taxes."""
+        ...
+
+    def parse_amount(self, text: str) -> Decimal | None:
+        """One money amount as the country writes it ("1.492,30"); None when the text is not one amount."""
+        ...
 
     def periodic_obligations(self, company_id: str, today: date) -> tuple[PeriodicObligation, ...]: ...
 

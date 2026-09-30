@@ -559,9 +559,13 @@ class TenantManager:
         with deterministic(f"{rt.tenant_id}:{event.seq}", clock.now):
             clock.advance_to(event.at)
             try:
-                return handler(self, rt, event, env)
+                result = handler(self, rt, event, env)
             except ServiceError as exc:
-                return _error(exc)
+                result = _error(exc)
+            # A sign-in that ends within a week is noted once, by the change that finds it (checklist R4): the
+            # same on replay, and the push goes out when it is first noted live (server/notify.py).
+            svc.warn_expiring()
+            return result
 
     # ----------------------------------------------------------------- creating tenants
 
@@ -800,7 +804,8 @@ class TenantManager:
         if reconnect is not None:
             svc = rt.service
             c = svc.repo.connectors.get(reconnect.group(1))
-            provider = (svc.sign_in.get(c.id) or {}).get("provider") if c is not None else None
+            options = dict(svc.sign_in.get(c.id) or {}) if c is not None else {}
+            provider = options.get("provider")
             if c is None or c.kind != "email" or provider not in ("google", "microsoft"):
                 return None
             cid, address = c.id, c.account.strip().lower()
@@ -811,12 +816,18 @@ class TenantManager:
                 return None
             address = address.strip().lower()
             cid = rt.service._slug("mail", address)
+            try:  # whose mailbox it is (a shared mailbox, a delegated one, an alias: checklist O2)
+                options = BackOfficeService._mailbox_options(provider, address, body)
+            except ServiceError:
+                return None  # the request itself is refused when it applies
         else:
             return None
         if provider not in getattr(self.authorizer, "providers", ()):
             return None
+        hint, scopes = BackOfficeService.consent_request(provider, address, options)
         try:
-            return self.authorizer.begin(provider, rt.tenant_id, cid, login_hint=address)
+            return self.authorizer.begin(provider, rt.tenant_id, cid, login_hint=hint,
+                                         **({"scopes": scopes} if scopes else {}))
         except Exception:
             log.warning("oauth_begin_failed", extra={"tenant": rt.tenant_id})
             return None
@@ -851,22 +862,30 @@ class TenantManager:
             return self.record(rt, "accountant.set", data, actor, self.live_env())
 
     def finish_sign_in(self, tenant_id: str, connection_id: str, provider: str,
-                       email: str | None) -> tuple[int, dict[str, Any]]:
-        """A mailbox sign-in came back from Google/Microsoft with a refresh token in the vault."""
+                       email: str | None, *, access_until: date | None = None) -> tuple[int, dict[str, Any]]:
+        """A mailbox sign-in came back from Google/Microsoft with a refresh token in the vault.
+
+        ``access_until``: the day the grant ends when the provider stated it (else what the vault recorded for it,
+        connectors.authorize): the event carries it, so the owner is reminded a week before (R4)."""
+        meta = self.vault.metadata(tenant_id, connection_id) if self.vault is not None else None
+        if access_until is None and meta is not None and meta.expires_at is not None:
+            access_until = meta.expires_at.astimezone(TZ).date()
+        extra = {"accessUntil": access_until.isoformat()} if access_until is not None else {}
         with self.open(tenant_id) as rt:
             if connection_id in rt.service.repo.connectors:
-                return self.record(rt, "sign_in.finished", {"connectionId": connection_id}, "system",
+                return self.record(rt, "sign_in.finished", {"connectionId": connection_id, **extra}, "system",
                                    self.live_env())
             if not email:
                 return 400, {"error": "bad_request", "message": "I couldn't tell which mailbox that was."}
-            status, body = self.record(rt, "email.connected", {"provider": provider, "address": email}, "system",
-                                       self.live_env())
+            status, body = self.record(rt, "email.connected", {"provider": provider, "address": email, **extra},
+                                       "system", self.live_env())
             new_id = body.get("id")
             if status == 200 and isinstance(new_id, str) and self.vault is not None and new_id != connection_id:
                 # The refresh token was sealed under the sign-in's temporary id: move it to the connector.
                 try:
                     secret = self.vault.open(tenant_id, connection_id)
-                    self.vault.store(tenant_id, new_id, provider, secret)
+                    self.vault.store(tenant_id, new_id, provider, secret,
+                                     expires_at=meta.expires_at if meta is not None else None)
                     self.vault.delete(tenant_id, connection_id)
                 except Exception:
                     log.exception("vault_move_failed", extra={"tenant": tenant_id})
@@ -1106,8 +1125,14 @@ def _chat_tool(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> t
     return 200, {"isError": False, "result": json.loads(json.dumps(result, default=str))}
 
 
+def _access_until(data: Mapping[str, Any]) -> date | None:
+    """The day a sign-in's grant ends, when the event recorded one (R4)."""
+    value = data.get("accessUntil")
+    return date.fromisoformat(str(value)) if value else None
+
+
 def _sign_in_finished(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
-    rt.service.finish_sign_in(str(event.data.get("connectionId")))
+    rt.service.finish_sign_in(str(event.data.get("connectionId")), access_until=_access_until(event.data))
     return 200, {"ok": True}
 
 
@@ -1116,7 +1141,7 @@ def _email_connected(m: TenantManager, rt: TenantRuntime, event: Event, env: Env
     svc.authorizer = _FixedAuthorizer("https://sign-in.invalid/finished")  # the sign-in already happened
     added = svc.add_source({"kind": "email", "provider": event.data.get("provider"),
                             "address": event.data.get("address")})
-    svc.finish_sign_in(added["id"])
+    svc.finish_sign_in(added["id"], access_until=_access_until(event.data))
     return 200, {"ok": True, "id": added["id"]}
 
 

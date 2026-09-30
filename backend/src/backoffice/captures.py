@@ -305,8 +305,11 @@ class CaptureAgent:
         report = IngestReport(route="answer", message="")
         if option_id == "same":
             extracted = self.o.documents.read(pending.parts)
+            held_before = existing.on_hold
             if extracted is not None:
-                self.o._merge_duplicate(existing, extracted, report)
+                options = pending.options or {}
+                self.o._merge_duplicate(existing, extracted, report, sender=options.get("sender"),
+                                        message_text=options.get("message_text") or "", at=now)
             pending.status = "merged"
             self.log("same_document_confirmed", subject_id=existing.id,
                      evidence_ids=[*pending.evidence_ids, answer_ev], values={"by": "owner"})
@@ -315,6 +318,10 @@ class CaptureAgent:
             kind, number = existing.label.split(" · ")[0], existing.document.invoice_number or ""
             words = kind[: -len(number)].strip() if number and kind.endswith(number) else kind
             what = " ".join(p for p in (display_name(existing.document.supplier_name), words.lower(), number) if p)
+            if existing.on_hold and not held_before and existing.fraud is not None:
+                # The copy added bank details the invoice did not have: held like any new beneficiary (Q4).
+                return AnswerOutcome(True, f"Done. I kept it with the {what}. It shows bank details you have not "
+                                           f"paid before, so I put the payment on hold: {existing.fraud.owner_message}")
             return AnswerOutcome(True, f"Done. I kept it with the {what}. It is one document, and every original is "
                                        "kept.")
         record = self.o._document_from_parts(pending.parts, at=now, origin=pending.origin, retrieved=pending.retrieved,

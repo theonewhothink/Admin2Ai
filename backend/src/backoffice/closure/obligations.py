@@ -1,8 +1,12 @@
 """Administrative obligations (§24): find them in letters, prove them done, list what's due.
 
-Detection reads government, bank, landlord and insurer text in Portuguese and
-English ("prazo", "data limite", "pagamento até", "Autoridade Tributária",
-"Segurança Social", "renovação", "KYC", "due by", ...) and produces a domain
+Detection reads government, bank, landlord and insurer text in English ("due by",
+"amount due", "KYC", "tax office", ...) plus the wording of the companies' countries,
+which lives in their country packs (§49, ``CompanyPack.obligation_vocabulary``): Portugal's
+"prazo", "data limite de pagamento", "Autoridade Tributária", "Segurança Social",
+"renovação"; Spain's "plazo", "importe a ingresar", "Agencia Tributaria"... A letter is read
+with its company's country's wording (the business's companies' when it names none; every
+company pack's when there are no companies yet). It produces a domain
 :class:`~backoffice.domain.models.Obligation` with the responsible person,
 amount, date, company, consequence, required evidence and a machine-checkable
 verification condition.
@@ -26,19 +30,19 @@ Rules of evidence:
 
 Local fees and grants (checklist X26, X30):
 
-* The municipal tourist tax ("taxa turística", "taxa municipal turística", "tourist tax", "city tax"):
+* The municipal tourist tax ("tourist tax", "city tax"; Portugal's "taxa municipal turística"):
   with an amount it is a payment to the municipality (proven by that payment), without one it is the
   monthly declaration (proven by the submission receipt or the owner's confirmation).
-* Grant and subsidy communications (IFAP, PEPAC, Portugal 2030, COMPETE 2030, Recuperar Portugal,
-  "subsídio", "apoio", "candidatura", "grant", "subsidy"): documents to send by a deadline (proven by
-  the agency's acknowledgement or the owner's confirmation), and a grant payment announced, approved
-  or made (proven only by the money arriving in the bank). Payroll words ("subsídio de férias",
-  "subsídio de refeição") and "apoio ao cliente" are never a grant.
+* Grant and subsidy communications ("grant", "subsidy"; the agencies and words a country's pack names,
+  such as Portugal's IFAP, Portugal 2030, "subsídio", "candidatura"): documents to send by a deadline
+  (proven by the agency's acknowledgement or the owner's confirmation), and a grant payment announced,
+  approved or made (proven only by the money arriving in the bank). Payroll words (Portugal's "subsídio
+  de férias") and support lines ("customer support", "apoio ao cliente") are never a grant.
 
 Everything here is wording, not law. The phrase tables are common letter
 conventions (unverified against a corpus, verified_as_of: never); the
 consequences are cautious "may" statements unless the letter itself names
-one. Relative deadlines ("no prazo de 15 dias") are counted in calendar days
+one. Relative deadlines ("within 15 days", "no prazo de 15 dias") are counted in calendar days
 from the day the letter arrived, which is never later than a business-day
 count from the same day; the exact legal counting rule is NOT encoded and the
 finding says the date needs checking.
@@ -96,6 +100,7 @@ __all__ = [
     "is_grant_text",
     "mentions_tourist_tax",
     "normalize_reference",
+    "pack_vocabulary",
     "proof_for",
     "satisfy",
 ]
@@ -130,115 +135,63 @@ class ProofKind(str, Enum):
     DECISION = "decision"  # owner decided not to renew
 
 
-# Folded phrases (lowercase, no accents). Unverified conventions; extend as letters are seen.
+# The core's own wording: English, as folded phrases (lowercase, no accents). A country's words live in its
+# pack (``CompanyPack.obligation_vocabulary``, e.g. backoffice.countries.pt.obligations) and are read with these.
+# Unverified conventions; extend as letters are seen.
 _ISSUER_PHRASES: dict[Issuer, tuple[str, ...]] = {
-    Issuer.TAX_AUTHORITY: (
-        "autoridade tributaria", "autoridade tributaria e aduaneira", "portal das financas",
-        "servico de financas", "servicos de financas", "direcao de financas", "hmrc",
-        "hm revenue", "agencia tributaria", "tax authority", "tax office",
-    ),
-    Issuer.SOCIAL_SECURITY: (
-        "seguranca social", "instituto da seguranca social", "igfss", "social security",
-    ),
-    Issuer.BANK: ("o seu banco", "your bank", "o banco", "the bank"),
-    Issuer.LANDLORD: ("senhorio", "landlord", "arrendamento", "contrato de arrendamento", "lease"),
-    Issuer.INSURER: ("seguradora", "companhia de seguros", "insurer", "insurance company", "apolice"),
-    Issuer.MUNICIPALITY: ("camara municipal", "municipio de", "municipio do", "municipio da", "junta de freguesia",
-                          "city council", "municipality", "town hall"),
-}  # fmt: skip
-# Agencies that run grants and subsidies, as their letters name them (folded), with their names for the owner.
-_GRANT_AGENCIES: dict[str, str] = {
-    "ifap": "IFAP", "instituto de financiamento da agricultura e pescas": "IFAP", "pepac": "PEPAC",
-    "portugal 2030": "Portugal 2030", "pt2030": "Portugal 2030", "compete 2030": "COMPETE 2030",
-    "norte 2030": "Norte 2030", "centro 2030": "Centro 2030", "lisboa 2030": "Lisboa 2030",
-    "alentejo 2030": "Alentejo 2030", "algarve 2030": "Algarve 2030", "balcao dos fundos": "Balcão dos Fundos",
-    "recuperar portugal": "Recuperar Portugal", "iapmei": "IAPMEI", "fundo ambiental": "Fundo Ambiental",
+    Issuer.TAX_AUTHORITY: ("hmrc", "hm revenue", "tax authority", "tax office"),
+    Issuer.SOCIAL_SECURITY: ("social security",),
+    Issuer.BANK: ("your bank", "the bank"),
+    Issuer.LANDLORD: ("landlord", "lease"),
+    Issuer.INSURER: ("insurer", "insurance company"),
+    Issuer.MUNICIPALITY: ("city council", "municipality", "town hall"),
 }  # fmt: skip
 _SOURCE_ISSUER = {SourceKind.BANK: Issuer.BANK, SourceKind.CARD: Issuer.BANK}
 
-_KYC = ("kyc", "know your customer", "conheca o seu cliente", "atualizacao de dados",
-        "actualizacao de dados", "atualizar os seus dados", "atualize os seus dados",
-        "actualizar os seus dados", "verify your identity", "identity verification",
-        "comprovativo de morada", "proof of address", "beneficiario efetivo",
-        "beneficiario efectivo", "beneficial owner", "update your details")  # fmt: skip
-_PAYMENT = ("pagamento", "pagar", "a pagar", "valor a pagar", "total a pagar", "liquidar",
-            "liquidacao", "contribuicoes", "contribuicao", "prestacao", "payment", "pay",
-            "amount due", "balance due", "total due")  # fmt: skip
-_FILING = ("declaracao", "declaracao periodica", "entrega da declaracao", "declaracao anual",
-           "modelo 22", "ies", "tax return", "vat return", "filing", "file your return",
-           "self assessment")  # fmt: skip
-_REQUEST = ("notificacao", "notificado", "notificada", "pedido de", "esclarecimento",
-            "esclarecimentos", "solicitamos", "apresentar", "documentos", "request", "requested",
-            "please provide", "please send", "information request", "audiencia previa")  # fmt: skip
-_DEBT = ("cobranca de divida", "cobranca de dividas", "recuperacao de credito",
-         "recuperacao de creditos", "injuncao", "divida", "divida em atraso", "debt collection",
-         "debt recovery", "collection agency", "outstanding debt", "ultimo aviso", "aviso final",
-         "final notice", "final demand", "penhora")  # fmt: skip
-_RENEWAL = ("renovacao", "renovar", "renova", "renove", "renewal", "renew", "renews", "expira",
-            "expiracao", "caducidade", "caduca", "expires", "expiry", "expiration")  # fmt: skip
-_INSURANCE = ("seguro", "apolice", "seguradora", "insurance", "insurer", "policy")
-_LICENSE = ("licenca", "alvara", "licence", "license", "permit", "certificacao", "certificado")
-_RENT = ("renda", "rendas", "rent", "senhorio", "landlord", "arrendamento")
-_BANK_REQUEST = ("documentacao", "documentos em falta", "missing documents", "please provide",
-                 "pedido de documentos", "pedido de informacao", "request")  # fmt: skip
-_PAYMENT_DEADLINE = ("pagamento ate", "data limite de pagamento", "data limite para pagamento",
-                     "data de vencimento", "vencimento:", "vence em", "vence a", "due by",
-                     "payment due", "amount due", "due date", "pay by", "valor a pagar",
-                     "total a pagar")  # fmt: skip
-# The municipal tourist tax (Lisbon, Porto, ... charge it per night; the operator declares and pays monthly).
-_TOURIST_TAX = ("taxa turistica", "taxas turisticas", "taxa municipal turistica", "taxas municipais turisticas",
-                "tourist tax", "city tax", "taxa de dormida", "taxa de dormidas", "overnight tax")
-# Grant words. Some are enough on their own; a core word ("candidatura", "apoio") needs a second grant word next to
-# it (a loan letter's "financiamento" and "investimento" alone are never a grant).
-_GRANT_ALONE = ("subsidio", "subsidios", "subvencao", "subvencoes", "subsidy", "subsidies", "fundo perdido",
-                "grant application", "grant agreement", "grant payment", "grant award", "grant funding",
-                "apoio financeiro", "incentivo financeiro")
-_GRANT_CORE = ("candidatura", "candidaturas", "grant", "grants", "apoio", "apoios", "incentivo", "incentivos",
-               "comparticipacao")
-_GRANT_PAIRED = (*_GRANT_CORE, "financiamento", "aprovada", "aprovado", "aprovacao", "beneficiario", "investimento",
-                 "fundos", "funding", "awarded", "beneficiary")
-# Never a grant: payroll allowances, customer support lines, access being granted.
-_NOT_GRANT = ("subsidio de ferias", "subsidio de natal", "subsidio de refeicao", "subsidio de alimentacao",
-              "subsidio de desemprego", "subsidio de doenca", "subsidio de parentalidade", "subsidio de turno",
-              "subsidios de ferias", "subsidios de natal", "apoio ao cliente", "linha de apoio", "apoio tecnico",
-              "customer support", "grant access", "granted access", "grants access")
+_KYC = ("kyc", "know your customer", "verify your identity", "identity verification", "proof of address",
+        "beneficial owner", "update your details")  # fmt: skip
+_PAYMENT = ("payment", "pay", "amount due", "balance due", "total due")
+_FILING = ("tax return", "vat return", "filing", "file your return", "self assessment")
+_REQUEST = ("request", "requested", "please provide", "please send", "information request")
+_DEBT = ("debt collection", "debt recovery", "collection agency", "outstanding debt", "final notice",
+         "final demand")  # fmt: skip
+_RENEWAL = ("renewal", "renew", "renews", "expires", "expiry", "expiration")
+_INSURANCE = ("insurance", "insurer", "policy")
+_LICENSE = ("licence", "license", "permit")
+_RENT = ("rent", "landlord")
+_BANK_REQUEST = ("missing documents", "please provide", "request")
+_PAYMENT_DEADLINE = ("due by", "payment due", "amount due", "due date", "pay by")
+# The municipal tourist tax (the operator declares and pays it monthly).
+_TOURIST_TAX = ("tourist tax", "city tax", "overnight tax")
+# Grant words. Some are enough on their own; a core word ("grant", Portugal's "candidatura") needs a second grant
+# word next to it (a loan letter's "funding" alone is never a grant).
+_GRANT_ALONE = ("subsidy", "subsidies", "grant application", "grant agreement", "grant payment", "grant award",
+                "grant funding")
+_GRANT_CORE = ("grant", "grants")
+_GRANT_PAIRED = (*_GRANT_CORE, "funding", "awarded", "beneficiary")
+# Never a grant: customer support lines, access being granted (a pack adds its payroll allowances).
+_NOT_GRANT = ("customer support", "grant access", "granted access", "grants access")
 # In a grant letter: documents to send (an application, a payment claim, an acceptance) ...
-_GRANT_DOCUMENTS = ("submeter", "submissao", "enviar", "entregar", "apresentar", "documentos", "documentacao",
-                    "elementos em falta", "comprovativos", "pedido de pagamento", "termo de aceitacao",
-                    "submit", "send", "provide", "upload", "documents", "supporting documents", "acceptance form")
+_GRANT_DOCUMENTS = ("submit", "send", "provide", "upload", "documents", "supporting documents", "acceptance form")
 # ... or money the agency pays: approved, to be paid, or paid.
-_GRANT_PAID = ("pagamento", "pago", "paga", "transferencia", "transferido", "transferida", "aprovada", "aprovado",
-               "aprovacao", "payment", "paid", "approved", "transfer", "transferred")
-_AUTO_RENEW = ("renova automaticamente", "renovacao automatica", "renovado automaticamente",
-               "renews automatically", "automatic renewal", "auto-renew", "auto renew",
-               "tacitamente")  # fmt: skip
+_GRANT_PAID = ("payment", "paid", "approved", "transfer", "transferred")
+_AUTO_RENEW = ("renews automatically", "automatic renewal", "auto-renew", "auto renew")
 
-# "vencimento" alone also means "salary" in Portuguese, so only its unambiguous forms anchor.
-_STRONG_DATE_ANCHORS = ("prazo", "prazo limite", "data limite", "data-limite", "pagamento ate",
-                        "ate ao dia", "ate dia", "data de vencimento", "vencimento:", "vence em",
-                        "vence a", "due by",
-                        "due on", "due date", "deadline", "no later than", "pay by",
-                        "renewal date", "data de renovacao", "expires on", "expira em", "expira a",
-                        "valid until", "valido ate", "valida ate", "termina em")  # fmt: skip
-_WEAK_DATE_ANCHORS = ("ate", "by", "before", "until", "antes de")
-_STRONG_AMOUNT_ANCHORS = ("total a pagar", "valor a pagar", "montante a pagar",
-                          "importancia a pagar", "quantia a pagar", "valor em divida",
-                          "amount due", "total due", "balance due", "amount payable",
-                          "total amount due", "outstanding balance")  # fmt: skip
-_WEAK_AMOUNT_ANCHORS = ("montante", "valor", "importancia", "quantia", "total", "amount",
-                        "renda", "rent", "premio", "premium")  # fmt: skip
+_STRONG_DATE_ANCHORS = ("due by", "due on", "due date", "deadline", "no later than", "pay by", "renewal date",
+                        "expires on", "valid until")  # fmt: skip
+_WEAK_DATE_ANCHORS = ("by", "before", "until")
+_STRONG_AMOUNT_ANCHORS = ("amount due", "total due", "balance due", "amount payable", "total amount due",
+                          "outstanding balance")  # fmt: skip
+_WEAK_AMOUNT_ANCHORS = ("total", "amount", "rent", "premium")
 
+# What a letter says may happen, by the label the owner reads (a pack adds "consequence:<label>" phrases).
 _CONSEQUENCE_PHRASES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("a fine", ("coima", "coimas", "multa", "multas", "fine", "fines", "penalty", "penalties",
-                "penalidade", "penalizacao")),
-    ("interest", ("juros", "juros de mora", "interest", "late interest")),
-    ("a late fee", ("late fee", "late payment fee", "taxa de atraso")),
-    ("suspension", ("suspensao", "suspender", "suspension", "suspend", "suspended", "bloqueio",
-                    "bloquear", "blocked")),
-    ("cancellation", ("cancelamento", "cancelar", "cancel", "cancellation", "termination",
-                      "terminate", "resolucao do contrato")),
-    ("legal action", ("execucao fiscal", "penhora", "tribunal", "court", "legal action",
-                      "acao judicial", "injuncao")),
+    ("a fine", ("fine", "fines", "penalty", "penalties")),
+    ("interest", ("interest", "late interest")),
+    ("a late fee", ("late fee", "late payment fee")),
+    ("suspension", ("suspension", "suspend", "suspended", "blocked")),
+    ("cancellation", ("cancel", "cancellation", "termination", "terminate")),
+    ("legal action", ("court", "legal action")),
 )  # fmt: skip
 
 _GENERIC_CONSEQUENCE: dict[ObligationKind, str] = {
@@ -413,39 +366,20 @@ class VerificationCondition:
 # =========================================================================== detection: dates
 
 
-_MONTH_TOKENS: dict[str, tuple[int, bool]] = {}
-for _i, (_pt, _en) in enumerate(
-    zip(
-        ("janeiro", "fevereiro", "marco", "abril", "maio", "junho", "julho", "agosto",
-         "setembro", "outubro", "novembro", "dezembro"),
-        ("january", "february", "march", "april", "may", "june", "july", "august",
-         "september", "october", "november", "december"),
-    ),
-    start=1,
-):  # fmt: skip
-    _MONTH_TOKENS[_pt] = (_i, False)
-    _MONTH_TOKENS[_en] = (_i, False)
-for _abbr, _i in {
-    "jan": 1, "fev": 2, "feb": 2, "mar": 3, "abr": 4, "apr": 4, "mai": 5, "jun": 6, "jul": 7,
-    "ago": 8, "aug": 8, "set": 9, "sep": 9, "sept": 9, "out": 10, "oct": 10, "nov": 11,
-    "dez": 12, "dec": 12,
-}.items():  # fmt: skip
-    _MONTH_TOKENS.setdefault(_abbr, (_i, True))
-
-_MONTH_ALT = "|".join(sorted(_MONTH_TOKENS, key=len, reverse=True))
+# Month names (a pack adds its own as "month:<n>" / "month_abbr:<n>"). A month name that is also an ordinary word
+# ("may", "march") needs a year after it to be a date ("month_ambiguous").
+_MONTHS = ("january", "february", "march", "april", "may", "june", "july", "august", "september", "october",
+           "november", "december")
+_MONTH_ABBREVIATIONS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7, "aug": 8, "sep": 9, "sept": 9,
+                        "oct": 10, "nov": 11, "dec": 12}  # fmt: skip
+_AMBIGUOUS_MONTHS = ("may", "march")
+# Relative deadlines ("within 15 days"; a pack adds "relative_lead" and "relative_days") and payment references
+# ("payment reference: 123 456 789"; a pack adds "reference_label").
+_RELATIVE_LEADS = ("within", "in the next")
+_RELATIVE_DAYS = ("business days", "working days", "days")
+_REFERENCE_LABELS = ("payment reference", "reference", "ref")
 _ISO_DATE = re.compile(r"(?<!\d)(\d{4})-(\d{2})-(\d{2})(?!\d)")
 _NUM_DATE = re.compile(r"(?<![\d/.-])(\d{1,2})([/.-])(\d{1,2})\2(\d{4}|\d{2})(?![\d/.-]?\d)")
-_TEXT_DMY = re.compile(
-    rf"(?<![0-9a-z])(\d{{1,2}})(?:st|nd|rd|th|o)?\s+(?:de\s+)?({_MONTH_ALT})\.?"
-    rf"(?:,?\s+(?:de\s+)?(\d{{4}}))?(?![0-9a-z])"
-)
-_TEXT_MDY = re.compile(
-    rf"(?<![0-9a-z])({_MONTH_ALT})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,?\s+(\d{{4}}))?(?![0-9a-z])"
-)
-_RELATIVE = re.compile(
-    r"(?:prazo\s+de|no\s+prazo\s+de|within|in\s+the\s+next)\s+(\d{1,3})\s+"
-    r"(dias\s+uteis|dias|business\s+days|working\s+days|days)(?![a-z])"
-)
 _SENTENCE_BREAK = re.compile(r"[.;!?]\s")
 
 
@@ -502,17 +436,18 @@ def _date_hits(folded: str, received_on: date) -> list[_Hit]:
         a, b, year = int(m.group(1)), int(m.group(3)), _full_year(m.group(4))
         value = _safe_date(year, b, a) or (_safe_date(year, a, b) if a <= 12 < b else None)
         add(m, value)
-    for m in _TEXT_DMY.finditer(folded):
-        month, abbrev = _MONTH_TOKENS[m.group(2)]
+    words = _words()
+    for m in words.text_dmy.finditer(folded):
+        month, abbrev = words.months[m.group(2)]
         if abbrev and not m.group(3):
             continue  # "3 out of 5" is not a date
         day = int(m.group(1))
         year = m.group(3)
         add(m, _safe_date(int(year), month, day) if year else _infer_year(month, day, received_on))
-    for m in _TEXT_MDY.finditer(folded):
-        month, abbrev = _MONTH_TOKENS[m.group(1)]
+    for m in words.text_mdy.finditer(folded):
+        month, abbrev = words.months[m.group(1)]
         year = m.group(3)
-        if (abbrev or m.group(1) in ("may", "march", "marco")) and not year:
+        if (abbrev or m.group(1) in words.ambiguous_months) and not year:
             continue  # "you may 2 ..." / "march 3 miles" are not dates
         day = int(m.group(2))
         add(m, _safe_date(int(year), month, day) if year else _infer_year(month, day, received_on))
@@ -642,9 +577,9 @@ def _tiered(
 
 # =========================================================================== classification
 
-# The core's own wording (English and Portuguese), by category. A country pack adds its own
-# (``CompanyPack.obligation_vocabulary``): the business's companies' packs are passed in as
-# ``vocabulary`` and merged for the call (issuer phrases under "issuer:<issuer>").
+# The core's own wording (English), by category. A country pack adds its own
+# (``CompanyPack.obligation_vocabulary``, folded phrases by category; issuer phrases under "issuer:<issuer>"):
+# a letter is read with its company's country's, see :func:`_letter_vocabulary`.
 _BASE_PHRASES: dict[str, tuple[str, ...]] = {
     "kyc": _KYC, "payment": _PAYMENT, "filing": _FILING, "request": _REQUEST,
     "debt": _DEBT, "renewal": _RENEWAL, "insurance": _INSURANCE, "license": _LICENSE,
@@ -654,7 +589,9 @@ _BASE_PHRASES: dict[str, tuple[str, ...]] = {
     "weak_amount": _WEAK_AMOUNT_ANCHORS, "tourist_tax": _TOURIST_TAX, "grant_alone": _GRANT_ALONE,
     "grant_paired": _GRANT_PAIRED, "grant_core": _GRANT_CORE, "not_grant": _NOT_GRANT,
     "grant_documents": _GRANT_DOCUMENTS,
-    "grant_paid": _GRANT_PAID, "grant_agency": tuple(_GRANT_AGENCIES),
+    "grant_paid": _GRANT_PAID,
+    # Grant agencies a country names ("ifap"), with their names for the owner under "agency:<folded>".
+    "grant_agency": (),
     # A periodic VAT return a country names as such ("modelo 303"): none in the core's own wording.
     "vat_return": (),
     **{f"issuer:{issuer.value}": phrases for issuer, phrases in _ISSUER_PHRASES.items()},
@@ -662,49 +599,167 @@ _BASE_PHRASES: dict[str, tuple[str, ...]] = {
 _NEVER = re.compile(r"(?!x)x")
 
 
-def _compile(phrases: dict[str, tuple[str, ...]]) -> dict[str, re.Pattern[str]]:
+def _compile(phrases: Mapping[str, Sequence[str]]) -> dict[str, re.Pattern[str]]:
     return {name: phrase_pattern(p) if p else _NEVER for name, p in phrases.items()}
 
 
-_P = _compile(_BASE_PHRASES)
-_CONSEQUENCE_PATTERNS = [(label, phrase_pattern(p)) for label, p in _CONSEQUENCE_PHRASES]
-# The patterns in use for the current call (the core's, or with the companies' countries' wording).
-_ACTIVE: ContextVar[dict[str, re.Pattern[str]] | None] = ContextVar("obligation_patterns", default=None)
-_TITLES: ContextVar[dict[str, str] | None] = ContextVar("obligation_titles", default=None)
-_MERGED: dict[tuple[tuple[str, tuple[str, ...]], ...], dict[str, re.Pattern[str]]] = {}
+def _alternation(phrases: Iterable[str]) -> str:
+    """Folded phrases as a regex alternation, longest first, any spacing between words."""
+    ordered = sorted({p for p in phrases if p}, key=len, reverse=True)
+    return "|".join(re.escape(p).replace(r"\ ", r"\s+") for p in ordered) or "(?!x)x"
+
+
+@dataclass(frozen=True, slots=True)
+class _Words:
+    """The wording one call reads letters with: the core's English and the countries' words (their packs')."""
+
+    patterns: dict[str, re.Pattern[str]]
+    confirmations: dict[str, re.Pattern[str]]
+    titles: dict[str, str]
+    consequences: tuple[tuple[str, re.Pattern[str]], ...]
+    agencies: dict[str, str]
+    months: dict[str, tuple[int, bool]]
+    ambiguous_months: frozenset[str]
+    text_dmy: re.Pattern[str]
+    text_mdy: re.Pattern[str]
+    relative: re.Pattern[str]
+    reference: re.Pattern[str]
+
+
+def _build(vocabulary: Mapping[str, Sequence[str]]) -> _Words:
+    """The core's wording with ``vocabulary`` (a pack's categories, plus ``title:<kind>``, ``consequence:<label>``,
+    ``agency:<folded>``, ``month:<n>``, ``month_abbr:<n>``, ``month_ambiguous``, ``relative_lead``,
+    ``relative_days`` and ``reference_label``)."""
+    merged = {name: tuple(phrases) for name, phrases in _BASE_PHRASES.items()}
+    confirmations = {name: tuple(phrases) for name, phrases in _C_PHRASES.items()}
+    consequences = {label: tuple(phrases) for label, phrases in _CONSEQUENCE_PHRASES}
+    titles: dict[str, str] = {}
+    agencies: dict[str, str] = {}
+    months = {name: (i, False) for i, name in enumerate(_MONTHS, start=1)}
+    abbreviations = list(_MONTH_ABBREVIATIONS.items())
+    ambiguous = set(_AMBIGUOUS_MONTHS)
+    leads, days, labels = list(_RELATIVE_LEADS), list(_RELATIVE_DAYS), list(_REFERENCE_LABELS)
+    for name, values in vocabulary.items():
+        phrases = tuple(values)
+        kind, _, rest = name.partition(":")
+        if kind == "title":
+            if phrases:
+                titles[rest] = phrases[0]
+        elif kind == "consequence":
+            consequences[rest] = (*consequences.get(rest, ()), *phrases)
+        elif kind == "agency":
+            if phrases:
+                agencies[rest] = phrases[0]
+        elif kind == "month":
+            months.update({p: (int(rest), False) for p in phrases})
+        elif kind == "month_abbr":
+            abbreviations += [(p, int(rest)) for p in phrases]
+        elif name == "month_ambiguous":
+            ambiguous.update(phrases)
+        elif name == "relative_lead":
+            leads += phrases
+        elif name == "relative_days":
+            days += phrases
+        elif name == "reference_label":
+            labels += phrases
+        elif name in confirmations:
+            confirmations[name] = (*confirmations[name], *phrases)
+        else:
+            merged[name] = (*merged.get(name, ()), *phrases)
+    merged["grant_agency"] = (*merged["grant_agency"], *agencies)
+    for abbreviation, month in abbreviations:
+        months.setdefault(abbreviation, (month, True))
+    month_alt = "|".join(sorted(months, key=len, reverse=True))
+    return _Words(
+        patterns=_compile(merged),
+        confirmations=_compile(confirmations),
+        titles=titles,
+        consequences=tuple((label, phrase_pattern(p)) for label, p in consequences.items() if p),
+        agencies=agencies,
+        months=months,
+        ambiguous_months=frozenset(ambiguous),
+        text_dmy=re.compile(
+            rf"(?<![0-9a-z])(\d{{1,2}})(?:st|nd|rd|th|o)?\s+(?:de\s+)?({month_alt})\.?"
+            rf"(?:,?\s+(?:de\s+)?(\d{{4}}))?(?![0-9a-z])"
+        ),
+        text_mdy=re.compile(
+            rf"(?<![0-9a-z])({month_alt})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,?\s+(\d{{4}}))?(?![0-9a-z])"
+        ),
+        relative=re.compile(rf"(?:{_alternation(leads)})\s+(\d{{1,3}})\s+(?:{_alternation(days)})(?![a-z])"),
+        # A digit group ends where the sentence does: "123 456 789." is one reference, while
+        # "123 456 1.234,56" stops before the amount.
+        reference=re.compile(
+            rf"(?<![a-z])(?:{_alternation(labels)})\.?\s*(?:n\.?\s?o\.?|number|no\.?|#)?\s*[:.]?\s*"
+            r"(\d+(?: \d+){0,5}(?!\d|[.,]\d)|[a-z0-9-]*\d[a-z0-9-]*)"
+        ),
+    )
+
+
+# The wording in use for the current call; built once per distinct vocabulary.
+_ACTIVE: ContextVar[_Words | None] = ContextVar("obligation_words", default=None)
+_BUILT: dict[tuple[tuple[str, tuple[str, ...]], ...], _Words] = {}
+
+
+def _built(vocabulary: Mapping[str, Sequence[str]]) -> _Words:
+    key = tuple(sorted((k, tuple(v)) for k, v in vocabulary.items()))
+    words = _BUILT.get(key)
+    if words is None:
+        words = _BUILT[key] = _build(vocabulary)
+    return words
+
+
+def pack_vocabulary(countries: Iterable[str] = ()) -> dict[str, tuple[str, ...]]:
+    """The letter wording of ``countries``' packs, merged (every company pack's when none is given).
+
+    A country no complete pack covers adds nothing: its letters are read with the core's English."""
+    from backoffice.countries import CountryPackError, company_countries, company_pack
+
+    merged: dict[str, tuple[str, ...]] = {}
+    for country in dict.fromkeys(c.upper() for c in (tuple(countries) or company_countries()) if c):
+        try:
+            vocabulary = company_pack(country).obligation_vocabulary()
+        except CountryPackError:
+            continue
+        for name, phrases in vocabulary.items():
+            merged[name] = tuple(dict.fromkeys((*merged.get(name, ()), *phrases)))
+    return merged
+
+
+def _words() -> _Words:
+    """The wording of the call in progress; outside one, the core's with every company pack's."""
+    return _ACTIVE.get() or _built(pack_vocabulary())
 
 
 def _pats() -> dict[str, re.Pattern[str]]:
-    return _ACTIVE.get() or _P
+    return _words().patterns
+
+
+def _letter_vocabulary(
+    text: str,
+    sender: str,
+    entities: Sequence[LegalEntity],
+    default_entity_id: str | None,
+    vocabulary: Mapping[str, Sequence[str]] | None,
+) -> Mapping[str, Sequence[str]]:
+    """The wording a letter is read with (§49): ``vocabulary`` when the caller gives it, else its company's
+    country's pack's (the company its tax number or name shows), else the business's companies' countries',
+    else every company pack's."""
+    if vocabulary is not None:
+        return vocabulary
+    entity_id, _ = _entity(fold(f"{sender} {text}"), entities, default_entity_id)
+    company = next((e for e in entities if e.id == entity_id), None)
+    countries = (company.country,) if company is not None else tuple(e.country for e in entities)
+    return pack_vocabulary(countries)
 
 
 @contextmanager
-def _wording(vocabulary: Mapping[str, Sequence[str]] | None) -> Iterator[None]:
+def _wording(vocabulary: Mapping[str, Sequence[str]]) -> Iterator[None]:
     """Use the core's wording plus ``vocabulary`` (folded phrases by category) for one call."""
-    if not vocabulary:
-        yield
-        return
-    key = tuple(sorted((k, tuple(v)) for k, v in vocabulary.items()))
-    patterns = _MERGED.get(key)
-    if patterns is None:
-        merged = {name: tuple(phrases) for name, phrases in _BASE_PHRASES.items()}
-        extra: dict[str, tuple[str, ...]] = {}
-        for name, phrases in vocabulary.items():
-            if name.startswith("title:"):
-                continue
-            if name in _C_PHRASES:
-                extra[name] = (*extra.get(name, ()), *phrases)
-            else:
-                merged[name] = (*merged.get(name, ()), *phrases)
-        confirmations = {name: (*phrases, *extra.get(name, ())) for name, phrases in _C_PHRASES.items()}
-        patterns = _MERGED[key] = {**_compile(merged), **{f"c:{k}": v for k, v in _compile(confirmations).items()}}
-    titles = {k[len("title:"):]: v[0] for k, v in vocabulary.items() if k.startswith("title:") and v}
-    token, title_token = _ACTIVE.set(patterns), _TITLES.set(titles)
+    token = _ACTIVE.set(_built(vocabulary))
     try:
         yield
     finally:
         _ACTIVE.reset(token)
-        _TITLES.reset(title_token)
 
 
 def _has(name: str, folded: str) -> bool:
@@ -728,20 +783,21 @@ def _issuer(folded: str, source_kind: SourceKind | None) -> Issuer:
 
 def grant_agency(text: str) -> str | None:
     """The grant agency a text names, as the owner knows it ('IFAP', 'Portugal 2030'), or None."""
-    m = _pats()["grant_agency"].search(fold(text))
-    return _GRANT_AGENCIES.get(" ".join(m.group(0).split())) if m else None
+    words = _words()
+    m = words.patterns["grant_agency"].search(fold(text))
+    return words.agencies.get(" ".join(m.group(0).split())) if m else None
 
 
 def mentions_tourist_tax(text: str) -> bool:
-    """'Taxa Municipal Turística', 'tourist tax', 'city tax'."""
+    """'tourist tax', 'city tax', and a pack's words for it ('Taxa Municipal Turística')."""
     return _has("tourist_tax", fold(text))
 
 
 def is_grant_text(text: str) -> bool:
-    """A grant or subsidy communication: an agency named, a word that means a grant on its own ('subsídio',
-    'subsidy'), or two grant words together ('candidatura' and 'apoio'). Payroll allowances ('subsídio de
-    férias') and support lines ('apoio ao cliente') never count. While a letter is read, the wording of the
-    companies' countries (their packs' obligation vocabulary) counts too."""
+    """A grant or subsidy communication: an agency named, a word that means a grant on its own ('subsidy',
+    Portugal's 'subsídio'), or two grant words together ('grant' and 'funding', 'candidatura' and 'apoio').
+    Payroll allowances ('subsídio de férias') and support lines ('customer support') never count. While a letter
+    is read, its wording (see :func:`_letter_vocabulary`) is used; outside one, every company pack's."""
     pats = _pats()
     folded = pats["not_grant"].sub(" ", fold(text))
     if pats["grant_agency"].search(folded) or pats["grant_alone"].search(folded):
@@ -806,7 +862,7 @@ def _classify(folded: str, issuer: Issuer, has_amount: bool) -> ObligationKind |
 
 def _title(kind: ObligationKind, issuer: Issuer) -> str:
     if kind is ObligationKind.VAT_RETURN:
-        return (_TITLES.get() or {}).get(kind.value) or "VAT return"
+        return _words().titles.get(kind.value) or "VAT return"
     social = issuer is Issuer.SOCIAL_SECURITY
     if kind is ObligationKind.TAX_DEADLINE:
         return "Social Security payment" if social else "Tax payment"
@@ -835,7 +891,7 @@ def _title(kind: ObligationKind, issuer: Issuer) -> str:
 def _consequence(folded: str, kind: ObligationKind) -> str:
     if _has("auto_renew", folded):
         return AUTO_RENEWS
-    named = [label for label, pattern in _CONSEQUENCE_PATTERNS if pattern.search(folded)]
+    named = [label for label, pattern in _words().consequences if pattern.search(folded)]
     if named:
         return f"The letter mentions {join_and(named)}."
     return _GENERIC_CONSEQUENCE[kind]
@@ -843,13 +899,6 @@ def _consequence(folded: str, kind: ObligationKind) -> str:
 
 # =========================================================================== detection: reference and company
 
-# A digit group ends where the sentence does: "123 456 789." is one reference, while
-# "123 456 1.234,56" stops before the amount.
-_REFERENCE = re.compile(
-    r"(?<![a-z])(?:referencia(?:\s+(?:de|para)\s+pagamento|\s+multibanco|\s+mb)?|payment\s+reference"
-    r"|reference|ref)\.?\s*(?:n\.?\s?o\.?|number|no\.?|#)?\s*[:.]?\s*"
-    r"(\d+(?: \d+){0,5}(?!\d|[.,]\d)|[a-z0-9-]*\d[a-z0-9-]*)"
-)
 # ISO 11649 creditor references are printed in groups of four: "RF18 5390 0754 7034".
 _RF_HEAD = re.compile(r"rf\d{2}(?![0-9a-z])")
 _RF_GROUP = re.compile(r" ([0-9a-z]{1,4})(?![0-9a-z])")
@@ -884,7 +933,7 @@ def _rf_reference(folded: str, start: int) -> str | None:
 
 def _reference(folded: str) -> str | None:
     refs: set[str] = set()
-    for m in _REFERENCE.finditer(folded):
+    for m in _words().reference.finditer(folded):
         token = m.group(1)
         ref = _rf_reference(folded, m.start(1)) if _RF_HEAD.fullmatch(token) else normalize_reference(token)
         if ref is not None and len(ref) >= 4:
@@ -1014,7 +1063,7 @@ def _pick_amount(folded: str) -> _Pick:
 
 
 def _relative_deadline(folded: str, received_on: date) -> tuple[date, str] | None:
-    m = _RELATIVE.search(folded)
+    m = _words().relative.search(folded)
     if not m:
         return None
     days = int(m.group(1))
@@ -1067,10 +1116,12 @@ def detect_obligation(
     suspended" is also how phishing reads, so only pass messages that already
     passed the sender checks (§26).
 
-    ``vocabulary`` is the wording of the business's companies' countries (their packs'
-    ``obligation_vocabulary``), read together with the core's English and Portuguese.
+    ``vocabulary`` is the wording of the countries to read it in (their packs' ``obligation_vocabulary``),
+    read together with the core's English. Without it, the letter is read in its company's country's
+    wording (the company its tax number or name shows), else the ``entities``' countries', else every
+    company pack's (§49).
     """
-    with _wording(vocabulary):
+    with _wording(_letter_vocabulary(text, sender, entities, default_entity_id, vocabulary)):
         return _detect_obligation(text, tenant_id=tenant_id, received_on=received_on, sender=sender,
                                   source_kind=source_kind, entities=entities, default_entity_id=default_entity_id)
 
@@ -1256,59 +1307,39 @@ def _why_lines(
 
 # =========================================================================== confirmations (proof that it was done)
 
-# Folded phrases, Portuguese and English. Unverified conventions (verified_as_of: never); extend
+# Folded phrases in English; a country's pack adds its own under the same names (Portugal's "recebemos os seus
+# documentos", "comprovativo de entrega"). Unverified conventions (verified_as_of: never); extend
 # as letters are seen. A confirmation is never proof on its own: the caller checks it against the
 # obligations on file (same company, kind, sender and reference) and closes one only when exactly
 # one fits (§3, §24).
-_STILL_ASKING = ("ainda precisamos", "ainda necessitamos", "continua em falta", "continuam em falta",
-                 "documentos em falta", "documentacao em falta", "falta enviar", "faltam", "queira enviar",
-                 "por favor envie", "solicitamos", "se nao pagar", "se nao efetuar", "se nao for paga",
-                 "se nao for pago", "caso nao pague", "caso nao efetue", "still need", "still missing",
-                 "still required", "missing documents", "please send", "please provide", "please upload",
-                 "unless", "if you do not", "if payment is not")  # fmt: skip
-_DECIDED = ("contrato cessado", "cessacao do contrato", "cessacao do seu contrato", "contrato terminado",
-            "contrato rescindido", "rescisao do contrato", "confirmamos a denuncia", "confirmamos a cessacao",
-            "confirmamos o cancelamento", "cancelamento confirmado", "apolice anulada", "apolice cancelada",
-            "nao sera renovado", "nao sera renovada", "has been cancelled", "has been canceled",
-            "has been terminated", "was terminated", "cancellation confirmed", "termination confirmed",
-            "will not be renewed")  # fmt: skip
-_RENEWED = ("foi renovado", "foi renovada", "foram renovados", "renovado ate", "renovada ate",
-            "renovacao efetuada", "renovacao efectuada", "renovacao concluida", "renovacao confirmada",
-            "confirmamos a renovacao", "renovado com sucesso", "renovada com sucesso", "has been renewed",
-            "was renewed", "renewed until", "renewal confirmed", "renewal is confirmed", "we have renewed",
-            "successfully renewed")  # fmt: skip
-_SUBMITTED = ("comprovativo de entrega", "declaracao submetida", "declaracao entregue", "declaracao foi submetida",
-              "declaracao foi entregue", "declaracao recebida", "entregue com sucesso", "submetida com sucesso",
-              "has been submitted", "was submitted", "submitted successfully", "successfully submitted",
+_STILL_ASKING = ("still need", "still missing", "still required", "missing documents", "please send",
+                 "please provide", "please upload", "unless", "if you do not", "if payment is not")  # fmt: skip
+_DECIDED = ("has been cancelled", "has been canceled", "has been terminated", "was terminated",
+            "cancellation confirmed", "termination confirmed", "will not be renewed")  # fmt: skip
+_RENEWED = ("has been renewed", "was renewed", "renewed until", "renewal confirmed", "renewal is confirmed",
+            "we have renewed", "successfully renewed")  # fmt: skip
+_SUBMITTED = ("has been submitted", "was submitted", "submitted successfully", "successfully submitted",
               "return received", "received your return", "successfully filed", "filing confirmation")  # fmt: skip
-_ANSWERED = ("recebemos os seus documentos", "recebemos a sua documentacao", "recebemos a documentacao",
-             "recebemos os documentos", "documentos recebidos", "documentacao recebida", "recebemos a sua resposta",
-             "resposta recebida", "confirmamos a rececao", "confirmamos a recepcao", "pedido concluido",
-             "processo concluido", "processo encerrado", "dados atualizados", "dados actualizados",
-             "atualizacao concluida", "actualizacao concluida", "verificacao concluida",
-             "we have received your documents", "we received your documents", "received your documents",
+_ANSWERED = ("we have received your documents", "we received your documents", "received your documents",
              "documents received", "received your reply", "received your response", "confirm receipt",
              "thank you for sending", "thank you for providing", "details have been updated",
              "your details are up to date", "verification complete", "verification completed",
              "identity has been verified", "request completed", "request has been completed",
              "no further action")  # fmt: skip
-_CONTRACT = ("contrato", "contract", "subscricao", "subscription", "assinatura", "avenca", "service agreement")
-_VALIDITY = ("ate", "until", "valido ate", "valida ate", "valid until", "valid to", "validade", "nova validade",
-             "nova data de validade", "new expiry date", "expires on", "expira em", "expira a", "termina em",
-             "ends on", "renovado ate", "renovada ate", "renewed until")  # fmt: skip
+_CONTRACT = ("contract", "subscription", "service agreement")
+_VALIDITY = ("until", "valid until", "valid to", "new expiry date", "expires on", "ends on",
+             "renewed until")  # fmt: skip
 _C_PHRASES: dict[str, tuple[str, ...]] = {
     "still_asking": _STILL_ASKING, "decided": _DECIDED, "renewed": _RENEWED, "submitted": _SUBMITTED,
     "answered": _ANSWERED, "contract": _CONTRACT, "validity": _VALIDITY,
 }  # fmt: skip
-_C = _compile(_C_PHRASES)
 
 
 def _cpats() -> dict[str, re.Pattern[str]]:
-    """The confirmation patterns in use: the core's, or with the companies' countries' wording."""
-    active = _ACTIVE.get()
-    if active is None:
-        return _C
-    return {name: active[f"c:{name}"] for name in _C_PHRASES}
+    """The confirmation patterns in use: the core's, with the letter's countries' wording."""
+    return _words().confirmations
+
+
 _CONFIRMED_LINE = {
     ProofKind.REPLY: "They confirm they received what they asked for",
     ProofKind.SUBMISSION: "Filing receipt",
@@ -1392,9 +1423,9 @@ def detect_confirmation(
     entrega", "Your contract has been terminated". A message that is still asking for something
     ("we still need", "please send", "unless") is never a confirmation. Like detection, this reads
     wording only: the caller decides whether it matches exactly one obligation on file.
-    ``vocabulary``: the wording of the business's companies' countries, as for detection.
+    ``vocabulary``: the wording of the countries to read it in, as for detection.
     """
-    with _wording(vocabulary):
+    with _wording(_letter_vocabulary(text, sender, entities, default_entity_id, vocabulary)):
         return _detect_confirmation(text, received_on=received_on, sender=sender, source_kind=source_kind,
                                     entities=entities, default_entity_id=default_entity_id)
 

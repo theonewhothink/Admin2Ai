@@ -19,7 +19,6 @@ of silently reading nothing.
 from __future__ import annotations
 
 import io
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -90,21 +89,22 @@ class Stage0:
 
 # --------------------------------------------------------------------------- QR payloads
 
-_PT_QR_START = re.compile(r"A:\d{9}\*B:")
-
 
 def fiscal_qr_payloads(text: str) -> list[str]:
-    """Portuguese AT invoice QR payloads in ``text`` (one per line; a payload never spans lines)."""
-    from backoffice.countries.pt import looks_like_pt_qr
+    """Fiscal invoice QR payloads in ``text`` (one per line; a payload never spans lines), as the country packs of
+    the countries a company can run in recognise them (§49: Portugal's AT code, Spain's Verifactu and TicketBAI
+    codes). The core names no country: it asks each pack (backoffice.countries registry)."""
+    from backoffice.countries import company_countries, company_pack
 
+    packs = [company_pack(country) for country in company_countries()]
     found: list[str] = []
     for line in (text or "").splitlines():
-        m = _PT_QR_START.search(line)
-        if m is None:
-            continue
-        payload = line[m.start():].strip()
-        if looks_like_pt_qr(payload) and payload not in found:
-            found.append(payload)
+        for pack in packs:
+            payload = pack.find_fiscal_qr(line)
+            if payload:
+                if payload not in found:
+                    found.append(payload)
+                break
     return found
 
 

@@ -266,9 +266,12 @@ def test_spanish_letters_are_read_with_the_spanish_wording() -> None:
     assert spanish is not None and (spanish.title, spanish.kind, spanish.amount, spanish.due_on, spanish.entity_id) == (
         "Social Security payment", ObligationKind.TAX_DEADLINE, Decimal("350.00"), date(2026, 10, 30),
         "hazel-tree-madrid")
-    # A business without a Spanish company reads with the core's English and Portuguese only.
-    assert company_pack("PT").obligation_vocabulary() == {}
-    without = detect_obligation(letter, tenant_id="t", received_on=date(2026, 10, 2), entities=svc.repo.entities)
+    # A business without a Spanish company reads with the core's English and its own companies' (Portuguese) packs.
+    portuguese = company_pack("PT").obligation_vocabulary()
+    assert "seguranca social" in portuguese["issuer:social_security"]
+    assert "seguridad social" not in portuguese["issuer:social_security"]
+    without = detect_obligation(letter, tenant_id="t", received_on=date(2026, 10, 2),
+                                entities=[e for e in svc.repo.entities if e.country == "PT"])
     assert without is None or without.title != "Social Security payment"
     # Through the engine: the letter becomes the Spanish company's deadline.
     report = svc.orchestrator.ingest_file(letter.encode(), filename="tgss.txt", content_type="text/plain",

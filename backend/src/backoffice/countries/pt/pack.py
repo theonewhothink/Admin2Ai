@@ -8,6 +8,7 @@ from datetime import date
 from decimal import Decimal
 
 from backoffice.countries.base import (
+    BankWording,
     FiscalQRResult,
     NamedObservation,
     NativeDocumentType,
@@ -18,7 +19,8 @@ from backoffice.countries.base import (
 )
 from backoffice.domain.models import DocumentType, ExtractionMethod, VatPart
 
-from . import atcud, documents, holidays, nif, qr, text_fields
+from . import atcud, banking_words, documents, holidays, nif, qr, text_fields
+from . import obligations as pt_obligations
 from . import vat as pt_vat
 
 
@@ -127,8 +129,21 @@ class PortugalPack:
         return None
 
     def obligation_vocabulary(self) -> Mapping[str, tuple[str, ...]]:
-        """Nothing to add: the core reads Portuguese and English letters already."""
-        return {}
+        """What Portuguese letters say (Autoridade Tributária, Segurança Social, "data limite de pagamento",
+        "comprovativo de entrega"...), read with the core's English (backoffice.closure.obligations)."""
+        return pt_obligations.VOCABULARY
+
+    def bank_wording(self) -> BankWording:
+        """How Portuguese bank statements word taxes, fees, salaries, loans, grants and the tourist tax."""
+        return banking_words.BANK_WORDING
+
+    def parse_amount(self, text: str) -> Decimal | None:
+        """'1.492,30' -> Decimal('1492.30'); None when the text is not one amount."""
+        return text_fields.parse_pt_amount(text)
+
+    def fiscal_qr_payload(self, fields: Mapping[str, str]) -> str:
+        """An AT fiscal QR payload with ``fields`` in the order the specification fixes (empty ones left out)."""
+        return "*".join(f"{k}:{fields[k]}" for k in qr.FIELD_ORDER if fields.get(k) not in (None, ""))
 
     def periodic_obligations(self, company_id: str, today: date) -> tuple[PeriodicObligation, ...]:
         """None yet: Portuguese deadlines come from the letters and messages that announce them."""

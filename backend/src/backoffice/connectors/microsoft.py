@@ -13,6 +13,15 @@
 
 Follow-up links are only followed on the Graph origin, so the bearer token is
 never sent anywhere else.
+
+**Shared mailboxes** (checklist O2): with ``GraphMailConfig.mailbox`` set to a
+Microsoft 365 shared mailbox's address (or a mailbox the signed-in user was
+given full access to), every mailbox call goes to ``/users/{address}/...``
+instead of ``/me/...``, with the signed-in user's delegated access. The sign-in
+then needs ``Mail.Read.Shared`` besides ``Mail.Read``
+(:data:`GRAPH_SHARED_MAIL_SCOPES`); Graph answers 403 or 404 when the user has
+no access to that mailbox, which is the owner's to fix (sign in again with an
+account that has access).
 """
 
 from __future__ import annotations
@@ -26,6 +35,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -40,6 +50,7 @@ from .base import (
     MailItem,
     MailSink,
     ProviderError,
+    ReconnectRequired,
     SyncOutcome,
     TimeRange,
     WebhookState,
@@ -56,6 +67,7 @@ from .oauth import TokenProvider
 __all__ = [
     "GRAPH_API",
     "GRAPH_MAIL_SCOPES",
+    "GRAPH_SHARED_MAIL_SCOPES",
     "GraphAttachment",
     "GraphMailConfig",
     "GraphSubscription",
@@ -64,6 +76,9 @@ __all__ = [
 
 GRAPH_API = "https://graph.microsoft.com/v1.0"
 GRAPH_MAIL_SCOPES = ("offline_access", "https://graph.microsoft.com/Mail.Read")
+# Reading a shared mailbox (or one the user has full access to) with the signed-in user's delegated access.
+GRAPH_SHARED_MAIL_SCOPE = "https://graph.microsoft.com/Mail.Read.Shared"
+GRAPH_SHARED_MAIL_SCOPES = (*GRAPH_MAIL_SCOPES, GRAPH_SHARED_MAIL_SCOPE)
 _SELECT = "id,receivedDateTime,isDraft,conversationId,internetMessageId"
 _CURSOR_VERSION = 1
 
@@ -76,6 +91,9 @@ class GraphMailConfig:
     history_window: timedelta = timedelta(days=90)
     page_size: int = 50
     max_pages: int = 10_000
+    # A shared mailbox's address (checklist O2): read through /users/{address} with the signed-in user's
+    # delegated access instead of /me. None: the signed-in user's own mailbox.
+    mailbox: str | None = None
 
 
 @dataclass(frozen=True)
@@ -143,6 +161,10 @@ class MicrosoftMailConnector:
         self.base_url = base_url.rstrip("/")
         self._http = AuthorizedHttp(client or httpx.Client(timeout=httpx.Timeout(30.0)), tokens, "graph")
         self._clock = clock
+        mailbox = (self.config.mailbox or "").strip()
+        # Whose mailbox every call reads: the signed-in user's, or a shared one through their delegated access.
+        self.user_path = f"users/{quote(mailbox, safe='@')}" if mailbox else "me"
+        self.root = f"{self.base_url}/{self.user_path}"
 
     # ----------------------------------------------------------------- sync
 
@@ -179,7 +201,7 @@ class MicrosoftMailConnector:
         counted = CountingSink(sink)
         flt = (f"receivedDateTime ge {gap.start.astimezone(timezone.utc):%Y-%m-%dT%H:%M:%SZ} and "
                f"receivedDateTime le {gap.end.astimezone(timezone.utc):%Y-%m-%dT%H:%M:%SZ}")
-        url = f"{self.base_url}/me/messages"
+        url = f"{self.root}/messages"
         params: dict[str, Any] | None = {"$select": _SELECT, "$filter": flt, "$top": self.config.page_size}
         try:
             for _ in range(self.config.max_pages):
@@ -197,7 +219,7 @@ class MicrosoftMailConnector:
         """Walk one folder's delta; returns the new deltaLink, ``None`` if the folder is gone."""
         if link is not None and not same_origin(link, self.base_url):
             raise CursorExpired("graph_foreign_cursor")  # never send the token elsewhere
-        url = link or f"{self.base_url}/me/mailFolders/{folder_id}/messages/delta"
+        url = link or f"{self.root}/mailFolders/{folder_id}/messages/delta"
         params: dict[str, Any] | None = None
         if link is None:
             params = {"$select": _SELECT,
@@ -243,7 +265,7 @@ class MicrosoftMailConnector:
     def _folder_ids(self) -> list[str]:
         ids: dict[str, None] = {}
         for name in self.config.folders:
-            response = self._http.request("GET", f"{self.base_url}/me/mailFolders/{name}",
+            response = self._http.request("GET", f"{self.root}/mailFolders/{name}",
                                           params={"$select": "id,childFolderCount"}, allow=(404,))
             if response.status_code == 404:
                 continue
@@ -253,13 +275,17 @@ class MicrosoftMailConnector:
             if self.config.include_child_folders and folder.get("childFolderCount"):
                 for child in self._children(folder_id, 1):
                     ids.setdefault(child, None)
+        if not ids and self.config.mailbox:
+            # Not one folder of the shared mailbox is visible: the signed-in account has no access to it. Reading
+            # nothing is never "synced": the owner signs in with an account that has access.
+            raise ReconnectRequired("graph_shared_mailbox_not_accessible")
         return list(ids)
 
     def _children(self, folder_id: str, depth: int) -> list[str]:
         if depth > self.config.max_folder_depth:
             return []
         found: list[str] = []
-        url = f"{self.base_url}/me/mailFolders/{folder_id}/childFolders"
+        url = f"{self.root}/mailFolders/{folder_id}/childFolders"
         params: dict[str, Any] | None = {"$select": "id,childFolderCount", "$top": 100}
         for _ in range(self.config.max_pages):
             page = self._http.get_json(url, params=params)
@@ -276,7 +302,7 @@ class MicrosoftMailConnector:
     # ----------------------------------------------------------------- messages
 
     def fetch_mime(self, message_id: str) -> bytes | None:
-        response = self._http.request("GET", f"{self.base_url}/me/messages/{message_id}/$value", allow=(404,))
+        response = self._http.request("GET", f"{self.root}/messages/{message_id}/$value", allow=(404,))
         return None if response.status_code == 404 else response.content
 
     def thread_messages(self, conversation_id: str) -> list[MailItem]:
@@ -286,7 +312,7 @@ class MicrosoftMailConnector:
         window (§8 "previous attachments").
         """
         escaped = conversation_id.replace("'", "''")
-        url = f"{self.base_url}/me/messages"
+        url = f"{self.root}/messages"
         params: dict[str, Any] | None = {"$select": _SELECT, "$filter": f"conversationId eq '{escaped}'",
                                          "$top": self.config.page_size}
         found: list[dict[str, Any]] = []
@@ -301,7 +327,7 @@ class MicrosoftMailConnector:
         return items
 
     def list_attachments(self, message_id: str) -> list[GraphAttachment]:
-        url = f"{self.base_url}/me/messages/{message_id}/attachments"
+        url = f"{self.root}/messages/{message_id}/attachments"
         found: list[GraphAttachment] = []
         for _ in range(self.config.max_pages):
             page = self._http.get_json(url)
@@ -322,7 +348,7 @@ class MicrosoftMailConnector:
             except (binascii.Error, ValueError):
                 raise ProviderError("graph_bad_attachment_bytes") from None
         elif kind in ("file", "item"):  # large files and attached items: raw download
-            data = self._http.request("GET", f"{self.base_url}/me/messages/{message_id}/attachments/"
+            data = self._http.request("GET", f"{self.root}/messages/{message_id}/attachments/"
                                               f"{attachment_id}/$value").content
         size = item.get("size")
         return GraphAttachment(attachment_id, kind, item.get("name"), item.get("contentType"),
@@ -338,7 +364,7 @@ class MicrosoftMailConnector:
         notification_url: str,
         client_state: str,
         lifetime: timedelta = timedelta(days=2),
-        resource: str = "me/mailFolders('inbox')/messages",
+        resource: str | None = None,
         lifecycle_url: str | None = None,
         now: datetime | None = None,
     ) -> tuple[ConnectorState, GraphSubscription]:
@@ -347,7 +373,7 @@ class MicrosoftMailConnector:
         body: dict[str, Any] = {
             "changeType": "created",
             "notificationUrl": notification_url,
-            "resource": resource,
+            "resource": resource or f"{self.user_path}/mailFolders('inbox')/messages",
             "expirationDateTime": (now + lifetime).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "clientState": client_state,
         }

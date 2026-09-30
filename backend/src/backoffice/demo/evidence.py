@@ -18,7 +18,7 @@ from decimal import Decimal
 from email.message import EmailMessage
 from email.utils import format_datetime
 
-from backoffice.countries.pt.qr import FIELD_ORDER
+from backoffice.countries import get_pack
 from backoffice.domain.models import TransactionKind
 
 from ..orchestrator import BankRow
@@ -51,8 +51,9 @@ ADOBE_INVOICE_URL = "https://accounts.adobe.com/billing/invoices/FT-AD2026-7734"
 
 
 def qr_payload(**fields: str) -> str:
-    """An AT fiscal QR payload with the fields in the order the specification fixes."""
-    return "*".join(f"{k}:{fields[k]}" for k in FIELD_ORDER if fields.get(k) not in (None, ""))
+    """An AT fiscal QR payload with the fields in the order the specification fixes (the Portugal pack builds it:
+    the demo's companies are Portuguese)."""
+    return get_pack("PT").fiscal_qr_payload(fields)
 
 
 def _invoice_text(header: list[str], body: list[str], qr: str) -> bytes:

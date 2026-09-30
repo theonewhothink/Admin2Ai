@@ -29,6 +29,7 @@ import io
 import json
 import re
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -561,11 +562,17 @@ class _Answer:
     text: str
     cards: list[dict[str, Any]] = field(default_factory=list)
     evidence: list[dict[str, str]] = field(default_factory=list)
+    # A money answer: its chips already name the payments behind the figure (capped, with "and N more" and the
+    # month view), so its spending card adds none of its own to them.
+    money: bool = False
 
     def chat(self) -> dict[str, Any]:
         cards = list(self.cards)
-        if self.evidence:
-            cards.append({"type": "evidence", "items": self.evidence})
+        # A payment the spending card already lists is not repeated as a chip under it.
+        listed = {p["id"] for c in cards if c.get("type") == "spending" for p in c.get("payments", []) if p.get("id")}
+        chips = [e for e in self.evidence if e["id"] not in listed]
+        if chips:
+            cards.append({"type": "evidence", "items": chips})
         return _reply(self.text, cards)
 
     def all_evidence(self) -> list[dict[str, str]]:
@@ -575,7 +582,7 @@ class _Answer:
             if card.get("type") == "documents":
                 out += [{"label": f"{d['supplier']} {d['number']}".strip(), "id": d["evidenceIds"][0]}
                         for d in card["items"] if d.get("evidenceIds")]
-            elif card.get("type") == "spending":
+            elif card.get("type") == "spending" and not self.money:
                 out += [{"label": p["evidence"], "id": p["id"]} for p in card["payments"] if p["id"]][:6]
             elif card.get("type") == "evidence":
                 out += card["items"]
@@ -959,7 +966,13 @@ class RuleBrain:
                 line += (" All of it is theirs to pay back." if recharged == total else
                          f" {self._m(recharged)} of it is theirs to pay back.")
             texts.append(line)
-            chips += [self.svc._tx_evidence(rec) for rec, _ in sorted(found, key=lambda x: (-x[1], x[0].id))[:6]]
+            ranked = sorted(found, key=lambda x: (-x[1], x[0].id))
+            chips += [self.svc._tx_evidence(rec) for rec, _ in ranked[:self.MONEY_CHIPS]]
+            if len(ranked) > self.MONEY_CHIPS:  # the rest: "and N more", in the month view of the job's company
+                hidden = len(ranked) - self.MONEY_CHIPS
+                last = Month.of(min(max(rec.tx.booked_on for rec, _ in ranked[self.MONEY_CHIPS:]), period.end))
+                chips.append({"label": f"and {hidden} more · {center.label} · {last.label(self.today)}",
+                              "id": f"month:{center.company_id}:{last}"})
         waiting = [n for n in self.repo.open_needs() if n.kind == "cost_center" and any(
             c.company_id == n.company_id for c in (self.repo.cost_centers.get(i) for i in s.cost_center_ids) if c)]
         if waiting:
@@ -988,7 +1001,60 @@ class RuleBrain:
         if direction == "out" and s.supplier_ids:
             held, chips = self._held_for(s.supplier_ids)
             text = " ".join([text, *held])
-        return _Answer(text, [self._money_card(m, period, s)] if m.covered else [], chips)
+        # Money moved between your own accounts is named (and linked) only where the answer names it.
+        moved = direction == "in" or not (s.supplier_ids or s.category)
+        chips = [*chips, *self._money_chips(m, period, s.company_ids, transfers=moved)]
+        return _Answer(text, [self._money_card(m, period, s)] if m.covered else [], chips, money=True)
+
+    # The payments named under a money answer, before "and N more" (checklist T9).
+    MONEY_CHIPS = 6
+
+    def _money_chips(self, m: Money, p: Period, company_ids: Sequence[str], *,
+                     transfers: bool = True) -> list[dict[str, str]]:
+        """Evidence behind a money figure (T9): the payments it counts, biggest first, then the ones the answer
+        names without counting (waiting for a company, payout reports still to come, money moved between your
+        companies, deposits given back or held, disputed or returned payments, cash paid in, claims waiting).
+        At most six; the rest as "and N more", which opens the month view where every one is listed."""
+        if m.covered is None:
+            return []
+        mentioned = [*m.pending, *m.waiting_payouts,
+                     *(x for x in m.left_out if x.kind == "transfer" and transfers),
+                     *m.given_back, *m.held_for, *m.disputed, *m.returned, *m.cash_banked, *m.claims_waiting,
+                     *m.other_currency_lines]
+        lines: list[Line] = []
+        seen: set[str] = set()
+        for x in [*sorted(m.lines, key=lambda x: (-x.amount, x.on, x.id)),
+                  *sorted(mentioned, key=lambda x: (-x.amount, x.on, x.id))]:
+            if x.evidence_id and x.evidence_id not in seen:  # imported bank history has no evidence to open
+                seen.add(x.evidence_id)
+                lines.append(x)
+        chips = [{"label": self.ledger.payment_label(x), "id": x.evidence_id or ""} for x in lines[:self.MONEY_CHIPS]]
+        rest = lines[self.MONEY_CHIPS:]
+        if not rest:
+            return chips
+        return [*chips, *self._month_links(rest, p, company_ids, first=f"and {len(rest)} more")]
+
+    def _month_links(self, rest: Sequence[Line], p: Period, company_ids: Sequence[str], *,
+                     first: str) -> list[dict[str, str]]:
+        """Links to the month view that lists what was not named: "and N more" for the company with most of
+        them, and that month's view of each other company they belong to."""
+        by_company: dict[str, list[Line]] = {}
+        for x in rest:
+            company = x.company_id or (company_ids[0] if len(company_ids) == 1 else None)
+            if company is None or company not in self.repo.companies:
+                company = next(iter(company_ids), None) or next(iter(sorted(self.repo.companies)), None)
+            if company is not None:
+                by_company.setdefault(company, []).append(x)
+        order = sorted(by_company, key=lambda c: (-len(by_company[c]), self.repo.company_name(c) or c))
+        links = []
+        for i, company in enumerate(order):
+            last = max(x.on for x in by_company[company])
+            month = Month.of(min(last, p.end))
+            name = self.repo.company_name(company) or company
+            label = f"{first} · {name} · {month.label(self.today)}" if i == 0 else \
+                f"{name} · {month.label(self.today)}"
+            links.append({"label": label, "id": f"month:{company}:{month}"})
+        return links
 
     def _money_text(self, m: Money, p: Period, u: Understanding) -> str:
         s = u.slots

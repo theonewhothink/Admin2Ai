@@ -1,10 +1,12 @@
 """Push notifications to the owner's phone, through Expo, for the few things that need them (§42).
 
-Only five things ever notify:
+Only six things ever notify:
 
 * a new hard approval: a payment on hold because the bank details changed
   or the invoice needs checking (§25, §26);
 * a connection that needs reconnecting (§47, §48);
+* a connection whose access ends within a week (a bank consent, a sign-in
+  given until a stated day): once per end date, a week before (checklist R4);
 * a supplier's site that needs the owner to sign in (or a code) before the
   invoice behind its link can be fetched (§9: "Supplier X needs authentication.");
 * a month that closed;
@@ -56,6 +58,7 @@ class Facts:
     closed: frozenset[tuple[str, str]]
     sign_ins: frozenset[str] = frozenset()  # invoice links whose site asks the owner to sign in
     payment_failed: str | None = None  # the day a payment for the plan failed (backoffice.billing), until it goes through
+    renewals: frozenset[str] = frozenset()  # "<connection>:<end date>": access ending within a week, noted (R4)
 
 
 def facts(svc: Any) -> Facts:
@@ -66,6 +69,8 @@ def facts(svc: Any) -> Facts:
         closed=frozenset(repo.closed_months),
         sign_ins=frozenset(url for url, link in getattr(repo, "links_seen", {}).items() if link.status == "sign_in"),
         payment_failed=_payment_failed(svc),
+        renewals=frozenset(f"{cid}:{info['warned']}" for cid, info in (getattr(svc, "sign_in", None) or {}).items()
+                           if isinstance(info, dict) and info.get("warned")),
     )
 
 
@@ -99,6 +104,11 @@ def messages_for(svc: Any, before: Facts, after: Facts) -> list[PushMessage]:
         if connector is not None:
             out.append(PushMessage("Connection needs you", f"{connector.name} needs reconnecting.",
                                    "/settings#connections"))
+    notices = {n["id"]: n for n in svc.access_notices()} if hasattr(svc, "access_notices") else {}
+    for key in sorted(after.renewals - before.renewals):
+        notice = notices.get(key.rsplit(":", 1)[0])
+        if notice is not None:  # once per end date: the push that a week-before reminder promises
+            out.append(PushMessage("Access ends soon", notice["note"], f"/needs-you#renew_{notice['id']}"))
     for url in sorted(after.sign_ins - before.sign_ins):
         link = repo.links_seen.get(url)
         if link is not None and link.message:

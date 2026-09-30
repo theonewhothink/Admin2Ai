@@ -41,6 +41,7 @@ from .beneficiary import (
     HardApproval,
     VerificationChannel,
     beneficiary_proposals,
+    new_beneficiary_ibans,
     trust_iban,
 )
 from .domains import (
@@ -100,6 +101,7 @@ __all__ = [
     "iban_country",
     "is_valid_iban",
     "mask_iban",
+    "new_beneficiary_ibans",
     "normalize_iban",
     "registrable_domain",
     "trust_iban",

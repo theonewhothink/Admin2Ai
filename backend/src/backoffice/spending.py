@@ -389,7 +389,8 @@ class Ledger:
     def _build(self) -> list[Line]:
         repo = self.repo
         resolver = repo.resolver()
-        engine = ExpectedEvidenceEngine(entities=repo.entities, suppliers=resolver)
+        engine = ExpectedEvidenceEngine(entities=repo.entities, suppliers=resolver,
+                                        account_countries=repo.account_countries())
         pending = {n.subject_id for n in repo.open_needs() if n.kind == "choice" and n.subject_type == "transaction"}
         out: list[Line] = []
         for tx in repo.history_transactions:

@@ -17,6 +17,7 @@ merely because the company is.
 """
 
 from .base import (
+    BankWording,
     CompanyPack,
     CountryPack,
     CountryPackError,
@@ -44,6 +45,7 @@ from .base import (
 )
 
 __all__ = [
+    "BankWording",
     "CompanyPack",
     "CountryPack",
     "CountryPackError",

@@ -128,10 +128,11 @@ class Reply:
     claims: tuple[str, ...] = ()  # the question's words the document's description supported
 
 
-def amounts_in(text: str) -> list[Decimal]:
-    """Every money amount written in a question ("€1,200", "418.00 EUR", "€64,10")."""
-    from backoffice.countries.pt import parse_pt_amount
+def amounts_in(text: str, *, country: str | None = None) -> list[Decimal]:
+    """Every money amount written in a question ("€1,200", "418.00 EUR", "€64,10").
 
+    An amount written the way a country writes it ("1.200,50") is read by that country's pack (§49): the
+    company's the question is about (``country``), else the first pack that reads it."""
     out: list[Decimal] = []
     for m in AMOUNT.finditer(text):
         raw = m.group(1) or m.group(2)
@@ -141,7 +142,7 @@ def amounts_in(text: str) -> list[Decimal]:
         elif re.fullmatch(r"\d+", raw):
             value = Decimal(raw)
         else:
-            value = parse_pt_amount(raw)
+            value = _pack_amount(raw, country)
             if value is None:
                 try:
                     value = Decimal(raw)
@@ -150,6 +151,21 @@ def amounts_in(text: str) -> list[Decimal]:
         if value is not None:
             out.append(value)
     return out
+
+
+def _pack_amount(raw: str, country: str | None) -> Decimal | None:
+    """An amount as a country pack reads it: the named country's first, then every other company country's."""
+    from backoffice.countries import CountryPackError, company_countries, company_pack
+
+    order = [c for c in (country, *company_countries()) if c]
+    for code in dict.fromkeys(order):
+        try:
+            value = company_pack(code).parse_amount(raw)
+        except (CountryPackError, ValueError):
+            continue
+        if value is not None:
+            return value
+    return None
 
 
 def description_lines(text: str) -> tuple[str, ...]:

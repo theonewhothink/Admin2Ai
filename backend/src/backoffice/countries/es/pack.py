@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Collection, Mapping, Sequence
 from datetime import date
 from decimal import Decimal
 
 from backoffice.countries.base import (
+    BankWording,
     FiscalQRResult,
     NamedObservation,
     NativeDocumentType,
@@ -18,9 +20,13 @@ from backoffice.countries.base import (
     VATRate,
 )
 from backoffice.domain.models import DocumentType, ExtractionMethod
+from backoffice.extraction.values import parse_amount as _parse_amount
 
-from . import documents, holidays, nif, obligations, qr, text_fields
+from . import banking_words, documents, holidays, nif, obligations, qr, text_fields
 from . import vat as es_vat
+
+# One amount in euros and cents as Spain writes it ("1.492,30", "64,10", "12.50"), and nothing else.
+_ONE_AMOUNT = re.compile(r"-?(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2}|-?\d+\.\d{2}")
 
 
 class SpainPack:
@@ -92,6 +98,16 @@ class SpainPack:
 
     def obligation_vocabulary(self) -> Mapping[str, tuple[str, ...]]:
         return obligations.VOCABULARY
+
+    def bank_wording(self) -> BankWording:
+        """How Spanish bank statements word taxes, fees, salaries, loans, grants and local tourist taxes."""
+        return banking_words.BANK_WORDING
+
+    def parse_amount(self, text: str) -> Decimal | None:
+        """'1.492,30' -> Decimal('1492.30') (euros and cents, grouped with dots); None when not one amount."""
+        if not isinstance(text, str) or not _ONE_AMOUNT.fullmatch(text.strip()):
+            return None
+        return _parse_amount(text.strip())
 
     def periodic_obligations(self, company_id: str, today: date) -> tuple[PeriodicObligation, ...]:
         return obligations.quarterly_vat_return(company_id, today)

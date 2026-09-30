@@ -194,6 +194,9 @@ class FraudCase:
     payment_amount: Decimal | None = None  # when there is no document
     payment_currency: str = "EUR"
     altered: Sequence[AlteredSignal] = ()
+    # The document's bank details arrived on a later copy of an invoice already on file (checklist Q4): they are
+    # judged exactly like bank details on a first copy, and the owner is told where they came from.
+    iban_on_later_copy: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.payment_amount, float):
@@ -309,7 +312,7 @@ def _own_ibans(entities: Sequence[LegalEntity]) -> frozenset[str]:
 def _beneficiaries(case: FraudCase, found: _Findings) -> list[_Beneficiary]:
     raw: list[tuple[str, str]] = []
     if case.document is not None and case.document.iban:
-        raw.append((case.document.iban, "invoice"))
+        raw.append((case.document.iban, "copy" if case.iban_on_later_copy else "invoice"))
     if case.payment_iban:
         raw.append((case.payment_iban, "payment"))
     raw.extend((iban, "email") for iban in find_ibans(case.message_text))
@@ -317,7 +320,7 @@ def _beneficiaries(case: FraudCase, found: _Findings) -> list[_Beneficiary]:
     result: list[_Beneficiary] = []
     for value, origin in raw:
         if not is_valid_iban(value):
-            where = "on this invoice" if origin == "invoice" else "for this payment"
+            where = "on this invoice" if origin in ("invoice", "copy") else "for this payment"
             found.add(SignalKind.INVALID_BANK_DETAILS, Severity.CRITICAL,
                       f"The bank details {where} are not valid.", origin=origin)  # fmt: skip
             continue
@@ -331,6 +334,8 @@ def _beneficiaries(case: FraudCase, found: _Findings) -> list[_Beneficiary]:
 def _changed_line(name: str, origin: str) -> str:
     if origin == "invoice":
         return f"{name} changed the IBAN shown on its invoice."
+    if origin == "copy":
+        return f"A new copy of {name}'s invoice shows a bank account you have not paid before."
     if origin == "email":
         return f"The email gives a new IBAN for {name}."
     return f"This payment goes to a new IBAN for {name}."
@@ -345,8 +350,10 @@ def _check_ibans(beneficiaries: Sequence[_Beneficiary], known: frozenset[str], f
                       origin=b.origin, iban=mask_iban(b.iban),
                       known=", ".join(sorted(mask_iban(k) for k in known)))  # fmt: skip
         elif not known:
-            found.add(SignalKind.NEW_PAYMENT_RECIPIENT, Severity.HIGH,
-                      f"{found.name} asks to be paid into an account you have not paid before.",
+            line = (f"A new copy of {found.name}'s invoice asks to be paid into an account you have not paid before."
+                    if b.origin == "copy" else
+                    f"{found.name} asks to be paid into an account you have not paid before.")
+            found.add(SignalKind.NEW_PAYMENT_RECIPIENT, Severity.HIGH, line,
                       origin=b.origin, iban=mask_iban(b.iban))  # fmt: skip
     if known and all(b.iban in known for b in beneficiaries):
         found.passed.append(f"Bank details match what {found.name} used before.")

@@ -12,6 +12,17 @@
 
 No folder or label is required (§8: does not depend on an "Invoices" folder).
 Drafts and chats are skipped; spam and trash are opt-in.
+
+**Delegated and alias addresses** (checklist O2), configured per mailbox connection:
+
+* ``GmailConfig.user_id``: another mailbox the signed-in account may read, as the
+  Gmail API's ``userId`` (``/users/{address}``). Google allows it only where the
+  account really has that access (its own address, or a Google Workspace set-up
+  that grants it); otherwise Gmail answers "Delegation denied", which is the
+  owner's to fix (sign in to that mailbox itself), never an empty sync.
+* ``GmailConfig.delivered_to``: an alias of the signed-in mailbox: only the mail
+  delivered to that address is read (``deliveredto:`` on listings, and the
+  message's own delivery headers for new mail).
 """
 
 from __future__ import annotations
@@ -20,6 +31,8 @@ import base64
 import binascii
 import json
 from collections.abc import Callable, Iterator, Mapping
+from email.parser import BytesHeaderParser
+from email.utils import getaddresses
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -71,6 +84,10 @@ class GmailConfig:
     page_size: int = 500
     include_spam_trash: bool = False
     max_pages: int = 10_000
+    # A delegated mailbox read as the API's userId (/users/{address}) where Google allows it; None: "me".
+    user_id: str | None = None
+    # An alias of the signed-in mailbox: only mail delivered to it is read. None: everything.
+    delivered_to: str | None = None
 
 
 @dataclass(frozen=True)
@@ -94,6 +111,9 @@ def _classify(response: httpx.Response) -> ConnectorError | None:
     status = response.status_code
     if status in (403, 429):
         reasons = _reasons(response)
+        if status == 403 and b"elegation denied" in (response.content or b""):
+            # Reading another mailbox this account may not read (checklist O2): the owner signs in to it itself.
+            return ReconnectRequired("gmail_delegation_denied")
         if reasons & _TRANSIENT_REASONS or status == 429:
             return TransientError(f"gmail_rate_limited_{status}", retry_after=retry_after_seconds(response))
         if reasons & _PERMISSION_REASONS or status == 403:
@@ -134,7 +154,13 @@ class GmailConnector:
         clock: Callable[[], datetime] = utcnow,
     ) -> None:
         self.config = config or GmailConfig()
-        self.base_url = base_url.rstrip("/")
+        base_url = base_url.rstrip("/")
+        user = (self.config.user_id or "").strip()
+        if user and base_url.endswith("/users/me"):  # a delegated mailbox (checklist O2)
+            base_url = f"{base_url[:-len('me')]}{quote(user, safe='@')}"
+        self.base_url = base_url
+        alias = (self.config.delivered_to or "").strip().lower()
+        self._alias = alias or None
         self._http = AuthorizedHttp(client or httpx.Client(timeout=httpx.Timeout(30.0)), tokens, "gmail",
                                     classify=_classify)
         self._clock = clock
@@ -167,7 +193,8 @@ class GmailConnector:
         """Re-read one period (known gap or missed webhooks) without touching the cursor."""
         now = now or self._clock()
         counted = CountingSink(sink)
-        query = f"after:{int(gap.start.timestamp())} before:{int(gap.end.timestamp()) + 1} -in:drafts -in:chats"
+        query = self._scoped(f"after:{int(gap.start.timestamp())} before:{int(gap.end.timestamp()) + 1} "
+                             "-in:drafts -in:chats")
         try:
             for message_id in self._list_ids(query):
                 self._deliver(message_id, counted)
@@ -181,10 +208,26 @@ class GmailConnector:
         if not history_id:
             raise ProviderError("gmail_profile_without_history_id")
         window_start = now - self.config.history_window
-        query = f"after:{int(window_start.timestamp())} -in:drafts -in:chats"
+        query = self._scoped(f"after:{int(window_start.timestamp())} -in:drafts -in:chats")
         for message_id in self._list_ids(query):
             self._deliver(message_id, sink)
         return history_id, window_start
+
+    def _scoped(self, query: str) -> str:
+        """The search, limited to mail delivered to the alias when the connection reads one (O2)."""
+        return f"{query} deliveredto:{self._alias}" if self._alias else query
+
+    def _delivered_to_alias(self, raw: bytes) -> bool:
+        """True when the message was delivered or addressed to the alias (its own delivery headers)."""
+        if self._alias is None:
+            return True
+        try:
+            headers = BytesHeaderParser().parsebytes(raw)
+        except Exception:  # an unreadable header block: not proven to be the alias's mail
+            return False
+        values = [str(v) for name in ("Delivered-To", "X-Original-To", "Envelope-To", "X-Forwarded-To", "To", "Cc")
+                  for v in (headers.get_all(name) or [])]
+        return any(address.strip().lower() == self._alias for _, address in getaddresses(values))
 
     def _list_ids(self, query: str) -> Iterator[str]:
         params: dict[str, Any] = {"q": query, "maxResults": self.config.page_size,
@@ -258,7 +301,7 @@ class GmailConnector:
 
     def _deliver(self, message_id: str, sink: MailSink) -> None:
         item = self.fetch_raw(message_id)
-        if item is not None:
+        if item is not None and self._delivered_to_alias(item.raw):
             sink(item)
 
     def thread_messages(self, thread_id: str) -> list[MailItem]:
