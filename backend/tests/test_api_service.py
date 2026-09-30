@@ -288,7 +288,8 @@ def test_upload_image_is_stored_and_reported(fresh: BackOfficeService) -> None:
     status, out = post(fresh, "/api/evidence", {"filename": "receipt.png", "contentType": "image/png",
                                                 "dataBase64": base64.b64encode(png).decode()})
     assert status == 200 and out["storedOnly"] is True and out["evidenceIds"]
-    assert out["message"] == "Got it. I saved it and will read it shortly."
+    # The demo has no document reader (the browser build has only pydantic): stored, waiting, said plainly.
+    assert out["message"] == "Got it. I stored it. Reading photos and PDFs is switched off in this demo."
     assert post(fresh, "/api/evidence", {"filename": "x.txt"})[0] == 400
 
 

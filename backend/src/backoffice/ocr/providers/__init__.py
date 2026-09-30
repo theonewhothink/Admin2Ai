@@ -8,12 +8,15 @@
   chat completions, method VLM;
 * :class:`CommercialOCRProvider`: ``commercial``, OpenAI-compatible chat or a
   generic JSON API, method VLM by default;
+* :class:`ClaudeVisionProvider`: ``claude-vision``, Anthropic Messages API with
+  a forced tool call returning the critical fields as JSON, method VLM;
 * :class:`FakeOCRProvider`: in memory, for tests and the golden dataset.
 
-Only the commercial provider is ``external``; it requires a redactor (§53).
+Only the commercial and Claude providers are ``external``; both redact first (§53).
 """
 
 from ._http import EndpointConfig
+from .claude import CLAUDE_VISION, DEFAULT_VISION_MODEL, ClaudeVisionConfig, ClaudeVisionProvider
 from .commercial import (
     CommercialOCRConfig,
     CommercialOCRProvider,
@@ -30,6 +33,10 @@ from .ppocr import InProcessPaddleOCR, PPOCRConfig, PPOCRv6Provider, PPOCRVarian
 from .unlimited import DEFAULT_TRANSCRIBE_PROMPT, Rasterizer, UnlimitedOCRConfig, UnlimitedOCRProvider
 
 __all__ = [
+    "CLAUDE_VISION",
+    "DEFAULT_VISION_MODEL",
+    "ClaudeVisionConfig",
+    "ClaudeVisionProvider",
     "DEFAULT_TRANSCRIBE_PROMPT",
     "CommercialOCRConfig",
     "CommercialOCRProvider",

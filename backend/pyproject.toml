@@ -15,7 +15,15 @@ dependencies = [
 
 [project.optional-dependencies]
 workflows = ["temporalio>=1.8"]
-dev = ["pytest>=8", "httpx>=0.27", "temporalio>=1.8"]
+# Reading uploaded PDFs and photos (backoffice.reading), every import lazy:
+#   documents  the PDF text layer, metadata and embedded e-invoices (Stage 0)
+#   qr         fiscal QR codes decoded from photos and scanned pages
+#   vision     page rendering and masking before the Claude vision fallback (§53);
+#              the Anthropic call itself uses httpx, a core dependency
+documents = ["pypdf>=3.17"]
+qr = ["zxing-cpp>=2.2", "Pillow>=10", "pypdfium2>=4"]
+vision = ["Pillow>=10", "pypdfium2>=4"]
+dev = ["pytest>=8", "httpx>=0.27", "temporalio>=1.8", "pypdf>=3.17", "Pillow>=10"]
 
 [build-system]
 requires = ["setuptools>=68"]

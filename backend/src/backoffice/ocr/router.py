@@ -62,11 +62,13 @@ from backoffice.domain.models import CriticalField, ExtractionMethod, FieldObser
 from backoffice.extraction._optional import MissingDependencyError
 from backoffice.extraction.fields import FieldExtractor, FieldMap
 from backoffice.extraction.quality import QualityReport
+from backoffice.extraction.values import typed_value
 
 from .base import (
     OCRError,
     OCRHints,
     OCRInputError,
+    OCRPage,
     OCRProviderInterface,
     OCRResult,
     OCRUnavailable,
@@ -76,7 +78,7 @@ from .base import (
     count_pages,
 )
 from .budget import BudgetHold, BudgetLedger
-from .consensus import Consensus, ConsensusPolicy, FieldConsensus, build_consensus
+from .consensus import Consensus, ConsensusPolicy, FieldConsensus, FieldState, build_consensus
 from .locate import locate
 from .registry import COMMERCIAL, PADDLEOCR_VL, PP_OCR_V6_MEDIUM, UNLIMITED_OCR, EngineRegistry
 
@@ -136,6 +138,7 @@ class ReasonCode(str, Enum):
     NO_STRUCTURED_DATA = "no_structured_data"
     # why a stage ran
     FIRST_PASS = "first_pass"
+    SINGLE_SOURCE = "single_source"
     TABLES = "tables"
     MULTI_COLUMN = "multi_column"
     SKEWED = "skewed"
@@ -261,6 +264,10 @@ class RouterConfig:
     max_cost_per_document: Decimal | None = None
     allow_paid_without_budget: bool = False
     consensus: ConsensusPolicy = field(default_factory=ConsensusPolicy)
+    # Run the primary (local) engine even when Stage 0 settles, if a required field rests on a
+    # single source and there are pages to read: a photo's QR code alone is one voice, and
+    # verification needs two independent ones for GREEN (§18). Never reaches a paid engine.
+    corroborate_single_source: bool = False
 
     def __post_init__(self) -> None:
         if not self.required_fields:
@@ -420,6 +427,13 @@ class _Run:
                 return voter, result.full_text
         return None
 
+    def boxed_pages(self) -> tuple[OCRPage, ...]:
+        """Pages of the latest local reading with line boxes (lets a redactor mask regions, §53)."""
+        for _, result in reversed(self.readings):
+            if any(line.bbox is not None for line in result.lines):
+                return result.pages
+        return ()
+
     def finish(self) -> RoutingOutcome:
         consensus = self.assess()
         status = OutcomeStatus.RESOLVED if consensus.settled else OutcomeStatus.HUMAN_EXCEPTION
@@ -437,6 +451,12 @@ class _Run:
             conflicts=consensus.conflicts,
             owner_message=owner_message(consensus.missing, consensus.conflicts, consensus.several),
         )
+
+
+def _single_source(consensus: Consensus) -> tuple[CriticalField, ...]:
+    """Required fields settled by one voter only (a reading worth corroborating locally)."""
+    return tuple(f for f in CriticalField if f in consensus.required and f in consensus.fields
+                 and consensus.fields[f].state is FieldState.SINGLE)
 
 
 def _unsettled(consensus: Consensus) -> list[Reason]:
@@ -479,6 +499,35 @@ def _estimate(run: _Run, provider: OCRProviderInterface) -> Decimal:
     return provider.cost_per_page * pages
 
 
+# Confidence of a field an engine stated without a score: a reading, never an anchor (§17).
+STATED_FIELD_CONFIDENCE = 0.6
+
+
+def _stated_fields(result: OCRResult) -> dict[CriticalField, list[FieldObservation]]:
+    """Observations from the fields an engine returned as structured data.
+
+    Values are typed for their field ("483.60" -> Decimal); a value that does
+    not parse is kept as written, so it still counts as dissent (§19).
+    Source and method are set by the caller (:func:`_as_reading`).
+    """
+    found: dict[CriticalField, list[FieldObservation]] = {}
+    for reading in result.fields:
+        typed = typed_value(reading.field, reading.value)
+        where = f"{result.method.value}:page {reading.page}" if reading.page else f"{result.method.value}:document"
+        if reading.printed:
+            where += f" · printed “{' '.join(reading.printed.split())[:80]}”"
+        found.setdefault(reading.field, []).append(
+            FieldObservation(
+                value=typed if typed is not None else reading.value,
+                source=result.engine,
+                method=result.method,
+                confidence=reading.confidence if reading.confidence is not None else STATED_FIELD_CONFIDENCE,
+                location=where,
+            )
+        )
+    return found
+
+
 def _as_reading(observation: FieldObservation, voter: _Voter) -> FieldObservation:
     """The observation labelled as what it is: ``voter``'s reading of text (§13, §18)."""
     if observation.source == voter.source and observation.method is voter.method:
@@ -518,9 +567,10 @@ class OCRRouter:
         run = _Run(request, self._config, pages)
 
         consensus = self._stage0(run)
-        if consensus.settled:
+        single = _single_source(consensus) if self._config.corroborate_single_source and run.pages else ()
+        if consensus.settled and not single:
             return run.finish()
-        if not consensus.improvable:
+        if not consensus.settled and not consensus.improvable:
             self._skip_ocr(run, Reason(code=ReasonCode.UNRESOLVABLE_CONFLICT))
             return run.finish()
         if not run.pages:
@@ -528,7 +578,9 @@ class OCRRouter:
             return run.finish()
 
         roles = self._config.roles
-        primary = await self._attempt(run, RouteStage.PRIMARY, roles.primary, [Reason(code=ReasonCode.FIRST_PASS)])
+        first = [Reason(code=ReasonCode.SINGLE_SOURCE, detail=f.value) for f in single] if consensus.settled else [
+            Reason(code=ReasonCode.FIRST_PASS)]
+        primary = await self._attempt(run, RouteStage.PRIMARY, roles.primary, first)
         complexity = self._complexity(primary, request.image_quality)
 
         vl_reasons = list(complexity)
@@ -648,7 +700,12 @@ class OCRRouter:
             run.record(stage, StepStatus.SKIPPED, [*reasons, blocked], engine=provider.name, version=provider.version)
             return None
 
-        hints = replace(run.request.hints, page_count=run.page_count, prior_text=prior[1] if prior else None)
+        hints = replace(
+            run.request.hints,
+            page_count=run.page_count,
+            prior_text=prior[1] if prior else None,
+            prior_pages=run.boxed_pages() if prior else (),
+        )
         try:
             result = await provider.recognize(run.pages, hints)
         except Exception as exc:  # the chain must continue whatever an engine does (§17)
@@ -733,9 +790,11 @@ class OCRRouter:
         return _Voter(f"{run.request.evidence_id}@{provider.name}", provider.method, provider.name)
 
     def _read_fields(self, run: _Run, voter: _Voter, result: OCRResult) -> list[Reason]:
-        """Extract fields from the engine's text and add them to the run as readings."""
+        """Extract fields from the engine's text (or take the fields it stated) and add them as readings."""
         try:
-            found = self._extractor(result.full_text, voter.source, voter.method)
+            found = _stated_fields(result) if result.fields else self._extractor(
+                result.full_text, voter.source, voter.method
+            )
             additions = [
                 (CriticalField(name), _as_reading(locate(obs, CriticalField(name), result), voter))
                 for name, observations in found.items()

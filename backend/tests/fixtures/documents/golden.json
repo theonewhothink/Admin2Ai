@@ -1,0 +1,86 @@
+{
+  "name": "uploaded-documents",
+  "version": "2026-09-30",
+  "documents": [
+    {
+      "id": "edp-ft-558120",
+      "description": "Born-digital PDF: text layer plus the fiscal QR payload printed under the QR code. The demo's chased EDP invoice.",
+      "pages": ["edp-ft-558120.pdf"],
+      "structured": "edp-ft-558120.pdf",
+      "tags": ["pt", "pdf", "text-layer", "qr-in-text", "expect:verified", "bank:mbcp-ht:2026-09-19:-64.10:EDP COMERCIAL"],
+      "expected": {
+        "invoice_number": "FT EDP2026/558120",
+        "supplier_tax_id": "501000100",
+        "customer_tax_id": "516123459",
+        "gross_amount": "64.10",
+        "net_amount": "52.11",
+        "vat_amount": "11.99",
+        "currency": "EUR",
+        "issue_date": "2026-09-18",
+        "due_date": "2026-09-19"
+      }
+    },
+    {
+      "id": "moderna-ft-pm2026-88",
+      "description": "Born-digital PDF whose fiscal QR payload is only in the PDF metadata.",
+      "pages": ["moderna-ft-pm2026-88.pdf"],
+      "structured": "moderna-ft-pm2026-88.pdf",
+      "tags": ["pt", "pdf", "text-layer", "qr-in-metadata", "expect:verified", "bank:card-2291:2026-09-22:-49.20:PAPELARIA MODERNA PORTO"],
+      "expected": {
+        "invoice_number": "FT PM2026/88",
+        "supplier_tax_id": "514400218",
+        "customer_tax_id": "517003210",
+        "gross_amount": "49.20",
+        "net_amount": "40.00",
+        "vat_amount": "9.20",
+        "currency": "EUR",
+        "issue_date": "2026-09-21"
+      }
+    },
+    {
+      "id": "alianca-ft-ga2026-412",
+      "description": "Altered printed totals: the text says 483,60 EUR, the fiscal QR says 438.00. Must be a conflict, never a guess.",
+      "pages": ["alianca-ft-ga2026-412.pdf"],
+      "structured": "alianca-ft-ga2026-412.pdf",
+      "tags": ["pt", "pdf", "text-layer", "qr-mismatch", "expect:conflict"],
+      "expected": {
+        "invoice_number": "FT GA2026/412",
+        "supplier_tax_id": "509123457",
+        "customer_tax_id": "516123459",
+        "currency": "EUR",
+        "issue_date": "2026-09-24"
+      }
+    },
+    {
+      "id": "central-fs-cc2026-3317-photo",
+      "description": "Phone photo of a simplified invoice with a real fiscal QR code and EXIF (camera, GPS). Read by local OCR; QR decoded when a decoder is installed.",
+      "pages": ["central-fs-cc2026-3317.jpg"],
+      "tags": ["pt", "photo", "ocr", "qr-image", "transcription:central-fs-cc2026-3317.txt"],
+      "expected": {
+        "invoice_number": "FS CC2026/3317",
+        "supplier_tax_id": "516722344",
+        "customer_tax_id": "516123459",
+        "gross_amount": "23.90",
+        "net_amount": "21.15",
+        "vat_amount": "2.75",
+        "currency": "EUR",
+        "issue_date": "2026-09-29"
+      }
+    },
+    {
+      "id": "central-fs-cc2026-3317-scan",
+      "description": "The same receipt as a scanned PDF: no text layer, QR only as pixels.",
+      "pages": ["central-fs-cc2026-3317-scan.pdf"],
+      "tags": ["pt", "pdf", "scan", "ocr", "qr-image", "transcription:central-fs-cc2026-3317.txt"],
+      "expected": {
+        "invoice_number": "FS CC2026/3317",
+        "supplier_tax_id": "516722344",
+        "gross_amount": "23.90",
+        "net_amount": "21.15",
+        "vat_amount": "2.75",
+        "currency": "EUR",
+        "issue_date": "2026-09-29"
+      }
+    }
+  ]
+}

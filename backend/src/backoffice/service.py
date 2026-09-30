@@ -938,8 +938,25 @@ class BackOfficeService:
     def needs_you(self) -> dict[str, Any]:
         items = []
         for n in self._open_needs():
-            items.append(self._choice(n) if n.kind == "choice" else self._approval(n))
+            if n.kind == "check":
+                items.append(self._check(n))
+            else:
+                items.append(self._choice(n) if n.kind == "choice" else self._approval(n))
         return {"items": items}
+
+    def _check(self, n: NeedsYouRecord) -> dict[str, Any]:
+        """A document whose sources disagree (§19), asked as a plain choice (§37)."""
+        doc = self.repo.documents[n.subject_id]
+        d = doc.document
+        shown = d.gross_amount if d.gross_amount is not None else next(
+            (o.values["gross_amount"] for o in n.options if isinstance(o.values.get("gross_amount"), Decimal)),
+            Decimal("0"))
+        return {
+            "id": n.id, "kind": "choice", "tone": "attention", "eyebrow": "We need one answer",
+            "merchant": display_name(d.supplier_name), "amount": _num(shown), "currency": d.currency,
+            "date": _iso(d.issue_date or doc.received_at.astimezone(TZ).date()), "companyId": n.company_id,
+            "question": n.prompt, "options": [{"id": o.id, "label": o.label} for o in n.options], "why": list(n.why),
+        }
 
     def _choice(self, n: NeedsYouRecord) -> dict[str, Any]:
         rec = self.repo.transactions[n.subject_id]
@@ -1166,6 +1183,10 @@ class BackOfficeService:
                 parts.append(f"{_article(who).capitalize()} {who} payment of {amount}: I need to know which company "
                              "it belongs to.")
                 evidence.append({"label": f"{who} · {amount}", "id": f"needs:{n.id}"})
+            elif n.kind == "check":
+                who = display_name(self.repo.documents[n.subject_id].document.supplier_name)
+                parts.append(n.prompt)
+                evidence.append({"label": f"{who} · invoice to check", "id": f"needs:{n.id}"})
             else:
                 doc = self.repo.documents[n.subject_id]
                 who = display_name(doc.document.supplier_name)
@@ -1232,7 +1253,7 @@ class BackOfficeService:
             docs.append({"id": doc.id, "label": doc.label, "supplier": display_name(doc.document.supplier_name),
                          "verified": doc.document.quality.value == "verified", "matched": bool(matched),
                          "evidenceIds": list(doc.evidence_ids)})
-            if matched and not doc.on_hold and not report.already_known:
+            if matched and not doc.on_hold and not report.already_known and doc.document.quality.value != "conflict":
                 rec = matched[0]
                 message = (f"Got it. It matches the {format_money(abs(rec.tx.amount), rec.tx.currency)} payment to "
                            f"{self.orchestrator.merchant_name(rec.tx)} on {day_month(rec.tx.booked_on, self._today())}.")

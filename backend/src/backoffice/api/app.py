@@ -81,6 +81,10 @@ def _service_from_env() -> BackOfficeService:
     from backoffice.mailer import mailer_from_env
 
     svc.mailer = mailer_from_env()
+    from backoffice.reading import reader_from_env
+
+    # Uploaded PDFs and photos are read (Stage 0, OCR sidecar, Claude vision only if switched on).
+    svc.repo.reader = reader_from_env()
     if os.environ.get("ANTHROPIC_API_KEY"):
         from backoffice.assistant import ClaudeBrain
 

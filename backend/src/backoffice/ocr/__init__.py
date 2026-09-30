@@ -32,7 +32,8 @@ Public API
 Contract: OCRProviderInterface, OCRResult, OCRPage, OCRLine, OCRWord,
     LayoutSignals, OCRCapabilities, OCRHints, PageImage, errors (OCRError...)
 Engines: PPOCRv6Provider (TINY/MEDIUM, HTTP or in-process), PaddleOCRVLProvider,
-    UnlimitedOCRProvider, CommercialOCRProvider (+ redactors), FakeOCRProvider
+    UnlimitedOCRProvider, CommercialOCRProvider (+ redactors), ClaudeVisionProvider
+    (+ backoffice.ocr.redact.vision_redactor), FakeOCRProvider
 Registry: EngineRegistry and conventional names (PP_OCR_V6_MEDIUM, ...)
 Routing: OCRRouter.route(RoutingRequest) -> RoutingOutcome, RouterConfig,
     EngineRoles, RouteStep, Reason/ReasonCode, INVOICE_FIELDS, RECEIPT_FIELDS
@@ -57,6 +58,7 @@ from .base import (
     LayoutSignals,
     OCRCapabilities,
     OCRError,
+    OCRFieldReading,
     OCRHints,
     OCRInputError,
     OCRLine,
@@ -100,6 +102,9 @@ from .consensus import (
 )
 from .locate import locate
 from .providers import (
+    CLAUDE_VISION,
+    ClaudeVisionConfig,
+    ClaudeVisionProvider,
     CommercialOCRConfig,
     CommercialOCRProvider,
     CommercialWireFormat,
@@ -147,6 +152,7 @@ from .router import (
 
 __all__ = [
     "ANY_LANGUAGE",
+    "CLAUDE_VISION",
     "COMMERCIAL",
     "INVOICE_FIELDS",
     "LATIN_LANGUAGES",
@@ -159,6 +165,8 @@ __all__ = [
     "BudgetHold",
     "BudgetLedger",
     "Candidate",
+    "ClaudeVisionConfig",
+    "ClaudeVisionProvider",
     "CommercialOCRConfig",
     "CommercialOCRProvider",
     "CommercialWireFormat",
@@ -182,6 +190,7 @@ __all__ = [
     "LayoutSignals",
     "OCRCapabilities",
     "OCRError",
+    "OCRFieldReading",
     "OCRHints",
     "OCRInputError",
     "OCRLine",

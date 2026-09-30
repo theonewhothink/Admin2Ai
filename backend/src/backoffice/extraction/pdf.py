@@ -31,6 +31,7 @@ __all__ = [
     "PdfContent",
     "extract_from_pdf",
     "read_pdf",
+    "render_pdf_pages",
 ]
 
 # Fewer non-blank characters than this per document means "no text layer".
@@ -84,6 +85,30 @@ def read_pdf(data: bytes, *, max_pages: int | None = None) -> PdfContent:
     except Exception as exc:  # pypdf raises many types for damaged files
         raise StructuredDataError("pdf_unreadable", type(exc).__name__) from None
     return PdfContent(texts, MappingProxyType(attachments), MappingProxyType(metadata))
+
+
+def render_pdf_pages(data: bytes, *, max_pages: int, dpi: int = 150) -> tuple[tuple[bytes, int, int], ...]:
+    """PNG images ``(png, width, height)`` of the first ``max_pages`` pages.
+
+    Needs the optional ``pypdfium2`` and ``Pillow`` (MissingDependencyError
+    otherwise); a PDF the renderer cannot open raises StructuredDataError.
+    """
+    pdfium = import_optional("pypdfium2", feature="Rendering PDF pages")
+    import_optional("PIL.Image", feature="Rendering PDF pages", package="Pillow")
+    try:
+        document = pdfium.PdfDocument(data)
+    except Exception as exc:  # pdfium raises its own error types for damaged or encrypted files
+        raise StructuredDataError("pdf_unrenderable", type(exc).__name__) from None
+    try:
+        pages = []
+        for index in range(min(len(document), max_pages)):
+            image = document[index].render(scale=dpi / 72).to_pil()
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            pages.append((buffer.getvalue(), image.width, image.height))
+        return tuple(pages)
+    finally:
+        document.close()
 
 
 def _attachments(reader: Any) -> dict[str, bytes]:

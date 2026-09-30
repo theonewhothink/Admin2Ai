@@ -104,7 +104,7 @@ def test_dockerfile_is_slim_non_root_and_serves_uvicorn() -> None:
     assert re.search(r"^FROM python:3\.11-slim$", text, re.M)
     user = re.findall(r"^USER (\S+)", text, re.M)
     assert user and not user[-1].startswith(("root", "0"))
-    assert 'pip install -e ".[workflows]"' in text
+    assert 'pip install -e ".[workflows,documents,qr,vision]"' in text
     assert 'CMD ["uvicorn", "backoffice.api.app:app"' in text
     assert text.index("USER ") > text.index("pip install")  # installs as root, runs as the user
 

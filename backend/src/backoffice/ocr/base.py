@@ -31,6 +31,7 @@ __all__ = [
     "LayoutSignals",
     "OCRCapabilities",
     "OCRError",
+    "OCRFieldReading",
     "OCRHints",
     "OCRInputError",
     "OCRLine",
@@ -205,7 +206,10 @@ class OCRHints:
     """What the caller already knows about the document.
 
     ``prior_text`` is text read by an earlier engine; it is local data and
-    only leaves our infrastructure through a redactor (§53).
+    only leaves our infrastructure through a redactor (§53). ``prior_pages``
+    are that engine's boxed pages: a redactor may use the boxes to mask
+    personal details on page images before they leave (§53); they are never
+    sent themselves.
     """
 
     languages: tuple[str, ...] = ("pt", "es", "en")
@@ -213,6 +217,7 @@ class OCRHints:
     document_kind: str | None = None
     fields: tuple[CriticalField, ...] = ()
     prior_text: str | None = field(default=None, repr=False)
+    prior_pages: tuple[OCRPage, ...] = field(default=(), repr=False)
 
 
 # --------------------------------------------------------------------------- results
@@ -287,6 +292,23 @@ class OCRPage(BaseModel):
         return self.markdown or ""
 
 
+class OCRFieldReading(BaseModel):
+    """A critical field an engine stated directly (a structured answer), not found by parsing text.
+
+    ``value`` is the engine's string ("483.60", "2026-09-18"); it is typed by
+    the router and, when it does not parse, kept as an unreadable reading.
+    ``printed`` is the text as it appears on the page, for review.
+    """
+
+    model_config = _FROZEN
+
+    field: CriticalField
+    value: str
+    page: int | None = Field(default=None, ge=1)
+    printed: str | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
 class OCRResult(BaseModel):
     """What one engine read, what it cost and how long it took.
 
@@ -294,6 +316,11 @@ class OCRResult(BaseModel):
     our engines had already read (``OCRHints.prior_text``, e.g. through a
     text-only redactor, §53). Such a reading is not independent of that
     engine, so it must never count as a second vote (§17, §19).
+
+    ``fields`` holds critical fields an engine returned as structured data
+    (a multimodal model answering with JSON); when present, the router uses
+    them instead of parsing the engine's text. ``supplier_name`` and
+    ``document_type`` are what such an engine said about the document.
     """
 
     model_config = _FROZEN
@@ -308,6 +335,9 @@ class OCRResult(BaseModel):
     pages_billed: int = Field(default=0, ge=0)
     warnings: tuple[str, ...] = ()
     from_prior_text: bool = False
+    fields: tuple[OCRFieldReading, ...] = ()
+    supplier_name: str | None = None
+    document_type: str | None = None
 
     @property
     def page_count(self) -> int:

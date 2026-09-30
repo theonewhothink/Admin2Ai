@@ -27,9 +27,11 @@ WORKDIR /app/backend
 
 COPY pyproject.toml ./
 COPY src ./src
-# The worker needs temporalio: the "workflows" extra of the same package.
+# The worker needs temporalio: the "workflows" extra of the same package. The api reads
+# uploaded PDFs and photos: "documents" (PDF text), "qr" (fiscal QR codes), "vision"
+# (page rendering and masking before any external reading, §53).
 RUN find src -name __pycache__ -type d -prune -exec rm -rf {} + \
-    && pip install -e ".[workflows]"
+    && pip install -e ".[workflows,documents,qr,vision]"
 
 COPY --from=db migrations /app/db/migrations
 COPY --from=db backoffice_db /app/db/backoffice_db

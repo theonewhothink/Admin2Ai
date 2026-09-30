@@ -10,8 +10,11 @@ Pipeline for one piece of evidence::
 
     Discovery      what arrived (email, e-invoice, fiscal QR text, bank rows, letter)
     Retrieval      invoice links in emails, followed through registered portal adapters (§9, §10)
-    Document       structured extraction: UBL, Portuguese fiscal QR + text fields (§13, §19)
-    Verification   field-level GREEN / AMBER / RED (§18, §57)
+    Document       structured extraction: UBL, Portuguese fiscal QR + text fields (§13, §19); uploaded
+                   PDFs and photos through the repository's document reader (backoffice.reading:
+                   text layer, QR, then the OCR chain), when one is configured (§13-17)
+    Verification   field-level GREEN / AMBER / RED (§18, §57); a disagreement becomes one plain
+                   question for the owner, whose answer is stored as evidence (§19, §37)
     Fraud          hard stops: changed IBAN, recipient mismatch, ... (§26)
     Entity         which company (§51), taught rules (§38)
     Reconciliation expected evidence (§21), then transaction <-> document matching (§20)
@@ -24,6 +27,8 @@ Pipeline for one piece of evidence::
 The orchestrator is pure Python: no network, no threads started, no
 filesystem. It runs unchanged in a browser (Pyodide). Time comes from an
 explicit :class:`Clock`, so a replayed demo gives the same result every time.
+The one exception is opt-in: a server that sets ``Repository.reader`` lets
+that reader call its OCR engines while a PDF or photo is read.
 """
 
 from __future__ import annotations
@@ -66,6 +71,7 @@ from backoffice.countries.pt import (
 )
 from backoffice.domain.lifecycle import IllegalTransition, Stage, TrackedItem
 from backoffice.domain.models import (
+    METHOD_RANK,
     CriticalField,
     Document,
     DocumentType,
@@ -80,6 +86,7 @@ from backoffice.domain.models import (
     Supplier,
     Transaction,
     TransactionKind,
+    VerifiedField,
 )
 from backoffice.evidence import (
     EmailIngestResult,
@@ -140,7 +147,8 @@ from backoffice.reconciliation import (
     SupplierResolver,
     reconcile,
 )
-from backoffice.verification import assess_document, currency_mark
+from backoffice.verification import DocumentAssessment, assess_document, currency_mark, lineage
+from backoffice.verification._display import field_label, join, method_label, show_many
 
 __all__ = [
     "SYSTEM",
@@ -152,6 +160,7 @@ __all__ = [
     "AnswerOutcome",
     "BankRow",
     "ChaseRecord",
+    "CheckOption",
     "Clock",
     "ConnectorState",
     "DocumentRecord",
@@ -366,6 +375,11 @@ class DocumentRecord:
     hold_released: bool = False
     matched_tx_ids: list[str] = field(default_factory=list)
     retrieved: bool = False  # fetched by the system from a link or portal (§9)
+    # Field-level verification (§18): every critical field's value, quality, reasons and the
+    # observations behind it (each with value, source, method, confidence and location).
+    checks: dict[str, VerifiedField] = field(default_factory=dict)
+    # Values the owner confirmed when the sources disagreed (§19): method HUMAN, source = the answer.
+    owner_values: dict[str, FieldObservation] = field(default_factory=dict)
 
     @property
     def id(self) -> str:
@@ -405,10 +419,24 @@ class TxRecord:
         return self.tx.entity_id or self.holder_id
 
 
+@dataclass(frozen=True)
+class CheckOption:
+    """One answer to a "which value is right?" question about a document (§19, §37).
+
+    ``values`` are the field values the owner confirms by choosing it (empty
+    for "neither"); ``channels`` are the sources that showed them.
+    """
+
+    id: str
+    label: str
+    values: Mapping[str, Any] = field(default_factory=dict)
+    channels: frozenset[str] = frozenset()
+
+
 @dataclass
 class NeedsYouRecord:
     id: str
-    kind: str  # "choice" | "approval"
+    kind: str  # "choice" | "approval" | "check" (a document whose sources disagree)
     subject_type: str  # "transaction" | "document"
     subject_id: str
     item_id: str
@@ -420,6 +448,8 @@ class NeedsYouRecord:
     answer: str | None = None
     answered_at: datetime | None = None
     resolution: str = ""
+    prompt: str = ""  # "check": the question, in plain words
+    options: tuple[CheckOption, ...] = ()  # "check": the answers
 
 
 @dataclass(frozen=True)
@@ -554,6 +584,10 @@ class Repository:
         self.pending_links: list[str] = []
         self.closed_months: dict[tuple[str, str], date] = {}
         self.recovered_tx_ids: set[str] = set()
+        # Reads uploaded PDFs and photos (backoffice.reading.DocumentReader, set by the server from its
+        # environment). None in the browser demo: such files are stored and wait, unread.
+        self.reader: Any = None
+        self.reads: dict[str, Any] = {}  # evidence id -> ReadOutcome (what was read, by which steps)
 
     # ----------------------------------------------------------------- set-up
 
@@ -701,12 +735,24 @@ class _Agent:
 
 @dataclass
 class _Part:
-    """One readable piece of a document bundle."""
+    """One readable piece of a document bundle.
+
+    A ``"read"`` part is a PDF or photo read by the document reader: ``text``
+    is its Stage 0 text (text layer and decoded QR payloads, produced by
+    ``method``), read here like any text; ``observations`` are the OCR/VLM
+    engines' readings, already labelled with their engine (§17-18).
+    """
 
     evidence_id: str
-    kind: str  # "text" | "ubl" | "email_body"
+    kind: str  # "text" | "ubl" | "email_body" | "read"
     text: str = ""
     data: bytes = b""
+    method: ExtractionMethod = ExtractionMethod.EMBEDDED_TEXT
+    observations: dict[str, list[FieldObservation]] = field(default_factory=dict)
+    reading_text: str = ""  # an engine's transcription: supplier name and document type only
+    supplier_name: str | None = None
+    doc_type: DocumentType | None = None
+    parser: str = ""
 
 
 @dataclass
@@ -806,9 +852,30 @@ _MONEY_WITH_CURRENCY = re.compile(r"(?:€|EUR)\s?-?\d[\d.,\u00a0 ]*\d|-?\d[\d.,
 
 
 class DocumentAgent(_Agent):
-    """Stage 0 extraction: UBL e-invoices, Portuguese fiscal QR codes and text fields (§13, §19)."""
+    """Stage 0 extraction: UBL e-invoices, Portuguese fiscal QR codes and text fields (§13, §19),
+    plus the readings of uploaded PDFs and photos (§13-17)."""
 
     name = "document"
+
+    def stage0_fields(self, text: str, source: str, method: ExtractionMethod) -> dict[str, list[FieldObservation]]:
+        """Fields this agent reads from a file's own text and QR payloads (Stage 0 for the OCR router)."""
+        extracted = self.read([_Part(source, "text", text=text, method=method)])
+        return {} if extracted is None else {k: list(v) for k, v in extracted.observations.items()}
+
+    def text_extractor(self) -> Any:
+        """Reads Portuguese fields from an OCR engine's text (the router labels them with the engine)."""
+        known = self.repo.own_tax_ids()
+
+        def extract(text: str, source: str, method: ExtractionMethod) -> dict[CriticalField, list[FieldObservation]]:
+            found: dict[CriticalField, list[FieldObservation]] = {}
+            for obs in extract_text_fields(text, source, method=method, known_customer_tax_ids=known).observations:
+                found.setdefault(obs.field, []).append(obs)
+            currency = _text_currency(text, source, method)
+            if currency is not None:
+                found.setdefault(CriticalField.CURRENCY, []).append(currency)
+            return found
+
+        return extract
 
     def read(self, parts: Sequence[_Part]) -> _Extracted | None:
         observations: dict[str, list[FieldObservation]] = {}
@@ -836,6 +903,14 @@ class DocumentAgent(_Agent):
                 doc_type = doc_type or result.doc_type
                 supplier_name = supplier_name or result.extras.get("supplier_name")
                 continue
+            if part.kind == "read":
+                for name, found in sorted(part.observations.items()):
+                    for obs in found:
+                        add(name, obs)
+                if part.observations:
+                    parsers.append(f"ocr:{part.parser}" if part.parser else "ocr")
+                supplier_name = supplier_name or part.supplier_name
+                doc_type = doc_type or part.doc_type
             text = part.text
             qr_payloads, rest = _split_qr(text)
             for payload in qr_payloads:
@@ -852,10 +927,11 @@ class DocumentAgent(_Agent):
                     value=code.currency, source=part.evidence_id, method=ExtractionMethod.QR, confidence=0.95,
                     location="qr:amounts are in euro"))
                 doc_type = doc_type or code.doc_type
-            method = ExtractionMethod.EMBEDDED_TEXT
+            method = part.method
             fields = extract_text_fields(rest, part.evidence_id, method=method, known_customer_tax_ids=known)
             if fields.observations:
-                parsers.append("pt_text_fields" if part.kind == "text" else "pt_text_fields:email_body")
+                parsers.append({"text": "pt_text_fields", "read": "pt_text_fields:pdf_text"}.get(
+                    part.kind, "pt_text_fields:email_body"))
             final_consumer = final_consumer or fields.buyer_is_final_consumer
             for obs in fields.observations:
                 add(obs.field, obs)
@@ -871,6 +947,9 @@ class DocumentAgent(_Agent):
             supplier_name = supplier_name or _first_line(rest)
             if doc_type is None and fields.observations:
                 doc_type = _text_doc_type(rest)
+            if part.kind == "read" and part.observations:
+                supplier_name = supplier_name or _first_line(part.reading_text)
+                doc_type = doc_type or _text_doc_type(part.reading_text)
         if not observations:
             return None
         number = _first_value(observations, CriticalField.INVOICE_NUMBER)
@@ -889,19 +968,30 @@ class VerificationAgent(_Agent):
 
     def verify(self, observations: Mapping[str, list[FieldObservation]], doc_type: DocumentType,
                bank_amount: Decimal | None = None, subject_id: str | None = None,
-               evidence_ids: Sequence[str] = ()) -> tuple[dict[str, Any], Quality, tuple[str, ...]]:
+               evidence_ids: Sequence[str] = (),
+               owner: Mapping[str, FieldObservation] | None = None) -> tuple[dict[str, Any], Quality, tuple[str, ...]]:
+        assessment = self.assess(observations, doc_type, bank_amount, subject_id=subject_id,
+                                 evidence_ids=evidence_ids, owner=owner)
+        return _settled_values(assessment), assessment.quality, assessment.reasons
+
+    def assess(self, observations: Mapping[str, list[FieldObservation]], doc_type: DocumentType,
+               bank_amount: Decimal | None = None, *, subject_id: str | None = None,
+               evidence_ids: Sequence[str] = (),
+               owner: Mapping[str, FieldObservation] | None = None) -> DocumentAssessment:
+        """Every field graded with the observations behind it (§18). A value the owner confirmed
+        replaces the readings that disagree with it (they stay on the record, §55)."""
+        observations = _with_owner(observations, owner or {})
         issue = _first_value(observations, CriticalField.ISSUE_DATE)
         try:
             rates = PACK.vat_rates(issue) if isinstance(issue, date) else PACK.vat_rates(self.repo.today())
         except RateDataUnavailable:
             rates = ()
         assessment = assess_document(observations, rates, bank_amount, doc_type=doc_type)
-        values = {name: (a.value if a.quality is not Quality.RED else None) for name, a in assessment.fields.items()}
         self.log("verify", subject_id=subject_id, evidence_ids=evidence_ids,
                  values={name: a.value for name, a in assessment.fields.items() if a.value is not None},
-                 validations=[{"field": n, "quality": a.quality.value} for n, a in sorted(assessment.fields.items())],
+                 validations=[_validation(n, a) for n, a in sorted(assessment.fields.items())],
                  response={"quality": assessment.quality.value, "with_bank_amount": bank_amount is not None})
-        return values, assessment.quality, assessment.reasons
+        return assessment
 
 
 class FraudAgent(_Agent):
@@ -1434,7 +1524,7 @@ class Orchestrator:
                 report.pending_links.append(url)
                 continue
             report.evidence_ids.append(ev)
-            self._document_from_parts([self._part_for(ev)], at=at, origin="link", retrieved=True, report=report)
+            self._document_from_parts(self._parts_for(ev), at=at, origin="link", retrieved=True, report=report)
         self.run(at)
         return report
 
@@ -1494,21 +1584,87 @@ class Orchestrator:
         return report
 
     def _process_evidence(self, evidence: Evidence, *, at: datetime, origin: str, report: IngestReport) -> None:
-        part = self._part_for(evidence.id)
-        if part is None:
+        parts = self._parts_for(evidence.id)
+        if not parts:
             report.stored_only = True
-            report.message = "Got it. I saved it and will read it shortly."
+            report.message = self._unread_message(evidence)
             self.discovery.log("stored_for_reading", subject_id=evidence.id, evidence_ids=[evidence.id],
                                values={"format": evidence.format.value})
             return
-        if part.kind == "text":
-            ob = self.obligations.detect(part.text, evidence.id, received_on=at.astimezone(TZ).date())
-            if ob is not None and not _QR_START.search(part.text):
+        letter = _letter_text(parts)
+        if letter:
+            ob = self.obligations.detect(letter, evidence.id, received_on=at.astimezone(TZ).date())
+            if ob is not None and not _QR_START.search(letter):
                 report.obligation_ids.append(ob.obligation.id)
                 self.activity(at, "collected", f"Read a letter about {ob.title.lower()}.",
                               ob.obligation.entity_id, amount=ob.obligation.amount, evidence_ids=[evidence.id])
                 return
-        self._document_from_parts([part], at=at, origin=origin, retrieved=False, report=report)
+        record = self._document_from_parts(parts, at=at, origin=origin, retrieved=False, report=report)
+        if record is None and any(p.kind == "read" for p in parts):
+            report.message = "Got it. I stored it, but I couldn't find invoice details in it."
+
+    def _unread_message(self, evidence: Evidence) -> str:
+        """Why a stored file was not read, in plain words (§36, §70)."""
+        if evidence.format not in _READABLE_FILES:
+            return "Got it. I saved it and will read it shortly."
+        if self.repo.reader is None:
+            return "Got it. I stored it. Reading photos and PDFs is switched off in this demo."
+        outcome = self.repo.reads.get(evidence.id)
+        missing = {s.step for s in outcome.missing_readers()} if outcome is not None else set()
+        if outcome is None or outcome.found_anything:
+            return "Got it. I stored it, but I couldn't read it."
+        if evidence.format is EvidenceFormat.PDF and "pdf_text" in missing:
+            return "Got it. I stored it. Reading PDFs is not set up here yet."
+        if "ocr" in missing:
+            what = "scanned PDFs" if evidence.format is EvidenceFormat.PDF else "photos"
+            return f"Got it. I stored it. Reading {what} is not set up here yet."
+        return "Got it. I stored it, but I couldn't find invoice details in it."
+
+    def _parts_for(self, evidence_id: str) -> list[_Part]:
+        """The readable parts of one piece of evidence: text/XML directly; PDFs and photos through the reader."""
+        evidence = self.repo.evidence(evidence_id)
+        if evidence.format in _READABLE_FILES:
+            return self._read_file(evidence)
+        part = self._part_for(evidence_id)
+        return [part] if part is not None else []
+
+    def _read_file(self, evidence: Evidence) -> list[_Part]:
+        """Stage 0 and the OCR chain for a PDF or photo (§13-17); nothing when no reader is configured."""
+        repo = self.repo
+        if repo.reader is None:
+            return []
+        outcome = repo.reads.get(evidence.id)
+        if outcome is None:
+            from backoffice.reading import ReadRequest  # server only: the browser demo has no reader
+
+            data = repo.registry.open(repo.tenant_id, evidence.id)
+            request = ReadRequest(
+                tenant_id=repo.tenant_id, evidence_id=evidence.id, data=data, mime_type=evidence.mime_type,
+                stage0_fields=lambda text, method: self.documents.stage0_fields(text, evidence.id, method),
+                extractor=self.documents.text_extractor(),
+            )
+            try:
+                outcome = repo.reader.read(request)
+            except Exception as exc:  # a reader bug must never lose the upload: it stays stored
+                self.documents.log("read_failed", subject_id=evidence.id, evidence_ids=[evidence.id],
+                                   response={"error": type(exc).__name__})
+                return []
+            repo.reads[evidence.id] = outcome
+            self.documents.log(
+                "read_file", subject_id=evidence.id, evidence_ids=[evidence.id],
+                values={"pages": outcome.page_count, "cost": outcome.cost, "engines": list(outcome.engines)},
+                validations=[s.as_dict() for s in outcome.steps], response={"found": outcome.found_anything},
+                parser=",".join(outcome.engines) or None)
+        if not outcome.found_anything:
+            return []
+        parts = [_Part(evidence.id, "ubl", data=xml) for xml in outcome.embedded_xml]
+        parts.append(_Part(
+            evidence.id, "read", text=outcome.text, method=outcome.text_method,
+            observations={name: list(found) for name, found in outcome.readings.items()},
+            reading_text=outcome.reading_text, supplier_name=outcome.supplier_name, doc_type=outcome.doc_type,
+            parser=",".join(outcome.engines),
+        ))
+        return parts
 
     def _part_for(self, evidence_id: str) -> _Part | None:
         evidence = self.repo.evidence(evidence_id)
@@ -1532,11 +1688,11 @@ class Orchestrator:
             report.question_ids += [q.id for q in questions]
             return
         body_part = _Part(message_id, "email_body", text=parsed.text_body) if parsed.text_body.strip() else None
-        parts: list[_Part] = []
+        groups: list[list[_Part]] = []
         for f in result.files:
-            part = self._part_for(f.evidence.id)
-            if part is not None:
-                parts.append(part)
+            file_parts = self._parts_for(f.evidence.id)
+            if file_parts:
+                groups.append(file_parts)
             else:
                 report.stored_only = True
         supplier = self.repo.supplier_for_domain(parsed.sender_domain)
@@ -1547,16 +1703,17 @@ class Orchestrator:
                 report.pending_links.append(link.url)
                 continue
             report.evidence_ids.append(ev)
-            self._document_from_parts([p for p in [self._part_for(ev)] if p], at=at, origin="link", retrieved=True,
+            self._document_from_parts(self._parts_for(ev), at=at, origin="link", retrieved=True,
                                       report=report, sender=sender, message_text=text, body=body_part)
-        for part in parts:
-            if part.kind == "text":
-                ob = self.obligations.detect(part.text, part.evidence_id, received_on=at.astimezone(TZ).date(),
+        for file_parts in groups:
+            letter = _letter_text(file_parts)
+            if letter:
+                ob = self.obligations.detect(letter, file_parts[0].evidence_id, received_on=at.astimezone(TZ).date(),
                                              sender=sender or "")
-                if ob is not None and not _QR_START.search(part.text):
+                if ob is not None and not _QR_START.search(letter):
                     report.obligation_ids.append(ob.obligation.id)
                     continue
-            self._document_from_parts([part], at=at, origin=origin, retrieved=False, report=report,
+            self._document_from_parts(file_parts, at=at, origin=origin, retrieved=False, report=report,
                                       sender=sender, message_text=text, body=body_part)
         for nested in result.attached_emails:
             self._process_email(nested, at=at, origin=origin, report=report)
@@ -1579,8 +1736,9 @@ class Orchestrator:
         self.documents.log("extract", evidence_ids=extracted.evidence_ids,
                            values={k: [o.value for o in v] for k, v in sorted(extracted.observations.items())},
                            parser=",".join(dict.fromkeys(extracted.parsers)) or None)
-        values, quality, reasons = self.verification.verify(extracted.observations, extracted.doc_type,
-                                                            evidence_ids=extracted.evidence_ids)
+        assessment = self.verification.assess(extracted.observations, extracted.doc_type,
+                                              evidence_ids=extracted.evidence_ids)
+        values, quality, reasons = _settled_values(assessment), assessment.quality, assessment.reasons
         supplier = self.repo.supplier_for_tax_id(values.get("supplier_tax_id"))
         existing = self._duplicate_of(values, supplier)
         if existing is not None:
@@ -1606,7 +1764,7 @@ class Orchestrator:
         record = DocumentRecord(
             document=document, evidence_ids=extracted.evidence_ids, origin=origin, received_at=at, item_id=item.id,
             observations=extracted.observations, reasons=reasons, sender=sender, message_text=message_text,
-            supplier_id=supplier.id if supplier else None, retrieved=retrieved,
+            supplier_id=supplier.id if supplier else None, retrieved=retrieved, checks=assessment.verified_fields,
         )
         self.repo.documents[doc_id] = record
         evidence = extracted.evidence_ids
@@ -1635,6 +1793,10 @@ class Orchestrator:
         report.document_ids.append(doc_id)
         if record.on_hold:
             report.message = f"Got it. I put the {who} payment on hold: {record.fraud.owner_message}"
+        elif quality is Quality.RED:
+            needs = self._ask_about_conflict(record, at)
+            if needs is not None:
+                report.message = f"Got it. I need one answer from you: {needs.prompt}"
         return record
 
     def _duplicate_of(self, values: Mapping[str, Any], supplier: Supplier | None) -> DocumentRecord | None:
@@ -1659,12 +1821,23 @@ class Orchestrator:
         for name, obs in extracted.observations.items():
             record.observations.setdefault(name, []).extend(obs)
         record.evidence_ids = [*record.evidence_ids, *new]
-        values, quality, reasons = self.verification.verify(record.observations, record.document.doc_type,
-                                                            subject_id=record.id, evidence_ids=record.evidence_ids)
-        record.document = record.document.model_copy(update={"quality": quality, "evidence_ids": record.evidence_ids})
-        record.reasons = reasons
+        assessment = self.verification.assess(record.observations, record.document.doc_type, subject_id=record.id,
+                                              evidence_ids=record.evidence_ids, owner=record.owner_values)
+        record.document = record.document.model_copy(update={"quality": assessment.quality,
+                                                             "evidence_ids": record.evidence_ids})
+        record.reasons = assessment.reasons
+        record.checks = assessment.verified_fields
         self.documents.log("merge_duplicate", subject_id=record.id, evidence_ids=new)
         report.document_ids.append(record.id)
+        if assessment.quality is Quality.RED and not record.on_hold:
+            now = self.repo.clock.now()
+            item = self.repo.items[record.item_id]
+            if item.stage is not Stage.CONFLICT:
+                self.advance(item, Stage.CONFLICT, record.evidence_ids, agent="verification",
+                             note=" ".join(assessment.reasons))
+            needs = self._ask_about_conflict(record, now)
+            if needs is not None:
+                report.message = f"Got it. I need one answer from you: {needs.prompt}"
         return record
 
     def _hold(self, record: DocumentRecord, at: datetime) -> None:
@@ -1683,6 +1856,80 @@ class Orchestrator:
         self.activity(at, "protected", f"Put the {who} payment on hold. The bank details on the invoice changed."
                       if self._iban_changed(record) else f"Put the {who} payment on hold. Something on the invoice "
                       "does not look right.", company, evidence_ids=record.evidence_ids)
+
+    # ----------------------------------------------------------------- sources that disagree (§19, §37)
+
+    def _ask_about_conflict(self, record: DocumentRecord, at: datetime) -> NeedsYouRecord | None:
+        """One plain question when a document's sources disagree. Nothing is guessed meanwhile (§19)."""
+        repo = self.repo
+        if any(n.subject_id == record.id and n.status == "open" for n in repo.needs.values()):
+            return None
+        prompt, options, why = self._conflict_question(record)
+        who = display_name(record.document.supplier_name)
+        needs_id = _unique_id(repo.needs, f"nd_{_slug(who.split()[0])}_check")
+        company = record.document.entity_id or self._holder_for_document(record)
+        needs = NeedsYouRecord(
+            id=needs_id, kind="check", subject_type="document", subject_id=record.id, item_id=record.item_id,
+            company_id=company, created_at=at, why=why, prompt=prompt, options=options)
+        repo.needs[needs_id] = needs
+        self.verification.log("ask_owner", subject_id=record.id, evidence_ids=record.evidence_ids,
+                              values={"options": [o.label for o in options]}, response={"needs_you": needs_id})
+        line = (f"Found two different values on the {who} invoice. I asked you which is right." if len(options) > 1
+                else f"The {who} invoice does not add up. I asked you what to do.")
+        self.activity(at, "checked", line, company, evidence_ids=record.evidence_ids)
+        return needs
+
+    def _conflict_question(self, record: DocumentRecord) -> tuple[str, tuple[CheckOption, ...], tuple[str, ...]]:
+        assessment = self.verification.assess(record.observations, record.document.doc_type,
+                                              subject_id=record.id, evidence_ids=record.evidence_ids,
+                                              owner=record.owner_values)
+        red = [name for name in _CONFLICT_ORDER
+               if name in assessment.fields and assessment.fields[name].quality is Quality.RED]
+        red += sorted(n for n, a in assessment.fields.items() if a.quality is Quality.RED and n not in red)
+        who = display_name(record.document.supplier_name)
+        currency = record.document.currency
+        observed = _with_owner(record.observations, record.owner_values)
+        why = [r for n in red for r in assessment.fields[n].reasons]
+        why.append("Until you answer, I won't match, pay or close this invoice.")
+        neither = CheckOption(id="neither", label=f"Neither. I'll get a corrected invoice from {who}.")
+        for lead in red:
+            groups = _value_groups(lead, observed.get(lead, []))
+            if len(groups) < 2:
+                continue
+            shown = show_many(lead, [value for value, _, _ in groups], currency)
+            options = []
+            for i, ((value, channels, methods), text) in enumerate(zip(groups, shown, strict=True), start=1):
+                labels = list(dict.fromkeys(method_label(m) for m in methods))
+                sources, verb = join(labels), ("shows" if len(labels) == 1 else "show")
+                picks = {lead: value}
+                for other in red:
+                    if other != lead:
+                        picked = _value_from(other, observed.get(other, []), channels)
+                        if picked is not None:
+                            picks[other] = picked
+                options.append(CheckOption(id=f"source_{i}", label=f"{text}, as {sources} {verb}", values=picks,
+                                           channels=channels))
+            noun = field_label(lead).removeprefix("the ")
+            prompt = f"Which is the right {noun} on the {who} invoice?"
+            return prompt, (*options, neither), tuple(dict.fromkeys(why))
+        prompt = f"The {who} invoice does not add up. What should I do?"
+        set_aside = CheckOption(id="neither", label=f"Set it aside. I'll get a corrected invoice from {who}.")
+        return prompt, (set_aside,), tuple(dict.fromkeys(why))
+
+    def _apply_assessment(self, record: DocumentRecord, assessment: DocumentAssessment) -> None:
+        """The document's fields and quality as verified now (a disputed field stays empty, §19)."""
+        values = _settled_values(assessment)
+        update: dict[str, Any] = {"quality": assessment.quality}
+        for name in ("supplier_tax_id", "invoice_number", "iban", "payment_reference"):
+            update[name] = _text(values.get(name))
+        for name in ("net_amount", "vat_amount", "gross_amount"):
+            update[name] = _dec(values.get(name))
+        for name in ("issue_date", "due_date"):
+            update[name] = _date(values.get(name))
+        update["currency"] = _text(values.get("currency")) or record.document.currency
+        record.document = record.document.model_copy(update=update)
+        record.reasons = assessment.reasons
+        record.checks = assessment.verified_fields
 
     def _iban_changed(self, record: DocumentRecord) -> bool:
         return bool(record.fraud and record.fraud.of_kind(SignalKind.CHANGED_IBAN))
@@ -1784,11 +2031,12 @@ class Orchestrator:
             return
         rec = self.repo.transactions[match.transaction_ids[0]]
         doc = self.repo.documents[match.document_ids[0]]
-        values, quality, reasons = self.verification.verify(
+        assessment = self.verification.assess(
             doc.observations, doc.document.doc_type, bank_amount=abs(rec.tx.amount), subject_id=doc.id,
-            evidence_ids=[*doc.evidence_ids, rec.evidence_id])
-        doc.document = doc.document.model_copy(update={"quality": quality})
-        doc.reasons = reasons
+            evidence_ids=[*doc.evidence_ids, rec.evidence_id], owner=doc.owner_values)
+        doc.document = doc.document.model_copy(update={"quality": assessment.quality})
+        doc.reasons = assessment.reasons
+        doc.checks = assessment.verified_fields
         if doc.document.entity_id is None and rec.tx.entity_id:
             doc.document = doc.document.model_copy(update={"entity_id": rec.tx.entity_id})
 
@@ -1819,6 +2067,8 @@ class Orchestrator:
                                                   else InteractionKind.ANSWER, entity_id=needs.company_id))
         if needs.kind == "approval":
             outcome = self._answer_approval(needs, option_id, answer_ev, now)
+        elif needs.kind == "check":
+            outcome = self._answer_check(needs, option_id, answer_ev, now)
         else:
             outcome = self._answer_choice(needs, option_id, remember, answer_ev, now)
         self.run(now)
@@ -1933,6 +2183,46 @@ class Orchestrator:
         self.activity(now, "protected", f"You confirmed {who}'s new bank details by phone. The payment can go ahead.",
                       needs.company_id, evidence_ids=[answer_ev])
         return AnswerOutcome(ok=True, message="Done. The payment will go to the new account.")
+
+    def _answer_check(self, needs: NeedsYouRecord, option_id: str, answer_ev: str, now: datetime) -> AnswerOutcome:
+        """The owner said which source shows the right value (or neither). Their answer is evidence (§19, §55)."""
+        repo = self.repo
+        option = next((o for o in needs.options if o.id == option_id), None)
+        if option is None:
+            raise ValueError("not one of the options")
+        record = repo.documents[needs.subject_id]
+        item = repo.items[record.item_id]
+        who = display_name(record.document.supplier_name)
+        owner = f"{OWNER_ACTOR}:{repo.owner.email}"
+        needs.status = "answered"
+        needs.answer = option.id
+        needs.answered_at = now
+        if not option.values:
+            self.verification.log("set_aside", subject_id=record.id, evidence_ids=[*record.evidence_ids, answer_ev],
+                                  actor=OWNER_ACTOR, response={"reason": "neither value is right"})
+            self.activity(now, "answered", f"You set the {who} invoice aside until a corrected one arrives.",
+                          needs.company_id, evidence_ids=[answer_ev])
+            return AnswerOutcome(ok=True, message=f"Done. I set it aside. When {who} sends a corrected invoice, "
+                                                  "I will read it.")
+        for name, value in option.values.items():
+            record.owner_values[name] = FieldObservation(
+                value=value, source=answer_ev, method=ExtractionMethod.HUMAN, confidence=1.0,
+                location="owner answer: " + option.label)
+        assessment = self.verification.assess(record.observations, record.document.doc_type, subject_id=record.id,
+                                              evidence_ids=[*record.evidence_ids, answer_ev],
+                                              owner=record.owner_values)
+        self._apply_assessment(record, assessment)
+        self.activity(now, "answered", f"You told me which values on the {who} invoice are right.", needs.company_id,
+                      amount=record.document.gross_amount, currency=record.document.currency,
+                      evidence_ids=[answer_ev])
+        if assessment.quality is Quality.RED:
+            follow_up = self._ask_about_conflict(record, now)
+            ask = f" {follow_up.prompt}" if follow_up is not None else ""
+            return AnswerOutcome(ok=True, message=f"Thanks. I still need one more answer.{ask}")
+        self.advance(item, Stage.UNDERSTOOD, [*record.evidence_ids, answer_ev], agent="verification", actor=owner,
+                     quality=assessment.quality, note=f"You said: {option.label}.")
+        return AnswerOutcome(ok=True, message=f"Done. I will use {option.label.split(', as ')[0]} for the {who} "
+                                              "invoice.")
 
     def payment_fingerprint(self, record: DocumentRecord) -> str:
         doc = record.document
@@ -2080,6 +2370,91 @@ def _first_line(text: str) -> str | None:
         if line and not line.lower().startswith(("nif", "fatura", "invoice", "data", "atcud")):
             return line
     return None
+
+
+_READABLE_FILES = frozenset({EvidenceFormat.PDF, EvidenceFormat.IMAGE, EvidenceFormat.SCREENSHOT})
+# The field a "which value is right?" question leads with, most useful first.
+_CONFLICT_ORDER = ("gross_amount", "vat_amount", "net_amount", "supplier_tax_id", "invoice_number", "issue_date",
+                   "iban", "currency", "customer_tax_id", "due_date", "payment_reference")
+_OPINION_FLOOR = 0.4  # below this confidence a reading neither supports nor contradicts (verification policy)
+_AS_PRINTED = frozenset({"invoice_number", "supplier_tax_id", "customer_tax_id", "payment_reference"})
+
+
+def _letter_text(parts: Sequence[_Part]) -> str:
+    """The readable text of a file, for spotting letters with a deadline (§24)."""
+    for part in parts:
+        if part.kind == "text":
+            return part.text
+        if part.kind == "read":
+            own = part.text if part.method is not ExtractionMethod.QR else ""
+            return own or part.reading_text
+    return ""
+
+
+def _option_value(f: CriticalField, raw: Any) -> Any:
+    """A value as the owner confirms it: amounts and dates typed, numbers and references as printed."""
+    from backoffice.extraction.values import typed_value
+
+    if f.value in _AS_PRINTED:
+        return " ".join(str(raw).split())
+    typed = typed_value(f, raw)
+    return typed if typed is not None else raw
+
+
+def _confident(observations: Sequence[FieldObservation]) -> list[FieldObservation]:
+    return sorted((o for o in observations
+                   if o.confidence >= _OPINION_FLOOR and o.method is not ExtractionMethod.ARITHMETIC),
+                  key=lambda o: (-METHOD_RANK.get(o.method, 0), -o.confidence, o.source))
+
+
+def _value_groups(name: str, observations: Sequence[FieldObservation]
+                  ) -> list[tuple[Any, frozenset[str], tuple[ExtractionMethod, ...]]]:
+    """The distinct values sources show for one field: (value, their channels, their methods), strongest first."""
+    from backoffice.extraction.values import comparison_key, is_usable
+
+    f = CriticalField(name)
+    groups: dict[str, list[FieldObservation]] = {}
+    for o in _confident(observations):
+        if is_usable(f, o.value):
+            groups.setdefault(comparison_key(f, o.value), []).append(o)
+    return [(_option_value(f, found[0].value), frozenset(t for o in found for t in lineage(o)),
+             tuple(dict.fromkeys(o.method for o in found))) for found in groups.values()]
+
+
+def _value_from(name: str, observations: Sequence[FieldObservation], channels: frozenset[str]) -> Any:
+    """What the chosen sources show for another disputed field, if they show it."""
+    from backoffice.extraction.values import is_usable
+
+    f = CriticalField(name)
+    for o in _confident(observations):
+        if lineage(o) & channels and is_usable(f, o.value):
+            return _option_value(f, o.value)
+    return None
+
+
+def _settled_values(assessment: DocumentAssessment) -> dict[str, Any]:
+    """Each field's value, None where the sources disagree (§19: never pick one)."""
+    return {name: (a.value if a.quality is not Quality.RED else None) for name, a in assessment.fields.items()}
+
+
+def _validation(name: str, assessment: Any) -> dict[str, Any]:
+    out: dict[str, Any] = {"field": name, "quality": assessment.quality.value}
+    if assessment.supporting:
+        out["sources"] = sorted({f"{o.method.value}@{o.source}" for o in assessment.supporting})
+    return out
+
+
+def _with_owner(observations: Mapping[str, Sequence[FieldObservation]],
+                owner: Mapping[str, FieldObservation]) -> dict[str, list[FieldObservation]]:
+    """Observations with the owner's confirmed values: for such a field, only readings that agree stay."""
+    from backoffice.extraction.values import comparison_key
+
+    out = {name: list(found) for name, found in observations.items()}
+    for name, ruling in owner.items():
+        f = CriticalField(name)
+        key = comparison_key(f, ruling.value)
+        out[name] = [o for o in out.get(name, []) if comparison_key(f, o.value) == key] + [ruling]
+    return out
 
 
 def _first_value(observations: Mapping[str, list[FieldObservation]], f: CriticalField) -> Any:
