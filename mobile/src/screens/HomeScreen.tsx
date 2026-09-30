@@ -9,8 +9,11 @@ import { useLoaded } from "../app/hooks";
 import { useNeeds } from "../app/needs";
 import { useServices } from "../app/servicesContext";
 import { buildHomeView, type Tile } from "../models/home";
+import { REQUIRES_SIGN_IN } from "../config";
+import { copy } from "../copy";
 import { sourceNote } from "../models/source";
 import { colors, space, toneColors } from "../theme/tokens";
+import { Icon } from "../ui/Icon";
 import { Banner, Card, Dot, FadeIn, Note, Screen, T } from "../ui/primitives";
 
 export function HomeScreen() {
@@ -40,9 +43,20 @@ export function HomeScreen() {
         void needs.refresh();
       }}
     >
-      <T variant="meta" style={{ marginBottom: space.s1 }}>
-        {view.greeting}
-      </T>
+      <View style={styles.topRow}>
+        <T variant="meta">{view.greeting}</T>
+        {REQUIRES_SIGN_IN ? (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={copy.account.title}
+            onPress={() => router.push("/account")}
+            style={styles.account}
+            hitSlop={8}
+          >
+            <Icon name="user" size={20} color={colors.text2} />
+          </Pressable>
+        ) : null}
+      </View>
       <FadeIn key={view.status.text}>
         <View style={styles.statusRow} accessibilityRole="header">
           <View style={{ marginTop: 13 }}>
@@ -121,6 +135,17 @@ function CompanyCard({ company }: { company: CompanySummary }) {
 }
 
 const styles = StyleSheet.create({
+  topRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", minHeight: 36, marginBottom: space.s1 },
+  account: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: colors.surface,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.line2,
+    alignItems: "center",
+    justifyContent: "center",
+  },
   statusRow: { flexDirection: "row", gap: space.s1 + 2, marginBottom: space.s1 },
   tiles: { flexDirection: "row", gap: space.s1, marginTop: space.s1 },
   tile: { paddingVertical: space.s2, gap: space.s0 },

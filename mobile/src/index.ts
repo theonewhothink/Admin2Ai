@@ -52,6 +52,15 @@ export { parseHome, parseNeedsYou, parseActivity, parseAskAnswer } from "./api/g
 export type * from "./api/types";
 export type { HttpSend, HttpRequest, HttpResponse, ApiEndpoint } from "./api/http";
 
+export { AuthStore } from "./auth/store";
+export type { AuthState, AuthUser, AuthApi, AuthHooks, TokenStorage, SignInOutcome } from "./auth/store";
+export { httpAuthApi, parseSignIn } from "./auth/api";
+export { onUnauthorized, emitUnauthorized } from "./auth/events";
+export { PushRegistration, PUSH_KEYS } from "./notifications/push";
+export type { PushPlatform, DeviceApi, PushPrefs, PermissionStatus, EnableResult } from "./notifications/push";
+export { routeForNotification } from "./notifications/route";
+export type { NotificationTarget } from "./notifications/route";
+
 export { AppLock, mapAuthError, DEFAULT_GRACE_MS } from "./security/lock";
 export type { Authenticator, AuthResult, LockState, SecurityLevel } from "./security/lock";
 

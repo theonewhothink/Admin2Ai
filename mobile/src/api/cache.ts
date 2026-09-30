@@ -14,6 +14,8 @@ export interface CachedEntry {
 export interface SnapshotCache {
   get(key: string): Promise<CachedEntry | null>;
   set(key: string, data: unknown, savedAt: number): Promise<void>;
+  /** Forget every screen (sign-out). */
+  clear(): Promise<void>;
 }
 
 export class MemorySnapshotCache implements SnapshotCache {
@@ -25,6 +27,10 @@ export class MemorySnapshotCache implements SnapshotCache {
 
   async set(key: string, data: unknown, savedAt: number): Promise<void> {
     this.entries.set(key, { savedAt, data });
+  }
+
+  async clear(): Promise<void> {
+    this.entries.clear();
   }
 }
 
@@ -58,6 +64,11 @@ export class SealedSnapshotCache implements SnapshotCache {
     } catch {
       // Caching is a convenience; the screen already has fresh data.
     }
+  }
+
+  async clear(): Promise<void> {
+    this.memory = {};
+    await this.file.save({});
   }
 
   private async load(): Promise<Record<string, CachedEntry>> {

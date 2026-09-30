@@ -286,6 +286,26 @@ export class OfflinePipeline {
     });
   }
 
+  /**
+   * A different owner signed in on this phone: the previous owner's unsent
+   * documents must never reach the new owner's account. Removes every item
+   * and the delivery history. Runs under the same lock as uploads, so nothing
+   * is half-sent; call it before the new session's token is stored.
+   */
+  discardAll(): Promise<number> {
+    return this.mutex.run(async () => {
+      const snap = await this.load();
+      const removed = snap.items.length;
+      // Orphans too (an interrupted capture), or recover() would bring them back.
+      const keys = new Set([...snap.items.map((i) => i.id), ...(await this.deps.blobs.list())]);
+      for (const key of keys) await this.deps.blobs.delete(key);
+      snap.items = [];
+      snap.sent = [];
+      await this.persist(snap);
+      return removed;
+    });
+  }
+
   subscribe(listener: (summary: QueueSummary) => void): () => void {
     this.listeners.add(listener);
     return () => {

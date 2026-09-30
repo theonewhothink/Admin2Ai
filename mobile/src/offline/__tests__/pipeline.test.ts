@@ -407,6 +407,21 @@ describe("owner actions and summary", () => {
     expect(h.queue.snapshot().items).toHaveLength(0);
   });
 
+  it("discards everything, orphans and history included, when another owner signs in", async () => {
+    const h = harness();
+    const p = new OfflinePipeline(h.deps);
+    await p.capture(input("sent one"));
+    await p.drain();
+    await p.capture(input("waiting one"));
+    await h.blobs.write("orphan-from-a-crash", new Uint8Array([1, 2, 3]));
+    expect(await p.discardAll()).toBe(1);
+    expect(h.blobs.blobs.size).toBe(0);
+    expect(h.queue.snapshot().items).toHaveLength(0);
+    expect(h.queue.snapshot().sent).toHaveLength(0);
+    expect((await p.recover()).reRegistered).toBe(0);
+    expect((await p.summary()).waiting).toBe(0);
+  });
+
   it("notifies subscribers with plain counts", async () => {
     const h = harness();
     const p = new OfflinePipeline(h.deps);

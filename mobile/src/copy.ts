@@ -124,6 +124,62 @@ export const copy = {
     nothing: "There was nothing I could use in that share.",
   },
 
+  auth: {
+    title: "Sign in",
+    lead: "Welcome back. I kept going while you were away.",
+    email: "Email",
+    password: "Password",
+    show: "Show",
+    hide: "Hide",
+    submit: "Sign in",
+    expired: "You were signed out. Sign in again to continue.",
+    signedOut: "You're signed out.",
+    newHere: "New here?",
+    createAccount: "Create an account",
+    createAccountHint: "Opens the sign-up page in your browser.",
+    forgot: "Forgot password?",
+    forgotBody(support: string): string {
+      return support ? `Ask support at ${support} to reset it.` : "Ask support to reset it.";
+    },
+  },
+
+  push: {
+    title: "Turn on notifications?",
+    body: "I only notify you when I need a decision, a connection stops working, or a month is closed.",
+    enable: "Turn on",
+    later: "Not now",
+    denied: "Notifications are off. You can turn them on in the phone's Settings.",
+  },
+
+  account: {
+    title: "Account",
+    signedInAs: "Signed in as",
+    notifications: "Notifications",
+    notificationsOn: "On. Only what needs you.",
+    notificationsOff: "Off",
+    turnOn: "Turn on",
+    openSettings: "Open Settings",
+    signOut: "Sign out",
+    signOutConfirm: "Sign out of Back Office on this phone?",
+    signOutWaiting(n: number): string {
+      if (n === 1) return "One document hasn't been sent yet. It stays on this phone and goes when you sign in again.";
+      const word = countWord(n);
+      return `${word.charAt(0).toUpperCase()}${word.slice(1)} documents haven't been sent yet. They stay on this phone and go when you sign in again.`;
+    },
+    cancel: "Cancel",
+    back: "Back",
+    demo: "This is the demo. Nothing leaves this phone.",
+  },
+
+  connections: {
+    title: "Connections",
+    healthy: "Connected",
+    stale: "Needs reconnecting",
+    reconnectHint: "Reconnecting opens the page where you signed in to it, on the web.",
+    reconnect: "Reconnect on the web",
+    empty: "Nothing is connected yet. Connect your email and bank on the web.",
+  },
+
   lock: {
     title: "Back Office is locked",
     body: "Unlock to see your business.",

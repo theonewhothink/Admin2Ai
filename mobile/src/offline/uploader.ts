@@ -110,6 +110,9 @@ export class HttpEvidenceUploader implements EvidenceTransport {
       { name: FILE_FIELD, fileName: request.meta.fileName, contentType: request.meta.mimeType, bytes: request.bytes },
       random,
     );
+    const auth = await authHeaders(endpoint);
+    // Signed out: never send evidence without a session. It stays queued until the owner signs in.
+    if (endpoint.getAuthToken && !auth.Authorization) return { kind: "auth", status: 401 };
     let response;
     try {
       response = await send({
@@ -119,7 +122,7 @@ export class HttpEvidenceUploader implements EvidenceTransport {
           Accept: "application/json",
           "Content-Type": `multipart/form-data; boundary=${boundary}`,
           [IDEMPOTENCY_HEADER]: request.idempotencyKey,
-          ...(await authHeaders(endpoint)),
+          ...auth,
         },
         body,
         timeoutMs: this.options.timeoutMs ?? 120_000,
@@ -133,6 +136,7 @@ export class HttpEvidenceUploader implements EvidenceTransport {
     } catch {
       return { kind: "network" };
     }
+    if (response.status === 401) endpoint.onUnauthorized?.();
     return classifyResponse(response.status, parseJson(text), response.header("retry-after"), now());
   }
 }

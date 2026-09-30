@@ -26,6 +26,8 @@ export interface ApiEndpoint {
   timeoutMs: number;
   /** Bearer token for the signed-in owner, if any. */
   getAuthToken?: () => Promise<string | null>;
+  /** Called when the server answers 401: the session is missing or has ended. */
+  onUnauthorized?: () => void;
 }
 
 /** Normalise a configured base URL: trims, drops trailing slashes, requires http(s). */

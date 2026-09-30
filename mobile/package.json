@@ -2,7 +2,7 @@
   "name": "backoffice-mobile",
   "version": "0.1.0",
   "private": true,
-  "description": "AI Back-Office Operator mobile app: capture, approve, resolve, ask (spec \u00a711-12, \u00a740-43).",
+  "description": "AI Back-Office Operator mobile app: capture, approve, resolve, ask (spec §11-12, §40-43).",
   "main": "expo-router/entry",
   "scripts": {
     "start": "expo start --dev-client",
@@ -28,6 +28,7 @@
     "expo-linking": "~57.0.11",
     "expo-local-authentication": "~57.0.3",
     "expo-network": "~57.0.2",
+    "expo-notifications": "~57.0.21",
     "expo-router": "~57.0.23",
     "expo-secure-store": "~57.0.4",
     "expo-share-intent": "~8.0.1",

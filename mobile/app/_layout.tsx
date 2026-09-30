@@ -1,6 +1,7 @@
 /**
  * Root layout: fonts, share intents (§12), services, the biometric lock (§52)
- * and the background upload task (§43).
+ * on top of sign-in, notification taps (§42) and the background upload task
+ * (§43).
  */
 // Registers the background upload task at module load (TaskManager requirement).
 import "../src/offline/expo/backgroundTask";
@@ -14,10 +15,13 @@ import { ShareIntentProvider } from "expo-share-intent";
 import { StatusBar } from "expo-status-bar";
 import { useEffect } from "react";
 import { SafeAreaProvider } from "react-native-safe-area-context";
+import { AuthGate } from "../src/app/AuthGate";
 import { LockGate } from "../src/app/LockGate";
 import { NeedsProvider } from "../src/app/needs";
+import { NotificationRouter } from "../src/app/NotificationRouter";
 import { ServicesProvider } from "../src/app/services";
 import { ShareHandler } from "../src/app/ShareHandler";
+import { REQUIRES_SIGN_IN } from "../src/config";
 import { colors } from "../src/theme/tokens";
 
 void SplashScreen.preventAutoHideAsync();
@@ -37,11 +41,14 @@ export default function RootLayout() {
       <SafeAreaProvider>
         <ServicesProvider>
           <LockGate>
-            <NeedsProvider>
-              <StatusBar style="dark" />
-              <Stack screenOptions={{ headerShown: false, contentStyle: { backgroundColor: colors.bg } }} />
-              <ShareHandler />
-            </NeedsProvider>
+            <StatusBar style="dark" />
+            <AuthGate>
+              <NeedsProvider>
+                <Stack screenOptions={{ headerShown: false, contentStyle: { backgroundColor: colors.bg } }} />
+                <ShareHandler />
+                {REQUIRES_SIGN_IN ? <NotificationRouter /> : null}
+              </NeedsProvider>
+            </AuthGate>
           </LockGate>
         </ServicesProvider>
       </SafeAreaProvider>

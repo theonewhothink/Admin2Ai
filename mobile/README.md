@@ -31,10 +31,14 @@ runs the Jest suite and the type-check.
 
 | Setting | Where | Notes |
 | --- | --- | --- |
-| API base URL | `EXPO_PUBLIC_API_URL` (inlined at build time) | Unset = demo mode: sample data, nothing leaves the phone, uploads stay queued. |
-| Bundle id / package | `app.json` → `ios.bundleIdentifier`, `android.package` | `eu.admin2ai.backoffice` is a placeholder. Set the real ids before the first store build. |
+| API base URL | `EXPO_PUBLIC_API_URL` (inlined at build time) | Unset = demo mode: sample data, no sign-in, nothing leaves the phone, uploads stay queued. Set = production: sign-in required. |
+| Web app URL | `EXPO_PUBLIC_WEB_URL` | Sign-up and reconnecting email or bank open here. Defaults to the API URL. |
+| Support email | `EXPO_PUBLIC_SUPPORT_EMAIL` | Shown under "Forgot password?" (the API has no reset endpoint). |
+| Bundle id / package | `APP_BUNDLE_ID`, `APP_ANDROID_PACKAGE` (`app.config.ts`) | Default `eu.admin2ai.backoffice` (a placeholder, from `app.json`). |
+| EAS project | `EAS_PROJECT_ID`, `EAS_OWNER` (`app.config.ts`) | The project id is required for Expo push tokens. |
 | URL scheme | `app.json` → `scheme` (`backoffice`) | Used by the Share Extension hand-off. |
-| Session token | `src/security/session.ts` (Keychain / Keystore) | Sent as `Authorization: Bearer`. Sign-in UI is not part of this phase. |
+| Router root | `app.json` → `expo-router` plugin `root: ./app` | Needed because `src/app/` (app wiring, not routes) would otherwise be taken as the routes folder. |
+| Session token | `src/security/session.ts` (Keychain / Keystore) | Written after sign-in, sent as `Authorization: Bearer`, deleted on sign-out or a 401. |
 
 ## How it works
 
@@ -122,6 +126,57 @@ plain cover. Releasing a payment to changed bank details asks for identity again
 right before sending (§25 hard approval). A phone with no passcode cannot be
 locked; the owner is told once.
 
+### Sign-in (production), `src/auth/`
+
+With `EXPO_PUBLIC_API_URL` set, the app needs a signed-in owner; the
+biometric lock stays on top of everything (`LockGate` wraps `AuthGate`).
+
+- **Sign in** with email and password (`POST /api/auth/login`). The token goes
+  to the Keychain / Keystore; every call sends `Authorization: Bearer <token>`
+  (bearer calls need no CSRF header). New owners tap "Create an account", which
+  opens `<web>/signup` in the browser. "Forgot password?" names the support
+  address.
+- **401 anywhere** (screens or the upload queue) ends the session on the phone:
+  the token is deleted, the app is replaced by the sign-in screen with "You were
+  signed out. Sign in again to continue.", and cached screens are forgotten. A
+  401 read never falls back to cached data from that session.
+- **Sign out** (Home → the person icon → Account): stops this phone's
+  notifications, ends the session on the server, deletes the token and the
+  cached screens. Documents still waiting to send stay sealed on the phone and
+  go after the next sign-in (the confirmation says so). Without a session the
+  queue never uploads.
+- **Another owner on the same phone** (`src/auth/ownerSwitch.ts`): before the
+  new session's token is stored, the previous owner's unsent documents and
+  cached screens are removed, so nothing of theirs reaches the new account. If
+  that fails, the sign-in is refused rather than risk it.
+- `AuthStore` (`src/auth/store.ts`) is pure and unit-tested; `AuthGate` renders
+  sign-in instead of the app while signed out, so no screen loads without a
+  session.
+
+### Notifications (§42), `src/notifications/`
+
+Rare by design: the server sends only a new hard approval (changed bank
+details, a payment to approve), a connection that needs reconnecting, and a
+month closed.
+
+- **Permission** is asked once, right after the first sign-in, on our own
+  screen with one line of why ("I only notify you when I need a decision, a
+  connection stops working, or a month is closed."). "Not now" is remembered;
+  Account can turn it on later (or open the phone's Settings if refused).
+- **Token.** With permission, the Expo push token (needs `EAS_PROJECT_ID`) is
+  sent to `POST /api/devices {expoPushToken, platform}` after sign-in and again
+  at each start (tokens can change; a changed one replaces the old). Sign-out
+  calls `POST /api/devices/remove {expoPushToken}` while the session still works.
+- **Taps** open the matching screen (`src/notifications/route.ts`): the payload
+  `data` may carry `screen` (`needs-you`, `connections`, `home`, `activity`),
+  `url` (`/needs-you`, `backoffice://connections`, …) or `type`/`kind`
+  (`hard_approval`, `payment_approval`, `bank_details_changed`,
+  `connection_stale`, `reconnect`, `month_closed`, …). The app handles the
+  notification that launched it, once.
+- **Connections** (`app/connections.tsx`) lists what syncs and what needs
+  reconnecting; reconnecting signs in to Google, Microsoft or the bank, which
+  happens on the web, so the button opens the web app.
+
 ### Owner API, `src/api/`
 
 | Call | Used by |
@@ -132,6 +187,9 @@ locked; the owner is told once.
 | `GET /api/activity` | Activity |
 | `POST /api/ask` `{question}` → `{answer, evidence[]}` | Ask |
 | `POST /api/evidence/upload` | Offline queue |
+| `POST /api/auth/login`, `POST /api/auth/logout` | Sign-in, sign-out |
+| `GET /api/auth/me` | Account |
+| `POST /api/devices`, `POST /api/devices/remove` | Notifications |
 
 Shapes follow the web app's contract (`web/README.md`), with money accepted as
 a JSON string or number and kept as a decimal string (never a float). Optional
@@ -166,6 +224,8 @@ src/offline/         §43 pipeline (pure) + expo/ adapters, background task
 src/scan/            §11 quality checks, scan session (pure) + expo adapters
 src/share/           §12 routing and ingest (pure)
 src/security/        §52 lock state machine + expo-local-authentication, session token
+src/auth/            sign-in store (pure), login/logout over HTTP, the 401 signal
+src/notifications/   push registration (pure), tap routing (pure), expo-notifications adapter
 src/api/             client, guards, sample data, sealed cache, expo/fetch transport
 src/models/          screen view-models (pure)
 src/screens/, src/ui/, src/navigation/, src/app/   React Native UI and wiring
@@ -175,9 +235,49 @@ native/              notes where config plugins do not reach
 
 `src/index.ts` exports the pure public API.
 
+## Release (EAS)
+
+`eas.json` has three build profiles: `development` (dev client, internal),
+`preview` (internal; Android APK) and `production` (store builds, build numbers
+incremented remotely). Each uses the EAS environment of the same name for its
+variables.
+
+1. Once: `npm i -g eas-cli`, `eas login`, then `eas init` (creates the project;
+   put the printed id in `EAS_PROJECT_ID`).
+2. Set the variables for each environment (`development`, `preview`,
+   `production`), for example:
+
+   ```bash
+   eas env:create --environment production --name EXPO_PUBLIC_API_URL --value https://api.admin2ai.eu --visibility plaintext
+   eas env:create --environment production --name EXPO_PUBLIC_WEB_URL --value https://app.admin2ai.eu --visibility plaintext
+   eas env:create --environment production --name EXPO_PUBLIC_SUPPORT_EMAIL --value support@admin2ai.eu --visibility plaintext
+   eas env:create --environment production --name APP_BUNDLE_ID --value <your.bundle.id> --visibility plaintext
+   eas env:create --environment production --name APP_ANDROID_PACKAGE --value <your.package> --visibility plaintext
+   eas env:create --environment production --name EAS_PROJECT_ID --value <project id> --visibility plaintext
+   ```
+
+   Export `EAS_PROJECT_ID` (and `EAS_OWNER` for a team) in your shell too: the
+   CLI reads `app.config.ts` locally. Leave `EXPO_PUBLIC_API_URL` unset for a
+   demo build.
+3. Push credentials: `eas credentials` (iOS: let EAS create the APNs key;
+   Android: upload the FCM V1 service-account key). Without them the app runs,
+   but no notification arrives.
+4. Build: `eas build --profile development --platform ios` (then
+   `npm start`), `eas build --profile preview --platform all` for testers,
+   `eas build --profile production --platform all` for the stores.
+5. Submit: `eas submit --profile production --platform ios|android`.
+6. Before the first store build, check on a device: sign in, the notification
+   prompt, a test push from the server opening Needs you and Connections, the
+   Share Extension, scanning offline, and sign-out.
+
+iOS usage texts are set by the config plugins (camera for scanning, Face ID
+for the lock); notifications need none. The Android notification icon is
+`assets/notification-icon.png` (white on transparent) tinted ink `#111318`.
+
 ## Known gaps
 
-- Sign-in and token refresh are not built; `setSessionToken` is the hook.
+- Token refresh: sessions last 30 days, sliding; after that the owner signs in
+  again.
 - Answers given while offline are not queued; the card says it could not send.
 - iOS: emails shared as data (not `.eml` files) are not accepted by the
   generated extension (see the native note).
