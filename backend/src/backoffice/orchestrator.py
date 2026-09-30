@@ -30,6 +30,8 @@ Pipeline for one piece of evidence::
     Closure        lifecycle transitions and month status (§2, §27, §48); an invoice naming another of your
                    companies is a question (§51); a large first purchase needs the buyer's tax number and
                    totals that add up (§26); a receipt paid in cash closes on its own evidence (§11)
+    Cost center    which job, property, vehicle, outlet, event, course or client each cost is for, with its
+                   reason; exact splits; one question otherwise. Only for companies that keep cost centers
     Auditor        re-checks closed items and reopens any that no longer hold (§55, §57)
 
 The orchestrator is pure Python: no network, no threads started, no
@@ -79,10 +81,21 @@ from backoffice.countries.pt import (
     parse_qr,
     qr_to_observations,
 )
+from backoffice.domain.cost_centers import (
+    CostCenter,
+    SplitError,
+    split_by_amounts,
+    split_by_percent,
+    split_by_weights,
+    to_cents,
+)
 from backoffice.domain.lifecycle import IllegalTransition, Stage, TrackedItem
 from backoffice.domain.models import (
     METHOD_RANK,
     SUPPORTING_DOCUMENT_TYPES,
+    AllocationMethod,
+    AllocationShare,
+    CostAllocation,
     CriticalField,
     Document,
     DocumentType,
@@ -97,6 +110,7 @@ from backoffice.domain.models import (
     Supplier,
     Transaction,
     TransactionKind,
+    VatPart,
     VerifiedField,
 )
 from backoffice.evidence import (
@@ -115,6 +129,7 @@ from backoffice.evidence import (
     sha256_hex,
 )
 from backoffice.extraction import StructuredFormatError, XMLSyntaxError, parse_einvoice
+from backoffice.extraction.invoicelines import InvoiceDetails, read_invoice_details
 from backoffice.fraud import (
     ApproverKind,
     BeneficiaryChangeRefused,
@@ -147,7 +162,18 @@ from backoffice.learning import (
     same_tax_id,
     suggest_rule_from_answer,
 )
-from backoffice.learning import Rule, RuleField, RuleMatch, RuleOutcome, RuleSubject
+from backoffice.learning import GENERAL, Rule, RuleField, RuleMatch, RuleOutcome, RuleSubject
+from backoffice.learning.cost_centers import (
+    SPLIT_OPTION,
+    CostCenterDecision,
+    CostCenterFacts,
+    cost_center_question,
+    decide_cost_center,
+    history_counts,
+    noun_for,
+    percents_of,
+    suggest_cost_center_rule,
+)
 from backoffice.mailer import is_simulated
 from backoffice.missing import (
     ChaseFacts,
@@ -448,6 +474,7 @@ class DocumentRecord:
     text: str = ""  # the document's readable text (for wording checks such as equipment)
     owner_confirmed: str | None = None  # evidence id of the owner's answer confirming a cash receipt
     hold_reason: str = ""  # plain reason it waits although nothing is missing (e.g. a large first purchase)
+    recipients: tuple[str, ...] = ()  # addresses the email was sent to (an alias can point to a cost center)
 
     @property
     def id(self) -> str:
@@ -518,7 +545,7 @@ class CheckOption:
 @dataclass
 class NeedsYouRecord:
     id: str
-    kind: str  # "choice" | "approval" | "check" (a document whose sources disagree)
+    kind: str  # "choice" | "approval" | "check" (a document whose sources disagree) | "cost_center" (which job)
     subject_type: str  # "transaction" | "document"
     subject_id: str
     item_id: str
@@ -750,6 +777,8 @@ class Repository:
         # environment). None in the browser demo: such files are stored and wait, unread.
         self.reader: Any = None
         self.reads: dict[str, Any] = {}  # evidence id -> ReadOutcome (what was read, by which steps)
+        # Jobs, properties, vehicles, outlets, events, courses or clients of each company (cost centers).
+        self.cost_centers: dict[str, CostCenter] = {}
 
     # ----------------------------------------------------------------- set-up
 
@@ -2424,6 +2453,404 @@ class AuditorAgent(_Agent):
         return None
 
 
+class CostCenterAgent(_Agent):
+    """Which job, property, vehicle, outlet, event, course or client each cost is for (cost centers).
+
+    Runs after entity assignment and matching, so a payment is decided together
+    with its invoices. A company without cost centers is never touched: no
+    question, no audit entry, nothing stored. Allocation never moves an item
+    along the golden path: closure still needs its evidence (§3).
+    """
+
+    name = "cost_center"
+    ALLOCATABLE = frozenset({EvidenceExpectation.INVOICE, EvidenceExpectation.RECEIPT,
+                             EvidenceExpectation.SALES_INVOICE, EvidenceExpectation.REFUND_OR_CREDIT_NOTE})
+
+    # ----------------------------------------------------------------- queries
+
+    def centers(self, company_id: str | None = None, *, active_only: bool = True) -> list[CostCenter]:
+        return sorted((c for c in self.repo.cost_centers.values()
+                       if (c.active or not active_only) and (company_id is None or c.company_id == company_id)),
+                      key=lambda c: (c.label.casefold(), c.id))
+
+    def using(self) -> set[str]:
+        return {c.company_id for c in self.repo.cost_centers.values() if c.active}
+
+    def open_question(self, tx_id: str) -> NeedsYouRecord | None:
+        return next((n for n in self.repo.needs.values()
+                     if n.kind == "cost_center" and n.subject_id == tx_id and n.status == "open"), None)
+
+    def history(self) -> dict[str, dict[str, dict[str, int]]]:
+        """{company: {supplier key: {cost center id or GENERAL: count}}} from decided payments (not from history)."""
+        resolver = self.repo.resolver()
+        entries: dict[str, list[tuple[str | None, str]]] = {}
+        for rec in sorted(self.repo.transactions.values(), key=lambda r: r.id):
+            allocation = rec.tx.cost_allocation
+            if allocation is None or rec.private or allocation.method is AllocationMethod.HISTORY:
+                continue
+            if allocation.general:
+                target = GENERAL
+            elif len(allocation.shares) == 1:
+                target = allocation.shares[0].cost_center_id
+            else:
+                continue
+            entries.setdefault(rec.company_id, []).append((resolver.resolve_transaction(rec.tx).key, target))
+        return {company: history_counts(pairs) for company, pairs in entries.items()}
+
+    # ----------------------------------------------------------------- facts
+
+    def details(self, record: DocumentRecord) -> InvoiceDetails | None:
+        """References, lines and VAT per rate of the document's e-invoice, when it has one."""
+        for evidence_id in record.evidence_ids:
+            evidence = self.repo.evidence(evidence_id)
+            if evidence.format in (EvidenceFormat.UBL, EvidenceFormat.XML):
+                found = read_invoice_details(self.repo.registry.open(self.repo.tenant_id, evidence_id))
+                if found is not None:
+                    return found
+            outcome = self.repo.reads.get(evidence_id)
+            for xml in getattr(outcome, "embedded_xml", ()) or ():
+                found = read_invoice_details(xml)
+                if found is not None:
+                    return found
+        return None
+
+    def _text_of(self, record: DocumentRecord) -> str:
+        words: list[str] = []
+        for evidence_id in record.evidence_ids:
+            evidence = self.repo.evidence(evidence_id)
+            if evidence.format in (EvidenceFormat.TEXT, EvidenceFormat.QR, EvidenceFormat.HTML):
+                data = self.repo.registry.open(self.repo.tenant_id, evidence_id)[:40000]
+                words.append(data.decode("utf-8", errors="ignore"))
+            outcome = self.repo.reads.get(evidence_id)
+            if outcome is not None and getattr(outcome, "text", ""):
+                words.append(outcome.text[:40000])
+        return "\n".join(words)
+
+    def document_texts(self, record: DocumentRecord, details: InvoiceDetails | None) -> list[tuple[str, str]]:
+        doc = record.document
+        kind = _DOC_LABELS.get(doc.doc_type, "Document").lower()
+        head = " ".join(p for p in (doc.supplier_name, doc.invoice_number, doc.payment_reference,
+                                    doc.customer_tax_id) if p)
+        texts = [(f"the {kind}", head)]
+        body = self._text_of(record)
+        if body:
+            texts.append((f"the {kind}", body))
+        if details is not None and details.references:
+            texts.append((f"the {kind}", "\n".join(details.references)))
+        if record.message_text.strip():
+            texts.append(("the email", record.message_text[:8000]))
+        return texts
+
+    def vat_parts(self, record: DocumentRecord, details: InvoiceDetails | None) -> tuple[VatPart, ...]:
+        """The document's total by VAT rate: the e-invoice's subtotals, the fiscal QR, or net plus VAT."""
+        doc = record.document
+        gross = abs(doc.gross_amount) if doc.gross_amount is not None else None
+        if gross is None:
+            return ()
+
+        def fits(parts: Sequence[VatPart]) -> bool:
+            return bool(parts) and sum((p.gross for p in parts), _ZERO) == gross
+
+        if details is not None and fits(details.vat_parts):
+            return tuple(details.vat_parts)
+        qr = _qr_vat_parts(self._text_of(record))
+        if fits(qr):
+            return qr
+        if doc.net_amount is not None and doc.vat_amount is not None:
+            single = (VatPart(rate=None, net=abs(doc.net_amount), vat=abs(doc.vat_amount)),)
+            if fits(single):
+                return single
+        return ()
+
+    def document_facts(self, record: DocumentRecord, company_id: str) -> CostCenterFacts | None:
+        doc = record.document
+        if doc.gross_amount is None or doc.gross_amount == 0:
+            return None
+        details = self.details(record)
+        match = self.repo.resolver().resolve_document(doc)
+        return CostCenterFacts(
+            tenant_id=self.repo.tenant_id, company_id=company_id, subject_type="document", subject_id=record.id,
+            total=abs(doc.gross_amount), currency=doc.currency, counterparty_key=match.key,
+            counterparty_label=display_name(doc.supplier_name), supplier_tax_id=doc.supplier_tax_id,
+            texts=tuple(self.document_texts(record, details)),
+            emails=tuple(e for e in (record.sender, *record.recipients) if e),
+            lines=doc.lines or (details.lines if details is not None else ()),
+            vat_parts=self.vat_parts(record, details), on=doc.issue_date,
+            evidence_ids=tuple(record.evidence_ids))
+
+    def payment_facts(self, rec: TxRecord) -> CostCenterFacts:
+        tx = rec.tx
+        repo = self.repo
+        docs = [repo.documents[d] for d in rec.document_ids if d in repo.documents]
+        match = repo.resolver().resolve_transaction(tx)
+        account = repo.accounts.get(tx.account_id)
+        texts = [("the bank line", " ".join(p for p in (tx.counterparty, tx.description, tx.reference or "") if p))]
+        emails: list[str] = []
+        evidence = [rec.evidence_id]
+        lines: tuple[Any, ...] = ()
+        parts: tuple[VatPart, ...] = ()
+        for record in docs:
+            details = self.details(record)
+            texts += self.document_texts(record, details)
+            emails += [e for e in (record.sender, *record.recipients) if e]
+            evidence += record.evidence_ids
+            if len(docs) == 1 and record.document.gross_amount is not None and \
+                    abs(record.document.gross_amount) == abs(tx.amount):
+                lines = record.document.lines or (details.lines if details is not None else ())
+                parts = self.vat_parts(record, details)
+        return CostCenterFacts(
+            tenant_id=repo.tenant_id, company_id=rec.company_id, subject_type="transaction", subject_id=rec.id,
+            total=abs(tx.amount), currency=tx.currency, counterparty_key=match.key,
+            counterparty_label=self.o.merchant_name(tx), card_last4=tx.card_last4, account_id=tx.account_id,
+            account_label=account.label if account is not None else None,
+            supplier_tax_id=next((d.document.supplier_tax_id for d in docs if d.document.supplier_tax_id), None),
+            texts=tuple(texts), emails=tuple(dict.fromkeys(emails)), lines=lines, vat_parts=parts,
+            on=tx.booked_on, evidence_ids=tuple(dict.fromkeys(evidence)))
+
+    def decide(self, facts: CostCenterFacts, history: Mapping[str, Mapping[str, int]] | None = None
+               ) -> CostCenterDecision:
+        accountant_ids = [self.repo.accountant.id] if self.repo.accountant else []
+        return decide_cost_center(centers=self.centers(facts.company_id), facts=facts, rulebook=self.repo.rulebook,
+                                  accountant_ids=accountant_ids, history=history, today=self.repo.today())
+
+    # ----------------------------------------------------------------- applying
+
+    def apply_payment(self, rec: TxRecord, allocation: CostAllocation) -> None:
+        rec.tx = rec.tx.model_copy(update={"cost_allocation": allocation})
+        self._log_allocation(rec.id, allocation)
+
+    def apply_document(self, record: DocumentRecord, allocation: CostAllocation) -> None:
+        record.document = record.document.model_copy(update={"cost_allocation": allocation})
+        self._log_allocation(record.id, allocation)
+
+    def _log_allocation(self, subject_id: str, allocation: CostAllocation) -> None:
+        self.log("allocate_cost_center", subject_id=subject_id, evidence_ids=list(allocation.evidence_ids),
+                 values={"general": allocation.general, "total": allocation.total,
+                         "shares": [[s.cost_center_id, s.amount] for s in allocation.shares]},
+                 validations=list(allocation.why),
+                 response={"method": allocation.method.value, "quality": allocation.quality.value})
+
+    def scaled(self, allocation: CostAllocation, total: Decimal, parts: Sequence[VatPart] = (),
+               evidence_ids: Sequence[str] = ()) -> CostAllocation:
+        """The same allocation for another amount (an invoice paid by one payment, or the other way round)."""
+        evidence = tuple(dict.fromkeys((*allocation.evidence_ids, *evidence_ids)))
+        if allocation.general:
+            return allocation.model_copy(update={"total": total, "evidence_ids": evidence})
+        if total == allocation.total and (not parts or all(s.parts for s in allocation.shares)):
+            return allocation.model_copy(update={"evidence_ids": evidence})
+        weights = [(s.cost_center_id, s.amount) for s in allocation.shares]
+        shares = split_by_weights(total, weights, parts)
+        return allocation.model_copy(update={"total": total, "shares": shares, "evidence_ids": evidence})
+
+    def _new_evidence(self, rec: TxRecord) -> bool:
+        """Invoices were matched to the payment after it was decided: their evidence is not behind the decision."""
+        allocation = rec.tx.cost_allocation
+        if allocation is None:
+            return False
+        known = set(allocation.evidence_ids)
+        return any(e not in known for d in rec.document_ids if d in self.repo.documents
+                   for e in self.repo.documents[d].evidence_ids)
+
+    def carry_to_documents(self, rec: TxRecord, *, overwrite: bool = False, by_owner: bool = False) -> int:
+        """A decided payment's invoices get the same cost centers.
+
+        By default only an invoice with nothing better (none, or a likely one
+        from history) takes it; ``overwrite`` replaces what the system decided
+        for the invoice; ``by_owner`` (the owner chose for the payment) replaces
+        anything, the owner's earlier choice for the invoice included.
+        """
+        allocation = rec.tx.cost_allocation
+        if allocation is None:
+            return 0
+        moved = 0
+        for doc_id in rec.document_ids:
+            record = self.repo.documents.get(doc_id)
+            if record is None or record.document.gross_amount is None or record.document.gross_amount == 0:
+                continue
+            current = record.document.cost_allocation
+            if current is not None and not by_owner:
+                if current.method is AllocationMethod.OWNER:
+                    continue
+                if not overwrite and current.method is not AllocationMethod.HISTORY:
+                    continue
+            total = abs(record.document.gross_amount)
+            parts = self.vat_parts(record, self.details(record))
+            try:
+                carried = self.scaled(allocation, total, parts, record.evidence_ids)
+            except SplitError:
+                continue
+            if current == carried:
+                continue
+            self.apply_document(record, carried)
+            moved += 1
+        return moved
+
+    def _carried(self, rec: TxRecord) -> CostAllocation | None:
+        """The payment's invoices' own allocations, combined, when they cover exactly this payment."""
+        docs = [self.repo.documents[d] for d in rec.document_ids if d in self.repo.documents]
+        allocations = [d.document.cost_allocation for d in docs]
+        if not docs or any(a is None for a in allocations):
+            return None
+        decided = [a for a in allocations if a is not None]
+        total = abs(rec.tx.amount)
+        if sum((a.total for a in decided), _ZERO) != total:
+            return None
+        why = tuple(dict.fromkeys(w for a in decided for w in a.why))
+        evidence = tuple(dict.fromkeys((rec.evidence_id, *[e for d in docs for e in d.evidence_ids])))
+        quality = Quality.AMBER if any(a.quality is not Quality.GREEN for a in decided) else Quality.GREEN
+        if all(a.general for a in decided):
+            return CostAllocation(total=total, currency=rec.tx.currency, general=True, method=AllocationMethod.INVOICE,
+                                  quality=quality, why=why, evidence_ids=evidence)
+        if any(a.general for a in decided):
+            return None
+        if len(decided) == 1:
+            shares = decided[0].shares
+        else:
+            amounts: dict[str, Decimal] = {}
+            for a in decided:
+                for share in a.shares:
+                    amounts[share.cost_center_id] = amounts.get(share.cost_center_id, _ZERO) + share.amount
+            shares = tuple(AllocationShare(cost_center_id=cid, amount=amount) for cid, amount in amounts.items())
+        return CostAllocation(total=total, currency=rec.tx.currency, shares=shares, method=AllocationMethod.INVOICE,
+                              quality=quality, why=why, evidence_ids=evidence)
+
+    # ----------------------------------------------------------------- the pass
+
+    def _ready_to_ask(self, rec: TxRecord) -> bool:
+        """Ask once the invoice had its chance to name the cost center (matched, not needed, or late)."""
+        if rec.decision is None:
+            return False
+        if rec.document_ids or not rec.decision.requires_document or self.repo.items[rec.item_id].is_done:
+            return True
+        return (self.repo.today() - rec.tx.booked_on).days >= CHASE_AFTER_DAYS
+
+    def allocate(self, now: datetime) -> int:
+        """Decide every open payment and document of the companies that keep cost centers."""
+        repo = self.repo
+        using = self.using()
+        for n in repo.needs.values():  # a company that stopped keeping cost centers is not asked any more
+            if n.kind == "cost_center" and n.status == "open" and n.company_id not in using:
+                n.status, n.resolution = "resolved", "cost_center_off"
+        if not using:
+            return 0
+        history = self.history()
+        moved = 0
+        for rec in sorted(repo.transactions.values(), key=lambda r: r.id):
+            if rec.private or rec.tx.entity_id is None or rec.company_id not in using:
+                continue
+            open_q = self.open_question(rec.id)
+            current = rec.tx.cost_allocation
+            if current is not None and (current.method is AllocationMethod.OWNER or not self._new_evidence(rec)):
+                if open_q is not None:
+                    open_q.status, open_q.resolution = "resolved", "cost_center_evidence"
+                moved += self.carry_to_documents(rec)
+                continue
+            if current is None and (rec.decision is None or rec.decision.expectation not in self.ALLOCATABLE):
+                continue
+            carried = self._carried(rec)
+            owner_docs = carried is not None and all(
+                (repo.documents[d].document.cost_allocation or carried).method is AllocationMethod.OWNER
+                for d in rec.document_ids if d in repo.documents)
+            decision = None if owner_docs else self.decide(self.payment_facts(rec), history.get(rec.company_id))
+            allocation = carried if owner_docs else (decision.allocation if decision is not None else None)
+            if allocation is None and carried is not None and len(rec.document_ids) > 1:
+                allocation = carried  # several invoices, each already decided on its own
+            if current is not None and allocation is None:
+                # Its invoice arrived and disagrees with how it was decided: withdrawn, and asked (never kept by habit).
+                rec.tx = rec.tx.model_copy(update={"cost_allocation": None})
+                self.log("withdraw_cost_center", subject_id=rec.id, evidence_ids=[rec.evidence_id],
+                         validations=list(decision.why) if decision is not None else [],
+                         response={"was": current.method.value})
+                for doc_id in rec.document_ids:
+                    record = repo.documents.get(doc_id)
+                    if record is not None and record.document.cost_allocation is not None and \
+                            record.document.cost_allocation.method is not AllocationMethod.OWNER:
+                        record.document = record.document.model_copy(update={"cost_allocation": None})
+                moved += 1
+            if allocation is not None:
+                if allocation == current:
+                    continue
+                self.apply_payment(rec, allocation)
+                self.carry_to_documents(rec, overwrite=current is not None)
+                if open_q is not None:
+                    open_q.status = "resolved"
+                    open_q.resolution = ("cost_center_rule" if allocation.method in
+                                         (AllocationMethod.RULE, AllocationMethod.LEARNED_SPLIT)
+                                         else "cost_center_evidence")
+                moved += 1
+                continue
+            if decision is None or decision.question is None or not self._ready_to_ask(rec):
+                continue
+            if open_q is None:
+                who = self.o.merchant_name(rec.tx)
+                needs_id = _unique_id(repo.needs, f"nd_{_slug(who.split()[0])}_{int(abs(rec.tx.amount))}_which")
+                repo.needs[needs_id] = NeedsYouRecord(
+                    id=needs_id, kind="cost_center", subject_type="transaction", subject_id=rec.id,
+                    item_id=rec.item_id, company_id=rec.company_id, created_at=now, question=decision.question,
+                    why=decision.why)
+                self.log("ask_owner", subject_id=rec.id, evidence_ids=[rec.evidence_id],
+                         validations=list(decision.why), response={"needs_you": needs_id})
+            elif open_q.question is not None and \
+                    [o.id for o in open_q.question.options] != [o.id for o in decision.question.options]:
+                open_q.question, open_q.why = decision.question, decision.why  # the list of cost centers changed
+        for record in sorted(repo.documents.values(), key=lambda d: d.id):
+            if record.matched_tx_ids or record.on_hold or record.document.cost_allocation is not None:
+                continue
+            if record.document.quality is Quality.RED:
+                continue
+            company = repo.item_company(repo.items[record.item_id])
+            if company not in using:
+                continue
+            facts = self.document_facts(record, company)
+            if facts is None:
+                continue
+            found = self.decide(facts, history.get(company))
+            if found.allocation is not None:
+                self.apply_document(record, found.allocation)
+                moved += 1
+        return moved
+
+    # ----------------------------------------------------------------- the owner's choice
+
+    def owner_allocation(self, company_id: str, facts: CostCenterFacts, *, cost_center_id: str | None = None,
+                         general: bool = False, split: Any = None, evidence_id: str | None = None
+                         ) -> CostAllocation:
+        """What the owner chose, checked: their own company's cost center, general costs, or an exact split.
+
+        Raises :class:`SplitError` (a ValueError) with a plain message when it cannot be used.
+        """
+        centers = {c.id: c for c in self.centers(company_id)}
+        noun = noun_for(list(centers.values())) if centers else "job"
+        evidence = tuple(dict.fromkeys((*facts.evidence_ids, *((evidence_id,) if evidence_id else ()))))
+        parts = facts.vat_parts if sum((p.gross for p in facts.vat_parts), _ZERO) == facts.total else ()
+        if split is not None:
+            entries = _split_entries(split, centers, noun)
+            percents = [p for _, _, p, _ in entries]
+            amounts = [a for _, a, _, _ in entries]
+            if all(p is not None for p in percents) and all(a is None for a in amounts):
+                shares = split_by_percent(facts.total, [(cid, p) for cid, _, p, _ in entries if p is not None], parts)
+            elif all(a is not None for a in amounts) and all(p is None for p in percents):
+                shares = split_by_amounts(facts.total, [(cid, a, r) for cid, a, _, r in entries if a is not None],
+                                          parts, currency=facts.currency)
+            else:
+                raise SplitError("Give either amounts or percentages for every share, not both.")
+            words = [f"{centers[s.cost_center_id].label} {format_money(s.amount, facts.currency)}" for s in shares]
+            return CostAllocation(total=facts.total, currency=facts.currency, shares=shares,
+                                  method=AllocationMethod.OWNER, why=(f"You split it: {_join_words(words)}.",),
+                                  evidence_ids=evidence)
+        if general:
+            return CostAllocation(total=facts.total, currency=facts.currency, general=True,
+                                  method=AllocationMethod.OWNER, why=("You said this is general costs.",),
+                                  evidence_ids=evidence)
+        center = centers.get(cost_center_id or "")
+        if center is None:
+            raise SplitError(f"That isn't one of this company's {_plural_noun(noun)}.")
+        share = AllocationShare(cost_center_id=center.id, amount=facts.total, parts=parts)
+        return CostAllocation(total=facts.total, currency=facts.currency, shares=(share,),
+                              method=AllocationMethod.OWNER, why=(f"You said this is for {center.label}.",),
+                              evidence_ids=evidence)
+
+
 # --------------------------------------------------------------------------- orchestrator
 
 
@@ -2447,6 +2874,7 @@ class Orchestrator:
         self.accountant = AccountantAgent(self)
         self.closure = ClosureAgent(self)
         self.auditor = AuditorAgent(self)
+        self.cost_centers = CostCenterAgent(self)
         self._activity_seq = 0
         # What sends the emails the back office writes itself (backoffice.mailer): the demo's simulated
         # outbox, or None. With None they wait in ``repo.outbox``; the production server sends each one
@@ -2802,6 +3230,7 @@ class Orchestrator:
             else:
                 report.stored_only = True
         supplier = self.repo.supplier_for_domain(parsed.sender_domain)
+        recipients = tuple(dict.fromkeys(a.address.lower() for a in (*parsed.to, *parsed.cc) if a.address))
         for link in parsed.invoice_links:
             ev = self.retrieval.follow(link.url, supplier_hint=supplier.name if supplier else None, at=at,
                                        context={"email_evidence_id": message_id})
@@ -2810,7 +3239,8 @@ class Orchestrator:
                 continue
             report.evidence_ids.append(ev)
             self._document_from_parts(self._parts_for(ev), at=at, origin="link", retrieved=True,
-                                      report=report, sender=sender, message_text=text, body=body_part)
+                                      report=report, sender=sender, message_text=text, body=body_part,
+                                      recipients=recipients)
         for file_parts in groups:
             letter = _letter_text(file_parts)
             if letter:
@@ -2820,7 +3250,7 @@ class Orchestrator:
                     report.obligation_ids.append(ob.obligation.id)
                     continue
             self._document_from_parts(file_parts, at=at, origin=origin, retrieved=False, report=report,
-                                      sender=sender, message_text=text, body=body_part)
+                                      sender=sender, message_text=text, body=body_part, recipients=recipients)
         for nested in result.attached_emails:
             self._process_email(nested, at=at, origin=origin, report=report)
 
@@ -2828,7 +3258,7 @@ class Orchestrator:
 
     def _document_from_parts(self, parts: list[_Part], *, at: datetime, origin: str, retrieved: bool,
                              report: IngestReport, sender: str | None = None, message_text: str = "",
-                             body: _Part | None = None) -> DocumentRecord | None:
+                             body: _Part | None = None, recipients: tuple[str, ...] = ()) -> DocumentRecord | None:
         extracted = self.documents.read(parts)
         if extracted is None:
             report.stored_only = True
@@ -2871,6 +3301,7 @@ class Orchestrator:
             net_amount=_dec(values.get("net_amount")), vat_amount=_dec(values.get("vat_amount")),
             gross_amount=_dec(values.get("gross_amount")), iban=_text(values.get("iban")),
             payment_reference=_text(values.get("payment_reference")), quality=quality,
+            lines=_invoice_lines(parts),
         )
         item = TrackedItem(id="item_" + doc_id, tenant_id=self.repo.tenant_id, subject_type="document",
                            subject_id=doc_id)
@@ -2882,6 +3313,7 @@ class Orchestrator:
             sales=sales, text=extracted.text,
             paid_in_cash=extracted.paid_in_cash and not sales and document.doc_type in _CASH_DOCUMENTS,
             referenced_number=extracted.referenced_number if document.doc_type is DocumentType.CREDIT_NOTE else None,
+            recipients=recipients,
         )
         self.repo.documents[doc_id] = record
         evidence = extracted.evidence_ids
@@ -3287,6 +3719,7 @@ class Orchestrator:
             report.transitions += moved
             if not moved:
                 break
+        self.cost_centers.allocate(now)  # which job, property, vehicle ...: nothing at all without cost centers
         report.chased = self.missing.chase_all(now)
         self.accountant.answer_all(now)
         report.sent = self.deliver(now)
@@ -3420,7 +3853,8 @@ class Orchestrator:
 
     # ----------------------------------------------------------------- the owner's answers
 
-    def answer(self, needs_id: str, option_id: str, *, remember: bool = False) -> AnswerOutcome:
+    def answer(self, needs_id: str, option_id: str, *, remember: bool = False, split: Any = None) -> AnswerOutcome:
+        """The owner's one tap. ``split``: for "which job is this for?", the amounts or percentages of a split."""
         repo = self.repo
         needs = repo.needs.get(needs_id)
         if needs is None:
@@ -3428,7 +3862,11 @@ class Orchestrator:
         if needs.status != "open":
             raise PermissionError("already answered")
         now = repo.clock.now()
-        answer_ev = self._record_answer(needs, option_id, now)
+        chosen = None
+        if needs.kind == "cost_center":
+            # Checked before anything is recorded: a split that doesn't add up changes nothing.
+            chosen = self._cost_center_choice(needs, option_id, split)
+        answer_ev = self._record_answer(needs, option_id, now, split=split if needs.kind == "cost_center" else None)
         repo.interactions.append(OwnerInteraction(at=now, active_seconds=ANSWER_SECONDS,
                                                   kind=InteractionKind.APPROVAL if needs.kind == "approval"
                                                   else InteractionKind.ANSWER, entity_id=needs.company_id))
@@ -3440,14 +3878,20 @@ class Orchestrator:
             outcome = self._answer_company(needs, option_id, answer_ev, now)
         elif needs.kind == "cash":
             outcome = self._answer_cash(needs, option_id, answer_ev, now)
+        elif needs.kind == "cost_center":
+            assert chosen is not None
+            outcome = self._answer_cost_center(needs, option_id, chosen, remember, answer_ev, now)
         else:
             outcome = self._answer_choice(needs, option_id, remember, answer_ev, now)
         self.run(now)
         return outcome
 
-    def _record_answer(self, needs: NeedsYouRecord, option_id: str, now: datetime) -> str:
-        body = json.dumps({"needs_id": needs.id, "option_id": option_id, "answered_by": self.repo.owner.email,
-                           "answered_at": now.isoformat(), "subject_id": needs.subject_id}, sort_keys=True).encode()
+    def _record_answer(self, needs: NeedsYouRecord, option_id: str, now: datetime, *, split: Any = None) -> str:
+        record = {"needs_id": needs.id, "option_id": option_id, "answered_by": self.repo.owner.email,
+                  "answered_at": now.isoformat(), "subject_id": needs.subject_id}
+        if split is not None:
+            record["split"] = split  # the split itself is the owner's evidence (§55)
+        body = json.dumps(record, sort_keys=True, default=str).encode()
         reg = self.repo.registry.register(body, tenant_id=self.repo.tenant_id, source_kind=SourceKind.UPLOAD,
                                           format=EvidenceFormat.JSON, mime_type="application/json",
                                           retrieved_at=now, metadata={"kind": "owner_answer"})
@@ -3502,6 +3946,150 @@ class Orchestrator:
         resolved = self._entities(now) if remember else 0
         others = tuple(n.id for n in repo.needs.values() if n.status == "resolved" and n.resolution == "rule")
         return AnswerOutcome(ok=True, message=message, learned=learned, resolved_ids=others if resolved else ())
+
+    # ----------------------------------------------------------------- which job (cost centers)
+
+    def _cost_center_choice(self, needs: NeedsYouRecord, option_id: str, split: Any) -> CostAllocation:
+        """What the owner's answer means, checked before anything is recorded (a bad split changes nothing)."""
+        question = needs.question
+        assert question is not None
+        rec = self.repo.transactions[needs.subject_id]
+        facts = self.cost_centers.payment_facts(rec)
+        if option_id == SPLIT_OPTION:
+            if split is None:
+                raise SplitError("Tell me how to split it: an amount or a percentage for each one.")
+            return self.cost_centers.owner_allocation(rec.company_id, facts, split=split)
+        try:
+            option = question.option(option_id)
+        except KeyError:
+            raise ValueError("not one of the options") from None
+        if option.kind is OptionKind.GENERAL:
+            return self.cost_centers.owner_allocation(rec.company_id, facts, general=True)
+        if option.kind is OptionKind.COST_CENTER:
+            return self.cost_centers.owner_allocation(rec.company_id, facts, cost_center_id=option.cost_center_id)
+        raise ValueError("not one of the options")
+
+    def _allocation_words(self, allocation: CostAllocation) -> str:
+        labels = {c.id: c.label for c in self.repo.cost_centers.values()}
+        if allocation.general:
+            return "in general costs"
+        if allocation.is_split:
+            words = [f"{labels.get(s.cost_center_id, 'another one')} {format_money(s.amount, allocation.currency)}"
+                     for s in allocation.shares]
+            return "split: " + _join_words(words)
+        return f"on {labels.get(allocation.shares[0].cost_center_id, 'it')}"
+
+    def _learn_cost_center_rule(self, question: Question, option_id: str, allocation: CostAllocation,
+                                answer_ev: str, now: datetime) -> str | None:
+        split = percents_of(allocation.shares, allocation.total) if option_id == SPLIT_OPTION else ()
+        names = {c.id: c.label for c in self.repo.cost_centers.values()}
+        proposal = suggest_cost_center_rule(question, option_id, answered_by=OWNER_ACTOR, answered_at=now,
+                                            split=split, names=names)
+        if proposal is None:
+            return None
+        rule = proposal.rule.model_copy(update={"id": "rule_" + hashlib.sha256(
+            f"{question.id}:{option_id}:{split}".encode()).hexdigest()[:12]})
+        self.repo.rulebook.add(rule, reason="one-tap answer")
+        label = f"{proposal.label[0].lower()}{proposal.label[1:]}"
+        self.activity(now, "learned", f"Learned: {label}. I will not ask again.", None, evidence_ids=[answer_ev])
+        self.cost_centers.log("learn_rule", subject_id=rule.id, evidence_ids=[answer_ev], actor=OWNER_ACTOR,
+                              values={"label": proposal.label})
+        return proposal.label
+
+    def _answer_cost_center(self, needs: NeedsYouRecord, option_id: str, chosen: CostAllocation, remember: bool,
+                            answer_ev: str, now: datetime) -> AnswerOutcome:
+        repo = self.repo
+        question = needs.question
+        assert question is not None
+        rec = repo.transactions[needs.subject_id]
+        allocation = chosen.model_copy(update={"evidence_ids": tuple(dict.fromkeys((*chosen.evidence_ids, answer_ev)))})
+        self.cost_centers.apply_payment(rec, allocation)
+        self.cost_centers.carry_to_documents(rec, by_owner=True)
+        needs.status, needs.answer, needs.answered_at = "answered", option_id, now
+        who = self.merchant_name(rec.tx)
+        noun = noun_for(self.cost_centers.centers(rec.company_id)) or "job"
+        before = {n.id for n in repo.needs.values() if n.kind == "cost_center" and n.status == "open"}
+        learned = self._learn_cost_center_rule(question, option_id, allocation, answer_ev, now) if remember else None
+        self.activity(now, "answered", f"You told me which {noun} the {who} payment is for.", rec.company_id,
+                      amount=abs(rec.tx.amount), currency=rec.tx.currency, evidence_ids=[answer_ev])
+        if learned:
+            self.cost_centers.allocate(now)
+        resolved = tuple(sorted(n.id for n in repo.needs.values() if n.id in before and n.status == "resolved"))
+        return AnswerOutcome(ok=True, message=f"Done. The {who} payment is now {self._allocation_words(allocation)}.",
+                             learned=learned, resolved_ids=resolved)
+
+    def allocate_by_owner(self, subject_id: str, *, cost_center_id: str | None = None, general: bool = False,
+                          split: Any = None, remember: bool = False) -> AnswerOutcome:
+        """The owner puts one payment or document on a cost center, on general costs, or splits it.
+
+        Raises KeyError (unknown subject) or :class:`SplitError` (plain message) before anything is recorded.
+        """
+        repo = self.repo
+        agent = self.cost_centers
+        rec = repo.transactions.get(subject_id)
+        record = repo.documents.get(subject_id) if rec is None else None
+        if rec is None and record is None:
+            raise KeyError(subject_id)
+        if rec is not None:
+            if rec.private or rec.tx.entity_id is None:
+                raise SplitError("First tell me which company this payment belongs to.")
+            company: str | None = rec.company_id
+            facts: CostCenterFacts | None = agent.payment_facts(rec)
+            thing, who = "payment", self.merchant_name(rec.tx)
+        else:
+            assert record is not None
+            company = repo.item_company(repo.items[record.item_id])
+            if company is None:
+                raise SplitError("First tell me which company this document belongs to.")
+            facts = agent.document_facts(record, company)
+            thing = _DOC_LABELS.get(record.document.doc_type, "Document").lower()
+            who = display_name(record.document.supplier_name)
+        if facts is None:
+            raise SplitError("This document has no total I can use.")
+        centers = agent.centers(company)
+        if not centers:
+            raise SplitError("Add a job, property, vehicle or client for this company first.")
+        allocation = agent.owner_allocation(company, facts, cost_center_id=cost_center_id, general=general,
+                                            split=split)
+        option_id = SPLIT_OPTION if split is not None else ("general" if general else f"cc:{cost_center_id}")
+        now = repo.clock.now()
+        body = json.dumps({"kind": "cost_center", "subject_id": subject_id, "option_id": option_id,
+                           "split": split, "answered_by": repo.owner.email, "answered_at": now.isoformat()},
+                          sort_keys=True, default=str).encode()
+        reg = repo.registry.register(body, tenant_id=repo.tenant_id, source_kind=SourceKind.UPLOAD,
+                                     format=EvidenceFormat.JSON, mime_type="application/json", retrieved_at=now,
+                                     metadata={"kind": "owner_answer"})
+        answer_ev = reg.evidence.id
+        self.log("owner", "allocate_cost_center", subject_id=subject_id, evidence_ids=[answer_ev], actor=OWNER_ACTOR,
+                 values={"option_id": option_id})
+        allocation = allocation.model_copy(update={"evidence_ids": (*allocation.evidence_ids, answer_ev)})
+        payments = [rec] if rec is not None else [
+            repo.transactions[t] for t in record.matched_tx_ids  # type: ignore[union-attr]
+            if t in repo.transactions and len(record.matched_tx_ids) == 1]  # type: ignore[union-attr]
+        if rec is not None:
+            agent.apply_payment(rec, allocation)
+            agent.carry_to_documents(rec, by_owner=True)
+        else:
+            agent.apply_document(record, allocation)  # type: ignore[arg-type]
+            for paid in payments:
+                same = agent.scaled(allocation, abs(paid.tx.amount), evidence_ids=[paid.evidence_id])
+                agent.apply_payment(paid, same)
+        for paid in payments:
+            open_q = agent.open_question(paid.id)
+            if open_q is not None:
+                open_q.status, open_q.answer, open_q.answered_at = "answered", option_id, now
+        repo.interactions.append(OwnerInteraction(at=now, active_seconds=ANSWER_SECONDS, kind=InteractionKind.ANSWER,
+                                                  entity_id=company))
+        learned = None
+        if remember:
+            question = cost_center_question(centers, facts, (), repo.today())
+            learned = self._learn_cost_center_rule(question, option_id, allocation, answer_ev, now)
+        noun = noun_for(centers)
+        self.activity(now, "answered", f"You told me which {noun} the {who} {thing} is for.", company,
+                      amount=facts.total, currency=facts.currency, evidence_ids=[answer_ev])
+        self.run(now)
+        return AnswerOutcome(ok=True, message=f"Done. The {who} {thing} is now {self._allocation_words(allocation)}.",
+                             learned=learned)
 
     def _answer_approval(self, needs: NeedsYouRecord, option_id: str, answer_ev: str, now: datetime) -> AnswerOutcome:
         repo = self.repo
@@ -3975,6 +4563,106 @@ _CONFLICT_ORDER = ("gross_amount", "vat_amount", "net_amount", "supplier_tax_id"
                    "iban", "currency", "customer_tax_id", "due_date", "payment_reference")
 _OPINION_FLOOR = 0.4  # below this confidence a reading neither supports nor contradicts (verification policy)
 _AS_PRINTED = frozenset({"invoice_number", "supplier_tax_id", "customer_tax_id", "payment_reference"})
+
+
+def _invoice_lines(parts: Sequence[_Part]) -> tuple[Any, ...]:
+    """The lines of the first structured e-invoice among ``parts`` (empty for text and scans)."""
+    for part in parts:
+        if part.kind == "ubl" and part.data:
+            details = read_invoice_details(part.data)
+            if details is not None and details.lines:
+                return details.lines
+    return ()
+
+
+def _qr_vat_parts(text: str) -> tuple[VatPart, ...]:
+    """A Portuguese fiscal QR's amounts by VAT rate (rates in percent; exempt at 0%, non-taxable without a rate)."""
+    if not text:
+        return ()
+    from backoffice.countries.pt.vat import rate_for
+
+    payloads, _ = _split_qr(text)
+    for payload in payloads:
+        try:
+            code = parse_qr(payload)
+        except QRCodeError:
+            continue
+        merged: dict[Decimal | None, tuple[Decimal, Decimal]] = {}
+
+        def add(rate: Decimal | None, net: Decimal, vat: Decimal) -> None:
+            old = merged.get(rate, (_ZERO, _ZERO))
+            merged[rate] = (old[0] + net, old[1] + vat)
+
+        for block in code.tax_blocks:
+            if block.exempt_base:
+                add(Decimal(0), block.exempt_base, _ZERO)
+            for bucket, base, vat in block.rate_pairs():
+                try:
+                    fraction = rate_for(block.region, bucket, code.issue_date)
+                except (ValueError, KeyError):
+                    fraction = None
+                pct = None
+                if fraction is not None:
+                    pct = fraction * 100
+                    pct = pct.quantize(Decimal(1)) if pct == pct.to_integral_value() else pct.normalize()
+                add(pct, base, vat)
+        for extra in (code.non_taxable, code.stamp_duty):
+            if extra:
+                add(None, extra, _ZERO)
+        return tuple(VatPart(rate=rate, net=net, vat=vat) for rate, (net, vat) in merged.items())
+    return ()
+
+
+def _decimal_value(value: Any, what: str) -> Decimal:
+    if isinstance(value, bool):
+        raise SplitError(f"That {what} is not a number.")
+    try:
+        number = Decimal(repr(value)) if isinstance(value, float) else Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        raise SplitError(f"That {what} is not a number.") from None
+    if not number.is_finite():
+        raise SplitError(f"That {what} is not a number.")
+    return number
+
+
+def _plural_noun(noun: str) -> str:
+    from backoffice.learning.cost_centers import plural
+
+    if noun == "one":
+        return "jobs, properties and the like"
+    return " or ".join(plural(w) for w in noun.split(" or "))
+
+
+def _split_entries(split: Any, centers: Mapping[str, CostCenter], noun: str
+                   ) -> list[tuple[str, Decimal | None, Decimal | None, Decimal | None]]:
+    """The owner's split as (cost center id, amount, percent, VAT rate); checked for shape, not yet for totals."""
+    if not isinstance(split, (list, tuple)) or len(split) < 2:
+        raise SplitError("A split needs at least two parts.")
+    if len(split) > 200:
+        raise SplitError("That is too many parts for one split.")
+    out: list[tuple[str, Decimal | None, Decimal | None, Decimal | None]] = []
+    for entry in split:
+        if not isinstance(entry, Mapping):
+            raise SplitError("I couldn't read that split.")
+        cid = entry.get("costCenterId") or entry.get("cost_center_id") or entry.get("id")
+        if not isinstance(cid, str) or cid not in centers:
+            raise SplitError(f"One of those isn't one of this company's {_plural_noun(noun)}.")
+        amount, percent = entry.get("amount"), entry.get("percent")
+        rate = entry.get("vatRate", entry.get("vat_rate"))
+        out.append((cid,
+                    to_cents(amount) if amount not in (None, "") else None,
+                    _decimal_value(percent, "percentage") if percent not in (None, "") else None,
+                    _decimal_value(rate, "VAT rate") if rate not in (None, "") else None))
+    keys = [(cid, rate) for cid, _, _, rate in out]
+    if len(set(keys)) != len(keys):
+        raise SplitError("Each one can appear only once in a split.")
+    return out
+
+
+def _join_words(words: Sequence[str]) -> str:
+    if len(words) <= 1:
+        return "".join(words)
+    return ", ".join(words[:-1]) + f" and {words[-1]}"
 
 
 def _letter_text(parts: Sequence[_Part]) -> str:

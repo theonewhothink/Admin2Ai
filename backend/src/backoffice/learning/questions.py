@@ -35,6 +35,7 @@ class QuestionKind(str, Enum):
     WHAT_IS_THIS = "what_is_this"  # §5 "This €92.40 Vodafone expense appears every month."
     MISSING_INVOICE = "missing_invoice"  # §37 "We can't find the invoice for this payment."
     CONFIRM_MATCH = "confirm_match"  # likely evidence found, one tap to confirm
+    WHICH_COST_CENTER = "which_cost_center"  # "Which job is this for?" (cost centers)
 
 
 class OptionKind(str, Enum):
@@ -44,6 +45,8 @@ class OptionKind(str, Enum):
     CATEGORY = "category"
     OTHER = "other"
     ACTION = "action"  # "Ask Vodafone for it", "I'll upload it", "Yes", "No"
+    COST_CENTER = "cost_center"  # one of the company's jobs, properties, vehicles ...
+    GENERAL = "general"  # the company's general costs, not one job
 
 
 class QuestionOption(BaseModel):
@@ -55,11 +58,14 @@ class QuestionOption(BaseModel):
     entity_id: str | None = None
     category: str | None = None
     action: str | None = None
+    cost_center_id: str | None = None
 
     @model_validator(mode="after")
     def _consistent(self) -> QuestionOption:
         if self.kind is OptionKind.ENTITY and not self.entity_id:
             raise ValueError("an entity option needs entity_id")
+        if self.kind is OptionKind.COST_CENTER and not self.cost_center_id:
+            raise ValueError("a cost center option needs cost_center_id")
         if self.kind is OptionKind.CATEGORY and not self.category:
             raise ValueError("a category option needs category")
         if self.kind is OptionKind.ACTION and not self.action:

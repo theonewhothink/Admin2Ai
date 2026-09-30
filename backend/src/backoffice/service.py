@@ -25,8 +25,11 @@ from decimal import ROUND_FLOOR, Decimal
 from typing import Any
 from urllib.parse import unquote
 
+from pydantic import ValidationError
+
 from backoffice.closure import BlockerKind, BusinessAuditFindings, Month, PriceIncrease, due_soon
 from backoffice.closure import render_business_audit
+from backoffice.domain.cost_centers import CostCenter, CostCenterIdentifiers, SplitError
 from backoffice.domain.lifecycle import Stage
 from backoffice.domain.models import DocumentType, SourceKind
 from backoffice.evidence import SharePayload, UploadRequest
@@ -1305,6 +1308,8 @@ class BackOfficeService:
                 items.append(self._check(n))
             elif n.kind in ("company", "cash"):
                 items.append(self._question(n))
+            elif n.kind == "cost_center":
+                items.append(self._cost_center_item(n))
             else:
                 items.append(self._choice(n) if n.kind == "choice" else self._approval(n))
         return {"items": items}
@@ -1327,6 +1332,43 @@ class BackOfficeService:
                                                                         for o in n.options],
             "why": list(n.why),
         }
+
+    def _cost_center_item(self, n: NeedsYouRecord) -> dict[str, Any]:
+        """'Which job is this for?': one tap, "Always ..." learning, and a split for costs shared by several."""
+        from backoffice.learning.cost_centers import SPLIT_OPTION, suggest_cost_center_rule
+
+        rec = self.repo.transactions[n.subject_id]
+        question = n.question
+        assert question is not None
+        account = self.repo.accounts.get(rec.tx.account_id)
+        item: dict[str, Any] = {
+            "id": n.id, "kind": "choice", "tone": "attention", "eyebrow": "We need one answer",
+            "merchant": self.orchestrator.merchant_name(rec.tx), "amount": _num(abs(rec.tx.amount)),
+            "currency": rec.tx.currency, "date": rec.tx.booked_on.isoformat(), "companyId": n.company_id,
+            "question": question.prompt, "options": [{"id": o.id, "label": o.label} for o in question.options],
+            "why": list(n.why),
+        }
+        if account is not None:
+            item["paidWith"] = account.label
+        template, overrides = None, {}
+        for option in question.options:
+            proposal = suggest_cost_center_rule(question, option.id, answered_by="owner", answered_at=self._now())
+            if proposal is None:
+                continue
+            if option.kind is OptionKind.COST_CENTER and template is None and option.label in proposal.label:
+                template = proposal.label.replace(option.label, "{choice}", 1)
+            elif option.kind is not OptionKind.COST_CENTER:
+                overrides[option.id] = proposal.label
+        if template is not None:
+            item["remember"] = {"template": template, "defaultChecked": True, **({"overrides": overrides}
+                                                                                if overrides else {})}
+        choices = [{"id": o.cost_center_id, "label": o.label} for o in question.options
+                   if o.kind is OptionKind.COST_CENTER]
+        if len(choices) > 1:
+            item["split"] = {"optionId": SPLIT_OPTION, "label": "Split it between several",
+                             "costCenters": choices, "total": _num(abs(rec.tx.amount)),
+                             "hint": "Give an amount or a percentage for each. They must add up exactly."}
+        return item
 
     def _check(self, n: NeedsYouRecord) -> dict[str, Any]:
         """A document whose sources disagree (§19), asked as a plain choice (§37)."""
@@ -1431,13 +1473,15 @@ class BackOfficeService:
             },
         }
 
-    def answer(self, needs_id: str, option_id: str, remember: bool = False) -> dict[str, Any]:
+    def answer(self, needs_id: str, option_id: str, remember: bool = False, split: Any = None) -> dict[str, Any]:
         if not isinstance(option_id, str) or not option_id.strip():
             raise ServiceError(400, "Please pick one of the options.")
         try:
-            outcome = self.orchestrator.answer(needs_id, option_id, remember=bool(remember))
+            outcome = self.orchestrator.answer(needs_id, option_id, remember=bool(remember), split=split)
         except KeyError:
             raise ServiceError(404, "I can't find that question any more.") from None
+        except SplitError as exc:
+            raise ServiceError(400, exc.message) from None
         except ValueError:
             raise ServiceError(400, "Please pick one of the options.") from None
         except PermissionError:
@@ -1447,6 +1491,159 @@ class BackOfficeService:
             result["learned"] = outcome.learned
         if outcome.resolved_ids:
             result["alsoResolved"] = list(outcome.resolved_ids)
+        return result
+
+    # ----------------------------------------------------------------- Cost centers (jobs, properties, vehicles ...)
+
+    def _cost_views(self):  # type: ignore[no-untyped-def]
+        from backoffice.cost_centers import CostCenterViews
+
+        return CostCenterViews(self)
+
+    def _cost_center_record(self, cost_center_id: str) -> CostCenter:
+        center = self.repo.cost_centers.get(cost_center_id)
+        if center is None:
+            raise ServiceError(404, "I can't find that one.")
+        return center
+
+    def cost_centers(self, company_id: str, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """A company's jobs (properties, vehicles ...): what each cost and brought in, and what is still open."""
+        if company_id not in self.repo.companies:
+            raise ServiceError(404, "I can't find that company.")
+        return self._cost_views().company(company_id, body)
+
+    def cost_center(self, cost_center_id: str, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """One job: money out and in, its payments and documents with the proof, and what is still open."""
+        return self._cost_views().detail(self._cost_center_record(cost_center_id), body)
+
+    def _identifiers(self, company_id: str, raw: Any, current: CostCenterIdentifiers | None = None
+                     ) -> CostCenterIdentifiers:
+        if raw is None:
+            return current or CostCenterIdentifiers()
+        if not isinstance(raw, Mapping):
+            raise ServiceError(400, "List what points to it: addresses, plates, cards, references, tax numbers, "
+                                    "email addresses or keywords.")
+        unknown = [k for k in raw if not isinstance(k, str) or CostCenterIdentifiers.field_for(k) is None]
+        if unknown:
+            raise ServiceError(400, "I can only recognise it by addresses, plates, cards, accounts, references, "
+                                    "tax numbers, email addresses or keywords.")
+        given = {CostCenterIdentifiers.field_for(k): v for k, v in raw.items()}
+        merged = {**(current.model_dump() if current else {}), **given}
+        try:
+            identifiers = CostCenterIdentifiers(**merged)
+        except (ValidationError, ValueError) as exc:
+            detail = exc.errors()[0].get("msg", "") if isinstance(exc, ValidationError) else str(exc)
+            detail = detail.removeprefix("Value error, ")
+            raise ServiceError(400, (detail[:1].upper() + detail[1:] + ".") if detail else
+                               "One of those doesn't look right.") from None
+        for account_id in identifiers.accounts:
+            account = self.repo.accounts.get(account_id)
+            if account is None or account.holder_id != company_id:
+                raise ServiceError(400, "I don't know that account for this company.")
+        return identifiers
+
+    def _cost_center_name(self, company_id: str, value: Any, *, skip: str | None = None) -> str:
+        readable = isinstance(value, str) or (isinstance(value, int) and not isinstance(value, bool))
+        name = " ".join(str(value).split()) if readable else ""
+        if not name:
+            raise ServiceError(400, "What is it called? For example the site's street, the plate or the client.")
+        if len(name) > 80:
+            raise ServiceError(400, "That name is too long.")
+        clash = next((c for c in self.repo.cost_centers.values() if c.company_id == company_id and c.active
+                      and c.id != skip and c.name.casefold() == name.casefold()), None)
+        if clash is not None:
+            raise ServiceError(409, f"{clash.label} is already here.")
+        return name
+
+    @staticmethod
+    def _cost_center_kind(value: Any, default: str) -> str:
+        if value in (None, ""):
+            return default
+        kind = " ".join(str(value).split()) if isinstance(value, str) else ""
+        if not kind or len(kind) > 30 or not re.fullmatch(r"[^\W\d_]+(?:[ '-][^\W\d_]+)*", kind):
+            raise ServiceError(400, "Use one or two words for the kind, like Job, Property, Vehicle or Client.")
+        return kind[:1].upper() + kind[1:]
+
+    def cost_center_create(self, company_id: str, body: Mapping[str, Any] | None) -> dict[str, Any]:
+        """Add a job, property, vehicle, outlet, event, course or client to one company."""
+        if company_id not in self.repo.companies:
+            raise ServiceError(404, "I can't find that company.")
+        b = body or {}
+        name = self._cost_center_name(company_id, b.get("name"))
+        kind = self._cost_center_kind(b.get("kind"), self._cost_views().kind_for(company_id))
+        identifiers = self._identifiers(company_id, b.get("identifiers"))
+        base = "cc-" + (_SLUG.sub("-", name.lower()).strip("-")[:40] or "x")
+        cid, n = base, 2
+        while cid in self.repo.cost_centers:
+            cid, n = f"{base}-{n}", n + 1
+        center = CostCenter(id=cid, tenant_id=self.repo.tenant_id, company_id=company_id, name=name, kind=kind,
+                            identifiers=identifiers)
+        self.repo.cost_centers[cid] = center
+        self.orchestrator.log("cost_center", "cost_center_added", subject_id=cid,
+                              actor=f"owner:{self.repo.owner.email}",
+                              values={"company_id": company_id, "name": name, "kind": kind,
+                                      "identifiers": identifiers.as_dict()})
+        self.orchestrator.activity(self._now(), "learned", f"Added {center.label}. I will put its costs on it.",
+                                   company_id)
+        self.orchestrator.run()
+        return {"ok": True, "costCenter": self.cost_center(cid),
+                "message": f"Done. {center.label} is set up. I will put its costs on it."}
+
+    def cost_center_update(self, cost_center_id: str, body: Mapping[str, Any] | None) -> dict[str, Any]:
+        """Rename it, change its kind or what points to it, or archive it (its past costs stay on it)."""
+        center = self._cost_center_record(cost_center_id)
+        b = body or {}
+        if not any(k in b for k in ("name", "kind", "identifiers", "active")):
+            raise ServiceError(400, "Tell me what to change: its name, its kind, what points to it, or archive it.")
+        update: dict[str, Any] = {}
+        if "name" in b:
+            update["name"] = self._cost_center_name(center.company_id, b.get("name"), skip=center.id)
+        if "kind" in b:
+            update["kind"] = self._cost_center_kind(b.get("kind"), center.kind)
+        if "identifiers" in b:
+            update["identifiers"] = self._identifiers(center.company_id, b.get("identifiers"), center.identifiers)
+        if "active" in b:
+            if not isinstance(b.get("active"), bool):
+                raise ServiceError(400, "Say true or false.")
+            update["active"] = b["active"]
+            if b["active"] and not center.active:
+                self._cost_center_name(center.company_id, update.get("name", center.name), skip=center.id)
+        changed = center.model_copy(update=update)
+        changed = CostCenter.model_validate(changed.model_dump())
+        self.repo.cost_centers[center.id] = changed
+        self.orchestrator.log("cost_center", "cost_center_changed", subject_id=center.id,
+                              actor=f"owner:{self.repo.owner.email}",
+                              values={"name": changed.name, "kind": changed.kind, "active": changed.active,
+                                      "identifiers": changed.identifiers.as_dict()})
+        self.orchestrator.run()
+        if not changed.active:
+            message = f"Done. {changed.label} is archived. Its past costs stay on it."
+        elif changed.label != center.label:
+            message = f"Done. It is now called {changed.label}."
+        else:
+            message = f"Done. I updated {changed.label}."
+        return {"ok": True, "costCenter": self.cost_center(center.id), "message": message}
+
+    def cost_center_allocate(self, body: Mapping[str, Any] | None) -> dict[str, Any]:
+        """Put one payment or document on a job, on general costs, or split it (and optionally always do so)."""
+        b = body or {}
+        subject = _field(b, "subjectId", "subject_id")
+        cost_center_id = b.get("costCenterId") or b.get("cost_center_id")
+        general = bool(b.get("general", False))
+        split = b.get("split")
+        if sum(1 for x in (cost_center_id, general or None, split) if x is not None) != 1:
+            raise ServiceError(400, "Choose one: where it goes, general costs, or how to split it.")
+        try:
+            outcome = self.orchestrator.allocate_by_owner(
+                subject, cost_center_id=cost_center_id if isinstance(cost_center_id, str) else None,
+                general=general, split=split, remember=bool(b.get("remember", False)))
+        except KeyError:
+            raise ServiceError(404, "I can't find that payment or document.") from None
+        except SplitError as exc:
+            raise ServiceError(400, exc.message) from None
+        result: dict[str, Any] = {"ok": outcome.ok, "message": outcome.message}
+        if outcome.learned:
+            result["learned"] = outcome.learned
         return result
 
     # ----------------------------------------------------------------- Activity
@@ -1588,6 +1785,13 @@ class BackOfficeService:
                 parts.append(n.prompt)
                 what = "which company" if n.kind == "company" else "cash receipt to confirm"
                 evidence.append({"label": f"{item['merchant']} · {what}", "id": f"needs:{n.id}"})
+            elif n.kind == "cost_center":
+                rec = self.repo.transactions[n.subject_id]
+                who = self.orchestrator.merchant_name(rec.tx)
+                amount = format_money(abs(rec.tx.amount), rec.tx.currency)
+                ask = n.question.prompt.lower().removesuffix("?") if n.question else "which one it is for"
+                parts.append(f"{_article(who).capitalize()} {who} payment of {amount}: {ask}?")
+                evidence.append({"label": f"{who} · {amount}", "id": f"needs:{n.id}"})
             else:
                 doc = self.repo.documents[n.subject_id]
                 who = display_name(doc.document.supplier_name)
@@ -1949,10 +2153,16 @@ class BackOfficeService:
             ("GET", r("/api/home"), lambda b: self.home()),
             ("GET", r("/api/needs-you"), lambda b: self.needs_you()),
             ("POST", r(f"/api/needs-you/{seg}/answer"),
-             lambda b, i: self.answer(i, _field(b, "option_id", "optionId"), bool(b.get("remember", False)))),
+             lambda b, i: self.answer(i, _field(b, "option_id", "optionId"), bool(b.get("remember", False)),
+                                      b.get("split"))),
             ("GET", r("/api/activity"), lambda b: self.activity()),
             ("GET", r("/api/companies"), lambda b: self.companies()),
             ("GET", r(f"/api/companies/{seg}"), lambda b, i: self.company(i)),
+            ("GET", r(f"/api/companies/{seg}/cost-centers"), lambda b, i: self.cost_centers(i, b)),
+            ("POST", r(f"/api/companies/{seg}/cost-centers"), lambda b, i: self.cost_center_create(i, b)),
+            ("POST", r("/api/cost-centers/allocate"), lambda b: self.cost_center_allocate(b)),
+            ("GET", r(f"/api/cost-centers/{seg}"), lambda b, i: self.cost_center(i, b)),
+            ("POST", r(f"/api/cost-centers/{seg}"), lambda b, i: self.cost_center_update(i, b)),
             ("GET", r(f"/api/months/{seg}/{seg}"), lambda b, c, m: self.month(c, m)),
             ("POST", r("/api/ask"), lambda b: self.ask(_field(b, "question"))),
             ("POST", r("/api/evidence"),

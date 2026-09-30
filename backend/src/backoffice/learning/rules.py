@@ -12,10 +12,11 @@ Rules are ranked separately for each field they decide, by this key, best first:
 
 1. **Authority for the field.** Who owns the answer to this kind of question:
 
-   * ``ENTITY`` (which company / personal): the **owner** outranks the
-     accountant. Only the owner knows which company actually bought something,
-     so an owner answer on this business beats an accountant rule, even a
-     global one covering all their clients.
+   * ``ENTITY`` (which company / personal) and ``COST_CENTER`` (which job,
+     property, vehicle ...; general costs; or a learned split): the **owner**
+     outranks the accountant. Only the owner knows which company, and which
+     job, actually bought something, so an owner answer on this business beats
+     an accountant rule, even a global one covering all their clients.
    * ``CATEGORY``, ``TAX_TREATMENT``, ``EXPECTATION``: the **accountant**
      outranks the owner. These are professional bookkeeping and tax judgements
      (§25 lists tax interpretation changes as owner-approval events; the
@@ -57,6 +58,7 @@ from .questions import Answer, OptionKind, Question
 
 __all__ = [
     "AUTHORITY",
+    "GENERAL",
     "PERSONAL",
     "Expectation",
     "FieldDecision",
@@ -79,6 +81,8 @@ __all__ = [
 
 # Value of the ENTITY field when the answer is "Personal" (entity ids look like "ent_…").
 PERSONAL = "personal"
+# Value of the COST_CENTER field when the answer is "general costs, not one job" (cost center ids look like "cc-…").
+GENERAL = "general"
 
 
 class RuleError(ValueError):
@@ -113,10 +117,15 @@ class RuleField(str, Enum):
     CATEGORY = "category"
     TAX_TREATMENT = "tax_treatment"
     EXPECTATION = "expectation"
+    # Which job, property, vehicle ... (cost center id), GENERAL, or a learned split
+    # ((cost center id, percent), ...) adding up to 100.
+    COST_CENTER = "cost_center"
 
 
 AUTHORITY: dict[RuleField, tuple[RuleAuthor, ...]] = {
     RuleField.ENTITY: (RuleAuthor.OWNER, RuleAuthor.ACCOUNTANT),
+    # Only the owner knows which job a purchase was for, like which company bought it.
+    RuleField.COST_CENTER: (RuleAuthor.OWNER, RuleAuthor.ACCOUNTANT),
     RuleField.CATEGORY: (RuleAuthor.ACCOUNTANT, RuleAuthor.OWNER),
     RuleField.TAX_TREATMENT: (RuleAuthor.ACCOUNTANT, RuleAuthor.OWNER),
     RuleField.EXPECTATION: (RuleAuthor.ACCOUNTANT, RuleAuthor.OWNER),
@@ -257,11 +266,32 @@ class RuleOutcome(BaseModel):
     category: str | None = None
     tax_treatment: str | None = None
     expectation: Expectation | None = None
+    cost_center_id: str | None = None  # a cost center id, or GENERAL
+    cost_center_split: tuple[tuple[str, Decimal], ...] = ()  # learned split: (cost center id, percent)
+
+    @field_validator("cost_center_split", mode="before")
+    @classmethod
+    def _split_money(cls, value: object) -> object:
+        if isinstance(value, (list, tuple)):
+            for entry in value:
+                if isinstance(entry, (list, tuple)) and any(isinstance(v, float) for v in entry):
+                    raise ValueError("percentages must be Decimal, never float")
+        return value
 
     @model_validator(mode="after")
     def _consistent(self) -> RuleOutcome:
         if self.private and self.entity_id:
             raise ValueError("an outcome cannot be both personal and a company")
+        if self.cost_center_id and self.cost_center_split:
+            raise ValueError("an outcome cannot be one cost center and a split")
+        if self.cost_center_split:
+            ids = [cid for cid, _ in self.cost_center_split]
+            if len(ids) < 2 or len(set(ids)) != len(ids) or GENERAL in ids:
+                raise ValueError("a split names at least two different cost centers")
+            if any(p <= 0 for _, p in self.cost_center_split):
+                raise ValueError("every share of a split is more than zero")
+            if sum((p for _, p in self.cost_center_split), Decimal(0)) != Decimal(100):
+                raise ValueError("a split adds up to exactly 100%")
         if not self.fields():
             raise ValueError("a rule must decide at least one thing")
         return self
@@ -276,6 +306,8 @@ class RuleOutcome(BaseModel):
             decided.add(RuleField.TAX_TREATMENT)
         if self.expectation is not None:
             decided.add(RuleField.EXPECTATION)
+        if self.cost_center_id or self.cost_center_split:
+            decided.add(RuleField.COST_CENTER)
         return frozenset(decided)
 
     def value(self, field: RuleField) -> Any:
@@ -285,6 +317,8 @@ class RuleOutcome(BaseModel):
             return self.category
         if field is RuleField.TAX_TREATMENT:
             return self.tax_treatment
+        if field is RuleField.COST_CENTER:
+            return self.cost_center_split or self.cost_center_id
         return self.expectation
 
     def without(self, fields: Iterable[RuleField]) -> RuleOutcome | None:
@@ -296,6 +330,8 @@ class RuleOutcome(BaseModel):
             "category": None if RuleField.CATEGORY in drop else self.category,
             "tax_treatment": None if RuleField.TAX_TREATMENT in drop else self.tax_treatment,
             "expectation": None if RuleField.EXPECTATION in drop else self.expectation,
+            "cost_center_id": None if RuleField.COST_CENTER in drop else self.cost_center_id,
+            "cost_center_split": () if RuleField.COST_CENTER in drop else self.cost_center_split,
         }
         if not any(v for v in data.values()):
             return None
@@ -423,6 +459,12 @@ class RuleDecision(BaseModel):
     @property
     def expectation(self) -> Expectation | None:
         decision = self.decisions.get(RuleField.EXPECTATION)
+        return decision.value if decision else None
+
+    @property
+    def cost_center(self) -> str | tuple[tuple[str, Decimal], ...] | None:
+        """A cost center id, GENERAL, or a learned split ((cost center id, percent), ...)."""
+        decision = self.decisions.get(RuleField.COST_CENTER)
         return decision.value if decision else None
 
 

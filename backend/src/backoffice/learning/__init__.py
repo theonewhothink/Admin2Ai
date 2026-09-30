@@ -19,6 +19,11 @@ Rules (§38 one-tap learning, §28 accountant rules) — :mod:`.rules`
 Entity Agent (§46, §51, §37) — :mod:`.entity`
     ``assign_entity(entities=, transaction=, document=, ownership=, rulebook=, history=) -> EntityAssignment``
 
+Cost centers: which job, property, vehicle, outlet, event, course or client — :mod:`.cost_centers`
+    ``decide_cost_center(centers=, facts=, rulebook=, history=) -> CostCenterDecision`` (rule, identifiers on
+    the evidence incl. invoice lines, card or account, consistent supplier history; else one question)
+    ``suggest_cost_center_rule(question, option_id, ...) -> RuleProposal | None`` ("Always put ... on Job ...")
+
 First run (§5) — :mod:`.onboarding`
     ``candidates_from_assignments(transactions, assignments, series_keys=None) -> list[Candidate]``
     ``select_questions(candidates, limit=4) -> list[Candidate]``
@@ -90,6 +95,7 @@ from .recurrence import (
 )
 from .rules import (
     AUTHORITY,
+    GENERAL,
     PERSONAL,
     Expectation,
     FieldDecision,
@@ -116,6 +122,7 @@ __all__ = [
     "AUTHORITY",
     "CADENCE_SPECS",
     "DEFAULT_QUESTION_LIMIT",
+    "GENERAL",
     "MAX_OFF_CYCLE_SHARE",
     "MAX_QUESTION_LIMIT",
     "PERSONAL",

@@ -735,6 +735,8 @@ class RuleBrain:
         s = u.slots
         personal = re.search(r"\b(?:personal|private|mine|me personally|not (?:a |for (?:the |my |any )?)?company)\b",
                              u.text)
+        if len(s.cost_center_ids) == 1 and not s.company_ids and not personal:
+            return self._assign_cost_center(u)
         if len(s.company_ids) != 1 and not personal:
             return None
         open_choices = [n for n in self.repo.open_needs() if n.kind == "choice"]
@@ -796,6 +798,35 @@ class RuleBrain:
             chips.append({"label": f"{who} · {what}", "id": f"needs:{n.id}"})
         return _Answer(" ".join(parts), evidence=chips)
 
+    def _assign_cost_center(self, u: Understanding) -> _Answer | None:
+        """'Put the Leroy Merlin payment on Job Rua das Flores': the same answer as "Which job is this for?"."""
+        s = u.slots
+        option = f"cc:{s.cost_center_ids[0]}"
+        resolver = self.repo.resolver()
+        matching = []
+        for n in self.repo.open_needs():
+            if n.kind != "cost_center" or n.question is None or option not in {o.id for o in n.question.options}:
+                continue
+            rec = self.repo.transactions[n.subject_id]
+            supplier = resolver.resolve_transaction(rec.tx).supplier
+            if s.supplier_ids and (supplier is None or supplier.id not in s.supplier_ids):
+                continue
+            if s.amount is not None and abs(abs(rec.tx.amount) - s.amount) > Decimal("0.005"):
+                continue
+            matching.append(n)
+        if not matching:
+            return None
+        if len(matching) > 1 and not (s.supplier_ids or s.amount is not None):
+            return None
+        if len(matching) > 1:
+            return _Answer("More than one payment fits. Tell me the supplier and the amount.")
+        remember = bool(re.search(r"\b(?:always|remember|from now on|every time|in future)\b", u.text))
+        result = self.svc.answer(matching[0].id, option, remember)
+        text = result["message"]
+        if result.get("learned"):
+            text += f" {result['learned']}."
+        return _Answer(text)
+
     def _refuse_money(self) -> _Answer:
         text = ("I don't move money. You make payments from your bank; I check the invoice and the bank details "
                 "first and tell you if something looks wrong.")
@@ -848,8 +879,56 @@ class RuleBrain:
         same = (prev.end < tracked) == (period.end < tracked) and (prev.start >= tracked) == (period.start >= tracked)
         return (prev.start, prev.end, prev.label) if same else None
 
+    def _cost_center_money(self, u: Understanding, *, direction: str) -> _Answer:
+        """'How much did we spend on Job Rua das Flores in September?': the parts of payments on that job."""
+        from backoffice.cost_centers import CostCenterViews
+        from backoffice.cost_centers import Period as CostPeriod
+
+        s = u.slots
+        period = s.period or self._closing_month()
+        views = CostCenterViews(self.svc)
+        window = CostPeriod(period.start, period.end, period.label, period.phrase)
+        resolver = self.repo.resolver()
+        texts: list[str] = []
+        chips: list[dict[str, str]] = []
+        for cid in s.cost_center_ids:
+            center = self.repo.cost_centers.get(cid)
+            if center is None:
+                continue
+            found = [(rec, share) for rec, share in views.shares(center, window)
+                     if (rec.tx.amount > 0) == (direction == "in")]
+            if s.supplier_ids:
+                found = [(rec, share) for rec, share in found
+                         if (m := resolver.resolve_transaction(rec.tx).supplier) is not None and m.id in s.supplier_ids]
+            sup = f" with {self._suppliers(s.supplier_ids)}" if s.supplier_ids else ""
+            if not found:
+                texts.append(f"Nothing came in for {center.label}{sup} {period.phrase}." if direction == "in" else
+                             f"Nothing went out for {center.label}{sup} {period.phrase}.")
+                continue
+            total = sum((share for _, share in found), Decimal(0))
+            count = count_phrase(len(found), "payment")
+            verb = f"You received {self._m(total)} for" if direction == "in" else f"You spent {self._m(total)} on"
+            line = f"{verb} {center.label}{sup} {period.phrase}: {count}."
+            if len(found) > 1:
+                biggest, share = max(found, key=lambda x: (x[1], x[0].id))
+                line += f" The biggest was {self.svc.orchestrator.merchant_name(biggest.tx)}, {self._m(share)}."
+            if any(rec.tx.cost_allocation is not None and rec.tx.cost_allocation.is_split for rec, _ in found):
+                line += " Shared costs count only their part."
+            texts.append(line)
+            chips += [self.svc._tx_evidence(rec) for rec, _ in sorted(found, key=lambda x: (-x[1], x[0].id))[:6]]
+        waiting = [n for n in self.repo.open_needs() if n.kind == "cost_center" and any(
+            c.company_id == n.company_id for c in (self.repo.cost_centers.get(i) for i in s.cost_center_ids) if c)]
+        if waiting:
+            texts.append(f"{count_phrase(len(waiting), 'payment').capitalize()} still "
+                         f"{'waits' if len(waiting) == 1 else 'wait'} for you to say where "
+                         f"{'it goes' if len(waiting) == 1 else 'they go'}.")
+            chips += [{"label": "Needs you", "id": f"needs:{n.id}"} for n in waiting[:3]]
+        return _Answer(" ".join(texts) or "I can't find that one.", [], chips)
+
     def _money_answer(self, u: Understanding, *, direction: str) -> _Answer:
         s = u.slots
+        if s.cost_center_ids:
+            return self._cost_center_money(u, direction=direction)
         over_time = (s.group_by == "month" or s.average or bool(s.supplier_ids and direction == "out")
                      or bool(re.search(r"\bsuppliers\b|\bvendors\b|\bwho did (?:we|i) pay\b|\bthe most\b", u.text)))
         if s.average and not s.group_by:
