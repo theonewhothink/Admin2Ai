@@ -19,6 +19,7 @@ __all__ = [
     "AccountExists",
     "Device",
     "IndexOp",
+    "Invitation",
     "MemoryStore",
     "SeqConflict",
     "Session",
@@ -98,6 +99,28 @@ class StoredEvent:
 
 
 @dataclass(frozen=True)
+class Invitation:
+    """A client business invited by an accountant (§29). Only the token's SHA-256 is kept."""
+
+    id: str
+    token_hash: str
+    inviter_tenant_id: str
+    inviter_user_id: str
+    inviter_email: str
+    inviter_name: str
+    firm: str
+    email: str
+    client_name: str
+    tax_ids: tuple[str, ...]
+    created_at: datetime
+    expires_at: datetime
+    sent_at: datetime | None = None
+    accepted_at: datetime | None = None
+    accepted_tenant_id: str | None = None
+    accepted_by: str | None = None
+
+
+@dataclass(frozen=True)
 class IndexOp:
     """A lookup row written in the same transaction as an event (accountant API keys)."""
 
@@ -145,6 +168,15 @@ class Store(Protocol):
     # accountant API keys
     def api_key_tenant(self, key_hash: str) -> str | None: ...
 
+    # accountants limited to some companies, and clients invited by their accountant (§28, §29, §51)
+    def membership_companies(self, tenant_id: str, user_id: str) -> tuple[str, ...] | None: ...
+    def create_invitation(self, invitation: Invitation) -> None: ...
+    def invitation(self, token_hash: str) -> Invitation | None: ...
+    def mark_invitation_sent(self, invitation: Invitation, at: datetime) -> None: ...
+    def invitations_from(self, tenant_id: str, user_id: str) -> list[Invitation]: ...
+    def accept_invitation(self, token_hash: str, *, tenant_id: str, accepted_by: str, companies: Sequence[str],
+                          at: datetime) -> bool: ...
+
     # mailbox sign-ins in progress
     def save_nonce(self, tenant_id: str, nonce: str, expires_at: datetime) -> None: ...
     def take_nonce(self, tenant_id: str, nonce: str, now: datetime) -> bool: ...
@@ -184,6 +216,9 @@ class _Data:
     api_keys: dict[str, tuple[str, str]] = field(default_factory=dict)  # hash -> (tenant, key id)
     nonces: dict[tuple[str, str], datetime] = field(default_factory=dict)
     erasures: dict[str, _Erasure] = field(default_factory=dict)
+    # (tenant, user) -> the companies an accountant membership is limited to (absent = every company)
+    membership_companies: dict[tuple[str, str], tuple[str, ...]] = field(default_factory=dict)
+    invitations: dict[str, Invitation] = field(default_factory=dict)  # token hash -> invitation
 
 
 class MemoryStore:
@@ -258,12 +293,80 @@ class MemoryStore:
                 return None
             return user, tenant, roles
 
-    def add_membership(self, tenant_id: str, user_id: str, role: str) -> None:
-        """Test helper (and invitations later): give ``user_id`` a role in ``tenant_id``."""
+    def add_membership(self, tenant_id: str, user_id: str, role: str, companies: Sequence[str] = ()) -> None:
+        """Give ``user_id`` a role in ``tenant_id`` (tests; invitations use :meth:`accept_invitation`).
+
+        ``companies`` limits an accountant membership to those companies of the business.
+        """
         with self._lock:
             if role not in ROLES or tenant_id not in self._d.tenants or user_id not in self._d.users:
                 raise StoreError("unknown tenant, user or role")
+            if companies and role != "accountant":
+                raise StoreError("only an accountant membership is limited to companies")
             self._d.memberships.add((tenant_id, user_id, role))
+            if role == "accountant":
+                if companies:
+                    self._d.membership_companies[(tenant_id, user_id)] = tuple(dict.fromkeys(companies))
+                else:
+                    self._d.membership_companies.pop((tenant_id, user_id), None)
+
+    def membership_companies(self, tenant_id: str, user_id: str) -> tuple[str, ...] | None:
+        """The companies an accountant membership is limited to; None when it covers every company."""
+        self._up()
+        with self._lock:
+            if (tenant_id, user_id, "accountant") not in self._d.memberships:
+                return None
+            return self._d.membership_companies.get((tenant_id, user_id)) or None
+
+    # ----------------------------------------------------------------- client invitations (§29)
+
+    def create_invitation(self, invitation: Invitation) -> None:
+        self._up()
+        with self._lock:
+            if invitation.token_hash in self._d.invitations or \
+                    any(i.id == invitation.id for i in self._d.invitations.values()):
+                raise StoreError("duplicate invitation")
+            if invitation.inviter_tenant_id not in self._d.tenants or invitation.inviter_user_id not in self._d.users:
+                raise StoreError("unknown tenant or user")
+            self._d.invitations[invitation.token_hash] = invitation
+
+    def invitation(self, token_hash: str) -> Invitation | None:
+        self._up()
+        return self._d.invitations.get(token_hash)
+
+    def mark_invitation_sent(self, invitation: Invitation, at: datetime) -> None:
+        self._up()
+        with self._lock:
+            found = self._d.invitations.get(invitation.token_hash)
+            if found is not None and found.sent_at is None:
+                self._d.invitations[invitation.token_hash] = replace(found, sent_at=at)
+
+    def invitations_from(self, tenant_id: str, user_id: str) -> list[Invitation]:
+        self._up()
+        with self._lock:
+            return sorted((i for i in self._d.invitations.values()
+                           if i.inviter_tenant_id == tenant_id and i.inviter_user_id == user_id),
+                          key=lambda i: (i.created_at, i.id), reverse=True)
+
+    def accept_invitation(self, token_hash: str, *, tenant_id: str, accepted_by: str, companies: Sequence[str],
+                          at: datetime) -> bool:
+        """Use the invitation once: the inviter becomes an accountant of ``tenant_id`` (limited to
+        ``companies`` when given). False when it is unknown, already used or expired."""
+        self._up()
+        with self._lock:
+            found = self._d.invitations.get(token_hash)
+            if found is None or found.accepted_at is not None or found.expires_at <= at:
+                return False
+            if tenant_id not in self._d.tenants or found.inviter_user_id not in self._d.users:
+                return False
+            self._d.invitations[token_hash] = replace(found, accepted_at=at, accepted_tenant_id=tenant_id,
+                                                      accepted_by=accepted_by)
+            self._d.memberships.add((tenant_id, found.inviter_user_id, "accountant"))
+            if companies:
+                self._d.membership_companies[(tenant_id, found.inviter_user_id)] = tuple(dict.fromkeys(companies))
+            else:
+                self._d.membership_companies.pop((tenant_id, found.inviter_user_id), None)
+            return True
 
     # ----------------------------------------------------------------- sessions
 
@@ -415,12 +518,18 @@ class MemoryStore:
             events = len(self._d.events.pop(tenant_id, []))
             self._d.erasures[tenant_id] = _Erasure(requested_at=at, completed_at=at, events_erased=events)
             self._d.memberships = {m for m in self._d.memberships if m[0] != tenant_id}
+            self._d.membership_companies = {k: v for k, v in self._d.membership_companies.items()
+                                            if k[0] != tenant_id}
+            self._d.invitations = {h: (replace(i, accepted_tenant_id=None) if i.accepted_tenant_id == tenant_id
+                                       else i)
+                                   for h, i in self._d.invitations.items() if i.inviter_tenant_id != tenant_id}
             self._d.sessions = {h: s for h, s in self._d.sessions.items() if s.tenant_id != tenant_id}
             self._d.devices = {k: d for k, d in self._d.devices.items() if k[0] != tenant_id}
             self._d.api_keys = {h: v for h, v in self._d.api_keys.items() if v[0] != tenant_id}
             self._d.nonces = {k: v for k, v in self._d.nonces.items() if k[0] != tenant_id}
             self._d.tenants.pop(tenant_id, None)
             if not any(u == user_id for _, u, _ in self._d.memberships):
+                self._d.invitations = {h: i for h, i in self._d.invitations.items() if i.inviter_user_id != user_id}
                 self._d.users.pop(user_id, None)
                 self._d.credentials.pop(user_id, None)
                 self._d.sessions = {h: s for h, s in self._d.sessions.items() if s.user_id != user_id}

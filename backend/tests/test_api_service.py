@@ -233,7 +233,9 @@ def test_accountant_clients_and_detail(svc: BackOfficeService) -> None:
     for r in rows.values():
         assert {"id", "name", "month", "complete", "missing", "needsAccountant"} == r.keys()
     assert rows["company-b"]["complete"] == 100 and rows["company-b"]["missing"] == 0
-    assert rows["company-c"]["needsAccountant"] == 1  # the IKEA question is still open
+    # Needs accountant = what only the accountant decides: Hazel Tree's rent tax flag. The accountant's own
+    # IKEA question (Company C) waits for the owner, so it is not the accountant's to settle.
+    assert rows["hazel-tree"]["needsAccountant"] == 1 and rows["company-c"]["needsAccountant"] == 0
     detail = get(svc, "/api/accountant/clients/hazel-tree")
     assert {"taxId", "software", "evidence", "anomalies", "taxFlags", "questions", "exportState"} <= detail.keys()
     assert detail["exportState"]["state"] == "partial"

@@ -27,6 +27,7 @@ from .store import (
     AccountExists,
     Device,
     IndexOp,
+    Invitation,
     SeqConflict,
     Session,
     StoredEvent,
@@ -381,6 +382,76 @@ class PostgresStore:
             cur.execute("SELECT tenant_id FROM accountant_api_keys WHERE key_hash = %s", (key_hash,))
             row = cur.fetchone()
             return row[0] if row else None
+
+    # ----------------------------------------------------------------- accountants of some companies (0011)
+
+    def membership_companies(self, tenant_id: str, user_id: str) -> tuple[str, ...] | None:
+        with self._tx(tenant=tenant_id, user=user_id) as cur:
+            cur.execute("SELECT company_ids FROM memberships WHERE tenant_id = %s AND user_id = %s "
+                        "AND role = 'accountant' AND revoked_at IS NULL", (tenant_id, user_id))
+            row = cur.fetchone()
+            return tuple(str(c) for c in row[0]) if row and row[0] else None
+
+    # ----------------------------------------------------------------- client invitations (0011, §29)
+
+    _INVITATION_COLUMNS = ("id, token_hash, inviter_tenant_id, inviter_user_id, inviter_email, inviter_name, firm, "
+                           "email, client_name, tax_ids, created_at, expires_at, sent_at, accepted_at, "
+                           "accepted_tenant_id, accepted_by")
+
+    @staticmethod
+    def _invitation(row: Any) -> Invitation:
+        (iid, token_hash, tenant, user, inviter_email, inviter_name, firm, email, client_name, tax_ids, created_at,
+         expires_at, sent_at, accepted_at, accepted_tenant, accepted_by) = row
+        return Invitation(id=iid, token_hash=str(token_hash).strip(), inviter_tenant_id=tenant, inviter_user_id=user,
+                          inviter_email=inviter_email, inviter_name=inviter_name, firm=firm, email=email,
+                          client_name=client_name, tax_ids=tuple(str(t) for t in tax_ids or ()),
+                          created_at=created_at, expires_at=expires_at, sent_at=sent_at, accepted_at=accepted_at,
+                          accepted_tenant_id=accepted_tenant, accepted_by=accepted_by)
+
+    def create_invitation(self, invitation: Invitation) -> None:
+        i = invitation
+        with self._tx(tenant=i.inviter_tenant_id, user=i.inviter_user_id) as cur:
+            cur.execute(f"INSERT INTO accountant_invitations ({self._INVITATION_COLUMNS}) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        (i.id, i.token_hash, i.inviter_tenant_id, i.inviter_user_id, i.inviter_email, i.inviter_name,
+                         i.firm, i.email, i.client_name, list(i.tax_ids), i.created_at, i.expires_at, i.sent_at,
+                         i.accepted_at, i.accepted_tenant_id, i.accepted_by))
+
+    def invitation(self, token_hash: str) -> Invitation | None:
+        with self._tx(settings={self._db.INVITE_SETTING: token_hash}) as cur:
+            cur.execute(f"SELECT {self._INVITATION_COLUMNS} FROM accountant_invitations WHERE token_hash = %s",
+                        (token_hash,))
+            row = cur.fetchone()
+            return self._invitation(row) if row else None
+
+    def mark_invitation_sent(self, invitation: Invitation, at: datetime) -> None:
+        with self._tx(tenant=invitation.inviter_tenant_id, user=invitation.inviter_user_id) as cur:
+            cur.execute("UPDATE accountant_invitations SET sent_at = %s WHERE id = %s AND sent_at IS NULL",
+                        (at, invitation.id))
+
+    def invitations_from(self, tenant_id: str, user_id: str) -> list[Invitation]:
+        with self._tx(tenant=tenant_id, user=user_id) as cur:
+            cur.execute(f"SELECT {self._INVITATION_COLUMNS} FROM accountant_invitations "
+                        "WHERE inviter_tenant_id = %s AND inviter_user_id = %s ORDER BY created_at DESC, id DESC",
+                        (tenant_id, user_id))
+            return [self._invitation(r) for r in cur.fetchall()]
+
+    def accept_invitation(self, token_hash: str, *, tenant_id: str, accepted_by: str, companies: Sequence[str],
+                          at: datetime) -> bool:
+        """One transaction: the invitation (locked) is used once, and its inviter becomes an accountant."""
+        with self._tx(tenant=tenant_id, user=accepted_by, settings={self._db.INVITE_SETTING: token_hash}) as cur:
+            cur.execute("SELECT inviter_user_id FROM accountant_invitations WHERE token_hash = %s "
+                        "AND accepted_at IS NULL AND expires_at > %s FOR UPDATE", (token_hash, at))
+            row = cur.fetchone()
+            if row is None:
+                return False
+            cur.execute("UPDATE accountant_invitations SET accepted_at = %s, accepted_tenant_id = %s, accepted_by = %s "
+                        "WHERE token_hash = %s", (at, tenant_id, accepted_by, token_hash))
+            cur.execute("INSERT INTO memberships (tenant_id, user_id, role, invited_by, created_at, company_ids) "
+                        "VALUES (%s, %s, 'accountant', %s, %s, %s) ON CONFLICT (tenant_id, user_id, role) DO UPDATE "
+                        "SET company_ids = EXCLUDED.company_ids, revoked_at = NULL",
+                        (tenant_id, row[0], accepted_by, at, list(dict.fromkeys(companies))))
+            return True
 
     def save_nonce(self, tenant_id: str, nonce: str, expires_at: datetime) -> None:
         with self._tx(tenant=tenant_id) as cur:

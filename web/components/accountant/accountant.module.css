@@ -449,3 +449,152 @@
     transform: none;
   }
 }
+
+/* ---------- Home: the business a client company belongs to, invitations ---------- */
+
+.business {
+  display: block;
+  margin-top: 2px;
+  font-weight: 450;
+}
+
+.tableEmpty {
+  padding: var(--s-3);
+}
+
+.below {
+  margin-top: var(--s-3);
+}
+
+.inviteForm {
+  display: grid;
+  gap: var(--s-2);
+}
+
+@media (min-width: 900px) {
+  .inviteForm {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    align-items: end;
+  }
+
+  .inviteForm > div {
+    grid-column: 1 / -1;
+  }
+}
+
+.field {
+  display: grid;
+  gap: 6px;
+  font-size: 14px;
+  color: var(--text-2);
+}
+
+.inviteLine {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* ---------- Client: reconciliation and originals ---------- */
+
+.recon {
+  display: grid;
+}
+
+.reconRow {
+  display: grid;
+  gap: 10px;
+  padding: 14px 0;
+}
+
+.reconRow + .reconRow {
+  border-top: 1px solid var(--line);
+}
+
+.reconHead {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 4px var(--s-2);
+}
+
+.reconHead > :global(.pill) {
+  grid-column: 2 / -1;
+  justify-self: start;
+}
+
+@media (min-width: 720px) {
+  .reconHead {
+    grid-template-columns: 72px minmax(0, 1fr) auto auto;
+  }
+
+  .reconHead > :global(.pill) {
+    grid-column: auto;
+  }
+}
+
+.reconDate {
+  white-space: nowrap;
+}
+
+.reconPayee {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.reconDesc {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reconAmount {
+  font-weight: 600;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.evidenceList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* Chips inside a list item (a question's evidence): not rows of their own. */
+.items .evidenceList {
+  margin-top: 6px;
+}
+
+.items .evidenceList li {
+  display: block;
+  padding: 0;
+}
+
+.items .evidenceList li + li {
+  border-top: 0;
+}
+
+.items .evidenceList li > :first-child {
+  margin-top: 0;
+}
+
+.evidenceItem {
+  display: inline-grid;
+  gap: 4px;
+  max-width: 100%;
+}
+
+.evidenceItem :global(.chip) {
+  max-width: 100%;
+}
+
+.evidenceItem :global(.chip) span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.evidenceError {
+  font-size: 13px;
+}

@@ -14,7 +14,9 @@
 * Roles: ``owner`` (everything in their business), ``accountant`` (reads and
   teaches rules), ``admin`` (the internal dashboard; also an owner of their
   own business). An email listed in BACKOFFICE_ADMIN_EMAILS becomes admin
-  when its account is created.
+  when its account is created. An accountant membership may be limited to
+  some companies of the business (``Principal.companies``, §28, §51): every
+  read is then filtered to those companies (server/http.py).
 """
 
 from __future__ import annotations
@@ -88,6 +90,8 @@ class Principal:
     roles: frozenset[str]
     token_hash: str
     via: str  # "cookie" | "bearer"
+    # An accountant (and nothing more) limited to these companies of the business; None = every company.
+    companies: frozenset[str] | None = None
 
     @property
     def role(self) -> str:
@@ -101,14 +105,23 @@ class Principal:
     def is_admin(self) -> bool:
         return "admin" in self.roles
 
+    @property
+    def limited(self) -> bool:
+        """An accountant who may see only some companies of this business."""
+        return self.companies is not None
+
     def public(self) -> dict[str, Any]:
-        return {"user": {"id": self.user.id, "email": self.user.email, "name": self.user.name},
-                "tenant": {"id": self.tenant.id, "name": self.tenant.name}, "role": self.role}
+        out = {"user": {"id": self.user.id, "email": self.user.email, "name": self.user.name},
+               "tenant": {"id": self.tenant.id, "name": self.tenant.name}, "role": self.role}
+        if self.companies is not None:
+            out["companies"] = sorted(self.companies)
+        return out
 
 
-# Accountants read and teach rules (§28); these POSTs are reads or rules.
+# Accountants read and teach rules (§28), and invite their clients (§29); these POSTs are reads, rules or invitations.
 ACCOUNTANT_POSTS = frozenset({"/api/ask", "/api/accountant/rules", "/api/documents/export", "/api/auth/logout",
-                              "/api/devices", "/api/devices/remove"})
+                              "/api/devices", "/api/devices/remove", "/api/accountant/invitations"})
+_ACCOUNTANT_CLIENT_POST = re.compile(r"^/api/accountant/clients/[^/]+/rules$")
 OWNER_ONLY_READS = frozenset({"/api/account/export"})
 
 
@@ -125,7 +138,7 @@ def permitted(principal: Principal, method: str, path: str) -> bool:
         return True
     if method in ("GET", "HEAD"):
         return path not in OWNER_ONLY_READS
-    return path in ACCOUNTANT_POSTS
+    return path in ACCOUNTANT_POSTS or bool(_ACCOUNTANT_CLIENT_POST.match(path))
 
 
 @dataclass(frozen=True)
@@ -253,7 +266,15 @@ class AuthService:
         if loaded is None:
             raise AuthError(401, "unauthorized", WRONG_CREDENTIALS)
         user, tenant, roles = loaded
-        return self._issue(Principal(user, tenant, roles, "", "bearer"), client, status=200)
+        return self._issue(Principal(user, tenant, roles, "", "bearer", self.scope(tenant.id, user.id, roles)),
+                           client, status=200)
+
+    def scope(self, tenant_id: str, user_id: str, roles: frozenset[str]) -> frozenset[str] | None:
+        """The companies an accountant-only member may see (None: every company, or not only an accountant)."""
+        if roles & {"owner", "admin"} or "accountant" not in roles:
+            return None
+        companies = self.store.membership_companies(tenant_id, user_id)
+        return frozenset(companies) if companies else None
 
     def _issue(self, principal: Principal, client: str, *, status: int) -> Issued:
         token = secrets.token_urlsafe(32)
@@ -262,8 +283,8 @@ class AuthService:
             token_hash=hash_token(token), user_id=principal.user.id, tenant_id=principal.tenant.id,
             client="mobile" if client == "mobile" else "web", created_at=now, last_seen_at=now,
             expires_at=now + timedelta(days=SESSION_DAYS)))
-        return Issued(Principal(principal.user, principal.tenant, principal.roles, hash_token(token), "bearer"),
-                      token, status)
+        return Issued(Principal(principal.user, principal.tenant, principal.roles, hash_token(token), "bearer",
+                                principal.companies), token, status)
 
     def reauthenticate(self, principal: Principal, password: Any, *, ip: str | None) -> None:
         """Ask for the password again before something irreversible (account deletion)."""
@@ -291,7 +312,7 @@ class AuthService:
         if now - session.last_seen_at >= SESSION_TOUCH:
             self.store.extend_session(token_hash, now, now + timedelta(days=SESSION_DAYS))
             extended = True
-        return Principal(user, tenant, roles, token_hash, via), extended
+        return Principal(user, tenant, roles, token_hash, via, self.scope(tenant.id, user.id, roles)), extended
 
     def logout(self, principal: Principal) -> None:
         self.store.revoke_session(principal.token_hash, self.now())

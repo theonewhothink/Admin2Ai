@@ -98,7 +98,8 @@ Evidence ids use prefixes so the UI can link them: `month:<company>:<yyyy-mm>`, 
 | `/signin`, `/signup`                | Production only (server builds; not in the static demo)                     |
 | `/onboarding/learning`              | Live counters, then four one-tap questions, then Home                       |
 | `/audit`                            | Free business audit result                                                  |
-| `/accountant`, `/accountant/[id]`   | Accountant workspace (its own layout): clients table, client detail, rules  |
+| `/accountant`, `/accountant/[id]`   | Accountant workspace (its own layout): clients table and client invitations; client detail with the reconciliation (payment ↔ document, "Why?"), what is still open, the originals as links (`GET /api/accountant/clients/{id}/evidence/{evidence}/file`), export (`…/export`) and rules (`POST …/rules`) |
+| `/invite`                           | Production only: the invited owner accepts their accountant's invitation (`POST /api/invitations/accept`) |
 
 The profile menu (top right) has a **Preview** section that links to the audit, onboarding, and the stale-connection demo. It also has "Bring back answered items", which resets the answers stored for the current browser session.
 

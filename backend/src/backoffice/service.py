@@ -19,7 +19,8 @@ import base64
 import binascii
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal
 from typing import Any
@@ -28,11 +29,20 @@ from urllib.parse import unquote
 from pydantic import ValidationError
 
 from backoffice.closure import BlockerKind, BusinessAuditFindings, Month, PriceIncrease, due_soon
-from backoffice.closure import render_business_audit
+from backoffice.closure import AccountantQuestion as ClosureQuestion
+from backoffice.closure import (
+    PackageEntry,
+    QuestionDirection,
+    QuestionStatus,
+    TaxFlag,
+    build_client_view,
+    render_business_audit,
+)
+from backoffice.closure import needs_accountant as closure_needs_accountant
 from backoffice.domain.cost_centers import CostCenter, CostCenterIdentifiers, SplitError, to_cents
 from backoffice.domain.lifecycle import Stage
 from backoffice.domain.models import DocumentType, SourceKind
-from backoffice.evidence import SharePayload, UploadRequest
+from backoffice.evidence import IntegrityError, ObjectNotFound, SharePayload, UploadRequest
 from backoffice.fraud import mask_iban, normalize_iban
 from backoffice.fraud.iban import is_valid_iban
 from backoffice.language import connector_problem, greeting, since_phrase, status_headline
@@ -71,6 +81,38 @@ _STAGE_WORDS = {Stage.DISCOVERED: "Found", Stage.ACQUIRED: "Received", Stage.UND
                 Stage.VERIFIED: "Checked", Stage.MATCHED: "Matched", Stage.ACTED: "Done", Stage.CONFIRMED: "Confirmed",
                 Stage.CLOSED: "Closed", Stage.NEEDS_OWNER: "Waiting for you", Stage.CONFLICT: "Details disagree",
                 Stage.NOT_REQUIRED: "Nothing needed"}
+
+
+# How the accountant sees a payment's reconciliation (closure.PackageEntry.status): label and tone.
+_RECON_STATUS = {
+    "closed": ("Matched", "good"),
+    "not_required": ("No document needed", "good"),
+    "conflict": ("Sources disagree", "risk"),
+    "waiting_for_owner": ("Waiting for the owner", "attention"),
+    "open": ("Looking for the document", "neutral"),
+}
+_EVIDENCE_KIND = {
+    "bank_transaction": "payment", "card_transaction": "payment", "email": "email", "eml": "email",
+    "government_notice": "letter", "pdf": "document", "image": "document", "screenshot": "document",
+    "ubl": "document", "xml": "document", "text": "document", "html": "document", "qr": "document",
+}
+_EVIDENCE_WORD = {"payment": "Bank record", "email": "Email", "letter": "Letter", "document": "Original"}
+_SOURCE_WORD = {
+    "email": "Email", "bank": "Bank feed", "card": "Card feed", "supplier_portal": "Supplier website",
+    "accounting_system": "Accounting software", "cloud_storage": "Cloud storage", "upload": "Uploaded",
+    "mobile_scan": "Phone scan", "mobile_share": "Shared from a phone", "government": "Tax office",
+    "accountant": "Accountant",
+}
+
+
+def _evidence_word(fmt: str, filename: str | None) -> str:
+    """A plain name for a piece of evidence nothing else labels: its file name, else what it is."""
+    return filename or _EVIDENCE_WORD.get(_EVIDENCE_KIND.get(fmt, ""), "File")
+
+
+def _accountant_id(address: str) -> str:
+    """The same accountant (one email address) has one id, whichever companies they look after."""
+    return "acct-" + (_SLUG.sub("-", address.lower()).strip("-")[:40] or "x")
 
 
 def _default_vault() -> Any:
@@ -181,39 +223,129 @@ class BackOfficeService:
         while company_id in self.repo.companies:
             company_id, n = f"{base}-{n}", n + 1
         self.repo.add_company(id=company_id, name=name, legal_name=legal, tax_id=nif)
-        # Sources that read for every company (mailboxes, the accountant) now cover this one too.
+        # Sources that read for every company (mailboxes) now cover this one too; the business's
+        # accountant looks after it until it gets its own (§28).
         for c in self.repo.connectors.values():
-            if c.kind in ("email", "accountant") and company_id not in c.company_ids:
+            if c.kind == "email" and company_id not in c.company_ids:
                 c.company_ids = (*c.company_ids, company_id)
+        self._sync_accountant_connectors()
         self.orchestrator.log("entity", "company_added", subject_id=company_id,
                               values={"tax_id": nif or None}, actor=f"owner:{self.repo.owner.email}")
         self.orchestrator.run()
         return {"ok": True, "company": self.company(company_id), "message": f"Done. {name} is set up."}
 
-    def set_accountant(self, email: Any, name: Any = None, software: Any = None) -> dict[str, Any]:
-        """Name the accountant who receives the monthly package (§5 step 5, §28)."""
+    def set_accountant(self, email: Any, name: Any = None, software: Any = None, company_id: Any = None,
+                       firm: Any = None) -> dict[str, Any]:
+        """Name the accountant who receives the monthly package (§5 step 5, §28).
+
+        Without ``company_id`` it is the business's accountant, used by every company that
+        has none of its own. With ``company_id`` that company gets its own accountant (§51).
+        """
         from backoffice.orchestrator import AccountantProfile
 
+        company = self._company(company_id, required=False)
         address = str(email or "").strip().lower()
         if not _EMAIL.match(address) or len(address) > 254:
             raise ServiceError(400, "That doesn't look like an email address.")
         person = " ".join(str(name or "").split())[:120]
         tool = " ".join(str(software or "").split())[:60] or "your accountant's software"
         local, _, domain = address.partition("@")
-        self.repo.accountant = AccountantProfile(
-            id="acct-" + (_SLUG.sub("-", address).strip("-")[:40] or "x"), firm=person or domain,
-            person=person or local, email=address, software=tool)
-        now = self._now()
-        self.repo.connectors.pop("accountant", None)
-        self.repo.add_connector(ConnectorState(
-            id="accountant", name=person or domain, kind="accountant", account=address,
-            company_ids=tuple(self.repo.companies), healthy=True, covered_from=now, covered_until=now,
-            last_synced_at=now))
-        self.orchestrator.log("accountant", "accountant_set", subject_id="accountant",
+        office = " ".join(str(firm or "").split())[:120] or person or domain
+        profile = AccountantProfile(id=_accountant_id(address), firm=office, person=person or local, email=address,
+                                    software=tool)
+        if company is None:
+            self.repo.accountant = profile
+        else:
+            self.repo.company_accountants[company] = profile
+        self._sync_accountant_connectors(fresh=address)
+        self.orchestrator.log("accountant", "accountant_set", subject_id=company or "accountant",
+                              values={"company": company} if company else None,
                               actor=f"owner:{self.repo.owner.email}")
         self.orchestrator.run()
-        return {"ok": True, "accountant": {"email": address, "name": person or None, "software": tool},
-                "message": f"Done. I will send the closed months to {address}."}
+        out: dict[str, Any] = {"ok": True, "accountant": {"email": address, "name": person or None, "software": tool,
+                                                          "firm": office, "companyId": company}}
+        if company is None:
+            out["message"] = f"Done. I will send the closed months to {address}."
+        else:
+            out["message"] = f"Done. I will send {self._company_name(company)}’s closed months to {address}."
+        return out
+
+    def clear_company_accountant(self, company_id: Any) -> dict[str, Any]:
+        """The company goes back to the business's accountant (or to none)."""
+        company = self._company(company_id)
+        assert company is not None
+        if self.repo.company_accountants.pop(company, None) is None:
+            raise ServiceError(404, "This company already uses the business's accountant.")
+        self._sync_accountant_connectors()
+        self.orchestrator.log("accountant", "accountant_cleared", subject_id=company, values={"company": company},
+                              actor=f"owner:{self.repo.owner.email}")
+        self.orchestrator.run()
+        name = self._company_name(company)
+        default = self.repo.accountant
+        return {"ok": True, "message": f"Done. {name} uses {default.email} again." if default else
+                f"Done. {name} has no accountant now."}
+
+    def accountant_settings(self, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """GET/POST ``/api/settings/accountant``: the business's accountant and each company's (§28, §51).
+
+        POST ``{email, name?, firm?, software?, companyId?}`` sets one; ``{companyId, useDefault: true}``
+        puts a company back on the business's accountant.
+        """
+        message = None
+        if body:
+            if body.get("useDefault") and body.get("companyId"):
+                message = self.clear_company_accountant(body.get("companyId"))["message"]
+            else:
+                message = self.set_accountant(body.get("email"), body.get("name"), body.get("software"),
+                                              body.get("companyId"), body.get("firm"))["message"]
+        repo = self.repo
+
+        def card(a: Any) -> dict[str, Any] | None:
+            return None if a is None else {"email": a.email, "name": a.person, "firm": a.firm, "software": a.software}
+
+        out: dict[str, Any] = {
+            "default": card(repo.accountant),
+            "companies": [{"companyId": c, "companyName": e.name, "accountant": card(repo.accountant_for(c)),
+                           "own": c in repo.company_accountants} for c, e in repo.companies.items()],
+        }
+        if message:
+            out["ok"], out["message"] = True, message
+        return out
+
+    def _sync_accountant_connectors(self, *, fresh: str | None = None) -> None:
+        """One "accountant" source per accountant, covering the companies they look after.
+
+        The business's accountant keeps the id "accountant"; a company's own accountant with
+        another address gets "accountant-<address>". ``fresh`` (an address that was just set)
+        starts that source's coverage now.
+        """
+        repo = self.repo
+        now = self._now()
+        served: dict[str, list[str]] = {}
+        for company_id in repo.companies:
+            a = repo.accountant_for(company_id)
+            if a is not None:
+                served.setdefault(a.email.lower(), []).append(company_id)
+        wanted: dict[str, tuple[Any, list[str]]] = {}
+        default = repo.accountant.email.lower() if repo.accountant is not None else None
+        if repo.accountant is not None:
+            wanted["accountant"] = (repo.accountant, served.get(default or "", []))
+        for a in repo.company_accountants.values():
+            key = a.email.lower()
+            if key != default:
+                wanted.setdefault("accountant-" + (_SLUG.sub("-", key).strip("-")[:40] or "x"),
+                                  (a, served.get(key, [])))
+        for cid in [c.id for c in repo.connectors.values() if c.kind == "accountant" and c.id not in wanted]:
+            repo.connectors.pop(cid)
+        for cid, (a, companies) in wanted.items():
+            old = repo.connectors.get(cid)
+            if old is not None and old.account == a.email and a.email != fresh:
+                old.name, old.company_ids = a.firm, tuple(companies)
+                continue
+            repo.connectors.pop(cid, None)
+            repo.add_connector(ConnectorState(
+                id=cid, name=a.firm, kind="accountant", account=a.email, company_ids=tuple(companies),
+                healthy=True, covered_from=now, covered_until=now, last_synced_at=now))
 
     @property
     def repo(self):  # type: ignore[no-untyped-def]
@@ -958,12 +1090,26 @@ class BackOfficeService:
         except ValueError:
             raise ServiceError(400, "Use dates like 2026-09-30.") from None
 
-    def documents_list(self, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def _visible_documents(self, companies: Collection[str] | None) -> set[str] | None:
+        """Ids of the documents whose company is one of ``companies`` (None: every document)."""
+        if companies is None:
+            return None
+        return {d.id for d in self.repo.documents.values() if self._document_company(d) in companies}
+
+    def documents_list(self, body: Mapping[str, Any] | None = None, *,
+                       companies: Collection[str] | None = None) -> dict[str, Any]:
         b = body or {}
+        company = str(b.get("company", ""))
+        if companies is not None and company and company not in companies:
+            raise ServiceError(404, "I can't find that client.")
         items = self.assistant.documents(query=str(b.get("q", "")), supplier=str(b.get("supplier", "")),
-                                         company_id=str(b.get("company", "")),
+                                         company_id=company,
                                          date_from=self._date_arg(b, "from"), date_to=self._date_arg(b, "to"))
-        return {"items": items, "companies": [{"id": c, "name": e.name} for c, e in self.repo.companies.items()],
+        visible = self._visible_documents(companies)
+        if visible is not None:
+            items = [i for i in items if i["id"] in visible]
+        return {"items": items, "companies": [{"id": c, "name": e.name} for c, e in self.repo.companies.items()
+                                              if companies is None or c in companies],
                 "total": len(items)}
 
     def document_detail(self, document_id: str) -> dict[str, Any]:
@@ -1079,14 +1225,18 @@ class BackOfficeService:
         })
         return view
 
-    def document_download(self, document_id: str) -> dict[str, Any]:
-        f = self.assistant.document_file(document_id)
+    def document_download(self, document_id: str, *, companies: Collection[str] | None = None) -> dict[str, Any]:
+        visible = self._visible_documents(companies)
+        f = self.assistant.document_file(document_id) if visible is None or document_id in visible else None
         if f is None:
             raise ServiceError(404, "I can't find that document.")
         return {"filename": f[0], "contentType": f[1], "data": base64.b64encode(f[2]).decode()}
 
-    def documents_export(self, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def documents_export(self, body: Mapping[str, Any] | None = None, *,
+                         companies: Collection[str] | None = None) -> dict[str, Any]:
         b = body or {}
+        if companies is not None and str(b.get("company", "")) not in companies:
+            raise ServiceError(403, "Choose one of your clients to export.")
         name, data, count = self.assistant.export_zip(company_id=str(b.get("company", "")),
                                                       date_from=self._date_arg(b, "from"),
                                                       date_to=self._date_arg(b, "to"))
@@ -1230,10 +1380,15 @@ class BackOfficeService:
         saved = getattr(self, "_report_cfg", None)
         if saved is not None:
             return saved
-        acct = self.repo.accountant
+        recipients = []
+        for acct in self.repo.accountants():  # each company's package goes to that company's accountant (§28)
+            served = self.repo.accountant_companies(acct.email)
+            entry: dict[str, Any] = {"email": acct.email, "name": acct.person, "role": "Accountant"}
+            if len(served) != len(self.repo.companies):
+                entry["companies"] = served
+            recipients.append(entry)
         return {
-            "recipients": ([{"email": acct.email, "name": acct.person, "role": "Accountant"}] if acct else []),
-            "day": 3, "format": "zip", "includeDocuments": True,
+            "recipients": recipients, "day": 3, "format": "zip", "includeDocuments": True,
             "companies": list(self.repo.companies), "copyOwner": True,
         }
 
@@ -1249,8 +1404,11 @@ class BackOfficeService:
                 email = (r.get("email") if isinstance(r, Mapping) else "") or ""
                 if not _EMAIL.match(email.strip()):
                     raise ServiceError(400, f"“{email}” doesn't look like an email address.")
-                clean.append({"email": email.strip().lower(), "name": str(r.get("name") or "")[:80],
-                              "role": str(r.get("role") or "")[:40]})
+                entry = {"email": email.strip().lower(), "name": str(r.get("name") or "")[:80],
+                         "role": str(r.get("role") or "")[:40]}
+                if isinstance(r.get("companies"), list):  # this recipient gets only these companies' months
+                    entry["companies"] = [c for c in r["companies"] if c in self.repo.companies]
+                clean.append(entry)
             day = body.get("day", cfg["day"])
             if not isinstance(day, int) or not 1 <= day <= 10:
                 raise ServiceError(400, "Choose a working day between 1 and 10.")
@@ -1349,6 +1507,13 @@ class BackOfficeService:
         if source_id in repo.connectors:
             c = repo.connectors.pop(source_id)
             name = c.account if c.kind == "email" else c.name
+            if c.kind == "accountant":  # that accountant no longer looks after any company
+                if repo.accountant is not None and repo.accountant.email == c.account:
+                    repo.accountant = None
+                for company_id, a in list(repo.company_accountants.items()):
+                    if a.email == c.account:
+                        del repo.company_accountants[company_id]
+                self._sync_accountant_connectors()
         elif source_id in repo.accounts:
             a = repo.accounts.pop(source_id)
             name = a.label
@@ -1510,7 +1675,8 @@ class BackOfficeService:
             if b.kind is BlockerKind.MONTH_NOT_OVER:
                 lines.append({"id": f"r_not_over_{len(lines)}", "text": b.message, "tone": "neutral"})
         if lines and not any(line["tone"] == "risk" for line in lines):
-            software = repo.accountant.firm if repo.accountant else "your accountant"
+            accountant = repo.accountant_for(company_id)
+            software = accountant.firm if accountant else "your accountant"
             lines.append({"id": "r_next", "tone": "neutral",
                           "text": f"Once those are done, I will send the month to {software}."})
         return lines
@@ -1531,16 +1697,9 @@ class BackOfficeService:
                     "reasons": [r.replace(": ", " ", 1) for r in rec.match_why],
                 })
             elif rec.proof_evidence_ids:
-                ob = next((o for o in repo.obligations.values() if rec.evidence_id in o.satisfied_by), None)
-                amount = format_money(abs(rec.tx.amount), rec.tx.currency)
-                reasons = [f"Tax letter asks for {amount}", f"Bank payment {amount}"]
-                if ob is not None and ob.reference:
-                    reasons.append(f"Reference {ob.reference} matches")
-                if ob is not None and rec.tx.booked_on <= ob.obligation.due_on:
-                    reasons.append(f"Paid before the deadline of {day_month(ob.obligation.due_on)}")
                 out.append({"id": f"m_{rec.id}", "supplier": "Tax office", "description": "Tax payment",
                             "amount": _num(abs(rec.tx.amount)), "currency": rec.tx.currency,
-                            "date": rec.tx.booked_on.isoformat(), "reasons": reasons})
+                            "date": rec.tx.booked_on.isoformat(), "reasons": self._tax_reasons(rec)})
         return out
 
     def _notices(self, company_id: str, month: Month) -> list[dict[str, Any]]:
@@ -2302,66 +2461,162 @@ class BackOfficeService:
 
     # ----------------------------------------------------------------- Accountant (§28)
 
-    def accountant_clients(self) -> dict[str, Any]:
+    def accountant_clients(self, companies: Collection[str] | None = None, *, prefix: str = "") -> dict[str, Any]:
+        """The accountant's home table: one row per client company for the month being closed.
+
+        ``companies`` limits the rows (an accountant who looks after some companies only);
+        ``prefix`` goes before each row id (production: the business, so one accountant can
+        list the companies of several businesses).
+        """
         month = self._current_month()
-        rows = []
-        for company_id in self.repo.companies:
-            rows.append(self._client_row(company_id, month))
+        rows = [self._client_row(c, month, prefix=prefix) for c in self.repo.companies
+                if companies is None or c in companies]
         rows.sort(key=lambda r: (r["complete"], r["name"]))
         return {"clients": rows}
 
-    def _client_row(self, company_id: str, month: Month) -> dict[str, Any]:
+    def _client_row(self, company_id: str, month: Month, *, prefix: str = "") -> dict[str, Any]:
         status = self._status(company_id, month)
-        waiting = [q for q in self.repo.accountant_questions.values()
-                   if q.company_id == company_id and q.status != "answered"]
-        return {"id": company_id, "name": self.repo.legal_names.get(company_id, company_id), "month": month.name,
-                "complete": status.percent_closed, "missing": status.missing_documents, "needsAccountant": len(waiting)}
+        questions, flags = self._accountant_inputs(company_id, month)
+        return {"id": f"{prefix}{company_id}", "name": self.repo.legal_names.get(company_id, company_id),
+                "month": month.name, "complete": status.percent_closed, "missing": status.missing_documents,
+                "needsAccountant": closure_needs_accountant(questions, flags)}
 
-    def accountant_client(self, company_id: str) -> dict[str, Any]:
+    def _month_txs(self, company_id: str, month: Month) -> list[TxRecord]:
+        return [self.repo.transactions[i.subject_id] for i in self.repo.items_for(company_id, month)
+                if i.subject_type == "transaction"]
+
+    def _accountant_inputs(self, company_id: str, month: Month) -> tuple[list[Any], list[Any]]:
+        """The month's questions and tax flags as the accountant workspace counts them (closure/accountant.py).
+
+        "Needs accountant" counts what only the accountant can decide: tax flags, and questions
+        routed *to* the accountant. The accountant's own questions are waiting for the owner or
+        the system, so they are not the accountant's to settle.
+        """
+        repo = self.repo
+        questions = [
+            ClosureQuestion(question_id=q.id, text=q.text, direction=QuestionDirection.FROM_ACCOUNTANT,
+                            status=QuestionStatus.ANSWERED if q.status == "answered" else
+                            QuestionStatus.WAITING_FOR_OWNER, asked_at=q.asked_at)
+            for q in sorted(repo.accountant_questions.values(), key=lambda q: q.id) if q.company_id == company_id]
+        flags = [TaxFlag(flag_id=f["id"], item_id=item_id, description=f["title"])
+                 for f, item_id in self._tax_flag_rows(company_id, self._month_txs(company_id, month), month)]
+        return questions, flags
+
+    def accountant_client(self, company_id: str, *, prefix: str = "",
+                          companies: Collection[str] | None = None) -> dict[str, Any]:
+        """One client company and month for the accountant (§28): the figures, the reconciliation
+        (each payment with its document and the "Why?" behind the match), what is still open, the
+        evidence as links, anomalies, tax flags, questions, rules and the export state.
+
+        Links point at ``/api/accountant/clients/<prefix><company>/…``; ``companies`` (an
+        accountant limited to some companies) leaves out evidence that also belongs to others.
+        """
         if company_id not in self.repo.companies:
             raise ServiceError(404, "I can't find that client.")
         repo = self.repo
         month = self._current_month()
-        row = self._client_row(company_id, month)
+        ref = f"{prefix}{company_id}"
+        row = self._client_row(company_id, month, prefix=prefix)
         status = self._status(company_id, month)
         items = repo.items_for(company_id, month)
         txs = [repo.transactions[i.subject_id] for i in items if i.subject_type == "transaction"]
         docs = [i for i in items if i.subject_type == "document"]
         matched = sum(1 for r in txs if r.document_ids or r.proof_evidence_ids)
+        approvals = [n for n in self._open_needs(company_id) if n.kind == "approval"]
         anomalies = [{"id": f"an_{n.id}", "title": f"{display_name(repo.documents[n.subject_id].document.supplier_name)}"
                       " bank details changed", "detail": "Payment blocked until the owner confirms by phone.",
-                      "tone": "risk"} for n in self._open_needs(company_id) if n.kind == "approval"]
+                      "tone": "risk"} for n in approvals]
         for name, before, after, _ in self.orchestrator.price_changes():
             if any(self.orchestrator.merchant_name(r.tx) == name and r.company_id == company_id for r in txs):
                 pct = ((after - before) * 100 / before).quantize(Decimal("1"))
                 anomalies.append({"id": f"an_price_{name.lower()}", "title": f"{name} price went up {pct}%",
                                   "detail": f"{format_money(before)} → {format_money(after)}.", "tone": "attention"})
         anomalies += self._statement_anomalies(company_id)
-        # Answered only once the answer reached the accountant's mailbox (the send path accepted it).
-        questions = [{"id": q.id, "question": q.text, "status": "answered" if q.status == "answered" else "waiting",
-                      **({"answer": q.answer} if q.answer and q.status == "answered" else {})}
-                     for q in sorted(repo.accountant_questions.values(), key=lambda q: q.id) if q.company_id == company_id]
+        index = self._evidence_index()
+        allowed = frozenset(companies) if companies is not None else None
+
+        def link(evidence_id: str, label: str) -> dict[str, str] | None:
+            owners = index.get(evidence_id, set())
+            if company_id not in owners or (allowed is not None and not owners <= allowed):
+                return None  # not this client's, or it also holds a company this accountant may not see
+            try:
+                kind = _EVIDENCE_KIND.get(repo.evidence(evidence_id).format.value, "file")
+            except Exception:
+                kind = "file"
+            return {"id": evidence_id, "label": label, "kind": kind,
+                    "href": f"/api/accountant/clients/{ref}/evidence/{evidence_id}/file"}
+
+        view, labels = self._client_view(company_id, month, status, items)
+        questions = []
+        for q in sorted(repo.accountant_questions.values(), key=lambda q: q.id):
+            if q.company_id != company_id:
+                continue
+            asked = link(q.evidence_id, f"Your email · {day_month(q.asked_at.astimezone(TZ).date(), self._today())}")
+            proof = [x for e in q.answer_evidence_ids[:3] if (x := link(e, labels.get(e, "Proof")))]
+            # Answered only once the answer reached the accountant's mailbox (the send path accepted it).
+            answered = q.status == "answered"
+            questions.append({"id": q.id, "question": q.text, "status": "answered" if answered else "waiting",
+                              **({"answer": q.answer} if q.answer and answered else {}),
+                              "evidence": [x for x in (asked, *(proof if answered else ())) if x]})
+        reconciliation = []
+        for e in view.reconciliations:
+            rec = repo.transactions[e.subject_id]
+            status_label, tone = self._recon_status(e.status, rec)
+            documents = []
+            for d in e.documents:
+                record = repo.documents.get(d.document_id)
+                if record is None:
+                    continue
+                doc_link = link(record.evidence_ids[0], record.label) if record.evidence_ids else None
+                documents.append({"id": d.document_id, "label": record.label,
+                                  **({"href": doc_link["href"], "evidenceId": doc_link["id"]} if doc_link else {})})
+            evidence = [x for ev in e.evidence
+                        if (x := link(ev.id, labels.get(ev.id) or _evidence_word(ev.format.value, ev.filename)))]
+            reconciliation.append({
+                "id": rec.id, "itemId": e.item_id, "date": e.booked_on.isoformat(),
+                "payee": self.orchestrator.merchant_name(rec.tx), "description": e.description,
+                "amount": _num(abs(rec.tx.amount)), "direction": "in" if rec.tx.amount > 0 else "out",
+                "currency": rec.tx.currency, "status": e.status, "statusLabel": status_label, "tone": tone,
+                "documents": documents, "evidence": evidence, "why": list(e.why),
+            })
+        missing = [{"id": m.transaction_id, "date": m.booked_on.isoformat(),
+                    "payee": self.orchestrator.merchant_name(repo.transactions[m.transaction_id].tx),
+                    "amount": _num(abs(m.amount)) if m.amount is not None else None, "currency": m.currency,
+                    "plan": self.orchestrator.missing.plan(repo.transactions[m.transaction_id])}
+                   for m in view.missing]
+        evidence_links = []
+        for ev in view.evidence:
+            x = link(ev.evidence_id, labels.get(ev.evidence_id) or _evidence_word(ev.format, ev.filename))
+            if x is not None:
+                evidence_links.append({**x, "source": ev.source,
+                                       "sourceLabel": _SOURCE_WORD.get(ev.source, "Other"),
+                                       "receivedAt": ev.retrieved_at.isoformat(), "filename": ev.filename,
+                                       "itemIds": list(ev.item_ids)})
+        accountant = repo.accountant_for(company_id)
         done = status.counts.done
         total = status.counts.total
-        software = repo.accountant.software if repo.accountant else "your software"
+        software = accountant.software if accountant else "your software"
         export = ({"state": "ready", "ready": total, "total": total,
                    "note": f"{month.name} is complete and ready to export to {software}."} if status.closed else
                   {"state": "partial", "ready": done, "total": total,
                    "note": f"{done} of {total} items are ready for {software}. The rest will follow when they close."})
-        last_day = (date(month.year + (month.month == 12), month.month % 12 + 1, 1) - timedelta(days=1))
-        rules = [{"id": r.id, "label": r.label, "scope": r.scope.value} for r in repo.rulebook.rules
-                 if r.active and r.author.value == "accountant" and repo.accountant is not None
-                 and r.author_id == repo.accountant.id]
+        rules = [{"id": r.id, "label": r.label, "scope": "client" if r.entity_ids or r.tenant_id else "all"}
+                 for r in self.orchestrator.accountant_rules(company_id)]
         return {**row, "taxId": repo.companies[company_id].tax_id, "software": software,
-                "period": {"key": str(month), "from": date(month.year, month.month, 1).isoformat(),
-                           "to": last_day.isoformat()},
-                "rules": rules,
+                "period": {"key": str(month), "from": month.first_day.isoformat(),
+                           "to": month.last_day.isoformat()},
+                "accountant": {"name": accountant.person, "firm": accountant.firm, "email": accountant.email}
+                if accountant else None,
                 "evidence": [{"label": "Transactions", "value": str(len(txs))},
                              {"label": "Matched with a document", "value": str(matched)},
                              {"label": "Documents collected", "value": str(len(docs))},
                              {"label": "Still missing", "value": str(status.missing_documents)}],
+                "evidenceLinks": evidence_links, "reconciliation": reconciliation, "missingDocuments": missing,
+                "openReasons": list(view.open_reasons),
                 "anomalies": anomalies, "taxFlags": self._tax_flags(company_id, txs, month), "questions": questions,
-                "exportState": export}
+                "rules": rules, "exportState": export,
+                "links": {"export": f"/api/accountant/clients/{ref}/export",
+                          "rules": f"/api/accountant/clients/{ref}/rules"}}
 
     def _statement_anomalies(self, company_id: str) -> list[dict[str, str]]:
         """For the accountant: suppliers' statements that differ from the records, and the business's own
@@ -2378,34 +2633,123 @@ class BackOfficeService:
                         "detail": detail, "tone": "attention"})
         return out
 
-    def _tax_flags(self, company_id: str, txs: list[TxRecord], month: Month | None = None) -> list[dict[str, str]]:
-        """What the accountant should look at (§28). Accountant-facing only: the owner is never asked."""
+    def _client_view(self, company_id: str, month: Month, status: Any, items: Sequence[Any]
+                     ) -> tuple[Any, dict[str, str]]:
+        """closure/accountant.py's client view over the month's items, and a label for each evidence id."""
         repo = self.repo
-        flags = []
-        records: dict[str, DocumentRecord] = {}
+        entries = []
+        labels: dict[str, str] = {}
+        for item in items:
+            evidence_ids: list[str] = []
+            if item.subject_type == "transaction":
+                rec = repo.transactions[item.subject_id]
+                records = [repo.documents[d] for d in rec.document_ids if d in repo.documents]
+                labels[rec.evidence_id] = self._tx_evidence(rec)["label"]
+                for p in rec.proof_evidence_ids:
+                    labels.setdefault(p, "Tax letter")
+                evidence_ids = [rec.evidence_id, *rec.proof_evidence_ids]
+                kwargs: dict[str, Any] = {"transaction": rec.tx, "documents": [d.document for d in records],
+                                          "why": self._recon_why(rec)}
+            elif item.subject_type == "document":
+                doc = repo.documents[item.subject_id]
+                records = [doc]
+                kwargs = {"documents": [doc.document],
+                          "booked_on": doc.document.issue_date or doc.received_at.astimezone(TZ).date()}
+            else:
+                continue
+            for d in records:
+                evidence_ids += d.evidence_ids
+            evidence = []
+            for e in dict.fromkeys(evidence_ids):
+                try:
+                    evidence.append(repo.evidence(e))
+                except Exception:  # an id without a stored original is shown nowhere
+                    continue
+            for d in records:
+                for i, e in enumerate(d.evidence_ids):
+                    found = next((ev for ev in evidence if ev.id == e), None)
+                    labels.setdefault(e, self._doc_evidence(d)["label"] if i == 0 else
+                                      f"{display_name(d.document.supplier_name)} · "
+                                      f"{_evidence_word(found.format.value if found else '', None).lower()}")
+            entry = PackageEntry.from_domain(item, evidence=evidence, **kwargs)
+            entries.append(replace(entry, entity_id=company_id))  # items_for already chose the company
+        decisions = [r.decision for r in self._month_txs(company_id, month) if r.decision is not None]
+        questions, flags = self._accountant_inputs(company_id, month)
+        view = build_client_view(repo.companies[company_id], status, entries=entries, decisions=decisions,
+                                 tax_flags=flags, questions=questions)
+        return view, labels
+
+    def _recon_status(self, status: str, rec: TxRecord) -> tuple[str, str]:
+        """Label and tone of one payment in the accountant's reconciliation list."""
+        if status == "closed" and not rec.document_ids and rec.proof_evidence_ids:
+            return "Matched to the tax letter", "good"
+        if status == "open":
+            if rec.document_ids:
+                return "Document found, being checked", "neutral"
+            if rec.likely_document_ids:
+                return "Likely match, being checked", "attention"
+            if rec.decision is not None and rec.decision.requires_document:
+                return "Document missing", "attention"
+            return "In progress", "neutral"
+        return _RECON_STATUS.get(status, ("In progress", "neutral"))
+
+    def _recon_why(self, rec: TxRecord) -> list[str]:
+        """The "Why?" of a payment's reconciliation (§54), in plain words."""
+        if rec.document_ids:
+            return [r.replace(": ", " ", 1) for r in rec.match_why]
+        if rec.proof_evidence_ids:
+            return self._tax_reasons(rec)
+        if rec.decision is not None and not rec.decision.requires_document:
+            return [rec.decision.reason]
+        if rec.likely_document_ids:
+            return ["A document looks like it belongs to this payment. I'm still checking it."]
+        if rec.decision is not None and rec.decision.requires_document:
+            return [self.orchestrator.missing.plan(rec)]  # what I'm doing to find it
+        return []
+
+    def _tax_reasons(self, rec: TxRecord) -> list[str]:
+        ob = next((o for o in self.repo.obligations.values() if rec.evidence_id in o.satisfied_by), None)
+        amount = format_money(abs(rec.tx.amount), rec.tx.currency)
+        reasons = [f"Tax letter asks for {amount}", f"Bank payment {amount}"]
+        if ob is not None and ob.reference:
+            reasons.append(f"Reference {ob.reference} matches")
+        if ob is not None and rec.tx.booked_on <= ob.obligation.due_on:
+            reasons.append(f"Paid before the deadline of {day_month(ob.obligation.due_on)}")
+        return reasons
+
+    def _tax_flag_rows(self, company_id: str, txs: Sequence[TxRecord], month: Month | None = None
+                       ) -> list[tuple[dict[str, str], str]]:
+        """What the accountant should look at (§28), each with the item it is about. Accountant-facing
+        only: the owner is never asked."""
+        repo = self.repo
+        flags: list[tuple[dict[str, str], str]] = []
+        # Each document once, with the item the flag is about: its payment's, else its own.
+        records: dict[str, tuple[DocumentRecord, str]] = {}
         for rec in txs:
             for doc_id in rec.document_ids:
-                records.setdefault(doc_id, repo.documents[doc_id])
+                records.setdefault(doc_id, (repo.documents[doc_id], rec.item_id))
         if month is not None:  # and the month's own documents: paid in cash, still waiting, or held
             for item in repo.items_for(company_id, month):
                 record = repo.documents.get(item.subject_id) if item.subject_type == "document" else None
                 if record is not None and not record.supporting:
-                    records.setdefault(record.id, record)
-        for doc_id, record in records.items():
+                    records.setdefault(record.id, (record, record.item_id))
+        for doc_id, (record, item_id) in records.items():
             doc = record.document
             if doc.doc_type is DocumentType.INVOICE_RECEIPT and doc.vat_amount == 0 and \
                     doc.supplier_tax_id and doc.supplier_tax_id[:1] in "123":
-                flags.append({"id": f"t_{doc_id}",
-                              "title": f"Rent paid to a private landlord · {format_money(doc.gross_amount or 0)}",
-                              "detail": "No withholding shown on the receipt. Whether it applies is your call."})
+                flags.append(({"id": f"t_{doc_id}",
+                               "title": f"Rent paid to a private landlord · {format_money(doc.gross_amount or 0)}",
+                               "detail": "No withholding shown on the receipt. Whether it applies is your call."},
+                              item_id))
             if not record.sales and possible_capital_asset(doc, record.text):
                 net = doc.net_amount if doc.net_amount is not None else doc.gross_amount
                 paid = " Paid in cash." if record.paid_in_cash else ""
-                flags.append({"id": f"t_asset_{doc_id}",
-                              "title": f"{CAPITAL_ASSET_FLAG} · {format_money(net or 0, doc.currency)} before VAT",
-                              "detail": f"{display_name(doc.supplier_name)} invoice"
-                                        f"{' ' + doc.invoice_number if doc.invoice_number else ''}. It may be "
-                                        f"equipment to depreciate rather than a cost of the month.{paid}"})
+                flags.append(({"id": f"t_asset_{doc_id}",
+                               "title": f"{CAPITAL_ASSET_FLAG} · {format_money(net or 0, doc.currency)} before VAT",
+                               "detail": f"{display_name(doc.supplier_name)} invoice"
+                                         f"{' ' + doc.invoice_number if doc.invoice_number else ''}. It may be "
+                                         f"equipment to depreciate rather than a cost of the month.{paid}"},
+                              item_id))
         for rec in sorted(repo.transactions.values(), key=lambda r: (r.tx.booked_on, r.id)):
             note = rec.company_note
             if note is None or company_id not in note or (month is not None and Month.of(rec.tx.booked_on) != month):
@@ -2413,32 +2757,250 @@ class BackOfficeService:
             paid_by, carried_by, named = note
             amount = format_money(abs(rec.tx.amount), rec.tx.currency)
             if paid_by != carried_by:
-                flags.append({"id": f"t_interco_{rec.id}",
-                              "title": f"Inter-company payment · {amount}",
-                              "detail": f"{repo.company_name(paid_by)} paid {repo.company_name(carried_by)}'s "
-                                        f"{self.orchestrator.merchant_name(rec.tx)} invoice from its own account. "
-                                        f"The owner confirmed {repo.company_name(carried_by)} carries it, so it owes "
-                                        f"{repo.company_name(paid_by)} {amount}."})
+                flags.append(({"id": f"t_interco_{rec.id}",
+                               "title": f"Inter-company payment · {amount}",
+                               "detail": f"{repo.company_name(paid_by)} paid {repo.company_name(carried_by)}'s "
+                                         f"{self.orchestrator.merchant_name(rec.tx)} invoice from its own account. "
+                                         f"The owner confirmed {repo.company_name(carried_by)} carries it, so it owes "
+                                         f"{repo.company_name(paid_by)} {amount}."},
+                              rec.item_id))
             elif carried_by != named:
-                flags.append({"id": f"t_interco_{rec.id}",
-                              "title": f"Invoice addressed to another company · {amount}",
-                              "detail": f"The owner chose {repo.company_name(carried_by)} for a "
-                                        f"{self.orchestrator.merchant_name(rec.tx)} invoice addressed to "
-                                        f"{repo.company_name(named)}. Whether its VAT can be deducted is your call."})
+                flags.append(({"id": f"t_interco_{rec.id}",
+                               "title": f"Invoice addressed to another company · {amount}",
+                               "detail": f"The owner chose {repo.company_name(carried_by)} for a "
+                                         f"{self.orchestrator.merchant_name(rec.tx)} invoice addressed to "
+                                         f"{repo.company_name(named)}. Whether its VAT can be deducted is your call."},
+                              rec.item_id))
         return flags
 
-    def accountant_rule(self, text: str, scope: str = "client") -> dict[str, Any]:
+    def _tax_flags(self, company_id: str, txs: Sequence[TxRecord], month: Month | None = None
+                   ) -> list[dict[str, str]]:
+        """What the accountant should look at (§28). Accountant-facing only: the owner is never asked."""
+        return [f for f, _ in self._tax_flag_rows(company_id, txs, month)]
+
+    # ----------------------------------------------------------------- evidence as files
+
+    def _document_company(self, doc: DocumentRecord) -> str | None:
+        return doc.document.entity_id or self.repo.item_company(self.repo.items[doc.item_id])
+
+    def _evidence_index(self) -> dict[str, set[str]]:
+        """Evidence id -> the companies whose records it supports ("?" when a record's company is not known)."""
+        repo = self.repo
+        index: dict[str, set[str]] = {}
+
+        def add(evidence_id: str, company: str | None) -> None:
+            if evidence_id:
+                index.setdefault(evidence_id, set()).add(company or "?")
+
+        for d in repo.documents.values():
+            company = self._document_company(d)
+            for e in d.evidence_ids:
+                add(e, company)
+        for r in repo.transactions.values():
+            for e in (r.evidence_id, *r.proof_evidence_ids):
+                add(e, None if r.private else r.company_id)
+        for q in repo.accountant_questions.values():
+            add(q.evidence_id, q.company_id)
+        for o in repo.obligations.values():
+            add(o.evidence_id, o.obligation.entity_id)
+        return index
+
+    def _evidence_filename(self, ev: Any) -> str:
+        if ev.filename:
+            return str(ev.filename)
+        ext = {"application/json": ".json", "message/rfc822": ".eml", "text/plain": ".txt", "application/pdf": ".pdf",
+               "application/xml": ".xml", "text/html": ".html"}.get(ev.mime_type or "", ".bin")
+        return f"{ev.id}{ext}"
+
+    def evidence_file(self, evidence_id: str, *, companies: Collection[str] | None = None,
+                      company_id: str | None = None) -> dict[str, Any]:
+        """One original, as stored (§55): ``{filename, contentType, data}`` (base64).
+
+        ``company_id``: it must support that company's records. ``companies``: every record
+        it supports must belong to one of them (an accountant limited to some companies, §52).
+        """
+        repo = self.repo
+        owners = self._evidence_index().get(evidence_id, set())
+        if company_id is not None and company_id not in owners:
+            raise ServiceError(404, "I can't find that evidence.")
+        if companies is not None and (not owners or not owners <= set(companies)):
+            raise ServiceError(404, "I can't find that evidence.")
+        try:
+            ev = repo.registry.get(repo.tenant_id, evidence_id)
+            data = repo.registry.open(repo.tenant_id, evidence_id)
+        except (ObjectNotFound, IntegrityError, ValueError):
+            raise ServiceError(404, "I can't find that evidence.") from None
+        return {"filename": self._evidence_filename(ev), "contentType": ev.mime_type or "application/octet-stream",
+                "data": base64.b64encode(data).decode()}
+
+    def accountant_evidence_file(self, company_id: str, evidence_id: str, *,
+                                 companies: Collection[str] | None = None) -> dict[str, Any]:
+        if company_id not in self.repo.companies:
+            raise ServiceError(404, "I can't find that client.")
+        return self.evidence_file(evidence_id, companies=companies, company_id=company_id)
+
+    def accountant_export(self, company_id: str) -> dict[str, Any]:
+        """The month's documents for one client company as a ZIP (originals, ledger.csv, manifest.json)."""
+        if company_id not in self.repo.companies:
+            raise ServiceError(404, "I can't find that client.")
+        month = self._current_month()
+        name, data, count = self.assistant.export_zip(company_id=company_id, date_from=month.first_day,
+                                                      date_to=month.last_day)
+        return {"filename": name, "contentType": "application/zip", "count": count,
+                "data": base64.b64encode(data).decode()}
+
+    # ----------------------------------------------------------------- accountant rules (§28)
+
+    def accountant_rule(self, text: str, scope: str = "client", company_id: str | None = None) -> dict[str, Any]:
         if not isinstance(text, str) or not text.strip():
             raise ServiceError(400, "Write the rule in one sentence, e.g. “Treat all Adobe subscriptions as Software”.")
+        if company_id is not None and company_id not in self.repo.companies:
+            raise ServiceError(404, "I can't find that client.")
         try:
-            rule, affected = self.orchestrator.accountant_rule(text, scope or "client")
-        except ValueError as exc:
-            raise ServiceError(400, str(exc)) from None
+            rule, affected = self.orchestrator.accountant_rule(text, scope or "client", company_id)
         except PermissionError:
             raise ServiceError(409, "No accountant is connected yet.") from None
+        except ValueError as exc:
+            message = str(exc)
+            if message.startswith("duplicate rule id"):
+                raise ServiceError(409, "I already know that rule.") from None
+            raise ServiceError(400, message) from None
         noun = "payment" if affected == 1 else "payments"
-        return {"ok": True, "rule": {"id": rule.id, "label": rule.label, "scope": rule.scope.value},
-                "affected": affected, "message": f"Done. {rule.label}. It applies to {affected} {noun} so far."}
+        where = f" for {self._company_name(company_id)}" if company_id and rule.entity_ids else ""
+        return {"ok": True, "rule": {"id": rule.id, "label": rule.label, "scope": rule.scope.value,
+                                     "companyIds": list(rule.entity_ids)},
+                "affected": affected,
+                "message": f"Done. {rule.label}{where}. It applies to {affected} {noun} so far."}
+
+    # ----------------------------------------------------------------- clients invited by the accountant (§29)
+
+    def _invitations(self) -> dict[str, dict[str, Any]]:
+        if getattr(self, "_invites", None) is None:
+            self._invites = {}
+        return self._invites
+
+    def invitations_list(self) -> dict[str, Any]:
+        now = self._now()
+        out = []
+        for rec in sorted(self._invitations().values(), key=lambda r: r["id"], reverse=True):
+            item = {k: v for k, v in rec.items() if k != "tokenHash"}
+            msg = self.assistant.outbox.get(rec.get("messageId") or "")
+            if rec["status"] == "waiting" and msg is not None and msg.status == "sent":
+                item["status"], item["statusLabel"] = "sent", "Sent"  # a transport took it since
+            if rec["acceptedAt"]:
+                item["status"], item["statusLabel"] = "accepted", "Accepted"
+            elif datetime.fromisoformat(rec["expiresAt"]) <= now:
+                item["status"], item["statusLabel"] = "expired", "Expired"
+            out.append(item)
+        return {"invitations": out}
+
+    def invite_client(self, body: Mapping[str, Any] | None) -> dict[str, Any]:
+        """The accountant invites a client business by email: "Your accountant has enabled Back Office for you."
+
+        The single-use token is created here and only its SHA-256 is kept. The email goes out
+        through the send path (backoffice.mailer): it counts as sent only once the transport
+        accepted it (the demo's is its simulated outbox); without one it is written and waits.
+        """
+        from backoffice import invitations as inv
+        from backoffice.assistant import OutboxMessage
+        from backoffice.mailer import is_simulated
+
+        try:
+            clean = inv.clean_invitation(dict(body or {}))
+        except ValueError as exc:
+            raise ServiceError(400, str(exc)) from None
+        if clean.email == self.repo.owner.email.lower():
+            raise ServiceError(400, "That is this business's own address. Enter your client's email.")
+        now = self._now()
+        _, digest = inv.new_token()
+        expires = inv.expiry(now)
+        acct = self.repo.accountant
+        inviter = acct.person if acct else "Your accountant"
+        firm = clean.firm or (acct.firm if acct else "")
+        subject, text = inv.invitation_email(inviter=inviter, firm=firm, client_name=clean.client_name, link=None,
+                                             expires_at=expires)
+        op = self.assistant
+        mailer = getattr(self, "mailer", None)
+        if mailer is not None:
+            try:
+                mailer.send([clean.email], subject, text, [])  # sent only once the transport accepted it
+            except Exception:
+                raise ServiceError(502, "I couldn't send the invitation email. Please try again in a few minutes.") \
+                    from None
+            if is_simulated(mailer):
+                delivery = "Recorded in the outbox. Email delivery is not connected in this demo."
+                status, label = "demo_outbox", "In the demo outbox"
+            else:
+                delivery, status, label = "Sent.", "sent", "Sent"
+        else:
+            delivery = "Not sent yet: email sending is not set up here, so it is waiting to be sent."
+            status, label = "waiting", "Waiting to be sent"
+        msg = OutboxMessage(id=op._id("out"), to=[clean.email], subject=subject, body=text,
+                            status="waiting" if status == "waiting" else "sent",
+                            sent_at=None if status == "waiting" else now.isoformat(), delivery=delivery)
+        op.outbox[msg.id] = msg
+        self._invite_seq = getattr(self, "_invite_seq", 0) + 1
+        iid = f"inv_{self._invite_seq:03d}"
+        self._invitations()[iid] = {
+            "id": iid, "email": clean.email, "clientName": clean.client_name or None, "taxIds": list(clean.tax_ids),
+            "createdAt": now.isoformat(), "expiresAt": expires.isoformat(), "status": status, "statusLabel": label,
+            "acceptedAt": None, "messageId": msg.id, "tokenHash": digest,
+        }
+        self.orchestrator.log("accountant", "client_invited", subject_id=iid,
+                              values={"companies": len(clean.tax_ids), "delivery": status},
+                              actor=f"accountant:{acct.id}" if acct else "system")
+        public = next(i for i in self.invitations_list()["invitations"] if i["id"] == iid)
+        message = (f"Done. I sent the invitation to {clean.email}." if status == "sent" else
+                   f"Done. The invitation to {clean.email} is in the outbox. This demo does not send real email."
+                   if status == "demo_outbox" else
+                   f"The invitation to {clean.email} is written but not sent: email sending is not set up here.")
+        return {"ok": status != "waiting", "invitation": public, "message": message}
+
+    # ----------------------------------------------------------------- an accountant of some companies (§52)
+
+    def dispatch_scoped(self, method: str, path: str, body_json: Any, companies: Collection[str], *,
+                        prefix: str = "") -> tuple[int, dict[str, Any]]:
+        """Route one request from an accountant who may see only ``companies`` (production memberships).
+
+        Only the accountant's own routes answer, each filtered to those companies; every other
+        route is refused. ``prefix`` is put before client ids in what comes back.
+        """
+        return self._route(method, path, body_json, self._scoped_routes(frozenset(companies), prefix),
+                           refuse=(403, {"error": "forbidden", "message": "You don't have access to that."}))
+
+    def _scoped_routes(self, allowed: frozenset[str], prefix: str):  # type: ignore[no-untyped-def]
+        r = re.compile
+        seg = r"([^/]+)"
+
+        def mine(company_id: str) -> str:
+            if company_id not in allowed or company_id not in self.repo.companies:
+                raise ServiceError(404, "I can't find that client.")
+            return company_id
+
+        def company(company_id: str) -> dict[str, Any]:
+            return self.company(mine(company_id))
+
+        return (
+            ("GET", r("/api/accountant/clients"), lambda b: self.accountant_clients(allowed, prefix=prefix)),
+            ("GET", r(f"/api/accountant/clients/{seg}"),
+             lambda b, c: self.accountant_client(mine(c), prefix=prefix, companies=allowed)),
+            ("GET", r(f"/api/accountant/clients/{seg}/evidence/{seg}/file"),
+             lambda b, c, e: self.accountant_evidence_file(mine(c), e, companies=allowed)),
+            ("GET", r(f"/api/accountant/clients/{seg}/export"), lambda b, c: self.accountant_export(mine(c))),
+            # Rules from an accountant of some companies stay with those companies.
+            ("POST", r(f"/api/accountant/clients/{seg}/rules"),
+             lambda b, c: self.accountant_rule(_field(b, "text"), "client", mine(c))),
+            ("POST", r("/api/accountant/rules"),
+             lambda b: self.accountant_rule(_field(b, "text"), "client", mine(str(b.get("companyId") or "")))),
+            ("GET", r("/api/companies"),
+             lambda b: {"companies": [c for c in self.companies()["companies"] if c["id"] in allowed]}),
+            ("GET", r(f"/api/companies/{seg}"), lambda b, c: company(c)),
+            ("GET", r(f"/api/months/{seg}/{seg}"), lambda b, c, m: self.month(mine(c), m)),
+            ("GET", r("/api/documents"), lambda b: self.documents_list(b, companies=allowed)),
+            ("GET", r(f"/api/documents/{seg}/file"), lambda b, d: self.document_download(d, companies=allowed)),
+            ("POST", r("/api/documents/export"), lambda b: self.documents_export(b, companies=allowed)),
+            ("GET", r(f"/api/evidence/{seg}/file"), lambda b, e: self.evidence_file(e, companies=allowed)),
+        )
 
     # ----------------------------------------------------------------- Free business audit (§60) + audit log (§55)
 
@@ -2510,6 +3072,11 @@ class BackOfficeService:
         Returns ``(status, json)``; errors come back as ``{"error": ..., "message": ...}``
         with a plain message, never a stack trace (§48, §70).
         """
+        return self._route(method, path, body_json, self._routes())
+
+    def _route(self, method: str, path: str, body_json: Any, routes: Sequence[Any], *,
+               refuse: tuple[int, dict[str, Any]] | None = None) -> tuple[int, dict[str, Any]]:
+        """``dispatch`` over ``routes``; ``refuse`` answers a path none of them knows (default 404)."""
         method = (method or "GET").upper()
         raw_path, _, query = (path or "/").partition("?")
         path = unquote(raw_path).rstrip("/") or "/"
@@ -2519,7 +3086,7 @@ class BackOfficeService:
                 from urllib.parse import parse_qsl
 
                 body = dict(parse_qsl(query))
-            for verb, pattern, handler in self._routes():
+            for verb, pattern, handler in routes:
                 m = pattern.fullmatch(path)
                 if m is None:
                     continue
@@ -2529,13 +3096,16 @@ class BackOfficeService:
                 if result is None:
                     return 404, {"error": "not_found", "message": "I can't find that."}
                 return 200, result
-            if any(p.fullmatch(path) for _, p, _ in self._routes()):
+            if refuse is not None:
+                return refuse[0], dict(refuse[1])
+            if any(p.fullmatch(path) for _, p, _ in routes):
                 return 405, {"error": "method_not_allowed", "message": "That is not something I can do here."}
             return 404, {"error": "not_found", "message": "I can't find that."}
         except _Reply as reply:
             return reply.status, reply.body
         except ServiceError as exc:
-            codes = {400: "bad_request", 404: "not_found", 409: "conflict", 413: "too_large", 415: "unsupported"}
+            codes = {400: "bad_request", 403: "forbidden", 404: "not_found", 409: "conflict", 410: "gone",
+                     413: "too_large", 415: "unsupported", 502: "unavailable"}
             return exc.status, {"error": codes.get(exc.status, "error"), "message": exc.message}
 
     def _routes(self):  # type: ignore[no-untyped-def]
@@ -2606,8 +3176,19 @@ class BackOfficeService:
             ("POST", r(f"/api/connections/{seg}/reconnect"), lambda b, i: self.reconnect(i)),
             ("GET", r("/api/accountant/clients"), lambda b: self.accountant_clients()),
             ("GET", r(f"/api/accountant/clients/{seg}"), lambda b, i: self.accountant_client(i)),
+            ("GET", r(f"/api/accountant/clients/{seg}/evidence/{seg}/file"),
+             lambda b, c, e: self.accountant_evidence_file(c, e)),
+            ("GET", r(f"/api/accountant/clients/{seg}/export"), lambda b, c: self.accountant_export(c)),
+            ("POST", r(f"/api/accountant/clients/{seg}/rules"),
+             lambda b, c: self.accountant_rule(_field(b, "text"), str(b.get("scope") or "client"), c)),
             ("POST", r("/api/accountant/rules"),
-             lambda b: self.accountant_rule(_field(b, "text"), str(b.get("scope") or "client"))),
+             lambda b: self.accountant_rule(_field(b, "text"), str(b.get("scope") or "client"),
+                                            str(b["companyId"]) if b.get("companyId") else None)),
+            ("GET", r("/api/accountant/invitations"), lambda b: self.invitations_list()),
+            ("POST", r("/api/accountant/invitations"), lambda b: self.invite_client(b)),
+            ("GET", r("/api/settings/accountant"), lambda b: self.accountant_settings()),
+            ("POST", r("/api/settings/accountant"), lambda b: self.accountant_settings(b or {"email": ""})),
+            ("GET", r(f"/api/evidence/{seg}/file"), lambda b, e: self.evidence_file(e)),
             ("GET", r("/api/audit"), lambda b: self.audit()),
             ("GET", r("/api/pipeline"), lambda b: self.pipeline()),
             ("GET", r("/api/internal/(overview|operations|readiness|acceptance)"), lambda b, view: self.internal(view, b)),

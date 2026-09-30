@@ -27,6 +27,7 @@ __all__ = [
     "EVIDENCE_ADMIN_ROLE",
     "GROUP_ROLES",
     "IDENTITY_SETTINGS",
+    "INVITE_SETTING",
     "LOGIN_EMAIL_SETTING",
     "RATE_SUBJECTS_SETTING",
     "READONLY_ROLE",
@@ -52,8 +53,10 @@ LOGIN_EMAIL_SETTING = "app.login_email"  # users row of the email being signed i
 SESSION_SETTING = "app.session_hash"  # sessions row of the token presented (its SHA-256)
 RATE_SUBJECTS_SETTING = "app.rate_subjects"  # login_attempts of these keyed hashes (comma-separated)
 API_KEY_SETTING = "app.api_key_hash"  # accountant_api_keys row of the key presented (its SHA-256)
+INVITE_SETTING = "app.invite_hash"  # accountant_invitations row of the token presented (its SHA-256, 0011)
 ERASURE_SETTING = "backoffice.tenant_erasure"  # the tenant being erased in this transaction (§52)
-IDENTITY_SETTINGS = (LOGIN_EMAIL_SETTING, SESSION_SETTING, RATE_SUBJECTS_SETTING, API_KEY_SETTING, ERASURE_SETTING)
+IDENTITY_SETTINGS = (LOGIN_EMAIL_SETTING, SESSION_SETTING, RATE_SUBJECTS_SETTING, API_KEY_SETTING, INVITE_SETTING,
+                     ERASURE_SETTING)
 SETTING_SQL = "SELECT set_config(%s, %s, true)"
 
 APP_ROLE = "backoffice_app"  # api and worker: DML under RLS

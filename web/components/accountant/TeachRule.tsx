@@ -2,45 +2,40 @@
 
 import { useState } from "react";
 import { Icon } from "@/components/Icon";
-import { call } from "@/lib/api";
+import { teachRule } from "@/lib/api";
 import styles from "./accountant.module.css";
 
 type Scope = "client" | "all";
-
-interface RuleReply {
-  ok?: boolean;
-  message?: string;
-  affected?: number;
-  rule?: { id: string; label: string; scope: string };
-}
+type Rule = { label: string; scope: string };
 
 /**
- * Teach a rule (§28). It is saved by the engine (POST /api/accountant/rules), which answers with the
- * rule as it understood it and how many payments it applies to so far. What is shown is that answer,
- * or the engine's own reason for refusing it; nothing is assumed.
+ * Teach a rule once (§28). It is saved by the engine or the backend (POST to the client's `links.rules`,
+ * else POST /api/accountant/rules), which answers with the rule as it understood it and how many
+ * payments it applies to so far. What is shown is that answer, or its own reason for refusing it;
+ * nothing is assumed. The list shows the rules that apply to this client, from the engine.
  */
-export function TeachRule({ clientName, existing }: { clientName: string; existing: { label: string; scope: string }[] }) {
+export function TeachRule({ clientName, path, existing }: { clientName: string; path?: string; existing: Rule[] }) {
   const [text, setText] = useState("");
   const [scope, setScope] = useState<Scope>("client");
-  const [state, setState] = useState<"idle" | "saving">("idle");
-  const [rules, setRules] = useState<{ label: string; scope: string }[]>(existing);
+  const [saving, setSaving] = useState(false);
+  const [rules, setRules] = useState<Rule[]>(existing);
   const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     const rule = text.trim();
-    if (!rule || state === "saving") return;
-    setState("saving");
+    if (!rule || saving) return;
+    setSaving(true);
     setResult(null);
-    const r = await call<RuleReply>("POST", "/api/accountant/rules", { text: rule, scope });
-    setState("idle");
-    if (!r.ok || !r.body.rule) {
-      setResult({ ok: false, text: r.body.message ?? "I couldn’t save that rule. Try again." });
+    const out = await teachRule(path ?? "/api/accountant/rules", rule, scope);
+    setSaving(false);
+    if (!out.ok || !out.label) {
+      setResult({ ok: false, text: out.message ?? "I couldn’t save that rule. Try again." });
       return;
     }
-    const saved = r.body.rule;
-    setRules((list) => [{ label: saved.label, scope: saved.scope }, ...list.filter((x) => x.label !== saved.label)]);
-    setResult({ ok: true, text: r.body.message ?? `Done. ${saved.label}.` });
+    const label = out.label;
+    setRules((list) => [{ label, scope }, ...list.filter((x) => x.label !== label)]);
+    setResult({ ok: true, text: out.message ?? `Done. ${label}.` });
     setText("");
   };
 
@@ -73,15 +68,15 @@ export function TeachRule({ clientName, existing }: { clientName: string; existi
               All clients
             </button>
           </div>
-          <button type="submit" className="btn btn-primary" disabled={!text.trim() || state === "saving"}>
-            {state === "saving" ? "One moment…" : "Teach"}
+          <button type="submit" className="btn btn-primary" disabled={!text.trim() || saving}>
+            {saving ? "One moment…" : "Teach"}
           </button>
         </div>
       </form>
       <div aria-live="polite">
         {result ? (
           result.ok ? (
-            <p className={styles.teachResult}>
+            <p className={styles.teachResult} role="status">
               <Icon name="check" size={18} strokeWidth={2.2} />
               {result.text}
             </p>

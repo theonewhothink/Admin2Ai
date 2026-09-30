@@ -302,13 +302,12 @@ class Ledger:
         resolver = repo.resolver()
         engine = ExpectedEvidenceEngine(entities=repo.entities, suppliers=resolver)
         pending = {n.subject_id for n in repo.open_needs() if n.kind == "choice" and n.subject_type == "transaction"}
-        accountant_ids = [repo.accountant.id] if repo.accountant else []
         out: list[Line] = []
         for tx in repo.history_transactions:
-            out.append(self._line(tx, None, engine.classify(tx), resolver, pending, accountant_ids))
+            out.append(self._line(tx, None, engine.classify(tx), resolver, pending))
         for rec in repo.transactions.values():
             decision = rec.decision or engine.classify(rec.tx)
-            out.append(self._line(rec.tx, rec, decision, resolver, pending, accountant_ids))
+            out.append(self._line(rec.tx, rec, decision, resolver, pending))
         for record in repo.documents.values():
             cash = self._cash_line(record)
             if cash is not None:
@@ -404,8 +403,7 @@ class Ledger:
                     description=f"{report.provider.fee_word.capitalize()} kept from the payout{ref}", **common))
         return out
 
-    def _line(self, tx: Transaction, rec: Any, decision: Any, resolver: Any, pending: set[str],
-              accountant_ids: list[str]) -> Line:
+    def _line(self, tx: Transaction, rec: Any, decision: Any, resolver: Any, pending: set[str]) -> Line:
         repo = self.repo
         match = resolver.resolve_transaction(tx)
         supplier = match.supplier
@@ -451,7 +449,11 @@ class Ledger:
         else:
             company = self._history_company(tx)
             waiting = company is None
-        category = self._category(tx, kind, supplier, match.key, rec, folded, accountant_ids)
+        # Taught categories: only the rules of this company's accountant, for this company (§28, §51).
+        account = repo.accounts.get(tx.account_id)
+        rule_company = company or (account.holder_id if account is not None else None)
+        category = self._category(tx, kind, supplier, match.key, rec, folded,
+                                  repo.accountant_ids_for(rule_company), rule_company)
         docs = tuple(rec.document_ids) if rec is not None else ()
         return Line(
             id=tx.id, on=tx.booked_on, amount=abs(tx.amount), direction="in" if tx.amount > 0 else "out",
@@ -475,13 +477,13 @@ class Ledger:
         return answers.pop() if len(answers) == 1 else None
 
     def _category(self, tx: Transaction, kind: str, supplier: Any, key: str, rec: Any, folded: str,
-                  accountant_ids: list[str]) -> str:
+                  accountant_ids: list[str], company: str | None = None) -> str:
         repo = self.repo
         if kind in ("transfer", "card_repayment", "payout") or kind in IN_KINDS:
             return kind
         try:
-            taught = repo.rulebook.evaluate(RuleSubject.from_transaction(tx, key=key), tenant_id=repo.tenant_id,
-                                            accountant_ids=accountant_ids).category
+            taught = repo.rulebook.evaluate(RuleSubject.from_transaction(tx, key=key, entity_id=company),
+                                            tenant_id=repo.tenant_id, accountant_ids=accountant_ids).category
         except Exception:  # a rule conflict never breaks an answer; the engine reports it elsewhere
             taught = None
         if taught:

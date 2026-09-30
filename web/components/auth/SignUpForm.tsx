@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { useState } from "react";
 import { Icon } from "@/components/Icon";
 import { safeNext, signUp } from "@/lib/account";
+import { pendingInvitation } from "@/lib/invite";
 import { checkNif } from "@/lib/nif";
 import styles from "./auth.module.css";
 import { Field, FormAlert, PasswordRule, emailError } from "./Field";
@@ -80,7 +81,8 @@ export function SignUpForm() {
     const tax = values.taxId.trim() ? checkNif(values.taxId) : null;
     const result = await signUp({ ...values, taxId: tax?.valid ? tax.normalized : undefined });
     if (result.ok) {
-      router.replace("/onboarding");
+      // Invited by their accountant (§29): accept first, then set up.
+      router.replace(pendingInvitation() ? "/invite" : "/onboarding");
       return;
     }
     setBusy(false);

@@ -1,11 +1,11 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import styles from "@/components/accountant/accountant.module.css";
+import { FirmBadge } from "@/components/accountant/FirmName";
 import { Icon } from "@/components/Icon";
 import { SessionBadge } from "@/components/session/SessionBadge";
 import { SessionProvider } from "@/components/session/SessionProvider";
 import { Logo } from "@/components/shell/Logo";
-import { accountantFirm } from "@/lib/data";
 import { production } from "@/lib/mode";
 
 export const metadata: Metadata = {
@@ -30,16 +30,7 @@ export default function AccountantLayout({ children }: { children: React.ReactNo
               <Icon name="swap" size={16} />
               Owner view
             </Link>
-            {production ? (
-              <SessionBadge />
-            ) : (
-              <span className={styles.firm}>
-                <span className={styles.firmAvatar} aria-hidden="true">
-                  {accountantFirm.initials}
-                </span>
-                <span className={styles.firmName}>{accountantFirm.name}</span>
-              </span>
-            )}
+            {production ? <SessionBadge /> : <FirmBadge />}
           </div>
         </div>
       </header>

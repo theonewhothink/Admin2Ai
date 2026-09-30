@@ -353,7 +353,8 @@ def decide_cost_center(
     # 1. a rule the owner taught
     if rulebook is not None:
         subject = RuleSubject(counterparty_key=facts.counterparty_key, card_last4=facts.card_last4,
-                              account_id=facts.account_id, amount=facts.total, supplier_tax_id=facts.supplier_tax_id)
+                              account_id=facts.account_id, amount=facts.total, supplier_tax_id=facts.supplier_tax_id,
+                              entity_id=facts.company_id)
         decision = rulebook.evaluate(subject, tenant_id=facts.tenant_id, accountant_ids=accountant_ids)
         if decision.unresolved(RuleField.COST_CENTER) is not None:
             return ask(["Two saved answers disagree about this.", *hit_lines(header)])
@@ -597,7 +598,8 @@ def decide_recharge(
     who = facts.counterparty_label
     if rulebook is not None:
         subject = RuleSubject(counterparty_key=facts.counterparty_key, card_last4=facts.card_last4,
-                              account_id=facts.account_id, amount=facts.total, supplier_tax_id=facts.supplier_tax_id)
+                              account_id=facts.account_id, amount=facts.total, supplier_tax_id=facts.supplier_tax_id,
+                              entity_id=facts.company_id)
         decision = rulebook.evaluate(subject, tenant_id=facts.tenant_id, accountant_ids=accountant_ids)
         taught = decision.get(RuleField.RECHARGE)
         if taught is not None and decision.unresolved(RuleField.RECHARGE) is None:
