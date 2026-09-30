@@ -29,7 +29,7 @@ from pydantic import ValidationError
 
 from backoffice.closure import BlockerKind, BusinessAuditFindings, Month, PriceIncrease, due_soon
 from backoffice.closure import render_business_audit
-from backoffice.domain.cost_centers import CostCenter, CostCenterIdentifiers, SplitError
+from backoffice.domain.cost_centers import CostCenter, CostCenterIdentifiers, SplitError, to_cents
 from backoffice.domain.lifecycle import Stage
 from backoffice.domain.models import DocumentType, SourceKind
 from backoffice.evidence import SharePayload, UploadRequest
@@ -64,7 +64,7 @@ BANK_CONSENT_DAYS = 180  # PSD2 access consent (RTS Art. 10, as amended 2022): r
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _SLUG = re.compile(r"[^a-z0-9]+")
 # Needs-You questions shown as one plain choice with the engine's own prompt and options (§37).
-_PLAIN_QUESTIONS = ("company", "cash", "obligation", "refund", "obligation_company")
+_PLAIN_QUESTIONS = ("company", "cash", "obligation", "refund", "obligation_company", "statement", "recharge")
 _ISSUER_NAMES = {"tax_authority": "Tax office", "social_security": "Social Security", "bank": "Your bank",
                  "landlord": "Your landlord", "insurer": "Your insurer"}
 _STAGE_WORDS = {Stage.DISCOVERED: "Found", Stage.ACQUIRED: "Received", Stage.UNDERSTOOD: "Read",
@@ -966,6 +966,119 @@ class BackOfficeService:
         return {"items": items, "companies": [{"id": c, "name": e.name} for c, e in self.repo.companies.items()],
                 "total": len(items)}
 
+    def document_detail(self, document_id: str) -> dict[str, Any]:
+        """One document: what it is, its proof and what it is matched to; for a supplier's account statement,
+        each of its lines checked against your records (§28, §54). Never changes anything."""
+        rec = self.repo.documents.get(document_id)
+        base = self.document(document_id)
+        if rec is None or base is None:
+            raise ServiceError(404, "I can't find that document.")
+        # Its lifecycle, the credit notes that correct it and the refund chain (§20), then the list's fields.
+        detail = {**{k: v for k, v in base.items() if k != "status"}, "stage": base["status"],
+                  **self.assistant.document_item(rec), "label": rec.label, "evidence": [self._doc_evidence(rec)],
+                  "payments": base["payments"],
+                  "supportsPayments": [self._tx_evidence(self.repo.transactions[t]) for t in rec.supports_tx_ids
+                                       if t in self.repo.transactions],
+                  "why": list(rec.reasons)}
+        sr = self.repo.statements.get(document_id)
+        if sr is not None:
+            detail["statement"] = self._statement_view(sr)
+        return detail
+
+    def _statement_view(self, sr: Any) -> dict[str, Any]:
+        """A supplier's account statement, line by line against your records, in plain words."""
+        from backoffice.supplier_statements import not_listed_line, summary
+
+        repo = self.repo
+        record = repo.documents[sr.document_id]
+        st = sr.statement
+        who = display_name(record.document.supplier_name)
+        today = self._today()
+        cur = st.currency
+        view: dict[str, Any] = {
+            **st.as_dict(), "supplier": who, "supplierKnown": sr.supplier_id is not None, "booked": False,
+            "note": "An account statement is never booked and never pays for anything. I use it to check your "
+                    "records against the supplier's.",
+        }
+        check = sr.check
+        if check is None:
+            view.update({"complete": False, "missing": [], "differences": [], "notOnStatement": [],
+                         "paymentsNotFound": [], "balance": None, "request": None, "needsYouId": None,
+                         "summary": ("I couldn't tell which supplier this statement is from, so I haven't checked "
+                                     "it. Add the supplier and I will." if sr.supplier_id is None else
+                                     "I haven't checked it yet.")})
+            return view
+
+        def money(value: Any) -> str:
+            return format_money(value if value is not None else Decimal("0"), cur)
+
+        answered = set(sr.answered)
+        printed = {x["row"]: x for x in st.as_dict()["lines"]}
+        from backoffice.orchestrator import statement_line_key
+
+        rows = []
+        for r in check.rows:
+            line = r.line
+            word = line.word[:1].upper() + line.word[1:]
+            name = f"{word} {line.number}" if line.number else word
+            if r.status == "matched" and r.transaction_id:
+                paid = repo.transactions[r.transaction_id]
+                text = f"{name} of {money(line.amount)}: in your bank on {day_month(paid.tx.booked_on, today)}."
+            elif r.status == "matched":
+                text = f"{name} · {money(line.amount)}: you have it" + (
+                    ", found by its amount and date." if r.by_amount else ".")
+            elif r.status == "missing":
+                text = f"{name} · {money(line.amount)}: you don't have it."
+            elif r.status == "differs":
+                text = f"{name}: {money(line.amount)} here, {money(r.our_amount)} on the {line.word} you have."
+                if statement_line_key(line) in answered:
+                    text += (" You said the statement is right." if sr.answer == "statement" else
+                             f" You said the {line.word} is right.")
+            elif r.status == "not_found":
+                text = f"{name} of {money(line.amount)}: I can't find it in your bank."
+            else:
+                text = line.description or name
+            row: dict[str, Any] = {**printed[line.row],
+                                   "status": r.status, "text": text,
+                                   "evidence": [{"id": e, "label": text} for e in r.evidence_ids[:1]]}
+            if r.document_id and r.document_id in repo.documents:
+                row["document"] = {"id": r.document_id, "label": repo.documents[r.document_id].label}
+            if r.transaction_id and r.transaction_id in repo.transactions:
+                row["payment"] = self._tx_evidence(repo.transactions[r.transaction_id])
+            rows.append(row)
+        request_text = self.orchestrator.statements.request_line(sr)
+        message = repo.outbox.get(sr.request_id) if sr.request_id else None
+        correction = repo.outbox.get(sr.correction_id) if sr.correction_id else None
+        if check.balance_agrees:
+            balance_text = f"The balance of {money(check.closing)} matches the invoices you have not paid yet."
+        else:
+            balance_text = (f"It says you owe {money(check.closing)}; the invoices you have not paid yet come to "
+                            f"{money(check.our_open)}." + (f" {check.explained}" if check.explained else ""))
+        needs = repo.needs.get(sr.needs_id or "")
+        text = summary(check, today)
+        if check.missing and request_text:
+            text += f" {request_text}"
+        view.update({
+            "lines": rows, "complete": check.complete, "summary": text,
+            "missing": [r for r in rows if r["status"] == "missing"],
+            "differences": [r for r in rows if r["status"] == "differs"],
+            "paymentsNotFound": [r for r in rows if r["status"] == "not_found"],
+            "notOnStatement": [{"id": d.id, "label": d.label, "date": d.on.isoformat() if d.on else None,
+                                "amount": _num(d.amount), "evidence": [self._doc_evidence(repo.documents[d.id])]}
+                               for d in check.not_on_statement if d.id in repo.documents],
+            "notOnStatementText": not_listed_line(check),
+            "balance": {"statement": _num(check.closing), "ours": _num(check.our_open),
+                        "difference": _num(check.difference), "agrees": check.balance_agrees, "text": balance_text},
+            "request": ({"status": "sent" if message.sent else "waiting", "to": message.to, "text": request_text}
+                        if message is not None else
+                        ({"status": "not_sent", "text": request_text} if request_text else None)),
+            "correction": ({"status": "sent" if correction.sent else "waiting", "to": correction.to}
+                           if correction is not None else None),
+            "needsYouId": needs.id if needs is not None and needs.status == "open" else None,
+            "answer": sr.answer,
+        })
+        return view
+
     def document_download(self, document_id: str) -> dict[str, Any]:
         f = self.assistant.document_file(document_id)
         if f is None:
@@ -1462,7 +1575,10 @@ class BackOfficeService:
 
     def _question(self, n: NeedsYouRecord) -> dict[str, Any]:
         """Which company carries a payment, a cash receipt to confirm, whether a payment pays a letter, a
-        refund that differs from its credit note, which company a letter is for: one plain choice (§37, §51)."""
+        refund that differs from its credit note, which company a letter is for, amounts that differ on a
+        supplier's statement, or whether a client pays a cost back: one plain choice (§37, §51)."""
+        if n.kind == "statement":
+            return self._statement_item(n)
         if n.subject_type == "transaction":
             rec = self.repo.transactions[n.subject_id]
             merchant, amount = self.orchestrator.merchant_name(rec.tx), abs(rec.tx.amount)
@@ -1477,12 +1593,39 @@ class BackOfficeService:
             merchant, amount = display_name(doc.document.supplier_name), doc.document.gross_amount or Decimal("0")
             currency = doc.document.currency
             day = doc.document.issue_date or doc.received_at.astimezone(TZ).date()
-        return {
+        item = {
             "id": n.id, "kind": "choice", "tone": "attention", "eyebrow": "We need one answer",
             "merchant": merchant, "amount": _num(amount), "currency": currency, "date": _iso(day),
             "companyId": n.company_id, "question": n.prompt, "options": [{"id": o.id, "label": o.label}
                                                                         for o in n.options],
             "why": list(n.why),
+        }
+        if n.kind == "recharge" and n.question is not None:
+            from backoffice.learning.cost_centers import recharge_rule
+
+            overrides = {}
+            for option in n.options:
+                proposal = recharge_rule(n.question, option.id == "recharge", answered_by="owner",
+                                         answered_at=self._now())
+                if proposal is not None:
+                    overrides[option.id] = proposal.label
+            if overrides:
+                item["remember"] = {"template": "Always {choice}", "defaultChecked": True, "overrides": overrides}
+        return item
+
+    def _statement_item(self, n: NeedsYouRecord) -> dict[str, Any]:
+        """Amounts that differ on a supplier's account statement: which is right (never a silent change)."""
+        doc = self.repo.documents[n.subject_id]
+        sr = self.repo.statements.get(n.subject_id)
+        rows = [r for r in (sr.check.differences if sr is not None and sr.check is not None else ())]
+        amount = rows[0].line.amount if len(rows) == 1 else (sr.statement.closing if sr is not None else None)
+        day = (sr.statement.end if sr is not None else None) or doc.received_at.astimezone(TZ).date()
+        return {
+            "id": n.id, "kind": "choice", "tone": "attention", "eyebrow": "We need one answer",
+            "merchant": display_name(doc.document.supplier_name), "amount": _num(amount),
+            "currency": sr.statement.currency if sr is not None else doc.document.currency, "date": _iso(day),
+            "companyId": n.company_id, "question": n.prompt,
+            "options": [{"id": o.id, "label": o.label} for o in n.options], "why": list(n.why),
         }
 
     def _cost_center_item(self, n: NeedsYouRecord) -> dict[str, Any]:
@@ -1668,6 +1811,51 @@ class BackOfficeService:
         """One job: money out and in, its payments and documents with the proof, and what is still open."""
         return self._cost_views().detail(self._cost_center_record(cost_center_id), body)
 
+    def cost_center_statement(self, cost_center_id: str, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """A period's statement: money received, costs with their proof, the management fee and what is left
+        (for a property, what is due to its owner). Not final while anything is still open."""
+        return self._cost_views().statement(self._cost_center_record(cost_center_id), body)
+
+    @staticmethod
+    def _cost_center_terms(b: Mapping[str, Any]) -> dict[str, Any]:
+        """The client pays its costs back; a property's owner; its management fee (percent and/or monthly)."""
+        out: dict[str, Any] = {}
+        if "recharge" in b:
+            if not isinstance(b.get("recharge"), bool):
+                raise ServiceError(400, "Say true or false.")
+            out["recharge"] = b["recharge"]
+        if "owner" in b:
+            owner = b.get("owner")
+            if owner in (None, ""):
+                out["owner_name"] = None
+            elif isinstance(owner, str) and " ".join(owner.split()):
+                name = " ".join(owner.split())
+                if len(name) > 80:
+                    raise ServiceError(400, "That name is too long.")
+                out["owner_name"] = name
+            else:
+                raise ServiceError(400, "Write the owner's name.")
+        key = "managementFee" if "managementFee" in b else "management_fee" if "management_fee" in b else None
+        if key is not None:
+            fee = b.get(key)
+            if fee is None:
+                out["fee_percent"] = out["fee_monthly"] = None
+            elif isinstance(fee, Mapping) and set(fee) <= {"percent", "monthly"} and any(
+                    fee.get(k) not in (None, "") for k in ("percent", "monthly")):
+                percent, monthly = fee.get("percent"), fee.get("monthly")
+                try:
+                    out["fee_percent"] = None if percent in (None, "") else to_cents(percent, what="percent")
+                    out["fee_monthly"] = None if monthly in (None, "") else to_cents(monthly, what="amount")
+                except SplitError as exc:
+                    raise ServiceError(400, exc.message) from None
+                if out["fee_percent"] is not None and not Decimal(0) < out["fee_percent"] <= Decimal(100):
+                    raise ServiceError(400, "A fee is more than 0% and at most 100%.")
+                if out["fee_monthly"] is not None and out["fee_monthly"] < 0:
+                    raise ServiceError(400, "A monthly fee can't be below zero.")
+            else:
+                raise ServiceError(400, "Give the fee as a percent of what comes in, an amount a month, or both.")
+        return out
+
     def _identifiers(self, company_id: str, raw: Any, current: CostCenterIdentifiers | None = None
                      ) -> CostCenterIdentifiers:
         if raw is None:
@@ -1724,17 +1912,18 @@ class BackOfficeService:
         name = self._cost_center_name(company_id, b.get("name"))
         kind = self._cost_center_kind(b.get("kind"), self._cost_views().kind_for(company_id))
         identifiers = self._identifiers(company_id, b.get("identifiers"))
+        terms = self._cost_center_terms(b)
         base = "cc-" + (_SLUG.sub("-", name.lower()).strip("-")[:40] or "x")
         cid, n = base, 2
         while cid in self.repo.cost_centers:
             cid, n = f"{base}-{n}", n + 1
         center = CostCenter(id=cid, tenant_id=self.repo.tenant_id, company_id=company_id, name=name, kind=kind,
-                            identifiers=identifiers)
+                            identifiers=identifiers, **terms)
         self.repo.cost_centers[cid] = center
         self.orchestrator.log("cost_center", "cost_center_added", subject_id=cid,
                               actor=f"owner:{self.repo.owner.email}",
                               values={"company_id": company_id, "name": name, "kind": kind,
-                                      "identifiers": identifiers.as_dict()})
+                                      "identifiers": identifiers.as_dict(), **_terms_audit(terms)})
         self.orchestrator.activity(self._now(), "learned", f"Added {center.label}. I will put its costs on it.",
                                    company_id)
         self.orchestrator.run()
@@ -1745,9 +1934,10 @@ class BackOfficeService:
         """Rename it, change its kind or what points to it, or archive it (its past costs stay on it)."""
         center = self._cost_center_record(cost_center_id)
         b = body or {}
-        if not any(k in b for k in ("name", "kind", "identifiers", "active")):
+        if not any(k in b for k in ("name", "kind", "identifiers", "active", "recharge", "owner", "managementFee",
+                                    "management_fee")):
             raise ServiceError(400, "Tell me what to change: its name, its kind, what points to it, or archive it.")
-        update: dict[str, Any] = {}
+        update: dict[str, Any] = self._cost_center_terms(b)
         if "name" in b:
             update["name"] = self._cost_center_name(center.company_id, b.get("name"), skip=center.id)
         if "kind" in b:
@@ -1766,7 +1956,10 @@ class BackOfficeService:
         self.orchestrator.log("cost_center", "cost_center_changed", subject_id=center.id,
                               actor=f"owner:{self.repo.owner.email}",
                               values={"name": changed.name, "kind": changed.kind, "active": changed.active,
-                                      "identifiers": changed.identifiers.as_dict()})
+                                      "identifiers": changed.identifiers.as_dict(),
+                                      **_terms_audit({k: v for k, v in update.items()
+                                                      if k in ("recharge", "owner_name", "fee_percent",
+                                                               "fee_monthly")})})
         self.orchestrator.run()
         if not changed.active:
             message = f"Done. {changed.label} is archived. Its past costs stay on it."
@@ -1785,10 +1978,13 @@ class BackOfficeService:
         split = b.get("split")
         if sum(1 for x in (cost_center_id, general or None, split) if x is not None) != 1:
             raise ServiceError(400, "Choose one: where it goes, general costs, or how to split it.")
+        recharge = b.get("recharge")
+        if recharge is not None and not isinstance(recharge, bool):
+            raise ServiceError(400, "Say true or false.")
         try:
             outcome = self.orchestrator.allocate_by_owner(
                 subject, cost_center_id=cost_center_id if isinstance(cost_center_id, str) else None,
-                general=general, split=split, remember=bool(b.get("remember", False)))
+                general=general, split=split, remember=bool(b.get("remember", False)), recharge=recharge)
         except KeyError:
             raise ServiceError(404, "I can't find that payment or document.") from None
         except SplitError as exc:
@@ -1937,7 +2133,8 @@ class BackOfficeService:
                 parts.append(n.prompt)
                 what = {"company": "which company", "cash": "cash receipt to confirm",
                         "obligation": "payment to confirm", "refund": "refund to confirm",
-                        "obligation_company": "which company"}[n.kind]
+                        "obligation_company": "which company", "statement": "statement to check",
+                        "recharge": "paid back by the client?"}[n.kind]
                 evidence.append({"label": f"{item['merchant']} · {what}", "id": f"needs:{n.id}"})
             elif n.kind == "cost_center":
                 rec = self.repo.transactions[n.subject_id]
@@ -2139,6 +2336,7 @@ class BackOfficeService:
                 pct = ((after - before) * 100 / before).quantize(Decimal("1"))
                 anomalies.append({"id": f"an_price_{name.lower()}", "title": f"{name} price went up {pct}%",
                                   "detail": f"{format_money(before)} → {format_money(after)}.", "tone": "attention"})
+        anomalies += self._statement_anomalies(company_id)
         # Answered only once the answer reached the accountant's mailbox (the send path accepted it).
         questions = [{"id": q.id, "question": q.text, "status": "answered" if q.status == "answered" else "waiting",
                       **({"answer": q.answer} if q.answer and q.status == "answered" else {})}
@@ -2164,6 +2362,21 @@ class BackOfficeService:
                              {"label": "Still missing", "value": str(status.missing_documents)}],
                 "anomalies": anomalies, "taxFlags": self._tax_flags(company_id, txs, month), "questions": questions,
                 "exportState": export}
+
+    def _statement_anomalies(self, company_id: str) -> list[dict[str, str]]:
+        """For the accountant: suppliers' statements that differ from the records, and the business's own
+        documents a statement does not list (§28). Never booked, never a question for the owner by itself."""
+        from backoffice.supplier_statements import not_listed_line, summary
+
+        out = []
+        for sr in sorted(self.repo.statements.values(), key=lambda s: s.document_id):
+            if sr.company_id != company_id or sr.check is None or sr.check.complete:
+                continue
+            who = display_name(self.repo.documents[sr.document_id].document.supplier_name)
+            detail = " ".join(p for p in (summary(sr.check, self._today()), not_listed_line(sr.check)) if p)
+            out.append({"id": f"an_statement_{sr.document_id}", "title": f"{who}'s statement differs from the records",
+                        "detail": detail, "tone": "attention"})
+        return out
 
     def _tax_flags(self, company_id: str, txs: list[TxRecord], month: Month | None = None) -> list[dict[str, str]]:
         """What the accountant should look at (§28). Accountant-facing only: the owner is never asked."""
@@ -2342,6 +2555,7 @@ class BackOfficeService:
             ("POST", r(f"/api/companies/{seg}/cost-centers"), lambda b, i: self.cost_center_create(i, b)),
             ("POST", r("/api/cost-centers/allocate"), lambda b: self.cost_center_allocate(b)),
             ("GET", r(f"/api/cost-centers/{seg}"), lambda b, i: self.cost_center(i, b)),
+            ("GET", r(f"/api/cost-centers/{seg}/statement"), lambda b, i: self.cost_center_statement(i, b)),
             ("POST", r(f"/api/cost-centers/{seg}"), lambda b, i: self.cost_center_update(i, b)),
             ("GET", r(f"/api/months/{seg}/{seg}"), lambda b, c, m: self.month(c, m)),
             ("POST", r("/api/ask"), lambda b: self.ask(_field(b, "question"))),
@@ -2375,7 +2589,7 @@ class BackOfficeService:
             ("GET", r("/api/documents"), lambda b: self.documents_list(b)),
             ("POST", r("/api/documents/export"), lambda b: self.documents_export(b)),
             ("GET", r(f"/api/documents/{seg}/file"), lambda b, did: self.document_download(did)),
-            ("GET", r(f"/api/documents/{seg}"), lambda b, did: self.document(did)),
+            ("GET", r(f"/api/documents/{seg}"), lambda b, did: self.document_detail(did)),
             ("GET", r(f"/api/transactions/{seg}"), lambda b, tid: self.transaction(tid)),
             ("GET", r("/api/obligations"), lambda b: self.obligations()),
             ("POST", r(f"/api/obligations/{seg}/done"), lambda b, oid: self.obligation_done(oid, b)),
@@ -2441,6 +2655,12 @@ def _body(body_json: Any) -> dict[str, Any]:
     if not isinstance(body_json, Mapping):
         raise ServiceError(400, "I couldn't read that request.")
     return dict(body_json)
+
+
+def _terms_audit(terms: Mapping[str, Any]) -> dict[str, Any]:
+    """A cost center's settings as the audit log records them (only those given)."""
+    names = {"recharge": "recharge", "owner_name": "owner", "fee_percent": "fee_percent", "fee_monthly": "fee_monthly"}
+    return {names[k]: v for k, v in terms.items() if k in names}
 
 
 def _field(body: Mapping[str, Any], *names: str) -> str:

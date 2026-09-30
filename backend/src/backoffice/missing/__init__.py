@@ -17,6 +17,8 @@ Chasing — :mod:`.chase`
     ``compose_request(facts, token=, today=, message_id_domain=) -> ChaseMessage`` (PT/EN)
     ``compose_reminder(facts, thread, today=, message_id_domain=) -> ChaseMessage``
     ``compose_correction_request(facts, token=, today=, message_id_domain=) -> ChaseMessage`` (an invoice on hold)
+    ``compose_statement_request(supplier_name=, ..., items=[StatementItem], corrections=False) -> ChaseMessage``
+    (documents a supplier's account statement lists that were never received, or that differ)
     ``next_reminder(thread, ReminderPolicy(), today) -> ReminderDecision``
     ``match_reply(threads, InboundEmail(...)) -> ReplyMatch | None``
     ``thread_token(tenant_id, subject_id) -> str``
@@ -59,6 +61,7 @@ from .chase import (
     ReminderStep,
     ReplyMatch,
     SentMessage,
+    StatementItem,
     activity_line,
     choose_language,
     clean_invoice_number,
@@ -66,6 +69,7 @@ from .chase import (
     compose_recurring_request,
     compose_reminder,
     compose_request,
+    compose_statement_request,
     day_month_pt,
     format_money_pt,
     match_reply,
@@ -102,6 +106,7 @@ __all__ = [
     "SearchAttempt",
     "SearchSource",
     "SentMessage",
+    "StatementItem",
     "Verifier",
     "activity_line",
     "choose_language",
@@ -110,6 +115,7 @@ __all__ = [
     "compose_recurring_request",
     "compose_reminder",
     "compose_request",
+    "compose_statement_request",
     "day_month_pt",
     "format_money_pt",
     "match_reply",

@@ -49,7 +49,7 @@ from backoffice.domain.models import (
     VatPart,
 )
 
-from .keys import fold, match_key
+from .keys import fold, match_key, same_tax_id
 from .plain import card_mask, join_and
 from .questions import OptionKind, Question, QuestionKind, QuestionOption, SubjectFacts, describe_subject
 from .rules import (
@@ -71,13 +71,16 @@ __all__ = [
     "CostCenterDecision",
     "CostCenterFacts",
     "Hit",
+    "RechargeDecision",
     "cost_center_question",
     "decide_cost_center",
+    "decide_recharge",
     "find_hits",
     "history_counts",
     "noun_for",
     "percents_of",
     "plural",
+    "recharge_rule",
     "suggest_cost_center_rule",
 ]
 
@@ -108,6 +111,7 @@ class CostCenterFacts:
     vat_parts: tuple[VatPart, ...] = ()  # the total by VAT rate, when known
     on: date | None = None
     evidence_ids: tuple[str, ...] = ()
+    customer_tax_ids: tuple[str, ...] = ()  # who the invoices are addressed to (a client, not the business)
 
 
 @dataclass(frozen=True)
@@ -536,3 +540,133 @@ def history_counts(entries: Iterable[tuple[str | None, str]]) -> dict[str, dict[
     return out
 
 
+# --------------------------------------------------------------------------- recharged to the client
+
+
+# Words that say a cost is a client's, bought for them to pay back: an end customer named on the invoice,
+# "on behalf of", a disbursement, a cost to re-invoice (folded text).
+_FOR_THE_CLIENT = re.compile(
+    r"(?<![a-z])(?:cliente\s+final|utilizador\s+final|end[\s-]+(?:customer|client|user)|"
+    r"on\s+behalf\s+of|em\s+nome\s+(?:de|do|da)|por\s+conta\s+(?:de|do|da)|a\s+refaturar|para\s+refaturar|"
+    r"refaturacao|re-?invoic\w*|rebill\w*|to\s+(?:be\s+)?recharged?|recharge\s+to|reembols\w*|reimburs\w*|"
+    r"disbursements?|despesas?\s+(?:do|de)\s+cliente|client\s+(?:expense|disbursement)s?|pass[\s-]+through)"
+    r"(?![a-z])")
+
+
+@dataclass(frozen=True)
+class RechargeDecision:
+    """Which shares of an allocation are the client's to pay back, why, or the one cost center to ask about."""
+
+    recharge: tuple[str, ...] = ()  # cost center ids whose share is recharged to the client
+    method: str | None = None  # "rule" | "setting" | "evidence" | "history"; None: nothing decided
+    why: tuple[str, ...] = ()
+    ask: str | None = None  # a cost center it genuinely cannot be told for: one plain question
+    rule_id: str | None = None
+
+
+def decide_recharge(
+    *,
+    allocation: CostAllocation,
+    centers: Mapping[str, CostCenter],
+    facts: CostCenterFacts,
+    rulebook: RuleBook | None = None,
+    accountant_ids: Iterable[str] = (),
+    history: Mapping[tuple[str, str], tuple[int, int]] | None = None,
+    recharging: Iterable[str] = (),
+    own_tax_ids: Iterable[str] = (),
+) -> RechargeDecision:
+    """Is a cost on a client's cost center the client's to pay back (a reimbursable cost, a disbursement,
+    media bought for them, a pass-through licence), or the business's own? Strongest first:
+
+    1. a rule the owner taught ("Always recharge IKEA paid with card •••• 4817 to the client it is for");
+    2. the cost center's own setting (its costs are the client's: a travel agency's trip, a matter's
+       disbursements);
+    3. the evidence: the invoice is addressed to the client, a line names the client as the end customer,
+       or the invoice says it is for the client ("on behalf of", "cliente final", "a refaturar");
+    4. history: the last costs from this supplier on this client were all recharged (likely, not proven).
+
+    Otherwise nothing is decided (the business's own cost), and only when the client has had costs
+    recharged before (so it genuinely could be either) is the owner asked one plain question.
+    ``history``: {(supplier key, cost center id): (recharged, not recharged)}; ``recharging``: cost
+    centers with any cost recharged before.
+    """
+    targets = [s.cost_center_id for s in allocation.shares if s.cost_center_id in centers]
+    if allocation.general or not targets:
+        return RechargeDecision()
+    labels = {cid: centers[cid].label for cid in targets}
+    who = facts.counterparty_label
+    if rulebook is not None:
+        subject = RuleSubject(counterparty_key=facts.counterparty_key, card_last4=facts.card_last4,
+                              account_id=facts.account_id, amount=facts.total, supplier_tax_id=facts.supplier_tax_id)
+        decision = rulebook.evaluate(subject, tenant_id=facts.tenant_id, accountant_ids=accountant_ids)
+        taught = decision.get(RuleField.RECHARGE)
+        if taught is not None and decision.unresolved(RuleField.RECHARGE) is None:
+            reason = (f"You told us: {taught.label}." if taught.label else
+                      "You told us the client pays these back." if taught.value else
+                      "You told us these are your own costs.")
+            if taught.author is RuleAuthor.ACCOUNTANT:
+                reason = f"Your accountant set this: {taught.label}." if taught.label else "Your accountant set this."
+            return RechargeDecision(recharge=tuple(targets) if taught.value else (), method="rule", why=(reason,),
+                                    rule_id=taught.rule_id)
+    own = [t for t in own_tax_ids if t]
+    why: dict[str, list[str]] = {}
+    setting = [cid for cid in targets if centers[cid].recharge]
+    for cid in setting:
+        why.setdefault(cid, []).append(f"Costs on {labels[cid]} are theirs to pay back, as you set.")
+    evidence: list[str] = []
+    for cid in targets:
+        center = centers[cid]
+        ids = center.identifiers.tax_ids
+        for tax_id in facts.customer_tax_ids:
+            if any(same_tax_id(t, tax_id) for t in ids) and not any(same_tax_id(o, tax_id) for o in own):
+                why.setdefault(cid, []).append(f"The invoice is addressed to {labels[cid]} (tax number {tax_id}), "
+                                               "so it is theirs to pay back.")
+                evidence.append(cid)
+        for line in facts.lines:
+            named = line.customer_tax_id and any(same_tax_id(t, line.customer_tax_id) for t in ids)
+            if named or (_FOR_THE_CLIENT.search(fold(line.text)) and find_hits(line.text, [center], "the line")):
+                why.setdefault(cid, []).append(f"Line {line.id} of the invoice names {labels[cid]} as the end "
+                                               "customer.")
+                evidence.append(cid)
+        for where, text in facts.texts:
+            if not text or not _FOR_THE_CLIENT.search(fold(text)) or not find_hits(text, [center], where):
+                continue
+            place = where[:1].upper() + where[1:]
+            line_text = f"{place} names {labels[cid]} as the client it was bought for."
+            if line_text not in why.get(cid, []):
+                why.setdefault(cid, []).append(line_text)
+            evidence.append(cid)
+    decided = [cid for cid in targets if cid in setting or cid in evidence]
+    if decided:
+        lines = tuple(dict.fromkeys(w for cid in decided for w in why.get(cid, [])))
+        return RechargeDecision(recharge=tuple(decided), method="evidence" if evidence else "setting", why=lines)
+    key = match_key(facts.counterparty_key) or ""
+    likely: list[str] = []
+    notes: list[str] = []
+    settled_own: set[str] = set()
+    for cid in targets:
+        yes, no = (history or {}).get((key, cid), (0, 0))
+        if yes >= HISTORY_MIN_COUNT and no == 0:
+            likely.append(cid)
+            notes.append(f"The last {yes} {who} costs on {labels[cid]} were all paid back by them.")
+        elif no >= HISTORY_MIN_COUNT and yes == 0:
+            settled_own.add(cid)
+    if likely:
+        return RechargeDecision(recharge=tuple(likely), method="history", why=tuple(notes))
+    before = set(recharging)
+    unsure = [cid for cid in targets if cid in before and cid not in settled_own]
+    return RechargeDecision(ask=unsure[0] if unsure else None)
+
+
+def recharge_rule(question: Question, recharge: bool, *, answered_by: str,
+                  answered_at: datetime) -> RuleProposal | None:
+    """'☑ Always recharge IKEA paid with card •••• 4817 to the client it is for' (checked by default, §38)."""
+    where = _where(question)
+    if where is None:
+        return None
+    match, subject_text = where
+    label = (f"Always recharge {subject_text} to the client it is for" if recharge else
+             f"Always keep {subject_text} as your own cost")
+    rule = Rule(author=RuleAuthor.OWNER, author_id=answered_by, scope=RuleScope.TENANT, tenant_id=question.tenant_id,
+                match=match, outcome=RuleOutcome(recharge=recharge), created_at=answered_at, label=label)
+    return RuleProposal(label=label, checked=True, rule=rule)

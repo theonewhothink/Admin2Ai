@@ -1,11 +1,24 @@
 """Cost centers as the owner sees them: each job, property, vehicle ... with its costs, income and proof.
 
 Read-only views over the engine's records, used by the service
-(``GET /api/companies/{id}/cost-centers``, ``GET /api/cost-centers/{id}``)
-and by the chat ("how much did we spend on Job Rua das Flores in
-September?"). Money comes only from payments the engine has decided with a
-reason; every amount links to its evidence (§39, §54). A cost center only ever
-shows its own company's payments and documents.
+(``GET /api/companies/{id}/cost-centers``, ``GET /api/cost-centers/{id}``,
+``GET /api/cost-centers/{id}/statement``) and by the chat ("how much did we
+spend on Job Rua das Flores in September?"). Money comes only from payments
+the engine has decided with a reason; every amount links to its evidence
+(§39, §54). A cost center only ever shows its own company's payments and
+documents.
+
+A **statement** covers one period: the money received for the cost center
+(rent and anything else), the costs put on it with their proof, the
+management fee when one is set on it (a percent of the money received, a
+fixed amount a month, or both) and what is left. For a property, apartment or
+house it is the **owner statement**: what is due to its owner. A statement
+with anything still open (a cost waiting for its invoice, an invoice not
+paid yet, a payment put on it by history only, a payment waiting for the
+owner to say where it goes) says so and is not final (§3).
+
+Costs a client pays back (``backoffice.recharges``) are shown with what came
+back for them.
 
 Words are the business's own ("Job", "Property", "Vehicle"); no accounting
 jargon (§36).
@@ -13,17 +26,18 @@ jargon (§36).
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import TYPE_CHECKING, Any
 
 from backoffice.closure import Month
 from backoffice.domain.cost_centers import DEFAULT_KIND, CostCenter
 from backoffice.domain.lifecycle import Stage
 from backoffice.domain.models import CostAllocation
-from backoffice.learning import day_month, display_name, format_money
+from backoffice.learning import day_month, display_name, fold, format_money
 from backoffice.learning.cost_centers import noun_for, plural
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -100,8 +114,13 @@ class CostCenterViews:
         return max(dict.fromkeys(kinds), key=lambda k: kinds.count(k))
 
     def card(self, center: CostCenter) -> dict[str, Any]:
+        fee = None
+        if center.fee_percent is not None or center.fee_monthly is not None:
+            fee = {"percent": _num(center.fee_percent), "monthly": _num(center.fee_monthly)}
         return {"id": center.id, "companyId": center.company_id, "name": center.name, "kind": center.kind,
-                "label": center.label, "active": center.active, "identifiers": center.identifiers.as_dict()}
+                "label": center.label, "active": center.active, "identifiers": center.identifiers.as_dict(),
+                "recharge": center.recharge, "owner": center.owner_name, "managementFee": fee,
+                "isProperty": center.is_property}
 
     # ----------------------------------------------------------------- periods
 
@@ -130,8 +149,8 @@ class CostCenterViews:
     # ----------------------------------------------------------------- money
 
     def _why(self, allocation: CostAllocation) -> list[str]:
-        lines = list(allocation.why)
-        if allocation.quality.value != "verified":
+        lines = [*allocation.why, *(w for w in allocation.recharge_why if w not in allocation.why)]
+        if allocation.quality.value != "verified" or allocation.recharge_method == "history":
             lines.append("Likely, not proven. Tell me if it is wrong.")
         return lines
 
@@ -170,6 +189,7 @@ class CostCenterViews:
                 "direction": "in" if incoming else "out", "amount": _num(share), "total": _num(abs(rec.tx.amount)),
                 "currency": rec.tx.currency, "split": allocation.is_split, "status": "closed" if closed else "open",
                 "likely": allocation.quality.value != "verified", "why": self._why(allocation), "evidence": evidence,
+                "toRecharge": bool(allocation.recharge_for(center.id)),
             })
             out.evidence += evidence
             if not closed:
@@ -270,7 +290,146 @@ class CostCenterViews:
         return {**self.card(center), "companyName": self.repo.company_name(center.company_id),
                 "period": period.as_dict(), "currency": "EUR", "spent": _num(t.spent), "received": _num(t.received),
                 "payments": t.payments, "documents": t.documents, "openItems": t.open_items, "evidence": t.evidence,
-                "summary": self.summary_line(center, t, period)}
+                "summary": self.summary_line(center, t, period), "recharged": self.recharge(center, period)}
+
+    # ----------------------------------------------------------------- costs the client pays back
+
+    def recharge(self, center: CostCenter, period: Period = ALL_TIME) -> dict[str, Any] | None:
+        """What was bought for this client to pay back, what they paid back, and money held for them."""
+        from backoffice.recharges import RechargeBook
+
+        client = RechargeBook(self.repo).for_center(center.id)
+        if client is None:
+            return None
+        found = client.summary(period.start, period.end)
+        when = f" {period.phrase}" if period.phrase else ""
+        if client.client_money and not found.received and not found.bought:
+            text = f"Nothing received from or paid for {center.label}{when}. Their money is never your revenue."
+        elif client.client_money:
+            text = (f"{format_money(found.received)} received from {center.label}{when} is client money, not "
+                    f"revenue. {format_money(found.bought)} was paid out for them.")
+            if client.held > 0:
+                text += f" {format_money(client.held)} of their money is still held for them."
+        elif not found.bought:
+            text = f"Nothing bought for {center.label} to recharge{when}."
+        else:
+            text = f"{format_money(found.bought)} bought for {center.label}{when}, to recharge to them."
+            if found.paid_back >= found.bought:
+                text += " All of it is paid back."
+            elif found.paid_back:
+                text += (f" {format_money(found.paid_back)} is already paid back; "
+                         f"{format_money(found.outstanding)} is still to come.")
+            else:
+                text += " Nothing is paid back yet."
+        svc = self.svc
+        return {
+            "clientMoney": client.client_money, "toRecharge": _num(found.bought), "paidBack": _num(found.paid_back),
+            "outstanding": _num(found.outstanding), "received": _num(found.received), "held": _num(client.held),
+            "costs": [{"id": rec.id, "date": rec.tx.booked_on.isoformat(),
+                       "merchant": svc.orchestrator.merchant_name(rec.tx), "amount": _num(part),
+                       "paidBack": _num(back), "evidence": [svc._tx_evidence(rec)]} for rec, part, back in found.costs],
+            "receipts": [{"id": rec.id, "date": rec.tx.booked_on.isoformat(),
+                          "merchant": svc.orchestrator.merchant_name(rec.tx), "amount": _num(part),
+                          "evidence": [svc._tx_evidence(rec)]} for rec, part in found.receipts],
+            "text": text,
+        }
+
+    # ----------------------------------------------------------------- the owner statement
+
+    def statement(self, center: CostCenter, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Money received, costs with their proof, the management fee and what is left, for one period.
+
+        The period is ``month=YYYY-MM`` or ``from``/``to``; without either, the month being closed.
+        """
+        b = dict(body or {})
+        if not any(b.get(k) for k in ("month", "from", "to")):
+            b["month"] = str(self.svc._current_month())
+        period = self.period(b)
+        t = self.totals(center, period)
+        svc = self.svc
+        received = [p for p in t.payments if p["direction"] == "in"]
+        costs = [p for p in t.payments if p["direction"] == "out"]
+        money_in = []
+        for p in received:
+            rec = self.repo.transactions[p["id"]]
+            words = f"{rec.tx.counterparty} {rec.tx.description} {rec.tx.reference or ''}"
+            kind = "rent" if _RENT.search(fold(words)) else "other"
+            money_in.append({**p, "kind": kind, "label": "Rent" if kind == "rent" else "Money received"})
+        fee = self._fee(center, period, t.received)
+        net = t.received - t.spent - (fee[0] if fee else _ZERO)
+        open_items = list(t.open_items)
+        for p in t.payments:
+            if p["likely"] and p["status"] == "closed":
+                when = day_month(date.fromisoformat(p["date"]), self.today)
+                open_items.append({"id": p["id"], "evidence": p["evidence"][:1],
+                                   "text": f"The {p['merchant']} payment on {when} is on it by its history only, "
+                                           "not proven."})
+        waiting = [n for n in self.repo.open_needs() if n.kind in ("cost_center", "recharge")
+                   and n.company_id == center.company_id and n.subject_type == "transaction"
+                   and period.contains(self.repo.transactions[n.subject_id].tx.booked_on)]
+        for n in waiting:
+            rec = self.repo.transactions[n.subject_id]
+            who = svc.orchestrator.merchant_name(rec.tx)
+            noun = self.kind_for(center.company_id).lower()
+            ask = (f"which {noun} it is for" if n.kind == "cost_center" else "whether the client pays it back")
+            open_items.append({"id": n.id, "evidence": [svc._tx_evidence(rec)],
+                               "text": f"The {who} payment of {format_money(abs(rec.tx.amount), rec.tx.currency)} "
+                                       f"waits for you to say {ask}."})
+        final = not open_items
+        owner = center.owner_name or ("the owner" if center.is_property else "")
+        title = (f"Owner statement · {center.label}" if center.is_property else f"Statement · {center.label}")
+        title += f" · {period.label}" if period.start or period.end else ""
+        when = f" {period.phrase}" if period.phrase else ""
+        parts = [f"{center.label}{when}: {format_money(t.received)} received, {format_money(t.spent)} in costs"]
+        if fee:
+            parts[0] += f", {format_money(fee[0])} management fee"
+        parts[0] += "."
+        if center.is_property:
+            who = owner[:1].upper() + owner[1:]
+            parts.append(f"{who} is due {format_money(net)}." if net >= 0 else
+                         f"The costs are more than the money received: {owner} owes {format_money(-net)}.")
+        else:
+            parts.append(f"What is left: {format_money(net)}.")
+        parts.append("Final: every amount is proven." if final else
+                     f"Not final: {len(open_items)} thing{'s are' if len(open_items) != 1 else ' is'} still open.")
+        evidence = list(t.evidence)
+        return {
+            "costCenter": self.card(center), "companyName": self.repo.company_name(center.company_id),
+            "title": title, "owner": center.owner_name, "ownerStatement": center.is_property,
+            "period": period.as_dict(), "currency": "EUR",
+            "moneyIn": money_in, "received": _num(t.received),
+            "costs": costs, "spent": _num(t.spent),
+            "managementFee": ({"amount": _num(fee[0]), "label": fee[1], "percent": _num(center.fee_percent),
+                               "monthly": _num(center.fee_monthly)} if fee else None),
+            "net": _num(net), "netDueToOwner": _num(net) if center.is_property else None,
+            "documents": t.documents, "openItems": open_items, "final": final,
+            "status": "final" if final else "not final", "evidence": evidence, "summary": " ".join(parts),
+        }
+
+    def _fee(self, center: CostCenter, period: Period, received: Decimal) -> tuple[Decimal, str] | None:
+        """(the management fee for the period, how it was worked out) when one is set on the cost center."""
+        if center.fee_percent is None and center.fee_monthly is None:
+            return None
+        amount = _ZERO
+        words = []
+        if center.fee_percent is not None:
+            part = (received * center.fee_percent / Decimal(100)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            amount += part
+            words.append(f"{_pct(center.fee_percent)} of {format_money(received)} received")
+        if center.fee_monthly is not None:
+            months = self._months(center, period)
+            part = center.fee_monthly * months
+            amount += part
+            words.append(f"{format_money(center.fee_monthly)} a month for {months} month{'s' if months != 1 else ''}")
+        return amount, "Management fee: " + " and ".join(words)
+
+    def _months(self, center: CostCenter, period: Period) -> int:
+        start, end = period.start, period.end
+        if start is None or end is None:
+            days = [rec.tx.booked_on for rec, _ in self.shares(center)]
+            start = start or (min(days) if days else self.today)
+            end = end or self.today
+        return max(0, (end.year - start.year) * 12 + end.month - start.month + 1)
 
     def summary_line(self, center: CostCenter, t: Totals, period: Period) -> str:
         when = f" {period.phrase}" if period.phrase else ""
@@ -283,3 +442,15 @@ class CostCenterViews:
         parts.append(f"{count} payment{'s' if count != 1 else ''}")
         tail = f" {len(t.open_items)} still open." if t.open_items else ""
         return f"{center.label}{when}: {', '.join(parts)}.{tail}"
+
+
+# Money received for a property that is its rent (or a stay's price), by the bank line's words (folded text).
+_RENT = re.compile(r"(?<![a-z])(?:renda|rendas|rent|rental|aluguer|arrendamento|alojamento|booking|airbnb|"
+                   r"estadia|reserva|hospede|guest|stay)(?![a-z])")
+
+
+def _pct(value: Decimal | None) -> str:
+    if value is None:
+        return ""
+    text = f"{value.normalize():f}" if value == value.to_integral_value() else f"{value:f}".rstrip("0").rstrip(".")
+    return f"{text}%"

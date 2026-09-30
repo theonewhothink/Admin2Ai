@@ -12,11 +12,13 @@ Rules are ranked separately for each field they decide, by this key, best first:
 
 1. **Authority for the field.** Who owns the answer to this kind of question:
 
-   * ``ENTITY`` (which company / personal) and ``COST_CENTER`` (which job,
-     property, vehicle ...; general costs; or a learned split): the **owner**
-     outranks the accountant. Only the owner knows which company, and which
-     job, actually bought something, so an owner answer on this business beats
-     an accountant rule, even a global one covering all their clients.
+   * ``ENTITY`` (which company / personal), ``COST_CENTER`` (which job,
+     property, vehicle ...; general costs; or a learned split) and
+     ``RECHARGE`` (the client pays it back, or it is the business's own cost):
+     the **owner** outranks the accountant. Only the owner knows which company,
+     and which job, actually bought something, so an owner answer on this
+     business beats an accountant rule, even a global one covering all their
+     clients.
    * ``CATEGORY``, ``TAX_TREATMENT``, ``EXPECTATION``: the **accountant**
      outranks the owner. These are professional bookkeeping and tax judgements
      (§25 lists tax interpretation changes as owner-approval events; the
@@ -120,12 +122,16 @@ class RuleField(str, Enum):
     # Which job, property, vehicle ... (cost center id), GENERAL, or a learned split
     # ((cost center id, percent), ...) adding up to 100.
     COST_CENTER = "cost_center"
+    # Whether a cost on a client's cost center is recharged to that client (True) or the business's own (False).
+    RECHARGE = "recharge"
 
 
 AUTHORITY: dict[RuleField, tuple[RuleAuthor, ...]] = {
     RuleField.ENTITY: (RuleAuthor.OWNER, RuleAuthor.ACCOUNTANT),
     # Only the owner knows which job a purchase was for, like which company bought it.
     RuleField.COST_CENTER: (RuleAuthor.OWNER, RuleAuthor.ACCOUNTANT),
+    # ... and whether the client pays it back.
+    RuleField.RECHARGE: (RuleAuthor.OWNER, RuleAuthor.ACCOUNTANT),
     RuleField.CATEGORY: (RuleAuthor.ACCOUNTANT, RuleAuthor.OWNER),
     RuleField.TAX_TREATMENT: (RuleAuthor.ACCOUNTANT, RuleAuthor.OWNER),
     RuleField.EXPECTATION: (RuleAuthor.ACCOUNTANT, RuleAuthor.OWNER),
@@ -268,6 +274,7 @@ class RuleOutcome(BaseModel):
     expectation: Expectation | None = None
     cost_center_id: str | None = None  # a cost center id, or GENERAL
     cost_center_split: tuple[tuple[str, Decimal], ...] = ()  # learned split: (cost center id, percent)
+    recharge: bool | None = None  # the client pays it back (True), or it is the business's own cost (False)
 
     @field_validator("cost_center_split", mode="before")
     @classmethod
@@ -308,6 +315,8 @@ class RuleOutcome(BaseModel):
             decided.add(RuleField.EXPECTATION)
         if self.cost_center_id or self.cost_center_split:
             decided.add(RuleField.COST_CENTER)
+        if self.recharge is not None:
+            decided.add(RuleField.RECHARGE)
         return frozenset(decided)
 
     def value(self, field: RuleField) -> Any:
@@ -319,6 +328,8 @@ class RuleOutcome(BaseModel):
             return self.tax_treatment
         if field is RuleField.COST_CENTER:
             return self.cost_center_split or self.cost_center_id
+        if field is RuleField.RECHARGE:
+            return self.recharge
         return self.expectation
 
     def without(self, fields: Iterable[RuleField]) -> RuleOutcome | None:
@@ -332,8 +343,9 @@ class RuleOutcome(BaseModel):
             "expectation": None if RuleField.EXPECTATION in drop else self.expectation,
             "cost_center_id": None if RuleField.COST_CENTER in drop else self.cost_center_id,
             "cost_center_split": () if RuleField.COST_CENTER in drop else self.cost_center_split,
+            "recharge": None if RuleField.RECHARGE in drop else self.recharge,
         }
-        if not any(v for v in data.values()):
+        if not any(v for k, v in data.items() if k != "recharge") and data["recharge"] is None:
             return None
         return RuleOutcome(**data)
 
@@ -465,6 +477,12 @@ class RuleDecision(BaseModel):
     def cost_center(self) -> str | tuple[tuple[str, Decimal], ...] | None:
         """A cost center id, GENERAL, or a learned split ((cost center id, percent), ...)."""
         decision = self.decisions.get(RuleField.COST_CENTER)
+        return decision.value if decision else None
+
+    @property
+    def recharge(self) -> bool | None:
+        """True: the client pays it back; False: the business's own cost; None: no rule says."""
+        decision = self.decisions.get(RuleField.RECHARGE)
         return decision.value if decision else None
 
 

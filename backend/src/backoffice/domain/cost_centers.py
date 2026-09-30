@@ -15,6 +15,11 @@ total to the cent, and to each VAT rate's net and VAT where the rates are
 known. Rounding leftovers go to the largest share. A split that does not add
 up is refused with a plain message (:class:`SplitError`), never stored.
 
+A client's cost center can say its costs are the client's to pay back
+(``recharge``: a travel agency's trip, a law firm's matter); a property's can
+name its owner and a management fee (a percent of the money received and/or a
+fixed amount a month) for the owner statement.
+
 Pure Python, no I/O (runs in the browser build too).
 """
 
@@ -32,6 +37,7 @@ from .models import AllocationShare, DocumentLine, VatPart
 
 __all__ = [
     "DEFAULT_KIND",
+    "PROPERTY_KINDS",
     "CostCenter",
     "CostCenterIdentifiers",
     "SplitError",
@@ -152,6 +158,10 @@ class CostCenterIdentifiers(BaseModel):
 API_NAMES = {"tax_ids": "taxIds"}
 
 
+PROPERTY_KINDS = frozenset({"property", "apartment", "flat", "unit", "house", "building", "villa", "room",
+                            "studio", "imovel", "apartamento", "fracao", "moradia", "predio", "casa"})
+
+
 class CostCenter(BaseModel):
     """One job, property, vehicle, outlet, event, course or client of one company."""
 
@@ -164,6 +174,46 @@ class CostCenter(BaseModel):
     kind: str = DEFAULT_KIND  # the business's own word, shown to the owner
     identifiers: CostCenterIdentifiers = CostCenterIdentifiers()
     active: bool = True
+    # Costs on it are its client's, paid back by them, and money from them for it is client money, not
+    # revenue (a travel agency's trip, a law firm's disbursements, media bought for an agency's client).
+    recharge: bool = False
+    owner_name: str | None = None  # a property's owner, for the owner statement
+    fee_percent: Decimal | None = None  # management fee: this percent of the money received for it
+    fee_monthly: Decimal | None = None  # management fee: this fixed amount for each month
+
+    @field_validator("owner_name")
+    @classmethod
+    def _owner(cls, value: str | None) -> str | None:
+        text = " ".join(str(value).split()) if value is not None else ""
+        if len(text) > _MAX_TEXT:
+            raise ValueError("that owner's name is too long")
+        return text or None
+
+    @field_validator("fee_percent")
+    @classmethod
+    def _percent(cls, value: Decimal | None) -> Decimal | None:
+        if value is None:
+            return None
+        if isinstance(value, float) or not value.is_finite() or value <= 0 or value > HUNDRED or \
+                value != value.quantize(CENT):
+            raise ValueError("a fee is more than 0% and at most 100%, in hundredths")
+        return value
+
+    @field_validator("fee_monthly")
+    @classmethod
+    def _monthly(cls, value: Decimal | None) -> Decimal | None:
+        if value is None:
+            return None
+        if isinstance(value, float) or not value.is_finite() or value < 0 or value != value.quantize(CENT):
+            raise ValueError("a monthly fee is an amount in whole cents")
+        return value
+
+    @property
+    def is_property(self) -> bool:
+        """A property, apartment, house ... (its owner gets a statement)."""
+        from backoffice.learning.keys import fold
+
+        return fold(self.kind) in PROPERTY_KINDS
 
     @field_validator("name")
     @classmethod

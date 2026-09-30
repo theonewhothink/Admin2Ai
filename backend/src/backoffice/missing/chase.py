@@ -52,6 +52,7 @@ __all__ = [
     "ReminderStep",
     "ReplyMatch",
     "SentMessage",
+    "StatementItem",
     "activity_line",
     "choose_language",
     "clean_invoice_number",
@@ -59,6 +60,7 @@ __all__ = [
     "compose_recurring_request",
     "compose_reminder",
     "compose_request",
+    "compose_statement_request",
     "day_month_pt",
     "format_money_pt",
     "match_reply",
@@ -380,6 +382,110 @@ def compose_correction_request(facts: ChaseFacts, *, token: str, today: date,
         token=token,
         message_id=_message_id(token, 0, today, message_id_domain),
     )
+
+
+@dataclass(frozen=True)
+class StatementItem:
+    """One document named on a supplier's account statement, as a request may mention it."""
+
+    kind: str  # "invoice" | "credit_note" | "debit_note"
+    number: str | None
+    on: date | None
+    amount: Decimal  # absolute, as the statement shows it
+    ours: Decimal | None = None  # a correction: the amount on the document the business received
+
+    def __post_init__(self) -> None:
+        if isinstance(self.amount, float) or isinstance(self.ours, float):
+            raise TypeError("money must be Decimal, never float")
+        if self.number is not None and clean_invoice_number(self.number) != self.number:
+            raise ValueError("document number must be one clean line (see clean_invoice_number)")
+
+
+_STATEMENT_WORDS = {
+    Language.EN: {"invoice": "Invoice", "credit_note": "Credit note", "debit_note": "Debit note"},
+    Language.PT: {"invoice": "Fatura", "credit_note": "Nota de crédito", "debit_note": "Nota de débito"},
+}
+
+
+def _statement_line(item: StatementItem, language: Language, currency: str, today: date) -> str:
+    word = _STATEMENT_WORDS[language].get(item.kind, _STATEMENT_WORDS[language]["invoice"])
+    number = f" {item.number}" if item.number else ""
+    if language is Language.PT:
+        when = f" de {day_month_pt(item.on, today)}" if item.on else ""
+        money = format_money_pt(item.amount, currency)
+        if item.ours is not None:
+            return (f"- {word}{number}{when}: no extrato {money}, na {word.lower()} que recebemos "
+                    f"{format_money_pt(item.ours, currency)}")
+        return f"- {word}{number}{when}, {money}"
+    when = f" of {day_month(item.on, today)}" if item.on else ""
+    money = format_money(item.amount, currency)
+    if item.ours is not None:
+        return (f"- {word}{number}{when}: {money} on the statement, {format_money(item.ours, currency)} on the "
+                f"{word.lower()} we received")
+    return f"- {word}{number}{when}, {money}"
+
+
+def compose_statement_request(
+    *,
+    supplier_name: str,
+    supplier_email: str,
+    company_name: str,
+    company_tax_id: str,
+    items: Sequence[StatementItem],
+    token: str,
+    today: date,
+    message_id_domain: str,
+    currency: str = "EUR",
+    company_country: str = "PT",
+    language: Language = Language.EN,
+    corrections: bool = False,
+) -> ChaseMessage:
+    """Ask a supplier for the documents its account statement lists that the business never received (§22),
+    or (``corrections``) for corrected documents where the statement and the document disagree.
+
+    Built from the statement's own facts only (numbers, dates, amounts) and our company's details.
+    """
+    if not items:
+        raise ValueError("a statement request names at least one document")
+    if not _PLAIN_ADDRESS.fullmatch(supplier_email):
+        raise ValueError("supplier email must be one plain address")
+    details = _our_details(ChaseFacts(
+        supplier_name=supplier_name, supplier_email=supplier_email, amount=max(i.amount for i in items) or 1,
+        currency=currency, paid_on=today, company_name=company_name.strip(), company_tax_id=company_tax_id,
+        company_country=company_country, language=language))
+    listed = "\n".join(_statement_line(i, language, currency, today) for i in items)
+    one = len(items) == 1
+    if language is Language.PT:
+        if corrections:
+            subject = "Extrato de conta corrente: documentos com valores diferentes"
+            corrected = "o documento corrigido" if one else "os documentos corrigidos"
+            ask = ("O vosso extrato de conta corrente mostra valores diferentes dos documentos que recebemos:\n"
+                   f"{listed}\n\nPoderiam, por favor, enviar-nos {corrected}, ou uma nota de crédito ou de débito "
+                   "pela diferença?")
+        else:
+            subject = "Extrato de conta corrente: documentos em falta"
+            these = "este documento, que" if one else "estes documentos, que"
+            ask = (f"O vosso extrato de conta corrente indica {these} não recebemos:\n{listed}\n\n"
+                   f"Poderiam, por favor, {'enviá-lo' if one else 'enviá-los'}?")
+        body = (f"Olá,\n\n{ask} Agradecemos desde já.\n\n{details}\n\n"
+                f"Com os melhores cumprimentos,\n{company_name.strip()}")
+    else:
+        if corrections:
+            subject = "Your account statement: amounts that differ"
+            ask = ("Your account statement shows amounts that differ from the documents we received:\n"
+                   f"{listed}\n\nCould you please send us {'a corrected document' if one else 'corrected documents'}, "
+                   "or a credit or debit note for the difference?")
+        else:
+            subject = "Documents on your account statement"
+            these = ("this document, but we have not received it" if one else
+                     "these documents, but we have not received them")
+            ask = (f"Your account statement lists {these}:\n{listed}\n\n"
+                   f"Could you please send {'it' if one else 'them'}?")
+        body = f"Hello,\n\n{ask} Thank you.\n\n{details}\n\nKind regards,\n{company_name.strip()}"
+    subject = f"{subject} (Ref. {token})"
+    _guard(subject, body)
+    return ChaseMessage(to=supplier_email, subject=subject, body=body, language=language, token=token,
+                        message_id=_message_id(token, 0, today, message_id_domain))
 
 
 def compose_request(facts: ChaseFacts, *, token: str, today: date, message_id_domain: str) -> ChaseMessage:

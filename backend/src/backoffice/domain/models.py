@@ -268,6 +268,9 @@ class AllocationShare(BaseModel):
     parts: tuple[VatPart, ...] = ()  # the amount by VAT rate, when the rates are known
     percent: Decimal | None = None  # when the split was given in percent
     line_ids: tuple[str, ...] = ()  # invoice lines behind this share
+    # Bought for the client this cost center is, to recharge to them (a reimbursable cost, a disbursement,
+    # media bought for a client, a pass-through licence): recoverable from them, not the business's own cost.
+    recharge: bool = False
 
     @model_validator(mode="after")
     def _exact(self) -> AllocationShare:
@@ -298,6 +301,10 @@ class CostAllocation(BaseModel):
     why: tuple[str, ...] = ()
     rule_id: str | None = None
     evidence_ids: tuple[str, ...] = ()
+    # Why a share is (or is not) to recharge to the client: "owner" | "rule" | "setting" | "evidence" |
+    # "history" (likely, not proven); None when nothing was decided about it (the business's own cost).
+    recharge_method: str | None = None
+    recharge_why: tuple[str, ...] = ()  # the reasons for it, shown under "Why?" after ``why``
 
     @model_validator(mode="after")
     def _adds_up(self) -> CostAllocation:
@@ -325,6 +332,15 @@ class CostAllocation(BaseModel):
 
     def amount_for(self, cost_center_id: str) -> Decimal:
         return next((s.amount for s in self.shares if s.cost_center_id == cost_center_id), Decimal(0))
+
+    def recharge_for(self, cost_center_id: str) -> Decimal:
+        """The part of this amount on ``cost_center_id`` that its client pays back (0 when none)."""
+        return next((s.amount for s in self.shares if s.cost_center_id == cost_center_id and s.recharge), Decimal(0))
+
+    @property
+    def recharged(self) -> Decimal:
+        """The part of this amount to recharge to clients (not the business's own cost)."""
+        return sum((s.amount for s in self.shares if s.recharge), Decimal(0))
 
 
 class DocumentType(str, Enum):

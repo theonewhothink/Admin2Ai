@@ -183,6 +183,8 @@ from backoffice.learning import (
     format_money,
     learn_series,
     next_expected,
+    join_and,
+    match_key,
     same_tax_id,
     suggest_rule_from_answer,
 )
@@ -193,16 +195,20 @@ from backoffice.learning.cost_centers import (
     CostCenterFacts,
     cost_center_question,
     decide_cost_center,
+    decide_recharge,
     history_counts,
     noun_for,
     percents_of,
+    recharge_rule,
     suggest_cost_center_rule,
 )
+from backoffice.learning.plain import count_phrase
 from backoffice.mailer import is_simulated
 from backoffice.missing import (
     ChaseFacts,
     ChaseMessage,
     RecurringChaseFacts,
+    StatementItem,
     activity_line,
     choose_language,
     clean_invoice_number,
@@ -210,6 +216,7 @@ from backoffice.missing import (
     compose_recurring_request,
     compose_request,
     recurring_activity_line,
+    compose_statement_request,
     thread_token,
 )
 from backoffice.policy import ActionContext, ActionKind, Approval, Decision, TenantPolicy, authorize
@@ -239,6 +246,18 @@ from backoffice.settlements import (
     match_payouts,
     parse_settlement_reports,
     provider_label,
+)
+from backoffice.supplier_statements import CREDIT_NOTE as STATEMENT_CREDIT_NOTE
+from backoffice.supplier_statements import DEBIT_NOTE as STATEMENT_DEBIT_NOTE
+from backoffice.supplier_statements import INVOICE as STATEMENT_INVOICE
+from backoffice.supplier_statements import (
+    OurDocument,
+    OurPayment,
+    RowCheck,
+    StatementCheck,
+    SupplierStatement,
+    check_statement,
+    read_statement,
 )
 from backoffice.verification import DocumentAssessment, assess_document, check_sum, currency_mark, lineage
 from backoffice.verification._display import field_label, join, method_label, show_many
@@ -780,6 +799,31 @@ class OutgoingMessage:
 
 
 @dataclass
+class StatementRecord:
+    """A supplier's account statement read line by line, and what checking it against the records found.
+
+    ``check`` is worked out again on every run, so a document that arrives later matches its line. The
+    request to the supplier for the documents it lists that the business never received is written once;
+    like every email the back office writes, it counts as asked only once a transport accepted it.
+    """
+
+    document_id: str
+    statement: SupplierStatement
+    check: StatementCheck | None = None
+    supplier_id: str | None = None
+    company_id: str | None = None
+    request_id: str = ""  # outbox id of the request for the documents it lists that the business doesn't have
+    requested: tuple[str, ...] = ()  # the lines that request asked for
+    request_note: str = ""  # why no request was written, in plain words
+    correction_id: str = ""  # outbox id of the request for corrected documents (after the owner's answer)
+    needs_id: str | None = None  # the one question about amounts that differ
+    answer: str | None = None  # "document" | "statement": the owner's answer about those amounts
+    answered: tuple[str, ...] = ()  # the lines that answer covers
+    detected: list[str] = field(default_factory=list)  # lines recorded as missing documents
+    retrieved: list[str] = field(default_factory=list)  # ... that arrived since
+
+
+@dataclass
 class AccountantQuestion:
     id: str
     company_id: str
@@ -887,6 +931,7 @@ class Repository:
         # A supplier's usual invoice that is overdue (§23), keyed by its own id; tracked as an item too.
         self.expected_invoices: dict[str, ExpectedInvoiceRecord] = {}
         self.settlements: dict[str, SettlementRecord] = {}  # payout reports, keyed by their document id
+        self.statements: dict[str, StatementRecord] = {}  # suppliers' account statements, by their document id
         self.chases: dict[str, ChaseRecord] = {}
         # Emails the back office wrote itself, in the order written; each is "sent" only once a transport took it.
         self.outbox: dict[str, OutgoingMessage] = {}
@@ -1101,6 +1146,7 @@ class _Extracted:
     referenced_number: str | None = None  # the invoice a credit note says it corrects
     paid_in_cash: bool = False
     text: str = ""
+    statement: SupplierStatement | None = None  # a supplier's account statement, read line by line
 
 
 class DiscoveryAgent(_Agent):
@@ -1361,19 +1407,35 @@ class DocumentAgent(_Agent):
                 if part.reading_text.strip():
                     texts.append(part.reading_text)
                     reference = reference or _referenced_invoice(part.reading_text)
+        joined = "\n".join(texts)
+        statement: SupplierStatement | None = None
         if not observations:
-            return None
+            # A supplier's account statement (a CSV export, or a text that names itself one) may carry no
+            # invoice fields at all: it is still kept, as a statement, and checked line by line.
+            statement = read_statement(joined) if joined.strip() and "qr" not in kinds else None
+            if statement is None:
+                return None
+            supplier_name = _statement_issuer(joined)
         number = _first_value(observations, CriticalField.INVOICE_NUMBER)
         doc_type = next((kinds[k] for k in ("qr", "ubl", "text", "reading", "reading_text") if k in kinds),
                         DocumentType.RECEIPT if receipt_fallback else DocumentType.INVOICE)
-        joined = "\n".join(texts)
+        if statement is None and "qr" not in kinds and "ubl" not in kinds and joined.strip():
+            if doc_type is DocumentType.SUPPLIER_STATEMENT:
+                statement = read_statement(joined, titled=True)
+            else:
+                statement = read_statement(joined, csv_only=True)  # a statement exported as CSV names no kind
+        if statement is not None:
+            doc_type = DocumentType.SUPPLIER_STATEMENT
+            number = None  # the numbers and amounts on a statement are its lines' documents, never its own
+            for name in _NOT_A_STATEMENT_FIELD:
+                observations.pop(name, None)
         return _Extracted(
             observations=observations, doc_type=doc_type, supplier_name=supplier_name,
             evidence_ids=list(dict.fromkeys(p.evidence_id for p in parts)), qr=qr,
-            buyer_is_final_consumer=final_consumer, parsers=parsers,
+            buyer_is_final_consumer=final_consumer, parsers=[*parsers, *(["supplier_statement"] if statement else [])],
             invoice_number=str(number) if number is not None else None,
             issuer_tax_id=issuer, referenced_number=reference, paid_in_cash=_says_paid_in_cash(joined),
-            text=joined[:_TEXT_KEPT],
+            text=joined[:_TEXT_KEPT], statement=statement,
         )
 
 
@@ -1640,8 +1702,10 @@ class ReconciliationAgent(_Agent):
     def _attach_supporting(self) -> None:
         """Pro-formas, quotes, delivery notes... kept with the payment they relate to (never as its proof)."""
         repo = self.repo
+        # A statement read line by line is checked by the statement agent: its balance is not a purchase amount.
         docs = [d for d in repo.documents.values()
-                if d.supporting and not d.supports_tx_ids and not d.on_hold and d.document.gross_amount is not None]
+                if d.supporting and not d.supports_tx_ids and not d.on_hold and d.document.gross_amount is not None
+                and d.id not in repo.statements]
         txs = [r for r in repo.transactions.values()
                if r.decision is not None and r.decision.requires_document and not r.private and r.tx.amount != 0]
         if not docs or not txs:
@@ -2540,7 +2604,8 @@ class MissingEvidenceAgent(_Agent):
                      response={"allowed": decision.allowed_now, "reason": decision.reason_plain})
             if not decision.allowed_now:
                 continue
-            facts = ChaseFacts.build(rec.tx, supplier, company)
+            # A supplier's statement may name the invoice this payment is missing: the request then asks for it.
+            facts = ChaseFacts.build(rec.tx, supplier, company, invoice_number=self.o.statements.number_for(rec))
             message = compose_request(facts, token=thread_token(self.repo.tenant_id, rec.id), today=today,
                                       message_id_domain=MESSAGE_ID_DOMAIN)
             out = self.o.write_email("supplier_request", rec.id, company.id, message.to, message.subject, message.body,
@@ -2771,6 +2836,434 @@ class MissingEvidenceAgent(_Agent):
 def _arrived_on(record: DocumentRecord) -> date:
     """The day an invoice belongs to for its supplier's rhythm: its own date, else the day it reached us."""
     return record.document.issue_date or record.received_at.astimezone(TZ).date()
+
+
+# The business's own documents a supplier's statement lists, by the kind the statement gives them.
+_STATEMENT_KINDS: dict[DocumentType, str] = {
+    DocumentType.INVOICE: STATEMENT_INVOICE, DocumentType.INVOICE_RECEIPT: STATEMENT_INVOICE,
+    DocumentType.SIMPLIFIED_INVOICE: STATEMENT_INVOICE, DocumentType.CREDIT_NOTE: STATEMENT_CREDIT_NOTE,
+    DocumentType.DEBIT_NOTE: STATEMENT_DEBIT_NOTE,
+}
+
+
+def statement_line_key(line: Any) -> str:
+    """A statement line's lasting name: its kind and document number (else its position and amount)."""
+    if line.number:
+        return f"{line.kind}:{re.sub(r'[^0-9A-Za-z]+', '', line.number).upper()}"
+    return f"{line.kind}:row{line.row}:{line.amount}"
+
+
+class StatementAgent(_Agent):
+    """Suppliers' account statements (extrato de conta corrente), checked line by line (§20, §22, §28).
+
+    A statement is supporting evidence only: never booked, never a copy of an invoice, never proof of a
+    payment (§3). Each line is compared with the business's own documents and bank payments from that
+    supplier (backoffice.supplier_statements). Documents it lists that the business never received are
+    missing documents: the supplier is asked for them in one email per statement, when the owner allowed
+    supplier requests (a document already paid from the bank is asked for with that payment instead). An
+    amount that differs from the business's own document is one plain question, never a silent change.
+    The business's documents the statement does not list, and its closing balance against the invoices
+    not paid yet, are shown for the accountant.
+    """
+
+    name = "statement"
+
+    def register(self, record: DocumentRecord, statement: SupplierStatement) -> StatementRecord:
+        repo = self.repo
+        sr = StatementRecord(document_id=record.id, statement=statement)
+        repo.statements[record.id] = sr
+        if record.supplier_id is None and not record.sales:
+            supplier = self.supplier_of(record)
+            if supplier is not None:
+                record.supplier_id = supplier.id
+                record.document = record.document.model_copy(update={"supplier_name": supplier.name})
+        self.log("read_statement", subject_id=record.id, evidence_ids=record.evidence_ids,
+                 values={"lines": len(statement.lines), "opening": statement.opening, "closing": statement.closing,
+                         "layout": statement.layout},
+                 response={"adds_up": statement.adds_up, "problems": list(statement.problems)})
+        return sr
+
+    # ----------------------------------------------------------------- who and what
+
+    def supplier_of(self, record: DocumentRecord) -> Supplier | None:
+        """The supplier that sent it: its tax number, the sender's domain, else the one supplier it names."""
+        from backoffice.learning import fold
+
+        repo = self.repo
+        supplier = repo.suppliers.get(record.supplier_id or "") or repo.supplier_for_tax_id(
+            record.document.supplier_tax_id)
+        if supplier is None and record.sender and "@" in record.sender:
+            supplier = repo.supplier_for_domain(record.sender.rsplit("@", 1)[1])
+        if supplier is None:
+            text = fold(f"{record.document.supplier_name or ''}\n{record.text[:4000]}")
+            named = [s for s in sorted(repo.suppliers.values(), key=lambda s: s.id)
+                     if any(len(fold(n)) >= 3 and re.search(rf"(?<![a-z0-9]){re.escape(fold(n))}(?![a-z0-9])", text)
+                            for n in (s.name, *s.aliases))]
+            supplier = named[0] if len(named) == 1 else None
+        return supplier
+
+    def company_of(self, record: DocumentRecord, supplier: Supplier | None = None) -> str | None:
+        """Which of your companies it is for: the one it names, your only one, or the only one this
+        supplier's own documents and payments belong to."""
+        from backoffice.learning import fold
+
+        repo = self.repo
+        company = repo.item_company(repo.items[record.item_id])
+        if company is None and len(repo.companies) == 1:
+            company = next(iter(repo.companies))
+        if company is None:
+            text = fold(record.text[:4000])
+            named = {c.id for c in repo.companies.values()
+                     for n in (c.name, repo.legal_names.get(c.id) or c.name)
+                     if len(fold(n)) >= 4 and re.search(rf"(?<![a-z0-9]){re.escape(fold(n))}(?![a-z0-9])", text)}
+            company = named.pop() if len(named) == 1 else None
+        if company is None and supplier is not None:
+            docs = {repo.item_company(repo.items[d.item_id]) for d in repo.documents.values()
+                    if d.id != record.id and d.supplier_id == supplier.id and not d.supporting}
+            resolver = repo.resolver()
+            paid = {r.company_id for r in repo.transactions.values() if r.tx.entity_id and not r.private
+                    and (found := resolver.resolve_transaction(r.tx).supplier) is not None and found.id == supplier.id}
+            known = {c for c in docs | paid if c}
+            company = known.pop() if len(known) == 1 else None
+        return company
+
+    def ours(self, supplier: Supplier, company: str | None) -> tuple[list[OurDocument], list[OurPayment]]:
+        """The business's own documents from this supplier and its bank payments to it."""
+        repo = self.repo
+        docs: list[OurDocument] = []
+        for d in sorted(repo.documents.values(), key=lambda d: d.id):
+            doc = d.document
+            if d.supporting or d.sales or doc.doc_type not in _STATEMENT_KINDS or doc.gross_amount is None:
+                continue
+            if d.supplier_id != supplier.id and not (doc.supplier_tax_id and same_tax_id(doc.supplier_tax_id,
+                                                                                          supplier.tax_id)):
+                continue
+            owner = repo.item_company(repo.items[d.item_id])
+            if company is not None and owner is not None and owner != company:
+                continue
+            paid = (repo.items[d.item_id].is_done or bool(d.matched_tx_ids) or d.paid_in_cash
+                    or doc.doc_type is DocumentType.INVOICE_RECEIPT)
+            docs.append(OurDocument(id=d.id, kind=_STATEMENT_KINDS[doc.doc_type], number=doc.invoice_number,
+                                    amount=abs(doc.gross_amount), paid=paid, label=d.label,
+                                    on=doc.issue_date or d.received_at.astimezone(TZ).date(),
+                                    evidence_ids=tuple(d.evidence_ids)))
+        resolver = repo.resolver()
+        payments: list[OurPayment] = []
+        for r in sorted(repo.transactions.values(), key=lambda r: r.id):
+            if r.tx.amount >= 0 or r.private or (company is not None and r.company_id != company):
+                continue
+            found = resolver.resolve_transaction(r.tx).supplier
+            if found is None or found.id != supplier.id:
+                continue
+            payments.append(OurPayment(id=r.id, amount=abs(r.tx.amount), on=r.tx.booked_on, evidence_id=r.evidence_id,
+                                       document_ids=tuple(r.document_ids)))
+        return docs, payments
+
+    def _unmatched_payment(self, line: Any, supplier: Supplier, company: str | None) -> TxRecord | None:
+        """A bank payment to this supplier of this document's amount that is still without its document."""
+        resolver = self.repo.resolver()
+        for r in sorted(self.repo.transactions.values(), key=lambda r: (r.tx.booked_on, r.id)):
+            if r.tx.amount >= 0 or r.private or r.document_ids or abs(r.tx.amount) != line.amount:
+                continue
+            if company is not None and r.company_id != company:
+                continue
+            if line.on is not None and r.tx.booked_on < line.on - timedelta(days=3):
+                continue
+            found = resolver.resolve_transaction(r.tx).supplier
+            if found is not None and found.id == supplier.id:
+                return r
+        return None
+
+    def number_for(self, rec: TxRecord) -> str | None:
+        """The invoice number a supplier's statement gives the document this payment is missing, if exactly one."""
+        repo = self.repo
+        if not repo.statements:
+            return None
+        supplier = repo.resolver().resolve_transaction(rec.tx).supplier
+        if supplier is None:
+            return None
+        found: set[str] = set()
+        for sr in repo.statements.values():
+            if sr.check is None or sr.supplier_id != supplier.id or (sr.company_id and sr.company_id != rec.company_id):
+                continue
+            for row in sr.check.missing:
+                line = row.line
+                if line.kind == STATEMENT_INVOICE and line.number and line.amount == abs(rec.tx.amount) and (
+                        line.on is None or line.on <= rec.tx.booked_on + timedelta(days=3)):
+                    number = clean_invoice_number(line.number)
+                    if number:
+                        found.add(number)
+        return found.pop() if len(found) == 1 else None
+
+    # ----------------------------------------------------------------- the pass
+
+    def review(self, now: datetime) -> int:
+        """Check every statement against the records as they are now; ask for what is missing, once."""
+        repo = self.repo
+        changed = 0
+        for sr in sorted(repo.statements.values(), key=lambda s: s.document_id):
+            record = repo.documents.get(sr.document_id)
+            if record is None or record.sales:
+                continue
+            supplier = self.supplier_of(record)
+            company = self.company_of(record, supplier)
+            sr.supplier_id, sr.company_id = (supplier.id if supplier else None), company
+            if supplier is None:
+                continue  # nothing to compare it with: shown as such, nothing asked
+            docs, payments = self.ours(supplier, company)
+            check = check_statement(sr.statement, docs, payments, supplier=display_name(supplier.name))
+            if sr.check is None or sr.check.key() != check.key():
+                self.log("check_statement", subject_id=record.id,
+                         evidence_ids=[*record.evidence_ids, *dict.fromkeys(e for r in check.rows
+                                                                            for e in r.evidence_ids)],
+                         values={"matched": [r.line.row for r in check.matched],
+                                 "missing": [r.line.row for r in check.missing],
+                                 "differs": [r.line.row for r in check.differences],
+                                 "payments_not_found": [r.line.row for r in check.payments_not_found],
+                                 "not_on_statement": [d.id for d in check.not_on_statement],
+                                 "closing": check.closing, "our_open": check.our_open},
+                         response={"complete": check.complete})
+                changed += 1
+            sr.check = check
+            self._track_missing(sr, record, check, company, now)
+            self._request(sr, record, supplier, company, now)
+            self._ask_about_differences(sr, record, check, company, now)
+        return changed
+
+    def _track_missing(self, sr: StatementRecord, record: DocumentRecord, check: StatementCheck, company: str | None,
+                       now: datetime) -> None:
+        """Documents it lists that the business doesn't have are missing documents; so is their arrival later."""
+        if company is None:
+            return
+        repo = self.repo
+        for row in check.missing:
+            key = statement_line_key(row.line)
+            if key in sr.detected:
+                continue
+            sr.detected.append(key)
+            repo.closure_log.append(ClosureActivity(
+                kind=ClosureKind.MISSING_DOCUMENT_DETECTED, at=now, entity_id=company, subject_id=f"{record.id}:{key}",
+                period=Month.of(row.line.on or now.astimezone(TZ).date())))
+        found = {statement_line_key(r.line) for r in check.rows if r.line.is_document and r.status != "missing"}
+        for key in sr.detected:
+            if key in found and key not in sr.retrieved:
+                sr.retrieved.append(key)
+                row = next(r for r in check.rows if statement_line_key(r.line) == key)
+                repo.closure_log.append(ClosureActivity(
+                    kind=ClosureKind.MISSING_DOCUMENT_RETRIEVED, at=now, entity_id=company,
+                    subject_id=f"{record.id}:{key}", period=Month.of(row.line.on or now.astimezone(TZ).date())))
+
+    def _request(self, sr: StatementRecord, record: DocumentRecord, supplier: Supplier, company: str | None,
+                 now: datetime) -> None:
+        """One email asking the supplier for the documents its statement lists that never arrived (§22, §25)."""
+        repo = self.repo
+        if sr.request_id or sr.check is None:
+            return
+        rows = [r for r in sr.check.missing if self._unmatched_payment(r.line, supplier, company) is None]
+        if not rows:
+            sr.request_note = ""
+            return
+        who = display_name(supplier.name)
+        entity = repo.companies.get(company or "")
+        if entity is None:
+            sr.request_note = "I don't know which of your companies this statement is for, so I haven't asked yet."
+            return
+        if not supplier.contact_email:
+            sr.request_note = f"I don't have an email address for {who}, so please ask them yourself."
+            return
+        decision = authorize(ActionKind.SUPPLIER_INVOICE_REQUEST, repo.policy, ActionContext(
+            tenant_id=repo.tenant_id, entity_id=entity.id, subject_id=record.id))
+        if sr.request_note != decision.reason_plain:
+            self.log("authorize_statement_request", subject_id=record.id, evidence_ids=record.evidence_ids,
+                     response={"allowed": decision.allowed_now, "reason": decision.reason_plain})
+        if not decision.allowed_now:
+            sr.request_note = decision.reason_plain
+            return
+        today = now.astimezone(TZ).date()
+        try:
+            items = [StatementItem(kind=r.line.kind, number=clean_invoice_number(r.line.number), on=r.line.on,
+                                   amount=r.line.amount) for r in rows]
+            message = compose_statement_request(
+                supplier_name=who, supplier_email=supplier.contact_email, company_name=entity.name,
+                company_tax_id=entity.tax_id, company_country=entity.country, items=items,
+                token=thread_token(repo.tenant_id, record.id), today=today, message_id_domain=MESSAGE_ID_DOMAIN,
+                currency=sr.statement.currency, language=choose_language(supplier, supplier.contact_email))
+        except ValueError:
+            sr.request_note = f"I couldn't write to {who} about this, so please ask them yourself."
+            return
+        out = self.o.write_email("statement_request", record.id, entity.id, message.to, message.subject, message.body,
+                                 now, headers=(("Message-ID", message.message_id),))
+        sr.request_id, sr.request_note = out.id, ""
+        sr.requested = tuple(statement_line_key(r.line) for r in rows)
+        self.log("write_statement_request", subject_id=record.id, evidence_ids=record.evidence_ids,
+                 values={"to": message.to, "subject": message.subject, "outbox_id": out.id,
+                         "documents": [r.line.number or r.line.row for r in rows]})
+
+    def request_line(self, sr: StatementRecord) -> str:
+        """Where the request for the missing documents stands, in plain words ("" when nothing is missing)."""
+        record = self.repo.documents.get(sr.document_id)
+        who = display_name(record.document.supplier_name) if record is not None else "the supplier"
+        message = self.repo.outbox.get(sr.request_id) if sr.request_id else None
+        if message is not None:
+            them = "it" if len(sr.requested) == 1 else "them"
+            return (f"I asked {who} for {them}." if message.sent else
+                    f"I wrote to {who} asking for {them}. It is waiting to be sent.")
+        if sr.check is not None and sr.check.missing:
+            if sr.request_note and sr.request_note[:1].isupper() and sr.request_note.endswith("."):
+                return sr.request_note
+            if sr.request_note:
+                note = sr.request_note.rstrip(".")
+                return f"I haven't asked {who} for them: {note[:1].lower()}{note[1:]}."
+            if len(sr.check.missing) == 1:
+                return "It is already paid from your bank: I ask for it with that payment."
+            return "They are already paid from your bank: I ask for each one with its payment."
+        return ""
+
+    # ----------------------------------------------------------------- amounts that differ: one question
+
+    def _ask_about_differences(self, sr: StatementRecord, record: DocumentRecord, check: StatementCheck,
+                               company: str | None, now: datetime) -> None:
+        repo = self.repo
+        rows = [r for r in check.differences if statement_line_key(r.line) not in sr.answered]
+        asked = repo.needs.get(sr.needs_id or "")
+        if asked is not None and asked.status == "open":
+            if not rows:  # the documents agree now (a corrected document arrived): nothing to ask any more
+                asked.status, asked.resolution = "resolved", "statement_evidence"
+            return
+        if not rows or company is None:
+            return
+        who = display_name(record.document.supplier_name)
+        prompt, options, why = self._question(rows, who, check.currency)
+        needs_id = _unique_id(repo.needs, f"nd_{_slug(who.split()[0])}_statement")
+        repo.needs[needs_id] = NeedsYouRecord(
+            id=needs_id, kind="statement", subject_type="document", subject_id=record.id, item_id=record.item_id,
+            company_id=company, created_at=now, why=why, prompt=prompt, options=options)
+        sr.needs_id = needs_id
+        self.log("ask_owner", subject_id=record.id,
+                 evidence_ids=[*record.evidence_ids, *(e for r in rows for e in r.evidence_ids)],
+                 validations=list(why), response={"needs_you": needs_id})
+
+    @staticmethod
+    def _question(rows: Sequence[RowCheck], who: str, currency: str
+                  ) -> tuple[str, tuple[CheckOption, ...], tuple[str, ...]]:
+        def money(value: Decimal | None) -> str:
+            return format_money(value if value is not None else _ZERO, currency)
+
+        why = tuple(f"{r.line.word.capitalize()} {r.line.number}: {money(r.line.amount)} on the statement, "
+                    f"{money(r.our_amount)} on the {r.line.word} you have." for r in rows)
+        why += ("I never change an amount without you. If the statement is right, I will ask them for a "
+                "corrected document.",)
+        if len(rows) == 1:
+            r = rows[0]
+            prompt = (f"{who}'s statement shows {r.line.word} {r.line.number} as {money(r.line.amount)}, but the "
+                      f"{r.line.word} says {money(r.our_amount)}. Which is right?")
+            options = (CheckOption(id="document", label=f"The {r.line.word}: {money(r.our_amount)}"),
+                       CheckOption(id="statement", label=f"The statement: {money(r.line.amount)}"))
+        else:
+            prompt = f"{who}'s statement shows different amounts for {len(rows)} documents. Which are right?"
+            options = (CheckOption(id="document", label="The documents you have"),
+                       CheckOption(id="statement", label="The statement"))
+        return prompt, options, why
+
+    def answer(self, needs: NeedsYouRecord, option_id: str, answer_ev: str, now: datetime) -> AnswerOutcome:
+        """The owner said which amounts are right. The documents themselves are never changed."""
+        repo = self.repo
+        sr = next(s for s in repo.statements.values() if s.needs_id == needs.id)
+        record = repo.documents[sr.document_id]
+        check = sr.check
+        rows = [r for r in (check.differences if check else ()) if statement_line_key(r.line) not in sr.answered]
+        sr.answer = option_id
+        sr.answered = (*sr.answered, *(statement_line_key(r.line) for r in rows))
+        needs.status, needs.answer, needs.answered_at = "answered", option_id, now
+        who = display_name(record.document.supplier_name)
+        one = len(rows) <= 1
+        self.log("answer_statement", subject_id=record.id, evidence_ids=[answer_ev, *record.evidence_ids],
+                 actor=OWNER_ACTOR, values={"option": option_id, "lines": [r.line.row for r in rows]})
+        self.o.activity(now, "answered", f"You told me which amounts are right on {who}'s statement.", needs.company_id,
+                        evidence_ids=[answer_ev])
+        if option_id == "document":
+            if one:
+                word = rows[0].line.word if rows else "document"
+                text = (f"Done. The {word} stays as it is. I noted the difference on {who}'s statement for your "
+                        "accountant.")
+            else:
+                text = (f"Done. Your documents stay as they are. I noted the differences on {who}'s statement for "
+                        "your accountant.")
+            return AnswerOutcome(ok=True, message=text)
+        out, note = self._request_corrections(sr, record, rows, needs.company_id, answer_ev, now)
+        corrected = "the corrected document arrives" if one else "the corrected documents arrive"
+        if out is not None:
+            sr.correction_id = out.id
+            return AnswerOutcome(ok=True, message=f"Done. Nothing changes until {corrected}. I will ask {who} for "
+                                                  f"{'it' if one else 'them'}.")
+        return AnswerOutcome(ok=True, message=f"Done. Nothing changes until {corrected}. {note}")
+
+    def _request_corrections(self, sr: StatementRecord, record: DocumentRecord, rows: Sequence[RowCheck],
+                             company_id: str, answer_ev: str, now: datetime) -> tuple[OutgoingMessage | None, str]:
+        """The owner said the statement is right: ask for corrected documents (their tap is the approval)."""
+        repo = self.repo
+        supplier = repo.suppliers.get(sr.supplier_id or "")
+        company = repo.companies.get(company_id)
+        who = display_name(record.document.supplier_name)
+        yourself = f"Please ask {who} for the corrected {'document' if len(rows) <= 1 else 'documents'} yourself."
+        if supplier is None or not supplier.contact_email or company is None or not rows:
+            return None, yourself
+        approval = Approval(tenant_id=repo.tenant_id, action=ActionKind.SUPPLIER_INVOICE_REQUEST, subject_id=record.id,
+                            level=Requirement.OWNER, approved_by=f"{OWNER_ACTOR}:{repo.owner.email}", approved_at=now,
+                            entity_id=company.id)
+        decision = authorize(ActionKind.SUPPLIER_INVOICE_REQUEST, repo.policy, ActionContext(
+            tenant_id=repo.tenant_id, entity_id=company.id, subject_id=record.id, unusual=True, approval=approval))
+        self.log("authorize_statement_correction", subject_id=record.id, evidence_ids=[answer_ev], actor=OWNER_ACTOR,
+                 response={"allowed": decision.allowed_now, "reason": decision.reason_plain})
+        if not decision.allowed_now:
+            return None, yourself
+        try:
+            items = [StatementItem(kind=r.line.kind, number=clean_invoice_number(r.line.number), on=r.line.on,
+                                   amount=r.line.amount, ours=r.our_amount) for r in rows]
+            message = compose_statement_request(
+                supplier_name=who, supplier_email=supplier.contact_email, company_name=company.name,
+                company_tax_id=company.tax_id, company_country=company.country, items=items,
+                token=thread_token(repo.tenant_id, f"{record.id}:corrections"), today=now.astimezone(TZ).date(),
+                message_id_domain=MESSAGE_ID_DOMAIN, currency=sr.statement.currency,
+                language=choose_language(supplier, supplier.contact_email), corrections=True)
+        except ValueError:
+            return None, yourself
+        out = self.o.write_email("statement_correction", record.id, company.id, message.to, message.subject,
+                                 message.body, now, headers=(("Message-ID", message.message_id),))
+        return out, ""
+
+    # ----------------------------------------------------------------- emails
+
+    def describe(self, message: OutgoingMessage) -> tuple[str, str]:
+        """(what was asked for, in words that follow "asking for"), and who was asked."""
+        sr = self.repo.statements.get(message.subject_id)
+        record = self.repo.documents.get(message.subject_id)
+        who = display_name(record.document.supplier_name) if record is not None else "the supplier"
+        if message.kind == "statement_correction":
+            return "corrected documents where its statement differs", who
+        n = len(sr.requested) if sr is not None else 0
+        rows = [r for r in (sr.check.rows if sr is not None and sr.check is not None else ())
+                if statement_line_key(r.line) in (sr.requested if sr is not None else ())]
+        if n == 1 and len(rows) == 1 and rows[0].line.number:
+            line = rows[0].line
+            return f"{line.word} {line.number}, which its statement lists but I don't have", who
+        return f"the {count_phrase(n, 'document')} its statement lists that I don't have", who
+
+    def sent(self, message: OutgoingMessage, at: datetime) -> None:
+        """A transport accepted the request: only now has the supplier been asked (§22)."""
+        repo = self.repo
+        sr = repo.statements.get(message.subject_id)
+        record = repo.documents.get(message.subject_id)
+        if sr is None or record is None:
+            return
+        what, who = self.describe(message)
+        end = sr.statement.end or at.astimezone(TZ).date()
+        repo.closure_log.append(ClosureActivity(
+            kind=ClosureKind.SUPPLIER_CHASED, at=at, entity_id=message.company_id or sr.company_id or "",
+            subject_id=sr.supplier_id or record.id, period=Month.of(end)))
+        self.o.activity(at, "chased", f"Asked {who} for {what}.", message.company_id, evidence_ids=record.evidence_ids)
+        self.log("request_statement_documents", subject_id=record.id, evidence_ids=record.evidence_ids,
+                 values={"to": message.to, "subject": message.subject, "kind": message.kind})
 
 
 _KIND_WORDS = {TransactionKind.TRANSFER_OUT: "transfer", TransactionKind.DIRECT_DEBIT: "direct debit",
@@ -3312,7 +3805,8 @@ class CostCenterAgent(_Agent):
             emails=tuple(e for e in (record.sender, *record.recipients) if e),
             lines=doc.lines or (details.lines if details is not None else ()),
             vat_parts=self.vat_parts(record, details), on=doc.issue_date,
-            evidence_ids=tuple(record.evidence_ids))
+            evidence_ids=tuple(record.evidence_ids),
+            customer_tax_ids=(doc.customer_tax_id,) if doc.customer_tax_id else ())
 
     def payment_facts(self, rec: TxRecord) -> CostCenterFacts:
         tx = rec.tx
@@ -3341,7 +3835,9 @@ class CostCenterAgent(_Agent):
             account_label=account.label if account is not None else None,
             supplier_tax_id=next((d.document.supplier_tax_id for d in docs if d.document.supplier_tax_id), None),
             texts=tuple(texts), emails=tuple(dict.fromkeys(emails)), lines=lines, vat_parts=parts,
-            on=tx.booked_on, evidence_ids=tuple(dict.fromkeys(evidence)))
+            on=tx.booked_on, evidence_ids=tuple(dict.fromkeys(evidence)),
+            customer_tax_ids=tuple(dict.fromkeys(d.document.customer_tax_id for d in docs
+                                                 if d.document.customer_tax_id)))
 
     def decide(self, facts: CostCenterFacts, history: Mapping[str, Mapping[str, int]] | None = None
                ) -> CostCenterDecision:
@@ -3362,8 +3858,10 @@ class CostCenterAgent(_Agent):
     def _log_allocation(self, subject_id: str, allocation: CostAllocation) -> None:
         self.log("allocate_cost_center", subject_id=subject_id, evidence_ids=list(allocation.evidence_ids),
                  values={"general": allocation.general, "total": allocation.total,
-                         "shares": [[s.cost_center_id, s.amount] for s in allocation.shares]},
-                 validations=list(allocation.why),
+                         "shares": [[s.cost_center_id, s.amount] for s in allocation.shares],
+                         **({"recharge": [s.cost_center_id for s in allocation.shares if s.recharge]}
+                            if allocation.recharge_method else {})},
+                 validations=[*allocation.why, *allocation.recharge_why],
                  response={"method": allocation.method.value, "quality": allocation.quality.value})
 
     def scaled(self, allocation: CostAllocation, total: Decimal, parts: Sequence[VatPart] = (),
@@ -3375,7 +3873,9 @@ class CostCenterAgent(_Agent):
         if total == allocation.total and (not parts or all(s.parts for s in allocation.shares)):
             return allocation.model_copy(update={"evidence_ids": evidence})
         weights = [(s.cost_center_id, s.amount) for s in allocation.shares]
-        shares = split_by_weights(total, weights, parts)
+        recharged = {s.cost_center_id for s in allocation.shares if s.recharge}
+        shares = tuple(s.model_copy(update={"recharge": s.cost_center_id in recharged})
+                       for s in split_by_weights(total, weights, parts))
         return allocation.model_copy(update={"total": total, "shares": shares, "evidence_ids": evidence})
 
     def _new_evidence(self, rec: TxRecord) -> bool:
@@ -3446,9 +3946,14 @@ class CostCenterAgent(_Agent):
             for a in decided:
                 for share in a.shares:
                     amounts[share.cost_center_id] = amounts.get(share.cost_center_id, _ZERO) + share.amount
-            shares = tuple(AllocationShare(cost_center_id=cid, amount=amount) for cid, amount in amounts.items())
+            recharged = {s.cost_center_id for a in decided for s in a.shares if s.recharge}
+            shares = tuple(AllocationShare(cost_center_id=cid, amount=amount, recharge=cid in recharged)
+                           for cid, amount in amounts.items())
+        method = next((a.recharge_method for a in decided if a.recharge_method), None)
+        recharge_why = tuple(dict.fromkeys(w for a in decided for w in a.recharge_why))
         return CostAllocation(total=total, currency=rec.tx.currency, shares=shares, method=AllocationMethod.INVOICE,
-                              quality=quality, why=why, evidence_ids=evidence)
+                              quality=quality, why=why, evidence_ids=evidence, recharge_method=method,
+                              recharge_why=recharge_why)
 
     # ----------------------------------------------------------------- the pass
 
@@ -3470,6 +3975,7 @@ class CostCenterAgent(_Agent):
         if not using:
             return 0
         history = self.history()
+        recharges = self.recharge_history()
         moved = 0
         for rec in sorted(repo.transactions.values(), key=lambda r: r.id):
             if rec.private or rec.tx.entity_id is None or rec.company_id not in using:
@@ -3504,6 +4010,9 @@ class CostCenterAgent(_Agent):
                         record.document = record.document.model_copy(update={"cost_allocation": None})
                 moved += 1
             if allocation is not None:
+                if rec.tx.amount < 0:  # only money out can be a cost the client pays back
+                    allocation = self.with_recharge(self.payment_facts(rec), allocation,
+                                                    recharges.get(rec.company_id))
                 if allocation == current:
                     continue
                 self.apply_payment(rec, allocation)
@@ -3532,8 +4041,8 @@ class CostCenterAgent(_Agent):
         for record in sorted(repo.documents.values(), key=lambda d: d.id):
             if record.matched_tx_ids or record.on_hold or record.document.cost_allocation is not None:
                 continue
-            if record.document.quality is Quality.RED:
-                continue
+            if record.document.quality is Quality.RED or record.id in repo.statements:
+                continue  # a supplier's statement is never a cost of its own
             company = repo.item_company(repo.items[record.item_id])
             if company not in using:
                 continue
@@ -3542,8 +4051,105 @@ class CostCenterAgent(_Agent):
                 continue
             found = self.decide(facts, history.get(company))
             if found.allocation is not None:
-                self.apply_document(record, found.allocation)
+                purchase = not record.sales and record.document.doc_type is not DocumentType.CREDIT_NOTE
+                self.apply_document(record, self.with_recharge(facts, found.allocation, recharges.get(company))
+                                    if purchase else found.allocation)
                 moved += 1
+        moved += self._recharges(now, using)
+        return moved
+
+    # ----------------------------------------------------------------- recharged to the client
+
+    def recharge_history(self) -> dict[str, tuple[dict[tuple[str, str], tuple[int, int]], set[str]]]:
+        """{company: ({(supplier key, cost center id): (recharged, not recharged)}, cost centers with any recharged)}.
+
+        Only payments whose recharge was decided (not by history itself) count; general costs never do.
+        """
+        resolver = self.repo.resolver()
+        out: dict[str, tuple[dict[tuple[str, str], tuple[int, int]], set[str]]] = {}
+        for rec in sorted(self.repo.transactions.values(), key=lambda r: r.id):
+            allocation = rec.tx.cost_allocation
+            if allocation is None or rec.private or allocation.general or rec.tx.amount >= 0:
+                continue
+            counts, recharging = out.setdefault(rec.company_id, ({}, set()))
+            recharging.update(s.cost_center_id for s in allocation.shares if s.recharge)
+            if allocation.recharge_method == "history" or (allocation.recharge_method is None
+                                                           and allocation.method is AllocationMethod.HISTORY):
+                continue  # likely, not proven: never evidence for the next one
+            key = match_key(resolver.resolve_transaction(rec.tx).key) or ""
+            for share in allocation.shares:
+                yes, no = counts.get((key, share.cost_center_id), (0, 0))
+                counts[(key, share.cost_center_id)] = (yes + 1, no) if share.recharge else (yes, no + 1)
+        return out
+
+    def with_recharge(self, facts: CostCenterFacts, allocation: CostAllocation,
+                      known: tuple[dict[tuple[str, str], tuple[int, int]], set[str]] | None = None) -> CostAllocation:
+        """The allocation with each share marked as the client's to pay back, or not (never over the owner)."""
+        if allocation.general or allocation.recharge_method == "owner":
+            return allocation
+        decision = self.recharge_decision(facts, allocation, known)
+        return self.marked(allocation, decision.recharge, decision.method, decision.why)
+
+    def recharge_decision(self, facts: CostCenterFacts, allocation: CostAllocation,
+                          known: tuple[dict[tuple[str, str], tuple[int, int]], set[str]] | None = None) -> Any:
+        counts, recharging = known if known is not None else ({}, set())
+        centers = {c.id: c for c in self.centers(facts.company_id, active_only=False)}
+        accountant_ids = [self.repo.accountant.id] if self.repo.accountant else []
+        return decide_recharge(allocation=allocation, centers=centers, facts=facts, rulebook=self.repo.rulebook,
+                               accountant_ids=accountant_ids, history=counts, recharging=recharging,
+                               own_tax_ids=self.repo.own_tax_ids())
+
+    @staticmethod
+    def marked(allocation: CostAllocation, recharge: Sequence[str], method: str | None,
+               why: Sequence[str]) -> CostAllocation:
+        """The same allocation with ``recharge`` shares marked as the client's to pay back, and why."""
+        shares = tuple(s.model_copy(update={"recharge": s.cost_center_id in recharge}) for s in allocation.shares)
+        return allocation.model_copy(update={"shares": shares, "recharge_method": method,
+                                             "recharge_why": tuple(why)})
+
+    def open_recharge_question(self, tx_id: str, *, answered: bool = False) -> NeedsYouRecord | None:
+        wanted = ("open", "answered") if answered else ("open",)
+        return next((n for n in self.repo.needs.values()
+                     if n.kind == "recharge" and n.subject_id == tx_id and n.status in wanted), None)
+
+    def _recharges(self, now: datetime, using: set[str]) -> int:
+        """Payments on a client whose recharge is not decided yet: decide it now, or ask once when it
+        genuinely cannot be told (the client has had costs paid back before, and nothing says)."""
+        repo = self.repo
+        known = self.recharge_history()
+        moved = 0
+        for rec in sorted(repo.transactions.values(), key=lambda r: r.id):
+            allocation = rec.tx.cost_allocation
+            if allocation is None or allocation.general or rec.private or rec.tx.amount >= 0 or \
+                    rec.company_id not in using or allocation.recharge_method is not None:
+                continue
+            asked = self.open_recharge_question(rec.id, answered=True)
+            facts = self.payment_facts(rec)
+            decision = self.recharge_decision(facts, allocation, known.get(rec.company_id))
+            if decision.method is not None:
+                self.apply_payment(rec, self.marked(allocation, decision.recharge, decision.method, decision.why))
+                self.carry_to_documents(rec, overwrite=True)
+                if asked is not None and asked.status == "open":
+                    asked.status, asked.resolution = "resolved", "recharge_evidence"
+                moved += 1
+                continue
+            if decision.ask is None or asked is not None or not self._ready_to_ask(rec):
+                continue
+            center = repo.cost_centers[decision.ask]
+            who = self.o.merchant_name(rec.tx)
+            needs_id = _unique_id(repo.needs, f"nd_{_slug(who.split()[0])}_{int(abs(rec.tx.amount))}_recharge")
+            question = cost_center_question(self.centers(rec.company_id), facts, (), repo.today())
+            repo.needs[needs_id] = NeedsYouRecord(
+                id=needs_id, kind="recharge", subject_type="transaction", subject_id=rec.id, item_id=rec.item_id,
+                company_id=rec.company_id, created_at=now, question=question,
+                prompt=f"Does {center.label} pay this back?",
+                options=(CheckOption(id="recharge", label=f"Yes, {center.label} pays it back",
+                                     values={"cost_center_id": center.id}),
+                         CheckOption(id="own", label="No, it is our own cost", values={"cost_center_id": center.id})),
+                why=(f"It is on {center.label}, and some of their costs are paid back by them.",
+                     "Nothing on the payment or its invoice says whether this one is."))
+            self.log("ask_owner", subject_id=rec.id, evidence_ids=[rec.evidence_id],
+                     values={"cost_center": center.id}, response={"needs_you": needs_id})
         return moved
 
     # ----------------------------------------------------------------- the owner's choice
@@ -3611,6 +4217,7 @@ class Orchestrator:
         self.closure = ClosureAgent(self)
         self.auditor = AuditorAgent(self)
         self.cost_centers = CostCenterAgent(self)
+        self.statements = StatementAgent(self)
         self._activity_seq = 0
         # What sends the emails the back office writes itself (backoffice.mailer): the demo's simulated
         # outbox, or None. With None they wait in ``repo.outbox``; the production server sends each one
@@ -3711,6 +4318,9 @@ class Orchestrator:
             self.missing.sent_expected(self.repo.expected_invoices[message.subject_id], at)
         elif message.kind == "accountant_answer" and message.subject_id in self.repo.accountant_questions:
             self.accountant.sent(self.repo.accountant_questions[message.subject_id], at)
+        elif message.kind in ("statement_request", "statement_correction") and \
+                message.subject_id in self.repo.statements:
+            self.statements.sent(message, at)
         elif message.kind == "correction_request" and message.subject_id in self.repo.documents:
             record = self.repo.documents[message.subject_id]
             who = display_name(record.document.supplier_name)
@@ -3749,6 +4359,11 @@ class Orchestrator:
                 text = (f"Wrote to {display_name(record.document.supplier_name)} asking for a corrected invoice. "
                         "It is waiting to be sent.")
                 evidence = list(record.evidence_ids)
+            elif message.kind in ("statement_request", "statement_correction") and \
+                    message.subject_id in self.repo.documents:
+                what, who = self.statements.describe(message)
+                text = f"Wrote to {who} asking for {what}. It is waiting to be sent."
+                evidence = list(self.repo.documents[message.subject_id].evidence_ids)
             self.activity(at, "waiting", text, message.company_id, evidence_ids=evidence)
 
     def evidence_text(self, evidence_id: str) -> str:
@@ -4052,6 +4667,8 @@ class Orchestrator:
         if existing is not None:
             return self._merge_duplicate(existing, extracted, report)
         doc_id = "doc_" + extracted.evidence_ids[0][3:19]
+        if extracted.statement is not None and doc_id in self.repo.documents:
+            return self._merge_duplicate(self.repo.documents[doc_id], extracted, report)  # the same statement again
         customer = values.get("customer_tax_id")
         if extracted.buyer_is_final_consumer and customer and str(customer) == "999999990":
             customer = None  # sold to a final consumer: addressed to nobody in particular
@@ -4102,6 +4719,9 @@ class Orchestrator:
             record.document = record.document.model_copy(update={"entity_id": entity_id})
         if record.fraud is not None and record.fraud.hard_stop:
             self._hold(record, at)
+        if extracted.statement is not None and not sales:
+            self.statements.register(record, extracted.statement)
+            document = record.document
         company = self.repo.item_company(item)
         who = display_name(document.supplier_name)
         kind = _DOC_LABELS.get(document.doc_type, "document").lower()
@@ -4125,6 +4745,10 @@ class Orchestrator:
         report.document_ids.append(doc_id)
         if record.on_hold and record.fraud is not None:
             report.message = f"Got it. I put the {who} payment on hold: {record.fraud.owner_message}"
+        elif record.id in self.repo.statements:
+            lines = count_phrase(len(extracted.statement.lines), "line") if extracted.statement else "its lines"
+            report.message = (f"Got it. This is {who}'s account statement. It is never booked: I check its {lines} "
+                              "against your invoices and payments.")
         elif record.supporting:
             report.message = (f"Got it. This is a {kind}, not an invoice. I keep it with the payment as supporting "
                               "evidence and still wait for the invoice.")
@@ -4663,6 +5287,7 @@ class Orchestrator:
         self.cost_centers.allocate(now)  # which job, property, vehicle ...: nothing at all without cost centers
         self._ask_about_refund_amounts(now)  # a refund that does not match its credit note: one question
         report.expected = self.missing.check_recurring(now)  # usual invoices that are overdue (§23)
+        self.statements.review(now)  # suppliers' account statements: nothing at all without one
         report.chased = self.missing.chase_all(now)
         self.missing.chase_expected(now)
         self.accountant.answer_all(now)
@@ -5159,6 +5784,8 @@ class Orchestrator:
         if needs.kind == "cost_center":
             # Checked before anything is recorded: a split that doesn't add up changes nothing.
             chosen = self._cost_center_choice(needs, option_id, split)
+        elif needs.kind in ("statement", "recharge") and option_id not in {o.id for o in needs.options}:
+            raise ValueError("not one of the options")
         answer_ev = self._record_answer(needs, option_id, now, split=split if needs.kind == "cost_center" else None)
         repo.interactions.append(OwnerInteraction(at=now, active_seconds=ANSWER_SECONDS,
                                                   kind=InteractionKind.APPROVAL if needs.kind == "approval"
@@ -5180,6 +5807,10 @@ class Orchestrator:
         elif needs.kind == "cost_center":
             assert chosen is not None
             outcome = self._answer_cost_center(needs, option_id, chosen, remember, answer_ev, now)
+        elif needs.kind == "statement":
+            outcome = self.statements.answer(needs, option_id, answer_ev, now)
+        elif needs.kind == "recharge":
+            outcome = self._answer_recharge(needs, option_id, remember, answer_ev, now)
         else:
             outcome = self._answer_choice(needs, option_id, remember, answer_ev, now)
         self.run(now)
@@ -5274,9 +5905,10 @@ class Orchestrator:
             return "in general costs"
         if allocation.is_split:
             words = [f"{labels.get(s.cost_center_id, 'another one')} {format_money(s.amount, allocation.currency)}"
-                     for s in allocation.shares]
+                     + (" (to recharge to them)" if s.recharge else "") for s in allocation.shares]
             return "split: " + _join_words(words)
-        return f"on {labels.get(allocation.shares[0].cost_center_id, 'it')}"
+        tail = ", to recharge to them" if allocation.shares[0].recharge else ""
+        return f"on {labels.get(allocation.shares[0].cost_center_id, 'it')}{tail}"
 
     def _learn_cost_center_rule(self, question: Question, option_id: str, allocation: CostAllocation,
                                 answer_ev: str, now: datetime) -> str | None:
@@ -5318,10 +5950,13 @@ class Orchestrator:
                              learned=learned, resolved_ids=resolved)
 
     def allocate_by_owner(self, subject_id: str, *, cost_center_id: str | None = None, general: bool = False,
-                          split: Any = None, remember: bool = False) -> AnswerOutcome:
+                          split: Any = None, remember: bool = False, recharge: bool | None = None) -> AnswerOutcome:
         """The owner puts one payment or document on a cost center, on general costs, or splits it.
 
-        Raises KeyError (unknown subject) or :class:`SplitError` (plain message) before anything is recorded.
+        ``recharge``: True when the client it is for pays it back (a reimbursable or pass-through cost),
+        False when it is the business's own; None leaves that to the evidence (and one question when it
+        genuinely cannot be told). Raises KeyError (unknown subject) or :class:`SplitError` (plain message)
+        before anything is recorded.
         """
         repo = self.repo
         agent = self.cost_centers
@@ -5350,9 +5985,18 @@ class Orchestrator:
             raise SplitError("Add a job, property, vehicle or client for this company first.")
         allocation = agent.owner_allocation(company, facts, cost_center_id=cost_center_id, general=general,
                                             split=split)
+        outgoing = rec.tx.amount < 0 if rec is not None else (
+            not record.sales and record.document.doc_type is not DocumentType.CREDIT_NOTE)  # type: ignore[union-attr]
+        if recharge is not None and allocation.general:
+            raise SplitError("General costs are your own: only a cost on a client can be paid back by them.")
+        if recharge is not None and not outgoing:
+            raise SplitError("Only a cost you paid can be paid back by a client.")
         option_id = SPLIT_OPTION if split is not None else ("general" if general else f"cc:{cost_center_id}")
         now = repo.clock.now()
-        body = json.dumps({"kind": "cost_center", "subject_id": subject_id, "option_id": option_id,
+        said = {"subject_id": subject_id, "option_id": option_id}
+        if recharge is not None:
+            said["recharge"] = recharge  # the owner's own word that the client pays it back (§55)
+        body = json.dumps({"kind": "cost_center", **said,
                            "split": split, "answered_by": repo.owner.email, "answered_at": now.isoformat()},
                           sort_keys=True, default=str).encode()
         reg = repo.registry.register(body, tenant_id=repo.tenant_id, source_kind=SourceKind.UPLOAD,
@@ -5362,6 +6006,13 @@ class Orchestrator:
         self.log("owner", "allocate_cost_center", subject_id=subject_id, evidence_ids=[answer_ev], actor=OWNER_ACTOR,
                  values={"option_id": option_id})
         allocation = allocation.model_copy(update={"evidence_ids": (*allocation.evidence_ids, answer_ev)})
+        if recharge is not None:
+            labels = join_and([c.label for c in centers if c.id in allocation.cost_center_ids])
+            allocation = agent.marked(allocation, allocation.cost_center_ids if recharge else (), "owner",
+                                      (f"You said {labels} pays this back." if recharge else
+                                       "You said this is your own cost.",))
+        elif outgoing:
+            allocation = agent.with_recharge(facts, allocation, agent.recharge_history().get(company or ""))
         payments = [rec] if rec is not None else [
             repo.transactions[t] for t in record.matched_tx_ids  # type: ignore[union-attr]
             if t in repo.transactions and len(record.matched_tx_ids) == 1]  # type: ignore[union-attr]
@@ -5389,6 +6040,45 @@ class Orchestrator:
         self.run(now)
         return AnswerOutcome(ok=True, message=f"Done. The {who} {thing} is now {self._allocation_words(allocation)}.",
                              learned=learned)
+
+    def _answer_recharge(self, needs: NeedsYouRecord, option_id: str, remember: bool, answer_ev: str,
+                         now: datetime) -> AnswerOutcome:
+        """The owner said whether the client pays this cost back. Their answer is the evidence (§55)."""
+        repo = self.repo
+        agent = self.cost_centers
+        rec = repo.transactions[needs.subject_id]
+        allocation = rec.tx.cost_allocation
+        yes = option_id == "recharge"
+        needs.status, needs.answer, needs.answered_at = "answered", option_id, now
+        who = self.merchant_name(rec.tx)
+        cid = str(needs.options[0].values.get("cost_center_id", "")) if needs.options else ""
+        center = repo.cost_centers.get(cid)
+        if allocation is None or allocation.general or center is None or cid not in allocation.cost_center_ids:
+            return AnswerOutcome(ok=True, message=f"Done. The {who} payment is not on a client any more, so there "
+                                                  "is nothing to pay back.")
+        why = (f"You said {center.label} pays this back.",) if yes else ("You said this is your own cost.",)
+        keep = [s.cost_center_id for s in allocation.shares if s.recharge and s.cost_center_id != cid]
+        updated = agent.marked(allocation, [*keep, *([cid] if yes else [])], "owner", why)
+        updated = updated.model_copy(update={"evidence_ids": tuple(dict.fromkeys((*updated.evidence_ids, answer_ev)))})
+        agent.apply_payment(rec, updated)
+        agent.carry_to_documents(rec, by_owner=True)
+        learned = None
+        if remember and needs.question is not None:
+            proposal = recharge_rule(needs.question, yes, answered_by=OWNER_ACTOR, answered_at=now)
+            if proposal is not None:
+                rule = proposal.rule.model_copy(update={"id": "rule_" + hashlib.sha256(
+                    f"{needs.id}:{option_id}".encode()).hexdigest()[:12]})
+                repo.rulebook.add(rule, reason="one-tap answer")
+                learned = proposal.label
+                self.activity(now, "learned", f"Learned: {learned[0].lower()}{learned[1:]}. I will not ask again.",
+                              None, evidence_ids=[answer_ev])
+                agent.log("learn_rule", subject_id=rule.id, evidence_ids=[answer_ev], actor=OWNER_ACTOR,
+                          values={"label": proposal.label})
+        self.activity(now, "answered", f"You told me whether {center.label} pays back the {who} payment.",
+                      rec.company_id, amount=abs(rec.tx.amount), currency=rec.tx.currency, evidence_ids=[answer_ev])
+        message = (f"Done. The {who} payment is on {center.label}, to recharge to them." if yes else
+                   f"Done. The {who} payment is your own cost.")
+        return AnswerOutcome(ok=True, message=message, learned=learned)
 
     def _answer_approval(self, needs: NeedsYouRecord, option_id: str, answer_ev: str, now: datetime) -> AnswerOutcome:
         repo = self.repo
@@ -5857,6 +6547,28 @@ def _first_line(text: str) -> str | None:
 
 
 _READABLE_FILES = frozenset({EvidenceFormat.PDF, EvidenceFormat.IMAGE, EvidenceFormat.SCREENSHOT})
+# A statement's own fields are its supplier, its customer and its date: the numbers and amounts printed on it
+# belong to the documents on its lines (a statement is never a copy of one of them, never an amount to pay).
+_NOT_A_STATEMENT_FIELD = ("invoice_number", "gross_amount", "net_amount", "vat_amount", "due_date",
+                          "payment_reference", "iban")
+
+
+def _statement_issuer(text: str) -> str | None:
+    """The first line of a statement that is not its title, a header row or a number (the supplier's name)."""
+    from backoffice.learning import fold
+
+    for raw in (text or "").splitlines():
+        cells = [c.strip() for c in re.split(r"[;,\t|]", raw) if c.strip()]
+        line = " ".join(cells)
+        folded = fold(line)
+        if not line or re.match(r"(?:nif|nipc|vat|data|date|periodo|period|cliente|customer)\b", folded):
+            continue
+        name = re.sub(r"(?i)\b(?:extrato\s+(?:de\s+)?conta[\s-]+corrente|statement\s+of\s+account|account\s+"
+                      r"statement|supplier\s+statement)\b[\s:-]*", "", line).strip(" -:")
+        name = re.split(r"(?i)\s+(?:NIF|NIPC|VAT)\b", name)[0].strip(" -:,")
+        if name and re.search(r"[A-Za-z]", name) and not re.search(r"\d{2}[/.-]\d{2}", name):
+            return name[:120]
+    return None
 # The field a "which value is right?" question leads with, most useful first.
 _CONFLICT_ORDER = ("gross_amount", "vat_amount", "net_amount", "supplier_tax_id", "invoice_number", "issue_date",
                    "iban", "currency", "customer_tax_id", "due_date", "payment_reference")
