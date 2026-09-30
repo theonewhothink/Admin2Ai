@@ -92,6 +92,7 @@ function Sidebar({
         { href: "/internal/operations", label: "Operations", icon: "activity" },
         { href: "/diagram", label: "Pipeline", icon: "workflow", away: true },
         { href: "/internal/connections", label: "Connections", icon: "plug", badge: stale },
+        { href: "/internal/qa", label: "QA", icon: "clipboard" },
       ],
     },
     {

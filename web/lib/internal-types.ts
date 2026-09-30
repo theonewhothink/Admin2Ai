@@ -181,3 +181,58 @@ export interface InternalOperations {
     entries: AuditEntry[];
   };
 }
+
+/* ---------- QA: the 50 SME cases and the acceptance checklist (backend/src/backoffice/acceptance.py) ---------- */
+
+export type AcceptanceStatus = "pass" | "partial" | "missing";
+
+export interface AcceptanceCounts {
+  pass: number;
+  partial: number;
+  missing: number;
+  total: number;
+}
+
+export interface AcceptanceCheck {
+  id: string;
+  text: string;
+  status: AcceptanceStatus;
+  where: string;
+  note: string;
+  evidence: string[];
+}
+
+export interface AcceptanceSection {
+  id: string;
+  title: string;
+  counts: AcceptanceCounts;
+  checks: AcceptanceCheck[];
+}
+
+export interface AcceptanceCase {
+  number: number;
+  title: string;
+  quote: string;
+  verdict: AcceptanceStatus;
+  passTest: { text: string; status: AcceptanceStatus; checks: { id: string; text: string; status: AcceptanceStatus }[] };
+  handles: { text: string; check: string; status: AcceptanceStatus; where: string; note: string }[];
+  covered: number;
+  handled: number;
+  gaps: { id: string; text: string; status: AcceptanceStatus; note: string }[];
+}
+
+export interface InternalAcceptance {
+  purpose: string;
+  legend: Record<AcceptanceStatus, string>;
+  summary: {
+    cases: AcceptanceCounts;
+    passTests: AcceptanceCounts;
+    checklist: AcceptanceCounts;
+    percent: number;
+    sector: AcceptanceCounts;
+  };
+  sections: AcceptanceSection[];
+  sector: AcceptanceCheck[];
+  cases: AcceptanceCase[];
+  finalTest: { question: string; categories: string[]; rule: string; status: AcceptanceStatus; note: string };
+}

@@ -7,8 +7,8 @@
  * and from the backend otherwise.
  */
 import { useEffect, useSyncExternalStore } from "react";
-import { getInternalOperations, getInternalOverview } from "@/lib/api";
-import type { InternalOperations, InternalOverview } from "@/lib/internal-types";
+import { getInternalAcceptance, getInternalOperations, getInternalOverview } from "@/lib/api";
+import type { InternalAcceptance, InternalOperations, InternalOverview } from "@/lib/internal-types";
 
 export interface ResourceState<T> {
   data: T | null;
@@ -66,6 +66,8 @@ function createResource<T>(load: () => Promise<T | null>) {
 }
 
 const overview = createResource<InternalOverview>(getInternalOverview);
+const acceptance = createResource<InternalAcceptance>(getInternalAcceptance);
+export const useAcceptance = acceptance.useResource;
 export const useOverview = overview.useResource;
 export const refreshOverview = overview.refresh;
 

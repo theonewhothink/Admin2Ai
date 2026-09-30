@@ -1464,7 +1464,8 @@ a.fix:hover {
   color: #fff;
 }
 
-.filter[aria-pressed="true"] {
+.filter[aria-pressed="true"],
+.filter[aria-selected="true"] {
   color: var(--a-amber-400);
   border-color: rgba(245, 158, 11, 0.4);
   background: rgba(245, 158, 11, 0.1);
@@ -1725,4 +1726,396 @@ a.fix:hover {
 
 .locked .ghostButton {
   margin-top: 8px;
+}
+
+/* ---------------------------------------------------------------- QA: cases and acceptance checklist */
+
+.qaSummary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.qaSummary > * {
+  margin-bottom: 0;
+}
+
+@media (min-width: 900px) {
+  .qaSummary {
+    grid-template-columns: 1.2fr 1fr 1fr;
+  }
+}
+
+.qaStat {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.qaStat .bigNumber {
+  margin: 0;
+}
+
+.qaStatLabel {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--a-amber-400);
+}
+
+.qaCounts {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.qaCounts [data-tone="green"] {
+  color: var(--a-green-400);
+}
+
+.qaCounts [data-tone="amber"] {
+  color: var(--a-amber-400);
+}
+
+.qaCounts [data-tone="red"] {
+  color: var(--a-red-400);
+}
+
+.qaLegend {
+  margin-bottom: 24px;
+}
+
+.qaLegend .detail {
+  margin: 0 0 12px;
+  color: var(--a-400);
+  font-size: 13px;
+}
+
+.qaLegend ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.qaLegend li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.qaTabs {
+  margin-bottom: 8px;
+}
+
+.qaTabs .filter {
+  height: 32px;
+  padding: 0 14px;
+  font-size: 13px;
+  text-transform: none;
+}
+
+.qaToolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  margin-bottom: 16px;
+}
+
+.qaToolbar .filters {
+  margin-bottom: 0;
+}
+
+.qaToolbar .filter {
+  text-transform: none;
+}
+
+.qaSearch {
+  height: 32px;
+  width: 100%;
+  max-width: 280px;
+  padding: 0 12px;
+  border-radius: 10px;
+  border: 1px solid var(--a-line);
+  background: rgba(2, 6, 23, 0.6);
+  color: #fff;
+  font: inherit;
+  font-size: 13px;
+}
+
+.qaSearch::placeholder {
+  color: var(--a-500);
+}
+
+.qaGrid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+@media (min-width: 720px) {
+  .qaGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 1180px) {
+  .qaGrid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+.qaCase {
+  --edge: var(--a-line);
+  border-color: var(--edge);
+  padding: 18px 20px;
+}
+
+.qaCaseHead {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.qaCaseTitle {
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: #fff;
+}
+
+.qaId {
+  flex: none;
+  min-width: 28px;
+  font-size: 12px;
+  color: var(--a-500);
+}
+
+.qaPassLine {
+  margin: 10px 0 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--a-300);
+}
+
+.qaDot {
+  display: inline-block;
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  vertical-align: middle;
+}
+
+.qaMore {
+  margin-top: 12px;
+}
+
+.qaMore > summary,
+.qaProof > summary {
+  cursor: pointer;
+  width: fit-content;
+  font-size: 12px;
+  color: var(--a-400);
+}
+
+.qaMore > summary:hover,
+.qaProof > summary:hover {
+  color: #fff;
+}
+
+.qaQuote {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-left: 2px solid var(--a-amber);
+  background: rgba(245, 158, 11, 0.06);
+  border-radius: 0 8px 8px 0;
+  font-size: 13px;
+  font-style: italic;
+  line-height: 1.5;
+  color: var(--a-300);
+}
+
+.qaSub {
+  margin: 14px 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--a-amber-400);
+}
+
+.qaHandles {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--a-300);
+}
+
+.qaHandles li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.qaHandles .qaDot {
+  transform: translateY(-1px);
+}
+
+.qaHandles small {
+  font-size: 12px;
+}
+
+.qaDepends {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--a-400);
+}
+
+.qaSections {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.qaSection {
+  padding: 0;
+}
+
+.qaSection > details > summary {
+  list-style: none;
+}
+
+.qaSection > details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.qaSectionHead {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  padding: 16px 20px;
+  cursor: pointer;
+}
+
+.qaSectionHead strong {
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.qaLetter {
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  background: rgba(245, 158, 11, 0.15);
+  color: var(--a-amber-400);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.qaSectionBar {
+  flex: 1 1 120px;
+  min-width: 120px;
+  max-width: 320px;
+  margin-left: auto;
+}
+
+.qaChecks {
+  list-style: none;
+  margin: 0;
+  padding: 0 20px 12px;
+  display: grid;
+}
+
+.qaSection > .qaChecks {
+  padding-top: 8px;
+}
+
+.qaCheck {
+  padding: 12px 0;
+  border-top: 1px solid var(--a-line);
+}
+
+.qaCheckHead {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+}
+
+.qaCheckHead .qaId {
+  padding-top: 2px;
+}
+
+.qaCheckText {
+  flex: 1;
+  min-width: 0;
+  color: #e2e8f0;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.qaWhere {
+  margin: 4px 0 0 38px;
+  font-size: 12px;
+  color: var(--a-400);
+}
+
+.qaWhere .muted {
+  font-size: 12px;
+}
+
+.qaProof {
+  margin: 6px 0 0 38px;
+}
+
+.qaProof ul {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--a-500);
+}
+
+.qaFinal .qaFinalList {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--a-300);
+  font-size: 13px;
+  display: grid;
+  gap: 4px;
+}
+
+.qaFinal .muted {
+  margin-top: 12px;
 }

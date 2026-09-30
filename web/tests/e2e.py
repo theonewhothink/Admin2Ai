@@ -421,10 +421,12 @@ def production() -> None:
         page.get_by_role("textbox", name="Rule").fill("Treat all Adobe subscriptions as Software")
         page.get_by_role("button", name="Teach").click()
         expect(page.get_by_text(re.compile(r"It applies to \d+ payments? so far\."))).to_be_visible(timeout=15000)
-        taught = [r for r in api.requests if r["path"] == "/api/accountant/rules"]
+        # The client's own rules link when the engine gives one (one company's accountant), else the general route.
+        taught = [r for r in api.requests
+                  if re.fullmatch(r"/api/accountant/(clients/[^/]+/)?rules", r["path"].split("?", 1)[0])]
         check(bool(taught) and json.loads(taught[-1]["body"]) == {"text": "Treat all Adobe subscriptions as Software",
                                                                    "scope": "client"} and taught[-1]["csrf"] == "admin2ai",
-              "Teach posts the rule to /api/accountant/rules")
+              "Teach posts the rule to the client's rules route")
         check(page.get_by_text("61 past transactions").count() == 0, "no made-up rule results")
         with page.expect_download() as dl:
             page.get_by_role("button", name=re.compile("^Download")).click()

@@ -20,7 +20,7 @@
 import { unstable_rethrow } from "next/navigation";
 import * as sample from "./data";
 import { engineRequest } from "./engine";
-import type { InternalOperations, InternalOverview } from "./internal-types";
+import type { InternalAcceptance, InternalOperations, InternalOverview } from "./internal-types";
 import { API_URL, BASE_PATH, browserEngine, clientRendered, production } from "./mode";
 import type {
   AccountantClientDetail,
@@ -501,6 +501,18 @@ export async function getInternalOperations(limit?: number): Promise<InternalOpe
   if (!browserEngine && !hasApi) return null;
   const path = `/api/internal/operations${limit ? `?limit=${encodeURIComponent(String(limit))}` : ""}`;
   return request<InternalOperations | null>(path, { method: "GET" }, isOperations, () => null);
+}
+
+function isAcceptance(v: unknown): InternalAcceptance | null {
+  return isRecord(v) && Array.isArray(v.cases) && Array.isArray(v.sections) && isRecord(v.summary)
+    ? (v as unknown as InternalAcceptance)
+    : null;
+}
+
+/** The QA page: the 50 SME cases and the acceptance checklist with their verdicts. */
+export async function getInternalAcceptance(): Promise<InternalAcceptance | null> {
+  if (!browserEngine && !hasApi) return null;
+  return request<InternalAcceptance | null>("/api/internal/acceptance", { method: "GET" }, isAcceptance, () => null);
 }
 
 /* ---------- Audit and accountant (sample data unless the browser engine runs) ---------- */

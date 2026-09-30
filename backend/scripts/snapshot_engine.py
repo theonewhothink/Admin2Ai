@@ -45,6 +45,7 @@ STATIC_PATHS = (
     "/api/internal/overview",
     "/api/internal/operations",
     "/api/internal/readiness",
+    "/api/internal/acceptance",
 )
 
 
