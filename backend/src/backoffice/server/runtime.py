@@ -84,6 +84,7 @@ log = logging.getLogger("backoffice.server")
 READ_ONLY_POSTS = frozenset({"/api/documents/export"})
 _API_KEYS = "/api/accountant/api-keys"
 _REVOKE = re.compile(r"^/api/accountant/api-keys/([^/]+)/revoke$")
+_RECONNECT = re.compile(r"^/api/connections/([^/]+)/reconnect$")
 _SERVICE_CODES = {400: "bad_request", 404: "not_found", 409: "conflict", 413: "too_large", 415: "unsupported"}
 
 
@@ -197,6 +198,7 @@ class TenantRuntime:
 
 HISTORY_TURNS = 10  # the chat history a brain is given and an event records
 HISTORY_CHARS = 4000  # per turn
+SEND_RETRY_AFTER = timedelta(minutes=10)  # after the mailer refused an email, before trying again
 
 
 def clean_history(history: Any) -> list[dict[str, str]]:
@@ -285,6 +287,7 @@ class TenantManager:
         self._locks: dict[str, threading.RLock] = {}
         self._guard = threading.Lock()
         self._refused: dict[str, ReplayDiverged] = {}
+        self._send_retry: dict[str, datetime] = {}  # tenant -> when to try its waiting emails again
 
     # ----------------------------------------------------------------- time, files
 
@@ -480,7 +483,31 @@ class TenantManager:
                 self.notifier.changed(rt.tenant_id, rt.svc, before, self.notifier.facts(rt.svc))
             except Exception:  # a notification never undoes a recorded change
                 log.exception("notification_failed")
+        if env.live and kind not in ("outbox.send", "void"):
+            self._deliver(rt)
         return result
+
+    def _deliver(self, rt: TenantRuntime) -> None:
+        """Send the emails the tenant wrote and could not send inside a change (§22, §25, §28).
+
+        Each goes out in an event of its own, applied with the live mailer: when the mailer refuses,
+        that event alone is void and the email stays "waiting to be sent" (retried after a pause). Without
+        a mailer nothing is sent, and every screen keeps saying so.
+        """
+        if self.mailer is None or rt.svc is None:
+            return
+        retry = self._send_retry.get(rt.tenant_id)
+        if retry is not None and retry > self.now():
+            return
+        for message_id in rt.svc.waiting_messages():
+            try:
+                self.record(rt, "outbox.send", {"id": message_id, "env": self._facts()}, "system:mailer",
+                            self.live_env())
+            except Exception:
+                log.warning("send_failed", extra={"tenant": rt.tenant_id})
+                self._send_retry[rt.tenant_id] = self.now() + SEND_RETRY_AFTER
+                return
+        self._send_retry.pop(rt.tenant_id, None)
 
     def _void(self, rt: TenantRuntime, failed: Event) -> None:
         """The live apply of ``failed`` broke: mark it void and rebuild the tenant without it."""
@@ -651,18 +678,31 @@ class TenantManager:
             return self.record(rt, "request", data, actor, env, index=index)
 
     def _authorize_url(self, rt: TenantRuntime, path: str, body: Mapping[str, Any]) -> str | None:
-        """For a new Google/Microsoft mailbox: the consent URL, obtained before the event is recorded."""
-        if path != "/api/sources" or body.get("kind") != "email" or self.authorizer is None:
+        """The Google/Microsoft consent URL, obtained before the event is recorded: for a new mailbox
+        (``/api/sources``) or for signing in again to one that needs reconnecting (``.../reconnect``)."""
+        if self.authorizer is None:
             return None
-        provider = body.get("provider") or "google"
-        address = body.get("address")
-        if provider not in ("google", "microsoft") or not isinstance(address, str) or not address.strip():
+        reconnect = _RECONNECT.match(path)
+        if reconnect is not None:
+            svc = rt.service
+            c = svc.repo.connectors.get(reconnect.group(1))
+            provider = (svc.sign_in.get(c.id) or {}).get("provider") if c is not None else None
+            if c is None or c.kind != "email" or provider not in ("google", "microsoft"):
+                return None
+            cid, address = c.id, c.account.strip().lower()
+        elif path == "/api/sources" and body.get("kind") == "email":
+            provider = body.get("provider") or "google"
+            address = body.get("address")
+            if provider not in ("google", "microsoft") or not isinstance(address, str) or not address.strip():
+                return None
+            address = address.strip().lower()
+            cid = rt.service._slug("mail", address)
+        else:
             return None
         if provider not in getattr(self.authorizer, "providers", ()):
             return None
-        cid = rt.service._slug("mail", address.strip().lower())
         try:
-            return self.authorizer.begin(provider, rt.tenant_id, cid, login_hint=address.strip().lower())
+            return self.authorizer.begin(provider, rt.tenant_id, cid, login_hint=address)
         except Exception:
             log.warning("oauth_begin_failed", extra={"tenant": rt.tenant_id})
             return None
@@ -909,6 +949,11 @@ def _tick(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[
     return 200, {"ok": True}
 
 
+def _outbox_send(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
+    """One waiting email, sent with the live mailer (on replay: the one that already went out)."""
+    return 200, rt.service.send_waiting(str(event.data.get("id") or ""))
+
+
 def _void(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
     return 200, {"ok": True}
 
@@ -928,5 +973,6 @@ _HANDLERS: dict[str, Handler] = {
     "sync.bank": _sync_bank,
     "sync.failed": _sync_failed,
     "tick": _tick,
+    "outbox.send": _outbox_send,
     "void": _void,
 }

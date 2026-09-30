@@ -13,23 +13,31 @@ import { formatDayShort } from "@/lib/format";
 /** Home. Rendered on the server (API or sample data) or in the browser (in-browser engine). */
 export function HomeView({ home, needsIds, demoStale }: { home: HomeData; needsIds: string[]; demoStale: boolean }) {
   const connections = demoStale ? staleConnections : home.connections;
+  const staleCount = connections.filter((c) => c.status === "stale").length;
   const stale = connections.find((c) => c.status === "stale");
   const nextDue = [...home.dueSoon].sort((a, b) => a.due.localeCompare(b.due))[0];
   const { currentMonth } = home;
+  const monthDone = currentMonth.percentClosed === 100;
 
   return (
     <div className="container page">
       {stale ? <ConnectionBanner connection={stale} /> : null}
 
       <div className={styles.home}>
-        <Headline greeting={home.greeting} needsIds={needsIds} />
+        {/* The engine's headline counts its own stale connections; the ?demo=stale preview adds sample ones. */}
+        <Headline
+          greeting={home.greeting}
+          needsIds={needsIds}
+          staleCount={staleCount}
+          headline={demoStale ? undefined : home.headline}
+        />
 
         <div className={styles.askDock}>
           <AskBox />
         </div>
 
         <section aria-label="At a glance" className="tiles">
-          <NeedsTile needsIds={needsIds} />
+          <NeedsTile needsIds={needsIds} staleCount={staleCount} />
           <Link href="#coming-up" className="card card-link tile">
             <span className="tile-label">
               <Dot tone="neutral" />
@@ -39,14 +47,19 @@ export function HomeView({ home, needsIds, demoStale }: { home: HomeData; needsI
           </Link>
           <Link href="/companies" className="card card-link tile">
             <span className="tile-label">
-              <Dot tone={currentMonth.percentClosed === 100 ? "good" : "neutral"} />
+              <Dot tone={monthDone ? "good" : "neutral"} />
               {currentMonth.label}
             </span>
             <span className={styles.tileSub}>
               <span className="tile-value num">
                 {currentMonth.percentClosed}%<small>closed</small>
               </span>
-              <Progress value={currentMonth.percentClosed} tone="good" label={`${currentMonth.label} closed`} />
+              {/* Green means closed: only at 100%. Anything less is still open (amber). */}
+              <Progress
+                value={currentMonth.percentClosed}
+                tone={monthDone ? "good" : "attention"}
+                label={`${currentMonth.label} closed`}
+              />
             </span>
           </Link>
         </section>

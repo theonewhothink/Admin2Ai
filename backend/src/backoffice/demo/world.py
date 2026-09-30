@@ -16,6 +16,7 @@ from decimal import Decimal
 
 from backoffice.domain.models import SourceKind, Supplier, Transaction
 from backoffice.learning import counterparty_key
+from backoffice.mailer import SimulatedOutbox
 from backoffice.policy import ActionKind
 
 from ..orchestrator import (
@@ -233,10 +234,16 @@ def _events() -> list[_Event]:
 
 
 def build() -> Orchestrator:
-    """The demo tenant with September replayed through the pipeline, as of 2 October 2026, 09:30."""
+    """The demo tenant with September replayed through the pipeline, as of 2 October 2026, 09:30.
+
+    Emails the demo sends (supplier requests, answers to the accountant) go through the send path like
+    everywhere else, to an explicit simulated outbox: they count as sent because that transport accepted
+    them, and nothing ever leaves the demo.
+    """
     repo = Repository(tenant_id=TENANT, owner=OWNER, now=START)
     _setup(repo)
     orchestrator = Orchestrator(repo)
+    orchestrator.transport = SimulatedOutbox()
     for event in sorted(_events(), key=lambda e: e.at):
         event.run(orchestrator, event.at)
     orchestrator.run(NOW)

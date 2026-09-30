@@ -80,7 +80,9 @@ def _service_from_env() -> BackOfficeService:
                                          state_key=key.encode())
     from backoffice.mailer import mailer_from_env
 
-    svc.mailer = mailer_from_env()
+    # Owner-confirmed emails go out over SMTP when it is configured, else to the demo's simulated outbox.
+    # The demo's own supplier requests always stay in that simulated outbox: never real mail to its suppliers.
+    svc.mailer = mailer_from_env() or svc.mailer
     from backoffice.reading import reader_from_env
 
     # Uploaded PDFs and photos are read (Stage 0, OCR sidecar, Claude vision only if switched on).

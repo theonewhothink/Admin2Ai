@@ -235,8 +235,22 @@ def test_a_mailbox_that_stops_syncing_for_a_day_is_shown_to_the_owner(tmp_path: 
     _same_after_replay(h, tenant)
 
 
+class _SignInAgain:
+    """Google's consent page for a mailbox that needs reconnecting (connectors.authorize.OAuthAuthorizer's shape)."""
+
+    providers = ("google",)
+
+    def __init__(self) -> None:
+        self.begun: list[tuple[str, str, str, str | None]] = []
+
+    def begin(self, provider: str, tenant_id: str, connection_id: str, login_hint: str | None = None) -> str:
+        self.begun.append((provider, tenant_id, connection_id, login_hint))
+        return f"https://accounts.google.com/o/oauth2/v2/auth?state=s{len(self.begun)}"
+
+
 def test_a_refused_sign_in_marks_the_mailbox_for_the_owner_once(tmp_path: Path) -> None:
-    h, vault, expo = _setup(tmp_path)
+    authorizer = _SignInAgain()
+    h, vault, expo = _setup(tmp_path, authorizer=authorizer)
     tenant, H = _gmail_owner(h, vault)
     google = FakeGoogle()
     google.token_error = (400, {"error": "invalid_grant"}, {})
@@ -253,10 +267,20 @@ def test_a_refused_sign_in_marks_the_mailbox_for_the_owner_once(tmp_path: Path) 
     h.clock.advance(hours=1)
     asked = len(google.requests)
     assert worker.run_once().skipped == [f"{tenant}/{MAILBOX}"] and len(google.requests) == asked  # waits for them
-    # The owner signs in again (here: taps Reconnect); the next pass tries again.
+    # Tapping Reconnect only hands out Google's sign-in page: nothing is retried and nothing is "back" yet.
     google.token_error = None
-    assert h.client.post(f"/api/connections/{MAILBOX}/reconnect", headers=H).status_code == 200
+    res = h.client.post(f"/api/connections/{MAILBOX}/reconnect", headers=H)
+    assert res.status_code == 200 and res.json()["authorizeUrl"].startswith("https://accounts.google.com/")
+    assert authorizer.begun[-1] == ("google", tenant, MAILBOX, "ana@padaria.pt")
+    assert worker.run_once().synced == [] and _source(h, H, "email")["status"] != "healthy"
+    # The owner signs in again: a new refresh token. Still not "connected" until a sync has worked.
+    vault.store(tenant, MAILBOX, "google", {"refresh_token": "rt-2", "scope": "gmail.readonly"})
+    assert h.manager.finish_sign_in(tenant, MAILBOX, "google", "ana@padaria.pt")[0] == 200
+    catching_up = next(c for c in h.client.get("/api/connections", headers=H).json()["connections"]
+                       if c["id"] == MAILBOX)
+    assert catching_up["status"] == "stale" and catching_up["reconnect"] == "catching_up"
     assert worker.run_once().synced == [f"{tenant}/{MAILBOX}"]
+    assert _source(h, H, "email")["status"] == "healthy"
     assert len(expo.sent) == 1
     _same_after_replay(h, tenant)
 

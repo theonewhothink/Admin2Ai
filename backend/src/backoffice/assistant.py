@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Any
 from backoffice.closure import Month
 from backoffice.learning import counterparty_key, day_month, display_name, fold, format_money, learn_from_transactions
 from backoffice.learning.plain import count_phrase, join_and
+from backoffice.mailer import SIMULATED_NOTE, is_simulated
 from backoffice.spending import CATEGORIES, MONTH_NAMES, Ledger, Line, Money, category_label
 from backoffice.understanding import (
     Period,
@@ -79,7 +80,8 @@ class OutboxMessage:
     subject: str
     body: str
     attachments: list[dict[str, str]] = field(default_factory=list)  # {"kind": "document"|"report", "id", "name"}
-    status: str = "draft"  # draft -> sent | cancelled
+    # draft -> sent (a mailer accepted it) | waiting (confirmed, no mailer yet) -> sent | cancelled
+    status: str = "draft"
     sent_at: str | None = None
     delivery: str = ""
 
@@ -310,28 +312,36 @@ class Operator:
         return msg
 
     def send(self, message_id: str) -> OutboxMessage:
-        """Owner confirmed (§25). Delivery goes through the configured mailer, if any."""
+        """Owner confirmed (§25). It counts as sent only when the configured mailer accepted it.
+
+        Without a mailer it waits ("waiting") and says so; a mailer that refuses raises, and nothing
+        is marked sent (the production server then voids the change, backoffice.server.runtime).
+        """
         msg = self.outbox.get(message_id)
         if msg is None:
             raise KeyError(message_id)
-        if msg.status != "draft":
+        if msg.status not in ("draft", "waiting"):
             return msg
+        now = self.svc._now()
         mailer = getattr(self.svc, "mailer", None)
-        if mailer is not None:
-            files = []
-            for a in msg.attachments:
-                if a["kind"] == "document" and (f := self.document_file(a["id"])):
-                    files.append(f)
-                elif a["kind"] == "report" and (r := self.reports.get(a["id"])):
-                    files.append((r["filename"], "text/csv", r["csv"].encode()))
-            mailer.send(msg.to, msg.subject, msg.body, files)
-            msg.delivery = "Sent."
-        else:
-            msg.delivery = "Recorded in the outbox. Email delivery is not connected in this demo."
+        if mailer is None:
+            if msg.status == "draft":
+                msg.status = "waiting"
+                self.svc.orchestrator.activity(now, "waiting", f"Wrote “{msg.subject}” to {', '.join(msg.to)}. "
+                                                               "It is waiting to be sent.")
+            msg.delivery = "Not sent yet: email sending is not set up here, so it is waiting to be sent."
+            return msg
+        files = []
+        for a in msg.attachments:
+            if a["kind"] == "document" and (f := self.document_file(a["id"])):
+                files.append(f)
+            elif a["kind"] == "report" and (r := self.reports.get(a["id"])):
+                files.append((r["filename"], "text/csv", r["csv"].encode()))
+        mailer.send(msg.to, msg.subject, msg.body, files)
+        msg.delivery = f"Sent. {SIMULATED_NOTE}" if is_simulated(mailer) else "Sent."
         msg.status = "sent"
-        msg.sent_at = self.svc._now().isoformat()
-        self.svc.orchestrator.activity(self.svc._now(), "answered",
-                                       f"Sent “{msg.subject}” to {', '.join(msg.to)}.")
+        msg.sent_at = now.isoformat()
+        self.svc.orchestrator.activity(now, "answered", f"Sent “{msg.subject}” to {', '.join(msg.to)}.")
         return msg
 
     # -- tasks ----------------------------------------------------------------
@@ -464,6 +474,14 @@ _ASSIGN = re.compile(r"^\s*(?:(?:please|pls|ok|okay|can you|could you|just)\s+)*
                      r"|^\s*(?:the\s+)?[\w€.,' ]{1,40}?\b(?:is|was|goes|belongs)\s+(?:for|to|with|under|personal|"
                      r"private)\b"
                      r"|^\s*(?:it|that|this)(?:'s| is| was)\s+(?:for|personal|private)\b", re.I)
+# "The right amount is €483.60", "use the QR value", "set it aside": the owner settling a document whose details
+# disagree. That is only ever done with their own tap in Needs you (§19, §37), never from the chat.
+_SETTLE = re.compile(
+    r"\b(?:right|correct|real|true|actual|proper)\s+(?:one|amount|total|value|figure|number|date|vat|iban|nif|"
+    r"tax number|invoice number)\b"
+    r"|\buse\s+(?:the\s+)?(?:qr|pdf|photo|scan|text|email|first|second|other|bank|printed)\b"
+    r"|\b(?:amount|total|value|vat|iban|date|number)\s+(?:is|was|should be)\s+(?:€|\d|the\s+(?:qr|pdf|first|second))"
+    r"|\bset\s+(?:it|that|this|the\s+[\w ]{1,30}?invoice)\s+aside\b|\bneither\b", re.I)
 _SEND = re.compile(r"\b(?:send|email|e-mail|mail|forward|share)\b", re.I)
 _INCREASE = re.compile(r"\b(?:went|gone|go|going) up\b|\bincreas\w*|\bmore expensive\b|\bprices?\b|\bpricier\b|"
                        r"\baument\w*|\bsubiu\b|\bsubiram\b")
@@ -563,6 +581,10 @@ class RuleBrain:
             return _Answer(f"You have {count_phrase(len(items), 'open task')}." if items else "You have no open tasks.")
         if _PAY.match(t) or _RELEASE.match(t):
             return self._refuse_money()
+        if _SETTLE.search(t) and not t.endswith("?"):
+            conflicts = [n for n in self.repo.open_needs() if n.kind == "check"]
+            if conflicts:
+                return self._refuse_owner_tap(conflicts)
         if actions and _ASSIGN.match(t) and not t.endswith("?") and (answer := self._assign(t)) is not None:
             return answer
         u = self.understand(t, history)
@@ -706,6 +728,21 @@ class RuleBrain:
             if s.amount is not None and abs(abs(rec.tx.amount) - s.amount) > Decimal("0.005"):
                 continue
             matching.append(n)
+        if not matching and (s.supplier_ids or s.amount is not None):
+            # Not a plain choice: an approval or a conflict about that supplier or amount needs the owner's tap.
+            blocked = []
+            for n in self.repo.open_needs():
+                doc = self.repo.documents.get(n.subject_id) if n.kind in ("check", "approval") else None
+                if doc is None:
+                    continue
+                if s.supplier_ids and doc.supplier_id not in s.supplier_ids:
+                    continue
+                gross = doc.document.gross_amount
+                if s.amount is not None and (gross is None or abs(abs(gross) - s.amount) > Decimal("0.005")):
+                    continue
+                blocked.append(n)
+            if blocked:
+                return self._refuse_owner_tap(blocked)
         if not matching or (len(matching) > 1 and not (s.supplier_ids or s.amount is not None)):
             return None
         if len(matching) > 1:
@@ -722,6 +759,22 @@ class RuleBrain:
         if result.get("learned"):
             text += f" {result['learned']}."
         return _Answer(text)
+
+    def _refuse_owner_tap(self, needs: list[Any]) -> _Answer:
+        """Conflicts and approvals are never settled from the chat: only the owner's own tap in Needs you (§19, §26)."""
+        parts, chips = [], []
+        if any(n.kind == "check" for n in needs):
+            parts.append("I can't settle that from the chat. When a document's details disagree, you choose the "
+                         "right one yourself in Needs you, with one tap.")
+        if any(n.kind == "approval" for n in needs):
+            parts.append("A payment on hold is only released by you, in Needs you, after you check it with the "
+                         "supplier on a number you already had.")
+        for n in needs:
+            doc = self.repo.documents.get(n.subject_id)
+            who = display_name(doc.document.supplier_name) if doc is not None else "Needs you"
+            what = "payment on hold" if n.kind == "approval" else "invoice to check"
+            chips.append({"label": f"{who} · {what}", "id": f"needs:{n.id}"})
+        return _Answer(" ".join(parts), evidence=chips)
 
     def _refuse_money(self) -> _Answer:
         text = ("I don't move money. You make payments from your bank; I check the invoice and the bank details "
@@ -1654,8 +1707,9 @@ TOOLS: list[dict[str, Any]] = [
          "required": ["to", "subject", "body"], "additionalProperties": False}},
     {"name": "answer_question", "description": "Record the owner's answer to one of the open questions from "
      "business_status (for example which company a payment belongs to). Use ONLY when the owner has clearly "
-     "given the answer in this conversation. Payment approvals and changed bank details can never be answered "
-     "here: the owner confirms those in Needs you.",
+     "given the answer in this conversation, and only for plain choices. Payment approvals, changed bank details "
+     "and conflicts (a document whose details disagree) can never be answered here: the owner taps those in "
+     "Needs you.",
      "input_schema": {"type": "object", "properties": {
          "question_id": _S, "option_id": _S,
          "remember": {"type": "boolean", "description": "Apply the same answer to future similar payments"}},
@@ -1676,7 +1730,8 @@ SYSTEM = ("You are the back-office operator for a small business owner: an excel
           "results, never from memory, and cite document numbers and amounts. Money is in euros. "
           "You can: look things up, prepare reports, draft emails (the owner taps Send), record the owner's "
           "answers to open questions, and keep the owner's task list. You never move money, never approve "
-          "payments or changed bank details, and never send anything yourself; say so plainly when asked. "
+          "payments or changed bank details, never settle a document whose details disagree (the owner taps those "
+          "in Needs you), and never send anything yourself; say so plainly when asked. "
           "Answer the question that was asked. For expenses, spending, costs or money received use "
           "spending_summary (spending is money out that is a real cost: transfers between the owner's own "
           "accounts and companies are left out; taxes and bank fees are included and named separately; say so "
@@ -1697,6 +1752,16 @@ def _iso(v: Any) -> date | None:
         return None
 
 
+def _needs_kind(op: Operator, needs_id: str) -> str:
+    """The engine's own kind of an open question: "choice", "check" (details disagree) or "approval".
+
+    Needs You shows a "check" to the owner as a choice card; the chat must still treat it as a conflict.
+    Unknown ids count as the strictest kind.
+    """
+    record = op.repo.needs.get(needs_id)
+    return record.kind if record is not None else "approval"
+
+
 def run_tool(op: Operator, name: str, args: dict[str, Any], cards: list[dict[str, Any]]) -> Any:
     """Run one tool against the engine. Raises ValueError/KeyError with a message the model can act on."""
     svc = op.svc
@@ -1704,11 +1769,12 @@ def run_tool(op: Operator, name: str, args: dict[str, Any], cards: list[dict[str
         home = svc.home()
         needs = []
         for n in svc.needs_you()["items"]:
-            item = {"question_id": n["id"], "kind": n.get("kind"), "merchant": n.get("merchant"),
+            kind = _needs_kind(op, n["id"])
+            item = {"question_id": n["id"], "kind": {"check": "conflict"}.get(kind, kind), "merchant": n.get("merchant"),
                     "amount": n.get("amount"), "date": n.get("date"),
                     "question": n.get("question") or n.get("title"),
-                    "owner_must_confirm_in_needs_you": n.get("kind") == "approval"}
-            if n.get("kind") != "approval":
+                    "owner_must_confirm_in_needs_you": kind != "choice"}
+            if kind == "choice":  # only plain choices can be answered from the chat
                 item["options"] = [{"option_id": o["id"], "label": o["label"]} for o in n.get("options", [])]
             needs.append(item)
         companies = [{"company_id": c["id"], "name": c["name"], "status": c.get("statusLabel"),
@@ -1760,11 +1826,14 @@ def run_tool(op: Operator, name: str, args: dict[str, Any], cards: list[dict[str
         item = next((n for n in svc.needs_you()["items"] if n["id"] == qid), None)
         if item is None:
             raise ValueError("That question is not open any more.")
-        if item.get("kind") == "approval":
-            cards.append({"type": "evidence", "items": [{"label": f"{item.get('merchant')} · confirm in Needs you",
+        # Decided on the engine's own record: a conflict is shown to the web as a choice, but it is not one.
+        kind = _needs_kind(op, qid)
+        if kind != "choice":
+            what = "confirm" if kind == "approval" else "check"
+            cards.append({"type": "evidence", "items": [{"label": f"{item.get('merchant')} · {what} in Needs you",
                                                          "id": f"needs:{qid}"}]})
-            raise ValueError("This needs the owner's own confirmation in Needs you (payment approvals and changed "
-                             "bank details are never answered in chat).")
+            raise ValueError("This needs the owner's own tap in Needs you: payment approvals, changed bank details "
+                             "and documents whose details disagree are never answered in chat.")
         return svc.answer(qid, option, bool(args.get("remember", False)))
     if name == "create_task":
         due = _iso(args.get("due_date"))

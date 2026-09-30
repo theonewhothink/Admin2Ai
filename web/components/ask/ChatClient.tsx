@@ -147,7 +147,9 @@ function EmailDraft({ card }: { card: Extract<Card, { type: "email" }> }) {
   }
   return (
     <div className="card card-pad" style={{ display: "grid", gap: 8 }}>
-      <span className="meta">Email · {status === "draft" ? "ready to send" : status}</span>
+      <span className="meta">
+        Email · {status === "draft" ? "ready to send" : status === "waiting" ? "waiting to be sent" : status}
+      </span>
       <span>
         <strong>To:</strong> {card.to.join(", ")}
       </span>

@@ -12,6 +12,7 @@ const kindIcon: Record<ActivityKind, IconName> = {
   closed: "checkCircle",
   protected: "shield",
   learned: "bookmark",
+  waiting: "clock",
 };
 
 const kindLabel: Record<ActivityKind, string> = {
@@ -23,6 +24,7 @@ const kindLabel: Record<ActivityKind, string> = {
   closed: "Closed",
   protected: "Protected",
   learned: "Learned",
+  waiting: "Waiting to be sent",
 };
 
 export function ActivityView({ feed }: { feed: ActivityFeed }) {
