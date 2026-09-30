@@ -210,7 +210,8 @@ def test_a_card_is_assigned_to_an_employee_by_the_owner_or_learned_from_the_bank
     tx = biz.pay(date(2026, 9, 18), "-31.90", "GALP ALFRAGIDE", card="5530", cardholder="MARTA REIS")
     marta = next(e for e in biz.repo.employees.values() if "5530" in e.cards)
     assert marta.name == "Marta Reis" and marta.learned_from == (biz.repo.transactions[tx].evidence_id,)
-    learned = [a.text for a in biz.repo.activity if a.kind == "learned"]
+    # (A new business's first run also says what it learned overall: only the card lines matter here.)
+    learned = [a.text for a in biz.repo.activity if a.kind == "learned" and "card" in a.text]
     assert learned == ["Learned from your bank: card •••• 5530 is Marta Reis's card. Add Marta's email so I can ask "
                        "Marta for its receipts."]
     biz.run(9, 22)

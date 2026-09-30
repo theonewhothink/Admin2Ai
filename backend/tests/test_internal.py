@@ -231,7 +231,7 @@ def test_targets_list_every_success_metric(svc: BackOfficeService) -> None:
     o = overview(svc)
     targets = {t["id"]: t for t in o["targets"]}
     assert list(targets) == ["owner_minutes", "zero_touch", "recovered", "silent_errors", "unresolved",
-                             "onboarding_minutes", "accountant_owner"]
+                             "onboarding_minutes", "time_to_first_value", "activated", "accountant_owner"]
     g = {x["id"]: x for x in o["golden"]}
     assert targets["zero_touch"]["value"] == g["zero_touch"]["value"]
     assert targets["zero_touch"]["evidence"] == "18 of 21 items"

@@ -248,6 +248,13 @@ class _UBLReader(_Reader):
             _text(self.find("cac:PartyName/cbc:Name", party))
             or _text(self.find("cac:PartyLegalEntity/cbc:RegistrationName", party)),
         )
+        address = self.find("cac:PostalAddress", party)
+        if address is not None:  # "StreetName BuildingNumber, PostalZone CityName" (checklist H3)
+            street = " ".join(t for t in (_text(self.find("cbc:StreetName", address)),
+                                          _text(self.find("cbc:BuildingNumber", address))) if t)
+            town = " ".join(t for t in (_text(self.find("cbc:PostalZone", address)),
+                                        _text(self.find("cbc:CityName", address))) if t)
+            self.c.extra(f"{role}_address", ", ".join(t for t in (street, town) if t) or None)
         for i, scheme in enumerate(self.findall("cac:PartyTaxScheme", party), start=1):
             company_id = _text(self.find("cbc:CompanyID", scheme))
             scheme_id = (_text(self.find("cac:TaxScheme/cbc:ID", scheme)) or "VAT").upper()
@@ -335,6 +342,12 @@ class _CIIReader(_Reader):
         if party is None:
             return
         self.c.extra(f"{role}_name", _text(self.find("ram:Name", party)))
+        address = self.find("ram:PostalTradeAddress", party)
+        if address is not None:
+            town = " ".join(t for t in (_text(self.find("ram:PostcodeCode", address)),
+                                        _text(self.find("ram:CityName", address))) if t)
+            self.c.extra(f"{role}_address",
+                         ", ".join(t for t in (_text(self.find("ram:LineOne", address)), town) if t) or None)
         for i, reg in enumerate(self.findall("ram:SpecifiedTaxRegistration", party), start=1):
             element = self.find("ram:ID", reg)
             scheme = (element.get("schemeID") or "").upper() if element is not None else ""

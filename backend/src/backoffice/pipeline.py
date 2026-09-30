@@ -59,6 +59,7 @@ AGENTS: dict[str, tuple[str, str]] = {
     "reconciliation": ("Matcher", "Pairs payments with invoices."),
     "settlement": ("Payout checker", "Checks payouts from card terminals and sales platforms against their payout "
                                      "reports: sales, fees and refunds."),
+    "payroll": ("Payroll", "Matches each salary with that month's payslip for that person."),
     "closure": ("Closure", "Checks, matches and closes items, only with evidence."),
     "missing": ("Invoice chaser", "Finds missing invoices, and asks the supplier when they can't be found."),
     "obligation": ("Deadlines", "Tracks tax payments and other things with a due date."),

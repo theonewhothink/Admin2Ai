@@ -10,6 +10,8 @@ Recurring expectations (§23) — :mod:`.recurrence`
     ``check_overdue(series, today, arrivals=()) -> OverdueNotice | None``
     (one-off extras are tolerated as ``off_cycle`` and never cover a missing period)
     ``detect_price_change(amounts, currency, name) -> PriceChange | None``
+    ``series.usual_method`` / ``payment_method_note(series, tx)`` / ``find_payment(series, txs, around=)``
+    (the card or account a supplier is usually paid from, L4)
 
 Rules (§38 one-tap learning, §28 accountant rules) — :mod:`.rules`
     ``RuleBook.add(rule)``, ``RuleBook.evaluate(subject, tenant_id=, accountant_ids=) -> RuleDecision``
@@ -17,7 +19,9 @@ Rules (§38 one-tap learning, §28 accountant rules) — :mod:`.rules`
     ``suggest_rule_from_answer(question, answer) -> RuleProposal | None``
 
 Entity Agent (§46, §51, §37) — :mod:`.entity`
-    ``assign_entity(entities=, transaction=, document=, ownership=, rulebook=, history=) -> EntityAssignment``
+    ``assign_entity(entities=, transaction=, document=, ownership=, rulebook=, history=, addressee=, directory=,
+    personal_signal=) -> EntityAssignment`` (billing name, billing address and receiving mailbox are hints that
+    never override a tax number; :func:`.personal.personal_signal` flags a clearly personal shop on a company card)
 
 Cost centers: which job, property, vehicle, outlet, event, course or client — :mod:`.cost_centers`
     ``decide_cost_center(centers=, facts=, rulebook=, history=) -> CostCenterDecision`` (rule, identifiers on
@@ -41,12 +45,15 @@ from __future__ import annotations
 from .entity import (
     ANOTHER_COMPANY,
     UNSURE_PROMPT,
+    Addressee,
+    CompanyDirectory,
     EntityAssignment,
     OwnershipBook,
     Vote,
     VoteKind,
     assign_entity,
     build_history,
+    same_address,
 )
 from .keys import (
     counterparty_key,
@@ -73,6 +80,7 @@ from .onboarding import (
     select_questions,
     uncertainty_for,
 )
+from .personal import personal_signal
 from .plain import card_mask, day_month, format_money, join_and, ordinal
 from .questions import Answer, OptionKind, Question, QuestionKind, QuestionOption, SubjectFacts, describe_subject
 from .recurrence import (
@@ -88,10 +96,13 @@ from .recurrence import (
     RecurringSeries,
     check_overdue,
     detect_price_change,
+    find_payment,
     learn_from_documents,
     learn_from_transactions,
     learn_series,
+    method_of,
     next_expected,
+    payment_method_note,
 )
 from .rules import (
     AUTHORITY,
@@ -127,10 +138,12 @@ __all__ = [
     "MAX_QUESTION_LIMIT",
     "PERSONAL",
     "UNSURE_PROMPT",
+    "Addressee",
     "Answer",
     "Basis",
     "Cadence",
     "Candidate",
+    "CompanyDirectory",
     "Coverage",
     "CoverageItem",
     "Direction",
@@ -177,6 +190,7 @@ __all__ = [
     "describe_subject",
     "detect_price_change",
     "display_name",
+    "find_payment",
     "fold",
     "format_money",
     "is_canonical_key",
@@ -187,12 +201,16 @@ __all__ = [
     "mad",
     "match_key",
     "median",
+    "method_of",
     "modified_z",
     "next_expected",
     "normalize_tax_id",
     "ordinal",
+    "payment_method_note",
+    "personal_signal",
     "qualified_tax_id",
     "recurring_expense_question",
+    "same_address",
     "same_tax_id",
     "select_questions",
     "suggest_rule_from_answer",

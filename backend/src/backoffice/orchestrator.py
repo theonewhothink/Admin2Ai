@@ -23,8 +23,14 @@ Pipeline for one piece of evidence::
                    question for the owner, whose answer is stored as evidence (§19, §37). A document
                    from abroad is checked by rules that hold anywhere, the bank confirming it (P7)
     Fraud          hard stops: changed IBAN, recipient mismatch, ... (§26)
-    Entity         which company (§51), taught rules (§38)
-    Reconciliation expected evidence (§21), then transaction <-> document matching (§20): only accounting
+    Entity         which company (§51), taught rules (§38); the billing name, billing address and receiving
+                   mailbox are hints that never override a tax number (H2, H3, H5); a clearly personal shop on a
+                   company card is one question (X23). A new business's first run asks only its few most
+                   valuable questions once its history is in, and defers the rest (§5, backoffice.onboarding)
+    Payroll        payslips prove salaries, paid to the employee's account or worded as a salary, only with
+                   that month's payslip for that employee; a missing one is asked of whoever runs payroll (J3)
+    Reconciliation expected evidence (§21, with what the owner or accountant taught, J7), then transaction <->
+                   document matching (§20): only accounting
                    documents of the kind the payment needs prove it; a pro-forma, quote, delivery note,
                    order or supplier statement is kept as supporting evidence only; a credit note linked
                    to its invoice is netted against it
@@ -93,7 +99,9 @@ from backoffice.closure import (
     compute_month_status,
     detect_confirmation,
     detect_obligation,
+    evaluate_activation,
     normalize_reference,
+    owner_touched,
     proof_for,
     satisfy,
 )
@@ -173,6 +181,7 @@ from backoffice.evidence.retrieval import LinkSource, PortalLinks, email_invoice
 from backoffice.extraction import StructuredFormatError, XMLSyntaxError, parse_einvoice
 from backoffice.extraction.fields import StructuredDataError
 from backoffice.extraction.htmldata import extract_html_structured
+from backoffice.extraction.addressee import read_billing_party
 from backoffice.extraction.invoicelines import InvoiceDetails, read_invoice_details
 from backoffice.fraud import (
     ApproverKind,
@@ -192,8 +201,10 @@ from backoffice.fraud import (
 )
 from backoffice.fraud.engine import COUNTRY_NAMES
 from backoffice.learning import (
+    Addressee,
     Answer,
     Basis,
+    CompanyDirectory,
     EntityAssignment,
     Occurrence,
     OptionKind,
@@ -205,22 +216,32 @@ from backoffice.learning import (
     RuleScope,
     assign_entity,
     build_history,
+    candidates_from_assignments,
     check_overdue,
+    compute_coverage,
+    confirm_line,
     counterparty_key,
+    coverage_items,
     day_month,
     detect_price_change,
     display_name,
+    find_payment,
     format_money,
     learn_series,
+    method_of,
     next_expected,
     join_and,
     match_key,
     normalize_tax_id,
+    payment_method_note,
+    personal_signal,
     qualified_tax_id,
     same_tax_id,
+    select_questions,
     suggest_rule_from_answer,
 )
 from backoffice.learning import GENERAL, Rule, RuleField, RuleMatch, RuleOutcome, RuleSubject
+from backoffice.learning.entity import HISTORY_MIN_COUNT
 from backoffice.learning.cost_centers import (
     SPLIT_OPTION,
     CostCenterDecision,
@@ -236,6 +257,9 @@ from backoffice.learning.cost_centers import (
 )
 from backoffice.learning.plain import count_phrase
 from backoffice.mailer import is_simulated
+from backoffice import onboarding as ob_
+from backoffice.onboarding import OnboardingState
+from backoffice.payroll import Payslip, person_name, read_payslip, salary_proof
 from backoffice.missing import (
     ChaseFacts,
     ChaseMessage,
@@ -260,6 +284,8 @@ from backoffice.reconciliation import (
     EvidenceExpectation,
     ExpectationDecision,
     ExpectedEvidenceEngine,
+    InMemoryExpectationOverrides,
+    LearnedExpectation,
     Match,
     MatchKind,
     PayoutProvider,
@@ -595,6 +621,10 @@ class DocumentRecord:
     linked_advances: list[str] = field(default_factory=list)  # advance invoices it names (taken off or already inside)
     applied: dict[int, str] = field(default_factory=dict)  # deposit it states (index) -> the payment or advance invoice
     part_answers: list[str] = field(default_factory=list)  # the owner's answers linking parts to it (evidence ids)
+    # Who it is made out to besides the tax number: the billing name and address printed on it (H2, H3).
+    billing_name: str | None = None
+    billing_address: str | None = None
+    payslip: Payslip | None = None  # a payslip: the salary it proves (checklist J3)
 
     @property
     def id(self) -> str:
@@ -650,6 +680,7 @@ class TxRecord:
     deposit_refund_of: str | None = None  # the deposit this payment gave back (that deposit's payment id)
     cardholder: str | None = None  # the cardholder the bank's card details name (backoffice.staff)
     claim_ids: list[str] = field(default_factory=list)  # expense claims this transfer pays back (backoffice.staff)
+    notes: list[str] = field(default_factory=list)  # plain facts worth knowing, never a hold ("paid from ...")
 
     @property
     def id(self) -> str:
@@ -1099,11 +1130,15 @@ _DOC_LABELS = {
     DocumentType.ORDER_CONFIRMATION: "Order confirmation",
     DocumentType.SUPPLIER_STATEMENT: "Account statement",
     DocumentType.PAYOUT_REPORT: "Payout report",
+    DocumentType.PAYROLL: "Payslip",
 }
 # Documents a purchase paid in cash can be evidenced by (§11: the owner photographs the receipt).
 _CASH_DOCUMENTS = frozenset({DocumentType.RECEIPT, *PURCHASE_INVOICE_TYPES})
 # Questions about deposits, part payments and deposits given back (checklist X8), answered by the staged agent.
 _STAGED_QUESTIONS = ("part", "deposit", "deposit_refund")
+# Documents paid after they are issued, so a due date on them can pass unpaid (F8). An invoice-receipt or a
+# simplified invoice from a till is paid when it is issued.
+_PAYABLE_LATER = frozenset({DocumentType.INVOICE, DocumentType.DEBIT_NOTE})
 
 
 # --------------------------------------------------------------------------- repository
@@ -1176,14 +1211,35 @@ class Repository:
         self.employees: dict[str, Any] = {}
         self.receipt_requests: dict[str, Any] = {}
         self.expense_claims: dict[str, Any] = {}
+        # A new business's first run and onboarding (§5, §58, §59; backoffice.onboarding). Empty for a business
+        # set up by hand, such as the demo: nothing is measured for it.
+        self.onboarding = OnboardingState()
+        # What the companies are known by besides their tax numbers (H2, H3, H5), and their line of business.
+        self.company_addresses: dict[str, list[str]] = {}
+        self.company_sectors: dict[str, str] = {}
+        self.mailboxes: dict[str, str] = {}  # a mailbox or alias -> the company the owner said it belongs to
+        # Learned expected evidence (§21, J7): the owner's or accountant's answer ("this never has an invoice"),
+        # used for every later payment to that counterparty. Company-limited accountant rules keep their own.
+        self.expectation_overrides = InMemoryExpectationOverrides()
+        self.company_expectation_overrides: dict[str, InMemoryExpectationOverrides] = {}
+        # Payroll (J3): employees known from their payslips (IBAN -> name, payroll_employees), who runs payroll for a company
+        # ("owner" | "accountant"), and the requests written for missing payslips (payment id -> outbox id).
+        self.payroll_employees: dict[str, str] = {}
+        self.payroll_by: dict[str, str] = {}
+        self.payslip_requests: dict[str, str] = {}
 
     # ----------------------------------------------------------------- set-up
 
-    def add_company(self, *, id: str, name: str, legal_name: str, tax_id: str, ibans: Sequence[str] = ()) -> LegalEntity:
+    def add_company(self, *, id: str, name: str, legal_name: str, tax_id: str, ibans: Sequence[str] = (),
+                    address: str | None = None, sector: str | None = None) -> LegalEntity:
         entity = LegalEntity(id=id, tenant_id=self.tenant_id, name=name, country="PT", tax_id=tax_id,
                              own_ibans=list(ibans))
         self.companies[id] = entity
         self.legal_names[id] = legal_name
+        if address and address.strip():
+            self.company_addresses[id] = [" ".join(address.split())]
+        if sector and sector.strip():
+            self.company_sectors[id] = " ".join(sector.split())
         return entity
 
     def add_account(self, account: Account) -> None:
@@ -1341,6 +1397,47 @@ class Repository:
     def open_needs(self) -> list[NeedsYouRecord]:
         return sorted((n for n in self.needs.values() if n.status == "open"), key=lambda n: (n.created_at, n.id))
 
+    # ----------------------------------------------------------------- what the companies are known by (H2-H5)
+
+    def shared_mailboxes(self) -> set[str]:
+        """Connected mailboxes that read for more than one company: never a sign of one company."""
+        return {c.account.strip().lower() for c in self.connectors.values()
+                if c.kind == "email" and len(c.company_ids) > 1}
+
+    def mailbox_map(self) -> dict[str, str]:
+        """Mailbox or alias -> the company whose mail it receives (H5), strongest source last so it wins:
+
+        learned (an address that received at least three invoices, every one made out to the same company
+        by its tax number; never a mailbox shared by several companies), a mailbox connected for one
+        company only, then what the owner said.
+        """
+        shared = self.shared_mailboxes()
+        counts: dict[str, dict[str, int]] = {}
+        for d in sorted(self.documents.values(), key=lambda d: d.id):
+            company = None if d.sales else self.company_for_tax_id(d.document.customer_tax_id)
+            if company is None:
+                continue
+            for address in d.recipients:
+                if address in shared:
+                    continue
+                bucket = counts.setdefault(address, {})
+                bucket[company] = bucket.get(company, 0) + 1
+        out = {a: next(iter(by)) for a, by in sorted(counts.items())
+               if len(by) == 1 and sum(by.values()) >= HISTORY_MIN_COUNT}
+        for c in sorted(self.connectors.values(), key=lambda c: c.id):
+            if c.kind == "email" and len(c.company_ids) == 1 and c.company_ids[0] in self.companies:
+                out[c.account.strip().lower()] = c.company_ids[0]
+        out.update({a: c for a, c in self.mailboxes.items() if c in self.companies})
+        return out
+
+    def directory(self) -> CompanyDirectory:
+        """Each company's legal and trade names, addresses and mailboxes, for the Entity Agent (H2, H3, H5)."""
+        return CompanyDirectory(
+            names={c: tuple(n for n in (self.legal_names.get(c),) if n) for c in sorted(self.companies)},
+            addresses={c: tuple(a) for c, a in sorted(self.company_addresses.items()) if a and c in self.companies},
+            mailboxes=self.mailbox_map(),
+        )
+
     def evidence(self, evidence_id: str) -> Evidence:
         return self.registry.get(self.tenant_id, evidence_id)
 
@@ -1403,6 +1500,8 @@ class _Extracted:
     text: str = ""
     statement: SupplierStatement | None = None  # a supplier's account statement, read line by line
     issuer: IssuerProfile | None = None
+    billing_name: str | None = None  # the customer name printed on it (H2)
+    billing_address: str | None = None  # the billing address printed on it (H3)
 
 
 class DiscoveryAgent(_Agent):
@@ -1742,6 +1841,8 @@ class DocumentAgent(_Agent):
         stated: list[Decimal] = []
         texts: list[str] = []
         reference: str | None = None
+        billed_name: str | None = None  # the customer name and address an e-invoice gives (H2, H3)
+        billed_address: str | None = None
 
         def add(field_: CriticalField | str, obs: FieldObservation) -> None:
             key = field_.value if isinstance(field_, CriticalField) else str(field_)
@@ -1760,6 +1861,8 @@ class DocumentAgent(_Agent):
                     kinds.setdefault("ubl", result.doc_type)
                 supplier_name = supplier_name or result.extras.get("supplier_name")
                 reference = reference or result.extras.get("invoice_reference")
+                billed_name = billed_name or result.extras.get("customer_name")
+                billed_address = billed_address or result.extras.get("customer_address")
                 continue
             if part.kind == "html":  # schema.org Invoice / Order data in an HTML email or page (§13 Stage 0)
                 for result in structured.get(i, ()):
@@ -1869,7 +1972,9 @@ class DocumentAgent(_Agent):
                 observations.pop(name, None)
         if stated and issuer is not None:
             issuer = replace(issuer, stated_rates=tuple(dict.fromkeys(stated)))
+        printed = read_billing_party(joined)  # "Cliente: ..." and the address under it, when labelled
         return _Extracted(
+            billing_name=billed_name or printed.name, billing_address=billed_address or printed.address,
             observations=observations, doc_type=doc_type, supplier_name=supplier_name,
             evidence_ids=list(dict.fromkeys(p.evidence_id for p in parts)), qr=qr,
             buyer_is_final_consumer=final_consumer, parsers=[*parsers, *(["supplier_statement"] if statement else [])],
@@ -1957,18 +2062,49 @@ class FraudAgent(_Agent):
 
 
 class EntityAgent(_Agent):
-    """Which of the owner's companies a payment belongs to (§46, §51), using taught rules (§38)."""
+    """Which of the owner's companies a payment belongs to (§46, §51), using taught rules (§38).
+
+    Besides the tax number, the billing name and address printed on the invoice and the mailbox or alias it
+    arrived at count as hints (H2, H3, H5): they never override the tax number, and a disagreement is the one
+    question. A company card at a clearly personal shop, with no history of the company paying it, is asked
+    rather than booked on the card's word (X23).
+    """
 
     name = "entity"
 
+    def addressee(self, record: DocumentRecord) -> Addressee:
+        """What the document says about who it is for, besides the tax number (never for your own sales)."""
+        if record.sales:
+            return Addressee()
+        return Addressee(name=record.billing_name, address=record.billing_address, mailboxes=record.recipients)
+
+    def personal_hint(self, rec: TxRecord) -> str | None:
+        """'a streaming service' when this card purchase is at a shop that is clearly personal for the company
+        the card belongs to; None for anything else (a known supplier, a transfer, money in)."""
+        tx = rec.tx
+        if tx.amount >= 0 or not tx.card_last4:
+            return None
+        owner = self.repo.ownership().cards.get(tx.card_last4)
+        if owner is None or owner not in self.repo.companies:
+            return None
+        known = self.repo.resolver().resolve_transaction(tx).supplier is not None
+        return personal_signal(tx.counterparty, tx.description, sector=self.repo.company_sectors.get(owner),
+                               known_supplier=known)
+
     def assign(self, rec: TxRecord) -> EntityAssignment:
-        docs = [self.repo.documents[d].document for d in rec.document_ids if d in self.repo.documents]
-        document = docs[0] if len(docs) == 1 and docs[0].customer_tax_id else None
+        docs = [self.repo.documents[d] for d in rec.document_ids if d in self.repo.documents]
+        record = docs[0] if len(docs) == 1 else None
+        addressee = self.addressee(record) if record is not None else None
+        hinted = addressee is not None and not addressee.empty
+        document = record.document if record is not None and (record.document.customer_tax_id or hinted) else None
         accountant_ids = self.repo.accountant_ids_for(rec.company_id)
         result = assign_entity(
             entities=self.repo.entities, transaction=rec.tx, document=document, ownership=self.repo.ownership(),
             rulebook=self.repo.rulebook, accountant_ids=accountant_ids,
             history=build_history(self.repo.history_pairs), today=self.repo.today(),
+            addressee=addressee if document is not None and hinted else None,
+            directory=self.repo.directory() if document is not None and hinted else None,
+            personal_signal=self.personal_hint(rec),
         )
         self.log("assign_entity", subject_id=rec.id, evidence_ids=[rec.evidence_id],
                  values={"entity_id": result.entity_id or "", "private": result.private},
@@ -1978,11 +2114,15 @@ class EntityAgent(_Agent):
 
     def assign_document(self, record: DocumentRecord) -> str | None:
         doc = record.document
-        if not doc.customer_tax_id:
+        addressee = self.addressee(record)
+        if not doc.customer_tax_id and addressee.empty:
             return None
-        result = assign_entity(entities=self.repo.entities, document=doc, today=self.repo.today())
+        result = assign_entity(entities=self.repo.entities, document=doc, today=self.repo.today(),
+                               addressee=None if addressee.empty else addressee,
+                               directory=None if addressee.empty else self.repo.directory())
         self.log("assign_entity", subject_id=record.id, evidence_ids=record.evidence_ids,
-                 values={"entity_id": result.entity_id or ""}, response={"quality": result.quality.value})
+                 values={"entity_id": result.entity_id or ""}, validations=list(result.why),
+                 response={"quality": result.quality.value})
         return result.entity_id if result.quality is Quality.GREEN else None
 
 
@@ -1991,8 +2131,14 @@ class ReconciliationAgent(_Agent):
 
     name = "reconciliation"
 
+    def engine(self) -> ExpectedEvidenceEngine:
+        """The expected-evidence rules with what was learned (J7) and the employees known from payslips (J3)."""
+        return ExpectedEvidenceEngine(entities=self.repo.entities, suppliers=self.repo.resolver(),
+                                      overrides=_LearnedExpectations(self.repo),
+                                      employee_ibans=sorted(self.repo.payroll_employees))
+
     def classify(self, records: Sequence[TxRecord]) -> None:
-        engine = ExpectedEvidenceEngine(entities=self.repo.entities, suppliers=self.repo.resolver())
+        engine = self.engine()
         for rec in records:
             decision = engine.classify(rec.tx)
             decision = self._customer_refund(rec, decision) or decision
@@ -2057,15 +2203,17 @@ class ReconciliationAgent(_Agent):
         repo = self.repo
         staged = self.o.staged
         # Payouts and payout reports are paired by the settlement agent, never with an invoice.
+        # A salary known by the employee's account is proven by the payroll agent, by its payslip only (J3).
         txs = [r for r in repo.transactions.values()
                if r.decision is not None and not r.document_ids and not r.private
                and not repo.items[r.item_id].is_done
                and r.decision.expectation is not EvidenceExpectation.PAYOUT_REPORT
+               and not (r.decision.expectation is EvidenceExpectation.PAYROLL and r.decision.quality is Quality.GREEN)
                and (r.decision.requires_document or r.decision.quality is not Quality.GREEN)]
         docs = [d for d in repo.documents.values()
                 if not d.on_hold and d.document.quality is not Quality.RED
                 and (not d.matched_tx_ids or staged.open_for_parts(d))
-                and d.document.doc_type is not DocumentType.PAYOUT_REPORT
+                and d.document.doc_type not in (DocumentType.PAYOUT_REPORT, DocumentType.PAYROLL)
                 and not repo.items[d.item_id].is_done
                 and not d.supporting and not d.paid_in_cash and not d.supports_tx_ids and staged.matchable(d)
                 and d.claim_id is None]  # paid with an employee's own money: an expense claim (backoffice.staff)
@@ -2230,6 +2378,236 @@ class ReconciliationAgent(_Agent):
                      values={"transactions": list(m.transaction_ids), "documents": list(m.document_ids)})
             for t in m.transaction_ids:
                 self.o.support(repo.transactions[t], [repo.documents[d] for d in m.document_ids])
+
+
+class _LearnedExpectations:
+    """What evidence a counterparty's payments need, as the owner or accountant taught it (§21, J7).
+
+    The pipeline's :class:`ExpectationOverrides`: a company-limited accountant rule for the payment's
+    company first, then what applies to every company (the owner's answers, accountant rules for all).
+    """
+
+    def __init__(self, repo: Repository) -> None:
+        self.repo = repo
+
+    def lookup(self, transaction: Transaction, supplier_key: str) -> LearnedExpectation | None:
+        rec = self.repo.transactions.get(transaction.id)
+        company = rec.company_id if rec is not None else transaction.entity_id
+        scoped = self.repo.company_expectation_overrides.get(company or "")
+        found = scoped.lookup(transaction, supplier_key) if scoped is not None else None
+        return found or self.repo.expectation_overrides.lookup(transaction, supplier_key)
+
+
+class PayrollAgent(_Agent):
+    """Payslips prove salaries (§21, checklist J3; :mod:`backoffice.payroll`).
+
+    A payslip ("recibo de vencimento") is read as a PAYROLL document for the employee, from the company
+    its employer tax number names. A salary paid to an employee's account (known from a payslip) is
+    certainly a salary; one worded as a salary is likely one. Either is closed only by that month's
+    payslip for that employee, with the net pay to the cent. A salary without it stays open with a plain
+    request to whoever runs payroll: the accountant (an email, when the owner allowed routine messages to
+    the accountant) or the owner. Social Security and IRS withholding payments keep their tax rules.
+    """
+
+    name = "payroll"
+
+    def accept(self, parts: Sequence[_Part], *, at: datetime, origin: str, report: IngestReport,
+               sender: str | None = None, message_text: str = "", recipients: tuple[str, ...] = ()) -> bool:
+        """A payslip becomes a PAYROLL document (True); anything else is left to the other agents (False)."""
+        text = "\n".join(p.text or p.reading_text for p in parts if p.kind in ("text", "read"))
+        payslip = read_payslip(text)
+        if payslip is None:
+            return False
+        repo = self.repo
+        evidence = list(dict.fromkeys(p.evidence_id for p in parts))
+        same = next((d for d in repo.documents.values() if d.payslip is not None
+                     and d.payslip.period == payslip.period and d.payslip.net == payslip.net
+                     and fold_name(d.payslip.employee) == fold_name(payslip.employee)), None)
+        if same is not None:  # the same payslip again: one document, every copy kept as evidence
+            new = [e for e in evidence if e not in same.evidence_ids]
+            same.evidence_ids = [*same.evidence_ids, *new]
+            same.document = same.document.model_copy(update={"evidence_ids": same.evidence_ids})
+            report.document_ids.append(same.id)
+            report.already_known = not new
+            report.message = "Got it. I already had this payslip." if not new else "Got it."
+            return True
+        company = repo.company_for_tax_id(payslip.employer_tax_id)
+        doc_id = "doc_" + evidence[0][3:19]
+        quality = Quality.RED if payslip.quality is Quality.RED else Quality.AMBER
+        document = Document(
+            id=doc_id, tenant_id=repo.tenant_id, evidence_ids=evidence, doc_type=DocumentType.PAYROLL,
+            supplier_name=payslip.employee, supplier_tax_id=payslip.employee_tax_id,
+            customer_tax_id=payslip.employer_tax_id, issue_date=payslip.issued_on or payslip.period.last_day,
+            currency=payslip.currency, gross_amount=payslip.net, iban=payslip.employee_iban, quality=quality,
+            entity_id=company,
+        )
+        item = TrackedItem(id="item_" + doc_id, tenant_id=repo.tenant_id, subject_type="document", subject_id=doc_id)
+        repo.items[item.id] = item
+        record = DocumentRecord(document=document, evidence_ids=evidence, origin=origin, received_at=at,
+                                item_id=item.id, observations={}, reasons=payslip.reasons(), sender=sender,
+                                message_text=message_text, recipients=recipients, text=text[:_TEXT_KEPT],
+                                payslip=payslip)
+        repo.documents[doc_id] = record
+        if payslip.employee_iban:
+            repo.payroll_employees[normalize_iban(payslip.employee_iban)] = payslip.employee
+        self.o.advance(item, Stage.ACQUIRED, evidence, agent="discovery", note="Payslip received.")
+        self.o.advance(item, Stage.UNDERSTOOD, evidence, agent=self.name, note=" ".join(payslip.reasons()))
+        if quality is Quality.RED:
+            self.o.advance(item, Stage.CONFLICT, evidence, agent=self.name, note=" ".join(payslip.reasons()))
+        self.log("read_payslip", subject_id=doc_id, evidence_ids=evidence,
+                 values={"employee": payslip.employee, "period": str(payslip.period), "net": payslip.net,
+                         "gross": payslip.gross, "employer_tax_id": payslip.employer_tax_id or ""},
+                 response={"quality": quality.value})
+        month = f"{payslip.period.name} {payslip.period.year}"
+        self.o.activity(at, "collected", f"Collected {payslip.employee}'s payslip for {month}.", company,
+                        amount=payslip.net, currency=payslip.currency, evidence_ids=evidence)
+        report.document_ids.append(doc_id)
+        report.message = (f"Got it. This is {payslip.employee}'s payslip for {month}. It does not add up, so it "
+                          "can't prove the salary yet." if quality is Quality.RED else
+                          f"Got it. This is {payslip.employee}'s payslip for {month}. I will match it with the "
+                          "salary.")
+        return True
+
+    def reclassify(self) -> int:
+        """Payments to an employee's account, decided before their payslip showed the account: salaries now."""
+        repo = self.repo
+        if not repo.payroll_employees:
+            return 0
+        engine = self.o.reconciliation.engine()
+        moved = 0
+        for rec in sorted(repo.transactions.values(), key=lambda r: r.id):
+            if rec.decision is None or rec.document_ids or rec.private or repo.items[rec.item_id].is_done:
+                continue
+            if rec.decision.expectation is EvidenceExpectation.PAYROLL and rec.decision.quality is Quality.GREEN:
+                continue
+            if normalize_iban(rec.tx.counterparty_iban or "") not in repo.payroll_employees:
+                continue
+            decision = engine.classify(rec.tx)
+            if decision.expectation is not EvidenceExpectation.PAYROLL:
+                continue
+            rec.decision = decision
+            self.log("expect", subject_id=rec.id, evidence_ids=[rec.evidence_id],
+                     values={"expectation": decision.expectation.value, "rule": decision.rule},
+                     response={"quality": decision.quality.value, "reason": decision.reason})
+            moved += 1
+        return moved
+
+    def payslips(self) -> list[DocumentRecord]:
+        return sorted((d for d in self.repo.documents.values() if d.payslip is not None and not d.matched_tx_ids
+                       and d.document.quality is not Quality.RED), key=lambda d: d.id)
+
+    def prove(self) -> int:
+        """Each open salary with exactly one payslip that proves it (same employee, month and net pay)."""
+        repo = self.repo
+        slips = self.payslips()
+        if not slips:
+            return 0
+        moved = 0
+        for rec in sorted(repo.transactions.values(), key=lambda r: (r.tx.booked_on, r.id)):
+            if rec.decision is None or rec.decision.expectation is not EvidenceExpectation.PAYROLL:
+                continue
+            if rec.document_ids or rec.private or repo.items[rec.item_id].is_done:
+                continue
+            found = [(d, proof) for d in slips if not d.matched_tx_ids
+                     and (proof := salary_proof(rec.tx, d.payslip, known_ibans=repo.payroll_employees)) is not None]
+            if len(found) != 1:
+                continue  # none yet, or two payslips fit: never a guess
+            doc, proof = found[0]
+            payslip = doc.payslip
+            assert payslip is not None
+            rec.document_ids = [doc.id]
+            rec.match_why = (*proof.why, *payslip.reasons())
+            rec.match_headline = proof.headline
+            rec.likely_document_ids = []
+            doc.matched_tx_ids = [rec.id]
+            update: dict[str, Any] = {}
+            if doc.document.quality is Quality.AMBER:
+                update["quality"] = Quality.GREEN  # the bank confirms the net pay the payslip states
+            if doc.document.entity_id is None and rec.tx.entity_id:
+                update["entity_id"] = rec.tx.entity_id
+            if update:
+                doc.document = doc.document.model_copy(update=update)
+            self.log("match", subject_id=rec.id, evidence_ids=[rec.evidence_id, *doc.evidence_ids],
+                     values={"transactions": [rec.id], "documents": [doc.id]}, validations=list(proof.why),
+                     response={"quality": doc.document.quality.value, "kind": "payslip"})
+            moved += 1
+        return moved
+
+    def runner(self, company_id: str) -> str:
+        """Who runs payroll for the company: what the owner said, else the accountant when there is one."""
+        said = self.repo.payroll_by.get(company_id)
+        if said in ("owner", "accountant"):
+            return said if said == "owner" or self.repo.accountant_for(company_id) is not None else "owner"
+        return "accountant" if self.repo.accountant_for(company_id) is not None else "owner"
+
+    def missing(self, now: datetime) -> list[TxRecord]:
+        today = now.astimezone(TZ).date()
+        return [r for r in sorted(self.repo.transactions.values(), key=lambda r: (r.tx.booked_on, r.id))
+                if r.decision is not None and r.decision.expectation is EvidenceExpectation.PAYROLL
+                and not r.document_ids and not r.private and r.tx.amount < 0
+                and not self.repo.items[r.item_id].is_done
+                and (today - r.tx.booked_on).days >= CHASE_AFTER_DAYS]
+
+    def request_missing(self, now: datetime) -> list[str]:
+        """One email to the accountant per company and month for the payslips still missing, when the accountant
+        runs payroll and the owner allowed routine messages to them (§25). Returns the outbox ids written."""
+        repo = self.repo
+        groups: dict[tuple[str, Month], list[TxRecord]] = {}
+        for rec in self.missing(now):
+            if rec.id in repo.payslip_requests or self.runner(rec.company_id) != "accountant":
+                continue
+            groups.setdefault((rec.company_id, Month.of(rec.tx.booked_on)), []).append(rec)
+        written: list[str] = []
+        for (company_id, month), recs in sorted(groups.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+            accountant = repo.accountant_for(company_id)
+            if accountant is None:
+                continue
+            decision = authorize(ActionKind.ROUTINE_ACCOUNTANT_RESPONSE, repo.policy, ActionContext(
+                tenant_id=repo.tenant_id, entity_id=company_id, subject_id=recs[0].id))
+            self.log("authorize_payslip_request", subject_id=recs[0].id,
+                     response={"allowed": decision.allowed_now, "reason": decision.reason_plain})
+            if not decision.allowed_now:
+                continue
+            name = repo.company_name(company_id) or "the company"
+            lines = [f"- {self.employee_name(r)}: {format_money(abs(r.tx.amount), r.tx.currency)} paid on "
+                     f"{day_month(r.tx.booked_on, repo.today())}" for r in recs]
+            body = (f"Hello {accountant.person},\n\nCould you please send the payslips for {name}'s salaries of "
+                    f"{month.name} {month.year}? I need them to match these payments:\n" + "\n".join(lines)
+                    + f"\n\nThank you,\n{repo.owner.full_name}\n")
+            out = self.o.write_email("payslip_request", recs[0].id, company_id, accountant.email,
+                                     f"Payslips for {name}, {month.name} {month.year}", body, now)
+            for r in recs:
+                repo.payslip_requests[r.id] = out.id
+            self.log("write_request", subject_id=recs[0].id, evidence_ids=[r.evidence_id for r in recs],
+                     values={"to": accountant.email, "outbox_id": out.id, "salaries": len(recs)})
+            written.append(out.id)
+        return written
+
+    def employee_name(self, rec: TxRecord) -> str:
+        """Who a salary was paid to, as a person's name: from the IBAN of a payslip on file, else the bank line."""
+        known = self.repo.payroll_employees.get(normalize_iban(rec.tx.counterparty_iban or ""))
+        return known or person_name(self.o.merchant_name(rec.tx))
+
+    def plan(self, rec: TxRecord, amount: str, who: str, when: str) -> str:
+        """Plain words for a salary still waiting for its payslip."""
+        who = self.employee_name(rec)
+        month = Month.of(rec.tx.booked_on).name
+        base = f"The {amount} salary to {who} on {when} needs {who}'s payslip for {month}."
+        company = rec.company_id
+        accountant = self.repo.accountant_for(company)
+        message = self.repo.outbox.get(self.repo.payslip_requests.get(rec.id, ""))
+        if message is not None and accountant is not None:
+            if message.sent:
+                return f"{base} I asked {accountant.firm} for it."
+            return f"{base} I wrote to {accountant.firm} asking for it. It is waiting to be sent."
+        if self.runner(company) == "accountant" and accountant is not None:
+            return f"{base} Your accountant runs payroll: I will ask {accountant.firm} for it."
+        return f"{base} Please send it to me, and I will match it."
+
+
+def fold_name(name: str | None) -> str:
+    """A person's name as compared between two payslips."""
+    return counterparty_key(name) or ""
 
 
 _REPORT_FORMATS = frozenset({EvidenceFormat.CSV, EvidenceFormat.JSON})
@@ -3023,6 +3401,9 @@ class MissingEvidenceAgent(_Agent):
         amount = format_money(abs(rec.tx.amount), rec.tx.currency)
         who = self.o.merchant_name(rec.tx)
         when = day_month(rec.tx.booked_on, self.repo.today())
+        if rec.id in self.repo.onboarding.deferred and rec.tx.entity_id is None:
+            return (f"I will ask you later which company the {amount} payment to {who} on {when} is for. Your first "
+                    "answers may settle it.")
         if rec.decision is not None and rec.decision.expectation is EvidenceExpectation.PAYOUT_REPORT:
             return self.o.settlement.plan(rec, amount, when)
         staged = None if rec.supporting_document_ids or rec.id in self.repo.chases else self.o.staged.plan(rec)
@@ -3033,6 +3414,8 @@ class MissingEvidenceAgent(_Agent):
         staff = self.o.staff.plan(rec)  # paid with an employee's card: the receipt is asked from them
         if staff is not None:
             return staff
+        if rec.decision is not None and rec.decision.expectation is EvidenceExpectation.PAYROLL:
+            return self.o.payroll.plan(rec, amount, who, when)
         chase = self.repo.chases.get(rec.id)
         link = self.repo.broken_links.get(chase.link_id or "") if chase is not None else None
         if chase is not None and link is not None:  # the invoice link in its email no longer works
@@ -5286,8 +5669,10 @@ class ClosureAgent(_Agent):
                                             note="Which company this belongs to.")
                 continue
             if not rec.decision.requires_document and rec.decision.quality is Quality.GREEN:
-                moved += self.o.advance(item, Stage.NOT_REQUIRED, [rec.evidence_id], agent=self.name,
-                                        quality=Quality.GREEN, note=rec.decision.reason)
+                # A learned "no document needed" carries the owner's or accountant's answer as evidence (§54).
+                taught = self.o.learned_evidence(rec) if rec.decision.rule == "learned" else None
+                moved += self.o.advance(item, Stage.NOT_REQUIRED, [rec.evidence_id, *([taught] if taught else [])],
+                                        agent=self.name, quality=Quality.GREEN, note=rec.decision.reason)
                 continue
             if rec.proof_evidence_ids:
                 evidence = [rec.evidence_id, *rec.proof_evidence_ids]
@@ -6142,6 +6527,7 @@ class Orchestrator:
         from backoffice.staff import StaffAgent  # imported here: it builds on this module's agents
 
         self.staff = StaffAgent(self)
+        self.payroll = PayrollAgent(self)
         self._activity_seq = 0
         # What sends the emails the back office writes itself (backoffice.mailer): the demo's simulated
         # outbox, or None. With None they wait in ``repo.outbox``; the production server sends each one
@@ -6245,6 +6631,12 @@ class Orchestrator:
             self.missing.sent_expected(self.repo.expected_invoices[message.subject_id], at)
         elif message.kind == "accountant_answer" and message.subject_id in self.repo.accountant_questions:
             self.accountant.sent(self.repo.accountant_questions[message.subject_id], at)
+        elif message.kind == "payslip_request":
+            asked = [t for t, m in self.repo.payslip_requests.items() if m == message.id]
+            self.activity(at, "checked", f"Asked your accountant for {count_phrase(len(asked), 'payslip')}.",
+                          message.company_id,
+                          evidence_ids=[self.repo.transactions[t].evidence_id for t in asked
+                                        if t in self.repo.transactions])
         elif message.kind in ("statement_request", "statement_correction") and \
                 message.subject_id in self.repo.statements:
             self.statements.sent(message, at)
@@ -6284,6 +6676,8 @@ class Orchestrator:
                     expected := self.repo.expected_invoices.get(message.subject_id)):
                 text = (f"Wrote to {expected.supplier_name} asking for its usual invoice for {expected.period.name}. "
                         "It is waiting to be sent.")
+            elif message.kind == "payslip_request":
+                text = "Wrote to your accountant asking for the missing payslips. It is waiting to be sent."
             elif message.kind == "accountant_answer":
                 text = "Wrote an answer to your accountant. It is waiting to be sent."
                 q = self.repo.accountant_questions.get(message.subject_id)
@@ -6437,6 +6831,7 @@ class Orchestrator:
         at = self.repo.clock.advance_to(at) if at else self.repo.clock.now()
         created = self.discovery.bank_rows(rows, at)
         self.reconciliation.classify(created)
+        self._note_payment_methods(created, at)
         report = IngestReport(route="bank", message="Got it.", evidence_ids=[r.evidence_id for r in created],
                               transaction_ids=[r.id for r in created])
         by_company: dict[str, int] = {}
@@ -6478,6 +6873,8 @@ class Orchestrator:
             self.discovery.log("stored_for_reading", subject_id=evidence.id, evidence_ids=[evidence.id],
                                values={"format": evidence.format.value})
             return
+        if self.payroll.accept(parts, at=at, origin=origin, report=report):
+            return  # a payslip: the evidence a salary needs (J3), never a letter or an invoice
         letter = _letter_text(parts)
         if letter and self._read_letter(letter, evidence.id, at=at, report=report):
             return
@@ -6636,6 +7033,9 @@ class Orchestrator:
             made += self._read_link(link, at=at, report=report, email=email)
         writer = _sender_line(parsed.sender)
         for file_parts in groups:
+            if self.payroll.accept(file_parts, at=at, origin=origin, report=report, sender=sender, message_text=text,
+                                   recipients=recipients):
+                continue  # a payslip (J3)
             letter = _letter_text(file_parts)
             if letter and self._read_letter(letter, file_parts[0].evidence_id, at=at, report=report, sender=writer):
                 continue
@@ -6799,7 +7199,8 @@ class Orchestrator:
             sales=sales, text=extracted.text,
             paid_in_cash=extracted.paid_in_cash and not sales and document.doc_type in _CASH_DOCUMENTS,
             referenced_number=extracted.referenced_number if document.doc_type is DocumentType.CREDIT_NOTE else None,
-            recipients=recipients, issuer=profile,
+            recipients=recipients, issuer=profile, billing_name=extracted.billing_name,
+            billing_address=extracted.billing_address,
         )
         self.repo.documents[doc_id] = record
         evidence = extracted.evidence_ids
@@ -7342,8 +7743,7 @@ class Orchestrator:
             evidence += [r.evidence.id for r in filed.registrations if r.evidence.id not in evidence]
         self.log("owner", "confirm_obligation", subject_id=ob.obligation.id, evidence_ids=evidence, actor=OWNER_ACTOR,
                  values={"outcome": outcome})
-        repo.interactions.append(OwnerInteraction(at=now, active_seconds=ANSWER_SECONDS, kind=InteractionKind.ANSWER,
-                                                  entity_id=ob.obligation.entity_id))
+        self.owner_time(now, entity_id=ob.obligation.entity_id, step="confirm_obligation")
         fact = EvidenceFact(evidence_id=reg.evidence.id, kind=wanted, on=today, quality=Quality.GREEN,
                             reference=ob.reference, valid_until=valid_until)
         result = satisfy(ob.obligation, [fact])
@@ -7375,8 +7775,7 @@ class Orchestrator:
                                      metadata={"kind": "owner_answer"})
         self.log("owner", "expected_invoice_not_coming", subject_id=record.id, evidence_ids=[reg.evidence.id],
                  actor=OWNER_ACTOR)
-        repo.interactions.append(OwnerInteraction(at=now, active_seconds=ANSWER_SECONDS, kind=InteractionKind.ANSWER,
-                                                  entity_id=record.company_id))
+        self.owner_time(now, entity_id=record.company_id, step="expected_invoice_not_coming")
         record.status = "not_coming"
         self.advance(repo.items[record.item_id], Stage.NOT_REQUIRED, [reg.evidence.id], agent="missing_evidence",
                      actor=f"{OWNER_ACTOR}:{repo.owner.email}", quality=Quality.GREEN,
@@ -7399,10 +7798,12 @@ class Orchestrator:
             moved = self._entities(now)
             moved += self._link_credit_notes(now)
             self.reconciliation.classify([r for r in self.repo.transactions.values() if r.decision is None])
+            moved += self.payroll.reclassify()  # paid to an employee's account: a salary (J3)
             moved += self.reconciliation.customer_refunds()  # money back to a customer: your own credit note
             moved += self.staff.settle(now)  # a transfer paying an employee back their approved expense claims
             moved += self.settlement.settle(now)  # payouts first: their reports and commission invoices
             moved += self.staged.settle(now)  # deposits, advance and final invoices, parts held back (X8)
+            moved += self.payroll.prove()  # salaries: only by that month's payslip for that employee (J3)
             matches = self.reconciliation.match()
             for m in matches:
                 self._reverify_with_bank(m)
@@ -7424,18 +7825,26 @@ class Orchestrator:
         report.chased = [*(r for b in linked if (r := self.repo.broken_links[b].tx_id)), *self.missing.chase_all(now)]
         self.missing.chase_expected(now)
         self.staff.follow_up(now)  # receipts asked from cardholders, reminders, expense claims to approve
+        self.payroll.request_missing(now)  # missing payslips, from whoever runs payroll (J3)
         self.accountant.answer_all(now)
         report.sent = self.deliver(now)
         self._announce_waiting(now)
         report.reopened = self.auditor.recheck()
         report.closed_months = self.closure.record_closures(now)
         self._record_recovered(now)
+        self._onboarding_progress(now)
         return report
 
     def _entities(self, now: datetime) -> int:
+        """Which company each payment is for (§51). During a new business's first run, questions wait for the
+        whole history, then only the most valuable few are asked (§5, backoffice.onboarding)."""
         moved = 0
+        ob = self.repo.onboarding
         for rec in sorted(self.repo.transactions.values(), key=lambda r: r.id):
+            if ob.learning:
+                ob.historical.add(rec.id)  # the history the first run learns from (and its coverage, §5)
             if rec.tx.entity_id is not None or rec.private or self.repo.items[rec.item_id].is_done:
+                ob.deferred.discard(rec.id)
                 continue
             open_q = next((n for n in self.repo.needs.values() if n.subject_id == rec.id and n.status == "open"), None)
             result = self.entity.assign(rec)
@@ -7446,26 +7855,203 @@ class Orchestrator:
                 if open_q is not None:
                     open_q.status = "resolved"
                     open_q.resolution = "rule" if result.rule_id else "evidence"
+                ob.deferred.discard(rec.id)
                 moved += 1
             elif result.private and result.quality is Quality.GREEN:
                 rec.private = True
                 if open_q is not None:
                     open_q.status = "resolved"
                     open_q.resolution = "rule"
+                ob.deferred.discard(rec.id)
                 self.advance(self.repo.items[rec.item_id], Stage.NOT_REQUIRED, [rec.evidence_id], agent="entity",
                              quality=Quality.GREEN, note="Personal, by your rule.")
                 moved += 1
             elif result.question is not None and open_q is None:
-                amount = abs(rec.tx.amount)
-                who = self.merchant_name(rec.tx)
-                needs_id = _unique_id(self.repo.needs, f"nd_{_slug(who.split()[0])}_{int(amount)}")
-                self.repo.needs[needs_id] = NeedsYouRecord(
-                    id=needs_id, kind="choice", subject_type="transaction", subject_id=rec.id, item_id=rec.item_id,
-                    company_id=rec.holder_id, created_at=now, question=result.question,
-                    why=self._entity_why(rec, result))
-                self.entity.log("ask_owner", subject_id=rec.id, evidence_ids=[rec.evidence_id],
-                                response={"needs_you": needs_id})
+                if ob.holds(rec.id):
+                    continue  # the first run is still learning, or this one waits its turn (§5)
+                self._ask_entity(rec, result, now)
+        if ob.learning and self._learning_done(now):
+            moved += self._finish_learning(now)
+        elif ob.deferred and not ob.learning:
+            moved += self._release_deferred(now)
         return moved
+
+    def _ask_entity(self, rec: TxRecord, result: EntityAssignment, now: datetime) -> NeedsYouRecord:
+        """One "which company?" question in Needs You (§37)."""
+        assert result.question is not None
+        amount = abs(rec.tx.amount)
+        who = self.merchant_name(rec.tx)
+        needs_id = _unique_id(self.repo.needs, f"nd_{_slug(who.split()[0])}_{int(amount)}")
+        needs = NeedsYouRecord(
+            id=needs_id, kind="choice", subject_type="transaction", subject_id=rec.id, item_id=rec.item_id,
+            company_id=rec.holder_id, created_at=now, question=result.question, why=self._entity_why(rec, result))
+        self.repo.needs[needs_id] = needs
+        self.entity.log("ask_owner", subject_id=rec.id, evidence_ids=[rec.evidence_id],
+                        response={"needs_you": needs_id})
+        return needs
+
+    # ----------------------------------------------------------------- the first run (§5, §6, §58, §59)
+
+    def _learning_done(self, now: datetime) -> bool:
+        """The history is in: no connection is still reading its first 90 days (or it took too long)."""
+        ob = self.repo.onboarding
+        if not self.repo.transactions:
+            return False
+        waiting = {c for c in ob.waiting_for if c in self.repo.connectors}
+        return not waiting or (ob.started_at is not None and now - ob.started_at > ob_.LEARNING_MAX)
+
+    def _waiting_for_owner(self, rec: TxRecord) -> bool:
+        return rec.tx.entity_id is None and not rec.private and not self.repo.items[rec.item_id].is_done \
+            and rec.assignment is not None and rec.assignment.question is not None
+
+    def _first_run_candidates(self, tx_ids: set[str]) -> list[Any]:
+        recs = [r for r in self.repo.transactions.values() if r.id in tx_ids and self._waiting_for_owner(r)]
+        return candidates_from_assignments([r.tx for r in recs], {r.id: r.assignment for r in recs
+                                                                  if r.assignment is not None})
+
+    def _finish_learning(self, now: datetime) -> int:
+        """The history is in: ask only the most valuable few questions, one per series; defer the rest (§5)."""
+        repo = self.repo
+        ob = repo.onboarding
+        ob.learning = False
+        # Never more than the cap open at once, even when a later connection's history comes in.
+        still_open = sum(1 for n in repo.needs.values() if n.status == "open" and n.id in {*ob.asked, *ob.released})
+        room = max(0, ob.question_limit - still_open)
+        chosen = select_questions(self._first_run_candidates(ob.historical), limit=room) if room else []
+        chosen_ids = {c.question.facts.subject_id for c in chosen}
+        moved = 0
+        for rec in sorted(repo.transactions.values(), key=lambda r: r.id):
+            if rec.id not in ob.historical or not self._waiting_for_owner(rec):
+                continue
+            if any(n.subject_id == rec.id and n.status == "open" for n in repo.needs.values()):
+                continue
+            if rec.id in chosen_ids:
+                ob.asked.append(self._ask_entity(rec, rec.assignment, now).id)  # type: ignore[arg-type]
+                moved += 1
+            else:
+                ob.deferred.add(rec.id)
+        history = [r for r in repo.transactions.values() if r.id in ob.historical]
+        coverage = compute_coverage(coverage_items([r.tx for r in history],
+                                                   {r.id: r.assignment for r in history if r.assignment is not None}))
+        self.milestone(ob_.LEARNING_FINISHED, now)
+        self.log("onboarding", "first_run_questions", evidence_ids=[r.evidence_id for r in history][:50],
+                 values={"payments": len(history), "asked": len(ob.asked), "deferred": len(ob.deferred),
+                         "limit": ob.question_limit},
+                 response={"coverage": coverage.percent, "headline": coverage.headline})
+        if history:
+            line = f"Learned how your business works from {count_phrase(len(history), 'payment')}. {coverage.headline}"
+            self.activity(now, "learned", f"{line} {confirm_line(len(ob.asked))}")
+        return moved
+
+    def _release_deferred(self, now: datetime) -> int:
+        """A deferred question is asked later, one series at a time and at most one a day, and only when
+        nothing from the first run is waiting for the owner: Needs You is never flooded (§5, §30)."""
+        repo = self.repo
+        ob = repo.onboarding
+        today = now.astimezone(TZ).date()
+        if ob.released_on == today:
+            return 0
+        waiting = {*ob.asked, *ob.released}
+        if any(n.status == "open" and n.id in waiting for n in repo.needs.values()):
+            return 0
+        chosen = select_questions(self._first_run_candidates(set(ob.deferred)), limit=1)
+        if not chosen:
+            return 0
+        rec = repo.transactions[chosen[0].question.facts.subject_id]
+        if rec.assignment is None or any(n.subject_id == rec.id and n.status == "open" for n in repo.needs.values()):
+            return 0
+        ob.deferred.discard(rec.id)
+        ob.released.append(self._ask_entity(rec, rec.assignment, now).id)
+        ob.released_on = today
+        return 1
+
+    def begin_onboarding(self, at: datetime | None = None, *, question_limit: int | None = None) -> None:
+        """A new business signed up (§4, §58): its first run learns before it asks, and its onboarding is timed."""
+        ob = self.repo.onboarding
+        now = at or self.repo.clock.now()
+        if ob.started_at is not None:
+            return
+        ob.started_at = now
+        ob.learning = True
+        if question_limit is not None:
+            ob.question_limit = question_limit
+        self.milestone(ob_.ACCOUNT_CREATED, now)
+
+    def milestone(self, name: str, at: datetime | None = None) -> bool:
+        """Record the first time an onboarding milestone was reached, with its time, as an audit event."""
+        ob = self.repo.onboarding
+        if ob.started_at is None or name in ob.milestones:
+            return False
+        when = max(at or self.repo.clock.now(), ob.started_at)
+        ob.milestones[name] = when
+        self.log("onboarding", "milestone", subject_id=name, values={"milestone": name, "at": when.isoformat()},
+                 response=ob_.MILESTONE_WORDS.get(name))
+        return True
+
+    def connection_reading(self, connector_id: str) -> None:
+        """A connection started reading its first 90 days: its history is learned from before anything in it is
+        asked (§5, §6). The first run waits for it; so does a connection added later, with the same cap."""
+        ob = self.repo.onboarding
+        if ob.started_at is None:
+            return
+        ob.waiting_for.add(connector_id)
+        ob.learning = True
+
+    def connection_read(self, connector_id: str) -> None:
+        """A connection finished its first read (or went away)."""
+        self.repo.onboarding.waiting_for.discard(connector_id)
+
+    def owner_time(self, at: datetime, *, kind: InteractionKind = InteractionKind.ANSWER, entity_id: str | None = None,
+                   seconds: int = ANSWER_SECONDS, step: str = "") -> None:
+        """One span of the owner's active time (§59). While onboarding is open it counts as onboarding time."""
+        ob = self.repo.onboarding
+        onboarding = ob.open_at(at)
+        self.repo.interactions.append(OwnerInteraction(
+            at=at, active_seconds=seconds, kind=InteractionKind.ONBOARDING if onboarding else kind,
+            entity_id=entity_id))
+        if onboarding:
+            ob.estimated_spans += 1
+            self.log("onboarding", "owner_time", subject_id=step or None, values={"step": step, "seconds": seconds})
+
+    def setup_step(self, step: str, *, entity_id: str | None = None) -> None:
+        """An owner set-up step during onboarding (§4): one span of their time. Nothing outside onboarding."""
+        now = self.repo.clock.now()
+        if self.repo.onboarding.open_at(now):
+            self.owner_time(now, entity_id=entity_id, step=step)
+
+    def _onboarding_progress(self, now: datetime) -> None:
+        """Milestones the state now shows (§58), and the end of onboarding (§59)."""
+        repo = self.repo
+        ob = repo.onboarding
+        if ob.started_at is None:
+            return
+        m = ob.milestones
+        if ob_.HISTORICAL_SCAN_COMPLETE not in m and ob_.EMAIL_CONNECTED in m and ob_.BANK_CONNECTED in m \
+                and not {c for c in ob.waiting_for if c in repo.connectors}:
+            self.milestone(ob_.HISTORICAL_SCAN_COMPLETE, now)
+        if ob_.FIRST_DOCUMENT_FOUND not in m and repo.documents:
+            first = min(d.received_at for d in repo.documents.values())
+            self.milestone(ob_.FIRST_DOCUMENT_FOUND, first)
+        if ob_.FIRST_AUTO_MATCH not in m:
+            matched = [t.at for rec in repo.transactions.values()
+                       if not owner_touched(item := repo.items[rec.item_id])
+                       for t in item.history if t.to_stage is Stage.MATCHED]
+            if matched:
+                self.milestone(ob_.FIRST_AUTO_MATCH, min(matched))
+        if ob.finished_at is None and not ob.learning:
+            first_run_open = any(n.status == "open" and n.id in ob.asked for n in repo.needs.values())
+            if not first_run_open or not ob.open_at(now):
+                ob.finished_at = now
+                self.milestone(ob_.ONBOARDING_FINISHED, now)
+        elif ob.finished_at is None and not ob.open_at(now):
+            ob.finished_at = now
+            self.milestone(ob_.ONBOARDING_FINISHED, now)
+
+    def activation(self) -> Any:
+        """§58 activation and time to first value (closure.ActivationReport), or None when this business never
+        went through onboarding (set up by hand, like the demo): nothing to measure."""
+        signals = self.repo.onboarding.activation_signals()
+        return None if signals is None else evaluate_activation(signals)
 
     def _link_credit_notes(self, now: datetime) -> int:
         """A credit note that names the invoice it corrects is linked to that invoice (§20 credit notes).
@@ -7852,6 +8438,228 @@ class Orchestrator:
                       rec.company_id, amount=rec.tx.amount, currency=rec.tx.currency, evidence_ids=[answer_ev])
         return AnswerOutcome(ok=True, message=f"Done. I counted it as part of credit note {number}. {still} is still to come.")
 
+    # ----------------------------------------------------------------- how a supplier is usually paid (L4)
+
+    def method_labels(self) -> dict[str, str]:
+        """Plain names of the cards and accounts ("card:4817" -> "card •••• 4817")."""
+        out: dict[str, str] = {}
+        for a in sorted(self.repo.accounts.values(), key=lambda a: a.id):
+            if a.card_last4:
+                out.setdefault(f"card:{a.card_last4}", a.label)
+            out[f"account:{a.id}"] = a.label
+        return out
+
+    def payment_keys(self) -> Any:
+        """A function giving the key a counterparty's payments are grouped by: the known supplier, else its
+        cleaned name (one resolver, cached per name)."""
+        resolver = self.repo.resolver()
+        cache: dict[str, str | None] = {}
+
+        def key(name: str | None) -> str | None:
+            if not name:
+                return None
+            if name not in cache:
+                cache[name] = resolver.resolve(name).key or counterparty_key(name)
+            return cache[name]
+
+        return key
+
+    def payment_groups(self, key: Any) -> dict[str, list[Transaction]]:
+        """Every payment out (the imported history included), grouped by counterparty key."""
+        groups: dict[str, list[Transaction]] = {}
+        for t in (*self.repo.history_transactions, *(r.tx for r in self.repo.transactions.values())):
+            if t.amount < 0 and (k := key(t.counterparty)):
+                groups.setdefault(k, []).append(t)
+        return groups
+
+    @staticmethod
+    def payment_series(key: str, payments: Sequence[Transaction], *, before: date | None = None,
+                       exclude: str | None = None) -> RecurringSeries | None:
+        """The rhythm of payments to one counterparty, with the card or account it is usually paid from (L4)."""
+        txs = [t for t in payments if t.id != exclude and (before is None or t.booked_on < before)]
+        if len(txs) < 2:
+            return None
+        occurrences = [Occurrence(on=t.booked_on, amount=abs(t.amount), currency=t.currency, label=t.counterparty,
+                                  ref=t.id, method=method_of(t)) for t in txs]
+        return learn_series(key, occurrences, basis=Basis.PAYMENTS)
+
+    def _note_payment_methods(self, created: Sequence[TxRecord], at: datetime) -> None:
+        """A payment of a supplier from another card or account than usual is noted in plain words (L4): a
+        note on the payment and one line in Activity, never a hold. Not during a first run's history import."""
+        outgoing = [r for r in created if r.tx.amount < 0]
+        if not outgoing:
+            return
+        labels = self.method_labels()
+        key_of = self.payment_keys()
+        groups = self.payment_groups(key_of)
+        for rec in sorted(outgoing, key=lambda r: (r.tx.booked_on, r.id)):
+            key = key_of(rec.tx.counterparty)
+            if not key:
+                continue
+            series = self.payment_series(key, groups.get(key, []), before=rec.tx.booked_on, exclude=rec.id)
+            note = payment_method_note(series, rec.tx, labels) if series is not None else None
+            if note is None or note in rec.notes:
+                continue
+            rec.notes.append(note)
+            self.log("reconciliation", "payment_method_differs", subject_id=rec.id, evidence_ids=[rec.evidence_id],
+                     values={"usual": labels.get(series.usual_method or "", "") if series else "",
+                             "this_time": labels.get(method_of(rec.tx), "")})
+            if not self.repo.onboarding.learning:
+                who = self.merchant_name(rec.tx)
+                self.activity(at, "checked", f"{who}: {note}", rec.holder_id, amount=abs(rec.tx.amount),
+                              currency=rec.tx.currency, evidence_ids=[rec.evidence_id])
+
+    # ----------------------------------------------------------------- evidence needs learned from answers (J7)
+
+    def learned_evidence(self, rec: TxRecord) -> str | None:
+        """The stored answer or rule behind a learned expectation of this payment, if any."""
+        key = self.repo.resolver().resolve_transaction(rec.tx).key
+        found = _LearnedExpectations(self.repo).lookup(rec.tx, key)
+        return found.evidence_id if found is not None else None
+
+    def learn_evidence_need(self, tx_id: str, need: str, *, by: str = "owner", company_id: str | None = None,
+                            evidence_id: str | None = None) -> tuple[LearnedExpectation, int]:
+        """"This never has an invoice" / "This always needs one", from the owner or the accountant (J7).
+
+        It is remembered for the counterparty (its IBAN when the bank shows one, else the supplier or bank
+        name) and used for this payment and every later one; open payments of that counterparty are decided
+        again now. ``company_id`` limits an accountant's answer to one company. Returns what was learned and
+        how many payments it changed.
+        """
+        repo = self.repo
+        rec = repo.transactions[tx_id]
+        if need not in ("none", "invoice", "receipt"):
+            raise ValueError("need is none, invoice or receipt")
+        expectation = {"none": EvidenceExpectation.BANK_EVIDENCE_SUFFICES, "invoice": EvidenceExpectation.INVOICE,
+                       "receipt": EvidenceExpectation.RECEIPT}[need]
+        who = self.merchant_name(rec.tx)
+        reasons = {
+            ("owner", "none"): f"You told me {who} never sends an invoice. The bank record is enough.",
+            ("owner", "invoice"): f"You told me {who} always sends an invoice.",
+            ("owner", "receipt"): f"You told me a receipt is enough for {who}.",
+            ("accountant", "none"): f"Your accountant said {who} needs no invoice. The bank record is enough.",
+            ("accountant", "invoice"): f"Your accountant said {who} always needs an invoice.",
+            ("accountant", "receipt"): f"Your accountant said a receipt is enough for {who}.",
+        }
+        now = repo.clock.now()
+        if evidence_id is None:
+            body = json.dumps({"kind": "evidence_need", "transaction_id": tx_id, "need": need, "by": by,
+                               "answered_at": now.isoformat(), "answered_by": repo.owner.email if by == "owner"
+                               else by}, sort_keys=True).encode()
+            evidence_id = repo.registry.register(body, tenant_id=repo.tenant_id, source_kind=SourceKind.UPLOAD,
+                                                 format=EvidenceFormat.JSON, mime_type="application/json",
+                                                 retrieved_at=now, metadata={"kind": "owner_answer"}).evidence.id
+        learned = LearnedExpectation(expectation, reasons[(by, need)], evidence_id=evidence_id, taught_by=by)
+        store = repo.expectation_overrides
+        if company_id is not None:
+            store = repo.company_expectation_overrides.setdefault(company_id, InMemoryExpectationOverrides())
+        match = repo.resolver().resolve_transaction(rec.tx)
+        if rec.tx.counterparty_iban:
+            store.remember_iban(rec.tx.counterparty_iban, learned)
+        if match.supplier is not None:
+            store.remember_supplier(match.key, learned)
+        try:
+            store.remember_descriptor(rec.tx.counterparty, learned)
+        except ValueError:
+            pass  # nothing in the bank name to remember: the IBAN or supplier carries it
+        key_of = self.payment_keys()
+        mine, iban = key_of(rec.tx.counterparty), normalize_iban(rec.tx.counterparty_iban or "")
+        changed = self.redecide(lambda r: key_of(r.tx.counterparty) == mine
+                                or (bool(iban) and normalize_iban(r.tx.counterparty_iban or "") == iban))
+        actor = f"{OWNER_ACTOR}:{repo.owner.email}" if by == "owner" else f"accountant:{by}"
+        self.log("reconciliation", "learn_expectation", subject_id=tx_id, evidence_ids=[evidence_id], actor=actor,
+                 values={"need": need, "by": by, "company": company_id or ""}, response={"changed": changed})
+        if by == "owner":
+            self.owner_time(now, entity_id=rec.company_id, step="evidence_need")
+        self.activity(now, "learned", f"Learned: {learned.reason} I will remember this.", company_id or rec.company_id,
+                      evidence_ids=[evidence_id])
+        self.run(now)
+        return learned, changed
+
+    def redecide(self, which: Any) -> int:
+        """Decide again what evidence open payments need (after something was learned); returns how many changed."""
+        engine = self.reconciliation.engine()
+        changed = 0
+        for rec in sorted(self.repo.transactions.values(), key=lambda r: r.id):
+            if rec.decision is None or rec.document_ids or rec.private or self.repo.items[rec.item_id].is_done:
+                continue
+            if not which(rec):
+                continue
+            decision = engine.classify(rec.tx)
+            if decision == rec.decision:
+                continue
+            rec.decision = decision
+            self.reconciliation.log("expect", subject_id=rec.id, evidence_ids=[rec.evidence_id],
+                                    values={"expectation": decision.expectation.value, "rule": decision.rule},
+                                    response={"quality": decision.quality.value, "reason": decision.reason})
+            changed += 1
+        return changed
+
+    # ----------------------------------------------------------------- due dates (F8)
+
+    def usable_due_date(self, record: DocumentRecord) -> date | None:
+        """The due date an invoice states, when it can be used: a real date, not before the invoice's own date,
+        and not disputed between sources (F8)."""
+        due = record.document.due_date
+        if due is None:
+            return None
+        check = record.checks.get(CriticalField.DUE_DATE.value)
+        if check is not None and (check.quality is Quality.RED or check.value is None):
+            return None
+        issued = record.document.issue_date
+        if issued is not None and due < issued:
+            return None
+        return due
+
+    def invoice_due(self, record: DocumentRecord, today: date | None = None) -> dict[str, Any] | None:
+        """An unpaid purchase invoice with a usable due date: when it is due and a plain line about it (F8).
+
+        None for anything already paid (matched), on hold (the hold says it), a sale, a supporting document,
+        a cash receipt or a credit note. ``overdue`` once the due date has passed without its payment.
+        """
+        doc = record.document
+        if record.sales or record.supporting or record.paid_in_cash or record.on_hold or record.matched_tx_ids \
+                or record.supports_tx_ids or doc.doc_type not in _PAYABLE_LATER or record.payslip is not None:
+            return None
+        if self.repo.items[record.item_id].is_done:
+            return None
+        due = self.usable_due_date(record)
+        if due is None:
+            return None
+        today = today or self.repo.today()
+        who = display_name(doc.supplier_name)
+        amount = format_money(doc.gross_amount, doc.currency) if doc.gross_amount is not None else None
+        what = f"The {who} invoice" + (f" of {amount}" if amount else "")
+        days = (due - today).days
+        if days < 0:
+            line = f"{what} was due on {day_month(due, today)}. I haven't seen its payment yet."
+        elif days == 0:
+            line = f"{what} is due today. I haven't seen its payment yet."
+        else:
+            line = f"{what} is due on {day_month(due, today)}."
+        if days < 0 and (likely := self.likely_payment(record, due)) is not None:
+            paid_with = self.method_labels().get(method_of(likely.tx), "")
+            line = (f"{what} was due on {day_month(due, today)}. A payment of "
+                    f"{format_money(abs(likely.tx.amount), likely.tx.currency)} on "
+                    f"{day_month(likely.tx.booked_on, today)}{' from ' + paid_with if paid_with else ''} may be it: "
+                    "I'm checking.")
+        return {"due": due, "overdue": days < 0, "days": days, "line": line, "document_id": record.id}
+
+    def likely_payment(self, record: DocumentRecord, around: date) -> TxRecord | None:
+        """An unmatched payment of this invoice's supplier, at its amount, near ``around``: looked for on the
+        supplier's usual card or account first (L4). Never a match: only words for the owner."""
+        doc = record.document
+        if record.supplier_id is None or doc.gross_amount is None:
+            return None
+        key_of = self.payment_keys()
+        series = self.payment_series(record.supplier_id, self.payment_groups(key_of).get(record.supplier_id, []))
+        if series is None:
+            return None
+        open_txs = [r.tx for r in self.repo.transactions.values() if not r.document_ids and not r.private
+                    and r.tx.amount == -abs(doc.gross_amount)]
+        found, _ = find_payment(series, open_txs, around=around, key=key_of)
+        return self.repo.transactions.get(found.id) if found is not None else None
+
     def merchant_name(self, tx: Transaction) -> str:
         """Plain name of whoever was paid: the known supplier's name, else the cleaned bank descriptor."""
         supplier = self.repo.resolver().resolve_transaction(tx).supplier
@@ -7990,9 +8798,8 @@ class Orchestrator:
                 option_id not in {o.id for o in needs.options}:
             raise ValueError("not one of the options")
         answer_ev = self._record_answer(needs, option_id, now, split=split if needs.kind == "cost_center" else None)
-        repo.interactions.append(OwnerInteraction(at=now, active_seconds=ANSWER_SECONDS,
-                                                  kind=InteractionKind.APPROVAL if needs.kind == "approval"
-                                                  else InteractionKind.ANSWER, entity_id=needs.company_id or None))
+        self.owner_time(now, kind=InteractionKind.APPROVAL if needs.kind == "approval" else InteractionKind.ANSWER,
+                        entity_id=needs.company_id or None, step=f"answer:{needs.kind}")
         if needs.kind == "approval":
             outcome = self._answer_approval(needs, option_id, answer_ev, now)
         elif needs.kind == "check":
@@ -8235,8 +9042,7 @@ class Orchestrator:
             open_q = agent.open_question(paid.id)
             if open_q is not None:
                 open_q.status, open_q.answer, open_q.answered_at = "answered", option_id, now
-        repo.interactions.append(OwnerInteraction(at=now, active_seconds=ANSWER_SECONDS, kind=InteractionKind.ANSWER,
-                                                  entity_id=company))
+        self.owner_time(now, entity_id=company, step="allocate")
         learned = None
         if remember:
             question = cost_center_question(centers, facts, (), repo.today())
@@ -8569,6 +9375,11 @@ class Orchestrator:
         only; "all" covers every company this accountant looks after (and their other clients)."""
         repo = self.repo
         author = self.rule_author(company_id)
+        for pattern, need in _EXPECTATION_RULES:
+            wanted = pattern.match(text)
+            if wanted is not None:
+                return self._accountant_expectation_rule(text, wanted.group("who").strip(), need, scope, company_id,
+                                                         author)
         m = re.match(r"^\s*(?:treat|classify|book)\s+(?:all\s+)?(?P<who>.+?)\s+(?:subscriptions?\s+|payments?\s+|"
                      r"invoices?\s+|expenses?\s+|costs?\s+)?as\s+(?P<what>.+?)\s*\.?\s*$", text, re.I)
         if m is None:
@@ -8607,6 +9418,67 @@ class Orchestrator:
                  values={"text": text, "scope": rule_scope.value, "companies": list(entity_ids)},
                  response={"affected": affected})
         self.activity(now, "learned", f"Your accountant taught me: {rule.label}.", company_id)
+        return rule, affected
+
+    def _accountant_expectation_rule(self, text: str, who: str, need: str, scope: str, company_id: str | None,
+                                     author: AccountantProfile) -> tuple[Rule, int]:
+        """"Vodafone never has an invoice" / "Adobe always needs an invoice": what evidence that counterparty's
+        payments need, learned for every payment from now on (§21, J7). Kept as the accountant's rule too, so
+        their rules list shows it."""
+        from backoffice.learning import Expectation
+
+        repo = self.repo
+        key = counterparty_key(who)
+        supplier = repo.resolver().resolve(who).supplier
+        if key is None and supplier is None:
+            raise ValueError("I could not tell which supplier the rule is about.")
+        all_clients = scope in ("all", "all_clients", "all_clients_of_accountant")
+        limited = company_id if company_id is not None and not all_clients else None
+        now = repo.clock.now()
+        name = display_name(supplier.name) if supplier else display_name(who)
+        label = f"{name} needs no invoice" if need == "none" else f"{name} always needs an invoice"
+        body = json.dumps({"kind": "accountant_rule", "text": text, "accountant": author.id, "company": limited,
+                           "at": now.isoformat()}, sort_keys=True).encode()
+        evidence_id = repo.registry.register(body, tenant_id=repo.tenant_id, source_kind=SourceKind.ACCOUNTANT,
+                                             format=EvidenceFormat.JSON, mime_type="application/json",
+                                             retrieved_at=now, metadata={"kind": "accountant_rule"}).evidence.id
+        reason = (f"Your accountant said {name} needs no invoice. The bank record is enough." if need == "none" else
+                  f"Your accountant said {name} always needs an invoice.")
+        expectation = EvidenceExpectation.BANK_EVIDENCE_SUFFICES if need == "none" else EvidenceExpectation.INVOICE
+        learned = LearnedExpectation(expectation, reason, evidence_id=evidence_id, taught_by="accountant")
+        store = repo.expectation_overrides if limited is None else repo.company_expectation_overrides.setdefault(
+            limited, InMemoryExpectationOverrides())
+        if supplier is not None:
+            store.remember_supplier(supplier.id, learned)
+        try:
+            store.remember_descriptor(who, learned)
+        except ValueError:
+            pass
+        seed = f"{text}|{scope}" if company_id is None else f"{text}|{scope}|{company_id}|{author.id}"
+        rule_scope = RuleScope.ALL_CLIENTS_OF_ACCOUNTANT if all_clients else RuleScope.CLIENT
+        rule = Rule(
+            id="rule_" + hashlib.sha256(seed.encode()).hexdigest()[:12],
+            author=RuleAuthor.ACCOUNTANT, author_id=author.id, scope=rule_scope,
+            tenant_id=None if all_clients else repo.tenant_id, entity_ids=(limited,) if limited else (),
+            match=RuleMatch(counterparty_key=supplier.id if supplier else key),
+            outcome=RuleOutcome(expectation=Expectation.NONE if need == "none" else Expectation.INVOICE),
+            created_at=now, label=label,
+        )
+        repo.rulebook.add(rule, reason="accountant rule")
+        key_of = self.payment_keys()
+        wanted = supplier.id if supplier is not None else key_of(who)
+
+        def covered(r: TxRecord) -> bool:
+            return key_of(r.tx.counterparty) == wanted and (limited is None or r.company_id == limited)
+
+        affected = sum(1 for r in repo.transactions.values() if covered(r))
+        changed = self.redecide(covered)
+        self.log("accountant", "accountant_rule", subject_id=rule.id, evidence_ids=[evidence_id],
+                 actor=f"accountant:{author.id}",
+                 values={"text": text, "scope": rule_scope.value, "companies": [limited] if limited else [],
+                         "need": need}, response={"affected": affected, "changed": changed})
+        self.activity(now, "learned", f"Your accountant taught me: {label}.", company_id, evidence_ids=[evidence_id])
+        self.run(now)
         return rule, affected
 
     def accountant_rules(self, company_id: str) -> list[Rule]:
@@ -8781,6 +9653,19 @@ _NOT_CASH_WORDS = re.compile(
     r"|bank\s+transfer|debito\s+direto|direct\s+debit|paypal|apple\s+pay|google\s+pay|tpa)(?![a-z])")
 _CASH_AND_CARRY = re.compile(r"cash\s*(?:&|and|e|n)\s*carry|cash\s*back|petty\s+cash")
 _TEXT_KEPT = 20_000  # characters of a document's text kept for wording checks
+# An accountant's rule about the evidence a counterparty's payments need (J7): "Vodafone never has an invoice".
+_INVOICE_WORD = r"(?:an?\s+)?invoices?"
+_EXPECTATION_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^\s*no\s+invoices?\s+(?:is\s+|are\s+)?(?:needed|required)\s+for\s+(?P<who>.+?)\s*\.?\s*$", re.I),
+     "none"),
+    (re.compile(r"^\s*(?P<who>.+?)\s+(?:payments?\s+|subscriptions?\s+|costs?\s+)?(?:never\s+(?:has|have|needs?|sends?|"
+                r"comes?\s+with)\s+" + _INVOICE_WORD + r"|(?:does|do)\s+not\s+need\s+" + _INVOICE_WORD +
+                r"|(?:doesn't|don't)\s+need\s+" + _INVOICE_WORD + r"|needs?\s+no\s+invoices?)\s*\.?\s*$", re.I), "none"),
+    (re.compile(r"^\s*(?:always\s+)?(?:require|ask\s+for)\s+" + _INVOICE_WORD + r"\s+for\s+(?P<who>.+?)\s*\.?\s*$",
+                re.I), "invoice"),
+    (re.compile(r"^\s*(?P<who>.+?)\s+(?:payments?\s+|subscriptions?\s+|costs?\s+)?always\s+(?:has|have|needs?|"
+                r"requires?|sends?)\s+" + _INVOICE_WORD + r"\s*\.?\s*$", re.I), "invoice"),
+)
 
 
 def _says_paid_in_cash(text: str) -> bool:

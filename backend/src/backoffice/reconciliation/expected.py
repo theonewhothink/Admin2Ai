@@ -252,10 +252,16 @@ class ExpectationDecision:
 
 @dataclass(frozen=True)
 class LearnedExpectation:
-    """An expectation the owner or accountant taught once ("I will remember this.")."""
+    """An expectation the owner or accountant taught once ("I will remember this.").
+
+    ``evidence_id`` is the stored answer or rule it came from (§54): a payment that needs no document
+    because of it carries that evidence. ``taught_by`` is "owner" or "accountant".
+    """
 
     expectation: EvidenceExpectation
     reason: str | None = None
+    evidence_id: str | None = None
+    taught_by: str = "owner"
 
 
 @runtime_checkable
