@@ -502,6 +502,8 @@ _JARGON: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("chargeback", re.compile(r"\bcharge[\s-]?backs?\b", _I)),
     # Deposits and staged invoices (checklist X8): the owner reads "held back by the customer" and "still to come".
     ("receivable", re.compile(r"\breceivables?\b", _I)),
+    # Leasing (checklist X24): the owner reads "the leasing company" and "your leasing contract".
+    ("lessor", re.compile(r"\blessors?\b|\blessees?\b", _I)),
     ("retention", re.compile(r"\bretentions?\b", _I)),
     # VAT mechanics are the accountant's (checklist X31): the owner never reads them.
     ("reverse charge", re.compile(r"\breverse[\s-]?charg\w*|\bautoliquida\w*", _I)),

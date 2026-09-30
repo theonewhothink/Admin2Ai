@@ -12,6 +12,9 @@ Rules run in a fixed order, first hit wins:
 2. nothing moved (zero amount),
 3. own accounts / own companies (IBAN, bank flag, or own company name),
 4. credit-card repayments (money out paying off a card),
+4b. cash moving between the bank and the cash box (backoffice.reconciliation.cash): an ATM
+   withdrawal or a transfer to the cash box needs no invoice (the cash receipts are the evidence
+   of what it paid for); cash paid into the bank needs the till reports it comes from,
 5. payouts (money in from a card terminal or a payment / sales platform: a net
    settlement whose evidence is the provider's payout report, never customer
    revenue on its own),
@@ -50,6 +53,7 @@ from backoffice.domain.models import (
 )
 
 from ._text import fold, normalize_iban, tokens
+from .cash import CASH_DEPOSIT, WITHDRAWAL, cash_movement
 from .bank import (
     NO_METADATA,
     BankMetadata,
@@ -409,6 +413,8 @@ class ExpectedEvidenceEngine:
             lambda: self._nothing_moved(tx),
             lambda: self._internal(tx),
             lambda: self._card_repayment(tx, meta),
+            # 'LEVANTAMENTO ATM' is cash for the cash box, 'DEPOSITO NUMERARIO' the till's cash going to the bank.
+            lambda: self._cash(tx),
             # 'STRIPE PAYMENTS' / 'TPA 1234 SIBS' in: sales paid out net of fees, not a customer invoice.
             lambda: self._payout(tx),
             # 'PAGAMENTO AO ESTADO IMPOSTO DO SELO' is tax, not a bank charge.
@@ -488,6 +494,23 @@ class ExpectedEvidenceEngine:
         return self._decide(
             tx, EvidenceExpectation.CARD_STATEMENT,
             "This pays off a card. The card statement covers it.", quality, "card_repayment",
+        )  # fmt: skip
+
+    def _cash(self, tx: Transaction) -> ExpectationDecision | None:
+        """Cash between the bank and the cash box (the bank's own words for the operation)."""
+        movement = cash_movement(tx)
+        if movement is None:
+            return None
+        if movement == CASH_DEPOSIT:
+            return self._decide(
+                tx, EvidenceExpectation.SALES_INVOICE,
+                "Cash paid into the bank. The till reports it comes from cover it.", Quality.AMBER, "cash_deposit",
+            )  # fmt: skip
+        what = "Cash taken out" if movement == WITHDRAWAL else "Money moved to your cash box"
+        return self._decide(
+            tx, EvidenceExpectation.NONE_INTERNAL_TRANSFER,
+            f"{what} for your cash box. It is not a cost and needs no invoice: the cash receipts show what it "
+            "paid for.", Quality.GREEN, "cash_withdrawal" if movement == WITHDRAWAL else "cash_box",
         )  # fmt: skip
 
     def _payout(self, tx: Transaction) -> ExpectationDecision | None:

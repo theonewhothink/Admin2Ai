@@ -81,7 +81,8 @@ _SLUG = re.compile(r"[^a-z0-9]+")
 # Needs-You questions shown as one plain choice with the engine's own prompt and options (§37).
 _PLAIN_QUESTIONS = ("company", "cash", "obligation", "refund", "obligation_company", "statement", "recharge",
                     "part", "deposit", "deposit_refund", "deposit_kept", "chargeback",
-                    "receipt", "expense_claim")
+                    "receipt", "expense_claim",
+                    "lease", "till", "member")  # leasing (X24), till reports (X5), receipts lists (X12)
 # Open payments proven without a document: their plan still shows in the month (I7, X9).
 _PLANNED_RULES = frozenset({"chargeback", "chargeback_won", "security_deposit"})
 _ISSUER_NAMES = {"tax_authority": "Tax office", "social_security": "Social Security", "bank": "Your bank",
@@ -1887,7 +1888,8 @@ class BackOfficeService:
                                   f"{format_money(abs(rec.tx.amount), rec.tx.currency)} belongs to."})
         for n in self._open_needs(company_id):
             if n.kind not in ("company", "cash", "obligation", "refund", "part", "deposit", "deposit_refund",
-                              "deposit_kept", "chargeback", "receipt", "expense_claim") or \
+                              "deposit_kept", "chargeback", "receipt", "expense_claim", "lease", "till",
+                              "member") or \
                     repo.item_month(repo.items[n.item_id]) != month:
                 continue
             lines.append({"id": f"r_{n.id}", "tone": "attention", "href": f"/needs-you#{n.id}", "linkLabel": "Answer",
@@ -1902,6 +1904,8 @@ class BackOfficeService:
                 continue
             if rec.decision is not None and (rec.decision.requires_document or rec.decision.rule in _PLANNED_RULES):
                 lines.append({"id": f"r_{rec.id}", "text": self.orchestrator.missing.plan(rec), "tone": "neutral"})
+        # A member's payment that came back: its period is unpaid again (X12).
+        lines += self.orchestrator.members.month_lines(company_id, month)
         for expected in sorted(repo.expected_invoices.values(), key=lambda e: (e.due_on, e.id)):
             # A supplier's usual invoice that has not arrived (§23): missing until it does.
             if expected.status == "missing" and expected.company_id == company_id and expected.period == month:
@@ -1978,6 +1982,12 @@ class BackOfficeService:
                     "currency": rec.tx.currency, "date": rec.tx.booked_on.isoformat(),
                     "reasons": [r.replace(": ", " ", 1) for r in rec.match_why],
                 })
+            elif rec.proof_evidence_ids and rec.id in repo.lease_payments:
+                # A leasing payment proven by its contract and the leasing company's statement (X24).
+                out.append({"id": f"m_{rec.id}", "supplier": self.orchestrator.merchant_name(rec.tx),
+                            "description": "Leasing payment", "amount": _num(abs(rec.tx.amount)),
+                            "currency": rec.tx.currency, "date": rec.tx.booked_on.isoformat(),
+                            "reasons": [r.replace(": ", " ", 1) for r in rec.match_why]})
             elif rec.proof_evidence_ids:
                 supplier, description = self._letter_payment_words(rec)
                 out.append({"id": f"m_{rec.id}", "supplier": supplier, "description": description,
@@ -2026,6 +2036,10 @@ class BackOfficeService:
             words = staged.invoice_words(record)
             out.append({"id": f"n_held_{record.id}", "tone": "neutral",
                         "text": f"{words[:1].upper()}{words[1:]}: {staged.held_sentence(held)}"})
+        # The cash box once the month is over: what it should hold, and anything not explained (X4).
+        cash_box = self.orchestrator.cash.month_line(company_id, month)
+        if cash_box is not None:
+            out.append(cash_box)
         return out
 
     # ----------------------------------------------------------------- Needs you
@@ -2626,7 +2640,9 @@ class BackOfficeService:
                         "obligation_company": "which company", "statement": "statement to check",
                         "recharge": "paid back by the client?", "part": "payment to confirm",
                         "deposit": "deposit to confirm", "deposit_refund": "deposit given back?",
-                        "deposit_kept": "security deposit kept?", "chargeback": "disputed card payment"}[n.kind]
+                        "deposit_kept": "security deposit kept?", "chargeback": "disputed card payment",
+                        "lease": "leasing payment to confirm", "till": "till report to check",
+                        "member": "which company"}.get(n.kind, "one answer")
                 evidence.append({"label": f"{item['merchant']} · {what}", "id": f"needs:{n.id}"})
             elif n.kind == "cost_center":
                 rec = self.repo.transactions[n.subject_id]
@@ -2951,7 +2967,19 @@ class BackOfficeService:
                    "note": f"{done} of {total} items are ready for {software}. The rest will follow when they close."})
         rules = [{"id": r.id, "label": r.label, "scope": "client" if r.entity_ids or r.tenant_id else "all"}
                  for r in self.orchestrator.accountant_rules(company_id)]
-        return {**row, "taxId": repo.companies[company_id].tax_id, "software": software,
+        # Leases (X24), the cash box and till reports (X4, X5), memberships and fees (X12): only when the
+        # company has them.
+        books: dict[str, Any] = {}
+        leases = self.orchestrator.leases.view(company_id)
+        if leases:
+            books["leases"] = leases
+        cash_box = self.orchestrator.cash.view(company_id, month)
+        if cash_box is not None:
+            books["cashBox"] = cash_box
+        members = self.orchestrator.members.view(company_id, month)
+        if members is not None:
+            books["memberships"] = members
+        return {**row, **books, "taxId": repo.companies[company_id].tax_id, "software": software,
                 "period": {"key": str(month), "from": month.first_day.isoformat(),
                            "to": month.last_day.isoformat()},
                 "accountant": {"name": accountant.person, "firm": accountant.firm, "email": accountant.email}
