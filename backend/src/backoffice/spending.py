@@ -36,6 +36,13 @@ separately with what the client already paid back. Money a client pays back for 
 ``paid_back``), or pays in as client money (kind ``client_money``: a travel agency's trip money), is not
 revenue either.
 
+**Deposits** (checklist X8): money a customer paid ahead of the work (a deposit, retainer or advance)
+is money in, kind ``deposit``, named apart as not invoiced yet; once the final invoice takes it off it is
+simply part of that invoice's income (kind ``income``), so the invoice is never counted twice: the
+deposit and the balance add up to it. A deposit given back when a booking was cancelled is neither
+income nor spending: the deposit (kind ``deposit_returned``) and the money that gave it back (kind
+``deposit_refund``) are left out of both, and said.
+
 **Payouts** from card terminals and payment / sales platforms (SIBS, Stripe,
 PayPal, Booking.com, Glovo, ...) are net settlements, never customer revenue
 on their own. Once the provider's payout report has matched the bank payout
@@ -163,8 +170,9 @@ _KIND: dict[EvidenceExpectation, str] = {
 _KIND_CATEGORY = {"tax": "tax", "bank_fee": "bank_fees", "payroll": "payroll", "loan": "loan",
                   "platform_fee": "platform_fees"}
 COST_KINDS = frozenset({"cost", "tax", "bank_fee", "payroll", "loan", "platform_fee"})
-IN_KINDS = frozenset({"income", "refund", "interest", "tax_refund", "sales"})
+IN_KINDS = frozenset({"income", "refund", "interest", "tax_refund", "sales", "deposit"})
 NOT_SPENDING = frozenset({"transfer", "card_repayment"})
+GIVEN_BACK = frozenset({"deposit_returned", "deposit_refund"})  # a deposit and the money that gave it back
 _ZERO = Decimal(0)
 _PURCHASE_DOCS = frozenset({DocumentType.INVOICE, DocumentType.INVOICE_RECEIPT, DocumentType.SIMPLIFIED_INVOICE,
                             DocumentType.RECEIPT, DocumentType.DEBIT_NOTE, DocumentType.CREDIT_NOTE})
@@ -253,6 +261,8 @@ class Money:
     # paid in as client money (in).
     recharged: list[Line] = field(default_factory=list)
     paid_back: list[Line] = field(default_factory=list)
+    # Deposits given back when a booking was cancelled (in), or the money that gave them back (out): never counted.
+    given_back: list[Line] = field(default_factory=list)
 
     @property
     def count(self) -> int:
@@ -313,6 +323,7 @@ class Ledger:
             if cash is not None:
                 out.append(cash)
         out = self._client_parts(out)
+        out = self._deposit_parts(out)
         out += self._settled_payouts({x.id: x for x in out})
         out.sort(key=lambda x: (x.on, x.id))
         return out
@@ -342,6 +353,37 @@ class Ledger:
                                    needs_document=x.needs_document if whole else False))
             if taken < x.amount:
                 out.append(replace(x, amount=x.amount - taken))
+        return out
+
+    def _deposit_parts(self, lines: list[Line]) -> list[Line]:
+        """Deposits as the owner thinks of them (module docstring): held apart until invoiced, part of the
+        invoice once it takes them off, left out when they went back (a part kept stays counted)."""
+        repo = self.repo
+        deposits = getattr(repo, "deposits", {})
+        if not deposits:
+            return lines
+        out: list[Line] = []
+        for x in lines:
+            rec = repo.transactions.get(x.id)
+            if x.history or rec is None:
+                out.append(x)
+                continue
+            if rec.deposit_refund_of and rec.deposit_refund_of in deposits:
+                out.append(replace(x, kind="deposit_refund", category="deposit_refund", needs_document=False))
+                continue
+            dep = deposits.get(x.id)
+            if dep is None or dep.direction != "in" or x.direction != "in":
+                out.append(x)
+                continue
+            waiting = dep.status == "held" and dep.advance_document_id is None  # not on any invoice yet
+            kept = replace(x, kind="deposit" if waiting else "income", category="deposit" if waiting else x.category)
+            if dep.returned <= 0:
+                out.append(kept)
+                continue
+            out.append(replace(x, id=f"{x.id}:given_back" if dep.available > 0 else x.id, amount=dep.returned,
+                               kind="deposit_returned", category="deposit_returned", needs_document=False))
+            if dep.available > 0:
+                out.append(replace(kept, amount=dep.available))
         return out
 
     def _cash_line(self, record: Any) -> Line | None:
@@ -585,10 +627,16 @@ class Ledger:
         pending: list[Line] = []
         waiting: list[Line] = []
         clients: list[Line] = []
+        given_back: list[Line] = []
         private = other_currency = 0
         for x in base:
             if x.private:
                 private += 1
+                continue
+            if x.kind in GIVEN_BACK:
+                # A deposit that went back, and the money that gave it back: neither income nor a cost.
+                if not company_ids or x.company_id in company_ids:
+                    given_back.append(x)
                 continue
             if x.kind in ("recharge", "paid_back", "client_money"):
                 # A client's money, not the business's own: reported on its own, never in a total.
@@ -628,7 +676,7 @@ class Ledger:
                        private_count=private, other_currency=other_currency, covered=covered,
                        history_months=self._history_months(counted), waiting_payouts=waiting,
                        recharged=[x for x in clients if x.kind == "recharge"],
-                       paid_back=[x for x in clients if x.kind != "recharge"])
+                       paid_back=[x for x in clients if x.kind != "recharge"], given_back=given_back)
         if compare is not None:
             p_start, p_end, p_label = compare
             result.previous = self.money(p_start, p_end, direction=direction, company_ids=company_ids,
@@ -672,8 +720,14 @@ class Ledger:
             company = d.entity_id or next((repo.transactions[t].company_id for t in doc.matched_tx_ids
                                            if t in repo.transactions and repo.transactions[t].tx.entity_id), None)
             sign = Decimal(-1) if d.doc_type is DocumentType.CREDIT_NOTE else Decimal(1)
+            # A final invoice whose total includes advance invoices it takes off: their VAT was counted on them
+            # already, so only the rest counts here (checklist X8: never twice).
+            advances = [repo.documents[a].document for a in getattr(doc, "netted", {}) if a in repo.documents]
+            taken_vat = sum((a.vat_amount or Decimal(0) for a in advances), Decimal(0))
+            taken_gross = sum((abs(a.gross_amount or Decimal(0)) for a in advances), Decimal(0))
             entry = {"id": d.id, "supplier": display_name(d.supplier_name), "number": d.invoice_number or "",
-                     "date": issued, "vat": d.vat_amount * sign, "gross": (d.gross_amount or Decimal(0)) * sign,
+                     "date": issued, "vat": (d.vat_amount - taken_vat) * sign,
+                     "gross": ((d.gross_amount or Decimal(0)) - taken_gross) * sign,
                      "company": company, "onHold": doc.on_hold and not doc.hold_released,
                      "evidenceId": doc.evidence_ids[0] if doc.evidence_ids else None}
             is_sale = fold(d.supplier_tax_id or "") in own_tax_ids
@@ -731,6 +785,8 @@ class Ledger:
             invoice = "matched" if x.status == "settled" else "missing"  # its payout report
         elif x.kind in ("sales", "platform_fee"):
             invoice = "matched"  # read from the payout report that matched the bank
+        elif x.kind == "deposit":
+            invoice = "matched" if x.has_document else "missing"  # your invoice for the work will take it off
         elif not x.needs_document:
             invoice = "not needed"
         elif x.kind == "tax":

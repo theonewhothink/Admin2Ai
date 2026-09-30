@@ -498,6 +498,9 @@ _JARGON: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("token", re.compile(r"\btokens?\b|\btokeni[sz]\w*", _I)),
     ("ledger", re.compile(r"\bledgers?\b", _I)),
     ("accrual", re.compile(r"\baccruals?\b", _I)),
+    # Deposits and staged invoices (checklist X8): the owner reads "held back by the customer" and "still to come".
+    ("receivable", re.compile(r"\breceivables?\b", _I)),
+    ("retention", re.compile(r"\bretentions?\b", _I)),
     # VAT mechanics are the accountant's (checklist X31): the owner never reads them.
     ("reverse charge", re.compile(r"\breverse[\s-]?charg\w*|\bautoliquida\w*", _I)),
     ("webhook", re.compile(r"\bweb[\s-]?hooks?\b", _I)),

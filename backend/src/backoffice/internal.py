@@ -362,9 +362,11 @@ def _fixes(t: _Tenant, rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]
             prompt = n.question.prompt if n.question is not None else "The owner needs to answer one question."
             add("blue", n.id, f"{who} {format_money(abs(rec.tx.amount), rec.tx.currency)}: waiting for the owner",
                 prompt, n.company_id, f"/needs-you#{n.id}")
-        elif n.kind in ("company", "cash", "obligation", "refund", "obligation_company", "statement", "recharge"):
+        elif n.kind in ("company", "cash", "obligation", "refund", "obligation_company", "statement", "recharge",
+                        "part", "deposit", "deposit_refund"):
             # which company carries it; a cash receipt to confirm; a letter's payment; a refund; a letter's company;
-            # a supplier statement that disagrees; a cost to recharge to a client
+            # a supplier statement that disagrees; a cost to recharge to a client; a part payment, a deposit or a
+            # deposit given back to confirm
             shown = svc._question(n)
             amount = format_money(Decimal(str(shown["amount"] or 0)), shown["currency"])
             add("blue", n.id, f"{shown['merchant']} {amount}: waiting for the owner", n.prompt, n.company_id,

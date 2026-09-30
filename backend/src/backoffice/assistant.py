@@ -1039,6 +1039,7 @@ class RuleBrain:
             if cards:
                 parts.append(f"I left out {self._m(cards)} paying off cards: their purchases are counted one by one.")
         parts += self._recharge_lines(m)
+        parts += self._given_back_lines(m)
         parts += self._pending_lines(m, s)
         if m.private_count:
             parts.append(f"I left out {count_phrase(m.private_count, 'payment')} you marked as not for your companies.")
@@ -1154,16 +1155,61 @@ class RuleBrain:
             head = f"{self._m(m.total)} came in{' for ' + who if who else ''} {p.phrase}"
             parts.append(f"{head}, across {m.count} payments: {join_and(rows[:3])}." if m.count > 1 else
                          f"{head}: {m.lines[0].merchant} on {self._day(m.lines[0].on)}.")
+            parts += self._deposit_lines(m)
             parts += self._sales_lines(m)
             if moved:
                 parts.append(f"I left out {self._m(sum((x.amount for x in moved), Decimal(0)))} moved between your "
                              "own accounts and companies.")
         parts += self._paid_back_lines(m)
+        parts += self._given_back_lines(m)
+        parts += self._held_back_lines(m, u.slots.company_ids)
         parts += self._waiting_payout_lines(m)
         if m.previous is not None and u.slots.compare:
             parts.append(self._comparison(m))
         parts += self._coverage_notes(m, p)
         return " ".join(parts)
+
+    def _held_back_lines(self, m: Money, company_ids: list[str]) -> list[str]:
+        """'Still to come: €500.00 held back by the customer on invoice FT 2026/50 until 15 October.' (X8)"""
+        staged = self.svc.orchestrator.staged
+        out = []
+        for held in sorted(self.repo.retentions.values(), key=lambda r: r.document_id):
+            record = self.repo.documents.get(held.document_id)
+            if held.status != "held" or held.direction != "in" or record is None:
+                continue
+            issued = record.document.issue_date or record.received_at.date()
+            if not m.start <= issued <= m.end or (company_ids and staged.company_of(record) not in company_ids):
+                continue
+            sentence = staged.held_sentence(held).removesuffix(".")
+            money, _, rest = sentence.partition(" held back by the customer ")
+            out.append(f"Still to come: {money} held back by the customer on {staged.invoice_words(record)} {rest}.")
+        return out[:3]
+
+    def _deposit_lines(self, m: Money) -> list[str]:
+        """Deposits not invoiced yet are money in, but not yet income for the work (checklist X8)."""
+        held = m.by_kind.get("deposit", Decimal(0))
+        if not held:
+            return []
+        if held == m.total:
+            several = len([x for x in m.lines if x.kind == "deposit"]) > 1
+            return ["All of it is deposits for work not invoiced yet." if several else
+                    "It is a deposit for work not invoiced yet."]
+        return [f"That includes {self._m(held)} in deposits for work not invoiced yet."]
+
+    def _given_back_lines(self, m: Money) -> list[str]:
+        """'I left out the €1,000.00 deposit from Maria Silva: it went back to them.' (never income, never a cost)."""
+        if not m.given_back:
+            return []
+        total = self._m(sum((x.amount for x in m.given_back), Decimal(0)))
+        if m.direction == "in":
+            if len(m.given_back) == 1:
+                x = m.given_back[0]
+                return [f"I left out the {self._m(x.amount)} deposit from {x.merchant}: it went back to them."]
+            return [f"I left out {total} in deposits that went back to customers."]
+        if len(m.given_back) == 1:
+            x = m.given_back[0]
+            return [f"I left out the {self._m(x.amount)} paid back to {x.merchant}: it gave back their deposit."]
+        return [f"I left out {total} paid back to customers: it gave back their deposits."]
 
     def _statements(self, u: Understanding) -> _Answer | None:
         """'Does our Vodafone statement match?': each supplier's latest account statement, checked (§20, §28)."""
@@ -1329,8 +1375,10 @@ class RuleBrain:
         if m.by_kind.get("platform_fee") and s.category != "platform_fees" and m.direction == "out":
             notes.append(f"Includes {self._m(m.by_kind['platform_fee'])} in payment and platform fees.")
         if m.direction == "in":
+            notes += self._deposit_lines(m)
             notes += self._sales_lines(m)
             notes += self._waiting_payout_lines(m)
+        notes += self._given_back_lines(m)
         moved = sum((x.amount for x in m.left_out), Decimal(0))
         if moved:
             notes.append(f"Left out {self._m(moved)} moved between your own accounts and companies.")
@@ -1376,7 +1424,8 @@ class RuleBrain:
         kinds = {"cost": "supplier_costs", "tax": "taxes", "bank_fee": "bank_fees", "payroll": "salaries",
                  "loan": "loan_repayments", "income": "customer_payments", "refund": "refunds",
                  "interest": "bank_interest", "tax_refund": "tax_refunds",
-                 "sales": "sales_through_card_terminals_and_platforms", "platform_fee": "payment_and_platform_fees"}
+                 "sales": "sales_through_card_terminals_and_platforms", "platform_fee": "payment_and_platform_fees",
+                 "deposit": "deposits_for_work_not_invoiced_yet"}
         out: dict[str, Any] = {
             "period": {"from": p.start.isoformat(), "to": p.end.isoformat(), "label": p.label},
             "records_cover": {"from": first.isoformat(), "to": last.isoformat()},
@@ -1396,6 +1445,8 @@ class RuleBrain:
             "payment_list": [self.payment_facts(x) for x in sorted(m.lines, key=lambda x: (x.on, x.id),
                                                                    reverse=True)[:40]],
         }
+        if m.given_back:  # a deposit that went back when a booking was cancelled: neither income nor a cost (X8)
+            out["left_out"]["deposits_given_back_eur"] = float(sum((x.amount for x in m.given_back), Decimal(0)))
         totals = self._sales_totals(m)
         if totals is not None:
             out["sales_from_payout_reports"] = {

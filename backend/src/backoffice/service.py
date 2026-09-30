@@ -78,7 +78,8 @@ BANK_CONSENT_DAYS = 180  # PSD2 access consent (RTS Art. 10, as amended 2022): r
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _SLUG = re.compile(r"[^a-z0-9]+")
 # Needs-You questions shown as one plain choice with the engine's own prompt and options (§37).
-_PLAIN_QUESTIONS = ("company", "cash", "obligation", "refund", "obligation_company", "statement", "recharge")
+_PLAIN_QUESTIONS = ("company", "cash", "obligation", "refund", "obligation_company", "statement", "recharge",
+                    "part", "deposit", "deposit_refund")
 _ISSUER_NAMES = {"tax_authority": "Tax office", "social_security": "Social Security", "bank": "Your bank",
                  "landlord": "Your landlord", "insurer": "Your insurer"}
 _STAGE_WORDS = {Stage.DISCOVERED: "Found", Stage.ACQUIRED: "Received", Stage.UNDERSTOOD: "Read",
@@ -444,6 +445,20 @@ class BackOfficeService:
                 "id": f"due_{due.obligation_id}", "title": due.title,
                 "companyName": self._company_name(due.entity_id) or "", "due": _iso(due.due_on),
                 "note": note, "tone": tone,
+            })
+        staged = self.orchestrator.staged
+        for held in sorted(self.repo.retentions.values(), key=lambda r: r.document_id):
+            # Money held back by a customer, due back soon (or overdue): still owed to you (checklist X8).
+            record = self.repo.documents.get(held.document_id)
+            if held.status != "held" or held.direction != "in" or held.until is None or record is None \
+                    or (held.until - today).days > 21:
+                continue
+            words = staged.invoice_words(record)
+            items.append({
+                "id": f"due_held_{record.id}", "title": f"Amount held back by {held.party}",
+                "companyName": self._company_name(staged.company_of(record)) or "", "due": _iso(held.until),
+                "note": f"{words[:1].upper()}{words[1:]}: {staged.held_sentence(held)}",
+                "tone": "attention" if held.until < today else "neutral",
             })
         return sorted(items, key=lambda i: (i["due"], i["id"]))
 
@@ -1280,7 +1295,19 @@ class BackOfficeService:
         }
         if not item.is_done and needs_document and not rec.document_ids:
             out["nextStep"] = self.orchestrator.missing.plan(rec)
+        # Deposits and invoices paid in parts (checklist X8): the deposit, each part, what is held back.
+        parts = self._parts(tx_id=rec.id)
+        if parts:
+            out["parts"] = parts
+        deposit = repo.deposits.get(rec.id)
+        if deposit is not None:
+            out["deposit"] = {"status": deposit.status, "text": self.orchestrator.staged.deposit_text(deposit)}
         return out
+
+    def _parts(self, **subject: str) -> list[dict[str, Any]]:
+        """Deposit -> advance invoice -> invoice -> each payment -> the part held back (checklist X8)."""
+        return [{**step, "amount": _num(step["amount"]), "date": _iso(step["date"])}
+                for step in self.orchestrator.staged.story(**subject)]
 
     def document(self, document_id: str) -> dict[str, Any] | None:
         """One document: its details, the payments it proves, the credit notes that correct it, its history."""
@@ -1291,6 +1318,26 @@ class BackOfficeService:
         d = record.document
         item = repo.items[record.item_id]
         corrects = repo.documents.get(record.credit_for or "")
+        out = self._document_view(record, d, item, corrects)
+        staged = self.orchestrator.staged
+        parts = self._parts(document_id=d.id)
+        if parts:  # paid in parts (checklist X8): what was received, what is still to come, what is held back
+            out["parts"] = parts
+        left = staged.balance(record)
+        if left is not None:
+            out["received"] = {"received": _num(staged.received(record)),
+                               "total": _num(abs(d.gross_amount or Decimal(0))),
+                               "stillToCome": _num(left), "text": staged.waiting_sentence(record)}
+        held = repo.retentions.get(d.id)
+        if held is not None:
+            out["heldBack"] = {"amount": _num(held.amount), "until": _iso(held.until), "status": held.status,
+                               "text": staged.held_sentence(held) if held.status == "held" else
+                               f"The {format_money(held.amount, held.currency)} held back was paid."}
+        return out
+
+    def _document_view(self, record: DocumentRecord, d: Any, item: Any, corrects: DocumentRecord | None
+                       ) -> dict[str, Any]:
+        repo = self.repo
         return {
             "id": d.id, "label": record.label, "supplier": display_name(d.supplier_name), "number": d.invoice_number or "",
             "type": d.doc_type.value.replace("_", " "), "date": _iso(d.issue_date or record.received_at.date()),
@@ -1631,7 +1678,7 @@ class BackOfficeService:
                           "text": f"I still need one thing from you: which company the {who} payment of "
                                   f"{format_money(abs(rec.tx.amount), rec.tx.currency)} belongs to."})
         for n in self._open_needs(company_id):
-            if n.kind not in ("company", "cash", "obligation", "refund") or \
+            if n.kind not in ("company", "cash", "obligation", "refund", "part", "deposit", "deposit_refund") or \
                     repo.item_month(repo.items[n.item_id]) != month:
                 continue
             lines.append({"id": f"r_{n.id}", "tone": "attention", "href": f"/needs-you#{n.id}", "linkLabel": "Answer",
@@ -1704,6 +1751,14 @@ class BackOfficeService:
                 out.append({"id": f"m_{rec.id}", "supplier": "Tax office", "description": "Tax payment",
                             "amount": _num(abs(rec.tx.amount)), "currency": rec.tx.currency,
                             "date": rec.tx.booked_on.isoformat(), "reasons": self._tax_reasons(rec)})
+            elif self.orchestrator.staged.settled_without_document(rec) is not None:
+                # A deposit given back when a booking was cancelled, and the money that gave it back (X8).
+                dep = repo.deposits.get(rec.deposit_refund_of or rec.id)
+                out.append({"id": f"m_{rec.id}", "supplier": dep.party if dep else display_name(rec.tx.counterparty),
+                            "description": "Deposit given back" if rec.deposit_refund_of else "Deposit",
+                            "amount": _num(abs(rec.tx.amount)), "currency": rec.tx.currency,
+                            "date": rec.tx.booked_on.isoformat(),
+                            "reasons": [r.replace(": ", " ", 1) for r in rec.match_why]})
         return out
 
     def _notices(self, company_id: str, month: Month) -> list[dict[str, Any]]:
@@ -1719,6 +1774,16 @@ class BackOfficeService:
                       else "Something on the invoice does not look right.")
             out.append({"id": f"n_{n.id}", "text": f"{when}{who} payment is on hold. {reason}", "tone": "risk",
                         "href": f"/needs-you#{n.id}", "linkLabel": "Review"})
+        staged = self.orchestrator.staged
+        for held in sorted(self.repo.retentions.values(), key=lambda r: r.document_id):
+            # Part of an invoice held back until the work is accepted: still owed, never a missing payment (X8).
+            record = self.repo.documents.get(held.document_id)
+            if held.status != "held" or record is None or staged.company_of(record) != company_id \
+                    or self.repo.item_month(self.repo.items[record.item_id]) != month:
+                continue
+            words = staged.invoice_words(record)
+            out.append({"id": f"n_held_{record.id}", "tone": "neutral",
+                        "text": f"{words[:1].upper()}{words[1:]}: {staged.held_sentence(held)}"})
         return out
 
     # ----------------------------------------------------------------- Needs you
@@ -2297,7 +2362,8 @@ class BackOfficeService:
                 what = {"company": "which company", "cash": "cash receipt to confirm",
                         "obligation": "payment to confirm", "refund": "refund to confirm",
                         "obligation_company": "which company", "statement": "statement to check",
-                        "recharge": "paid back by the client?"}[n.kind]
+                        "recharge": "paid back by the client?", "part": "payment to confirm",
+                        "deposit": "deposit to confirm", "deposit_refund": "deposit given back?"}[n.kind]
                 evidence.append({"label": f"{item['merchant']} · {what}", "id": f"needs:{n.id}"})
             elif n.kind == "cost_center":
                 rec = self.repo.transactions[n.subject_id]
