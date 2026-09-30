@@ -1,0 +1,546 @@
+"""Where the money went: every payment as the owner thinks of it (§20–21, §39, §54).
+
+The chat answers "what did we spend in August?", "how much did Company C spend
+on software?", "income last month" or "how much VAT did we pay?" from the
+engine's own records, never from a model's memory. :class:`Ledger` turns every
+bank payment the engine knows into a :class:`Line`: the tracked payments and
+the 90-day bank history imported at onboarding (§6). Each line says who was
+paid, which company it belongs to, what kind of money it is and a cost
+category.
+
+**Kind** comes from the expected-evidence engine (§21), the same decision that
+drives chasing: a supplier purchase is a cost; a tax payment, a bank charge, a
+salary or a loan instalment is named as such; money moved between the owner's
+own accounts or companies is *not* spending, and neither is paying off a card
+(its purchases are counted one by one).
+
+**Category**, first hit wins:
+
+1. a category rule the accountant or the owner taught (§28, "Treat all Adobe
+   subscriptions as Software"): authoritative;
+2. the expected-evidence decision: taxes, bank fees, salaries, loan repayments;
+3. what the supplier's own documents and the bank line say ("Renda",
+   "Eletricidade", "Adobe Software Portugal", "Viagem") and well-known merchant
+   names. These wording tables are conventions, not facts (AMBER, §57): they
+   group answers for the owner; they never close, match or file anything.
+
+**Spending** is money out that is a real cost: supplier purchases, taxes, bank
+fees, salaries and loan instalments. Answers name taxes and bank fees
+separately and say what was left out. Totals are in euros; a payment in
+another currency is left out of a total and mentioned.
+
+Pure Python (runs in the browser build too).
+"""
+
+from __future__ import annotations
+
+import re
+from collections import defaultdict
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, field
+from datetime import date
+from decimal import Decimal
+from typing import TYPE_CHECKING, Any
+
+from backoffice.domain.models import DocumentType, Transaction, TransactionKind
+from backoffice.learning import RuleSubject, counterparty_key, day_month, display_name, fold, format_money
+from backoffice.reconciliation import EvidenceExpectation, ExpectedEvidenceEngine
+
+if TYPE_CHECKING:  # pragma: no cover
+    from backoffice.service import BackOfficeService
+
+__all__ = ["CATEGORIES", "Category", "Ledger", "Line", "Money", "VatResult", "category_label"]
+
+CURRENCY = "EUR"
+MONTH_NAMES = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+               "November", "December")
+
+
+# --------------------------------------------------------------------------- categories
+
+
+@dataclass(frozen=True)
+class Category:
+    """A cost category: how the owner asks for it and what evidence puts a payment in it."""
+
+    id: str
+    label: str
+    asked: tuple[str, ...]  # folded words an owner uses ("phone", "internet")
+    evidence: tuple[str, ...] = ()  # folded words on invoices, bank lines or merchant names
+
+
+# Engine kinds first (decided by the expected-evidence engine), then evidence wording.
+# The wording tables are conventions (unverified against live feeds): extend them as data is seen.
+CATEGORIES: tuple[Category, ...] = (
+    Category("tax", "Taxes", ("tax", "taxes", "taxation", "tax office", "tax authority", "tax payments",
+                              "impostos", "imposto", "financas", "social security", "seguranca social",
+                              "irs", "irc", "withholding", "retencoes")),
+    Category("bank_fees", "Bank fees", ("bank fees", "bank fee", "bank charges", "bank charge", "bank costs",
+                                        "fees", "commissions", "comissoes", "account fees", "maintenance fees")),
+    Category("payroll", "Salaries", ("salaries", "salary", "payroll", "wages", "staff costs", "ordenados",
+                                     "salarios", "vencimentos")),
+    Category("loan", "Loan repayments", ("loan", "loans", "loan repayments", "repayments", "emprestimo",
+                                         "emprestimos")),
+    Category("rent", "Rent", ("rent", "rents", "rental", "lease", "landlord", "renda", "rendas", "arrendamento",
+                              "aluguer", "office rent"),
+             ("renda", "rendas", "rent", "arrendamento", "aluguer", "senhorio", "landlord", "lease")),
+    Category("telecom", "Phone and internet", ("telecom", "telecoms", "telco", "phone", "phones", "telephone",
+                                               "mobile", "internet", "broadband", "telemovel", "telecomunicacoes",
+                                               "comunicacoes", "fibre", "fiber"),
+             ("comunicacoes", "telecomunicacoes", "telecom", "internet", "telemovel", "servicos moveis", "fibra",
+              "broadband", "mobile phone", "vodafone", "meo", "nos comunicacoes", "nowo", "digi mobil")),
+    Category("energy", "Electricity, gas and water", ("electricity", "energy", "power", "utilities", "utility",
+                                                      "gas", "water", "eletricidade", "electricidade", "energia",
+                                                      "luz", "agua"),
+             ("eletricidade", "electricidade", "electricity", "energia", "energy", "gas natural", "agua",
+              "water", "edp", "galp", "endesa", "iberdrola", "goldenergy", "epal")),
+    Category("software", "Software", ("software", "saas", "licences", "licenses", "licence", "license", "apps",
+                                      "cloud"),
+             ("software", "saas", "licenca", "licence", "license", "creative cloud", "adobe", "microsoft",
+              "google workspace", "notion", "slack", "dropbox", "atlassian", "github", "canva", "zoom",
+              "openai", "anthropic")),
+    Category("travel", "Travel", ("travel", "trips", "taxi", "taxis", "rides", "transport", "transportation",
+                                  "flights", "flight", "train", "trains", "fuel", "petrol", "parking", "tolls",
+                                  "viagens", "deslocacoes", "combustivel", "portagens"),
+             ("viagem", "viagens", "trip", "taxi", "uber", "bolt", "free now", "ryanair", "easyjet", "tap air",
+              "comboios", "via verde", "portagens", "combustivel", "gasolina", "fuel", "parking",
+              "estacionamento", "airbnb", "booking com", "hotel")),
+    Category("meals", "Meals", ("meals", "meal", "food", "restaurants", "restaurant", "lunch", "lunches",
+                                "dinner", "dinners", "coffee", "eating out", "refeicoes", "restaurantes",
+                                "almocos", "jantares"),
+             ("restaurante", "restaurant", "pastelaria", "snack bar", "refeicao", "refeicoes", "glovo",
+              "uber eats", "bolt food", "cervejaria", "tasca")),
+    Category("office", "Office and furniture", ("furniture", "office supplies", "office equipment", "supplies",
+                                                "equipment", "stationery", "moveis", "mobiliario",
+                                                "material de escritorio", "office"),
+             ("moveis e decoracao", "mobiliario", "furniture", "estante", "secretaria", "cadeira",
+              "material de escritorio", "papelaria", "office supplies", "ikea", "staples", "worten")),
+    Category("insurance", "Insurance", ("insurance", "insurances", "seguro", "seguros", "premiums"),
+             ("seguro", "seguros", "insurance", "apolice", "fidelidade", "allianz", "ageas", "tranquilidade",
+              "generali", "zurich", "mapfre")),
+)
+OTHER = Category("other", "Other costs", ())
+_BY_ID = {c.id: c for c in (*CATEGORIES, OTHER)}
+_EVIDENCE_PHRASES = sorted(((p, c.id) for c in CATEGORIES for p in c.evidence), key=lambda x: -len(x[0]))
+
+# Expected evidence (§21) -> what kind of money a payment is.
+_KIND: dict[EvidenceExpectation, str] = {
+    EvidenceExpectation.INVOICE: "cost",
+    EvidenceExpectation.RECEIPT: "cost",
+    EvidenceExpectation.TAX_NOTICE_OR_PROOF: "tax",
+    EvidenceExpectation.BANK_EVIDENCE_SUFFICES: "bank_fee",
+    EvidenceExpectation.PAYROLL: "payroll",
+    EvidenceExpectation.LOAN_STATEMENT: "loan",
+    EvidenceExpectation.CARD_STATEMENT: "card_repayment",
+    EvidenceExpectation.NONE_INTERNAL_TRANSFER: "transfer",
+    EvidenceExpectation.SALES_INVOICE: "income",
+    EvidenceExpectation.REFUND_OR_CREDIT_NOTE: "refund",
+}
+_KIND_CATEGORY = {"tax": "tax", "bank_fee": "bank_fees", "payroll": "payroll", "loan": "loan"}
+COST_KINDS = frozenset({"cost", "tax", "bank_fee", "payroll", "loan"})
+IN_KINDS = frozenset({"income", "refund", "interest", "tax_refund"})
+NOT_SPENDING = frozenset({"transfer", "card_repayment"})
+_PURCHASE_DOCS = frozenset({DocumentType.INVOICE, DocumentType.INVOICE_RECEIPT, DocumentType.SIMPLIFIED_INVOICE,
+                            DocumentType.RECEIPT, DocumentType.DEBIT_NOTE, DocumentType.CREDIT_NOTE})
+_TEXT_MIME = re.compile(r"^(?:text/|application/(?:xml|json)|message/)")
+
+
+def category_label(category_id: str) -> str:
+    c = _BY_ID.get(category_id)
+    if c is not None:
+        return c.label
+    return category_id.split(":", 1)[-1]
+
+
+def _has_phrase(folded: str, phrase: str) -> bool:
+    return re.search(rf"(?<![a-z0-9]){re.escape(phrase)}(?![a-z0-9])", folded) is not None
+
+
+# --------------------------------------------------------------------------- lines
+
+
+@dataclass(frozen=True)
+class Line:
+    """One payment in or out, as the owner thinks of it."""
+
+    id: str
+    on: date
+    amount: Decimal  # always positive; see ``direction``
+    direction: str  # "out" | "in"
+    currency: str
+    merchant: str
+    supplier_id: str | None
+    company_id: str | None  # None while the owner has not said (``pending``) or when personal
+    pending: bool
+    private: bool
+    kind: str  # cost | tax | bank_fee | payroll | loan | transfer | card_repayment | income | refund | interest
+    category: str
+    evidence_id: str | None  # stored evidence of the bank line (tracked payments only)
+    document_ids: tuple[str, ...]
+    history: bool  # from the bank history imported at onboarding (§6), not tracked item by item
+    needs_document: bool
+    has_document: bool
+    description: str = ""
+
+    @property
+    def category_label(self) -> str:
+        return category_label(self.category)
+
+
+@dataclass
+class Money:
+    """A total over some lines, with what was counted, left out and why (card-ready)."""
+
+    start: date
+    end: date
+    direction: str
+    lines: list[Line]
+    total: Decimal
+    group_by: str
+    rows: list[tuple[str, Decimal, int]]
+    by_kind: dict[str, Decimal]
+    left_out: list[Line]  # transfers between own accounts/companies, card repayments
+    pending: list[Line]  # not counted: waiting for the owner to say which company
+    private_count: int
+    other_currency: int
+    covered: tuple[date, date] | None  # the part of the period the records cover; None: no records at all
+    history_months: list[str]
+    previous: Money | None = None
+    previous_label: str = ""
+
+    @property
+    def count(self) -> int:
+        return len(self.lines)
+
+
+@dataclass
+class VatResult:
+    start: date
+    end: date
+    purchases: list[dict[str, Any]]
+    purchase_vat: Decimal
+    sales: list[dict[str, Any]]
+    sales_vat: Decimal
+    paid_to_state: list[Line]
+    pending: list[dict[str, Any]]
+
+
+# --------------------------------------------------------------------------- the ledger
+
+
+class Ledger:
+    """Every payment the engine knows, classified once per question."""
+
+    def __init__(self, service: BackOfficeService) -> None:
+        self.svc = service
+        self.repo = service.repo
+        self.today = service._today()
+        self._supplier_text: dict[str, str] = {}
+        self.lines = self._build()
+
+    # -- building -------------------------------------------------------------
+
+    def _build(self) -> list[Line]:
+        repo = self.repo
+        resolver = repo.resolver()
+        engine = ExpectedEvidenceEngine(entities=repo.entities, suppliers=resolver)
+        pending = {n.subject_id for n in repo.open_needs() if n.kind == "choice" and n.subject_type == "transaction"}
+        accountant_ids = [repo.accountant.id] if repo.accountant else []
+        out: list[Line] = []
+        for tx in repo.history_transactions:
+            out.append(self._line(tx, None, engine.classify(tx), resolver, pending, accountant_ids))
+        for rec in repo.transactions.values():
+            decision = rec.decision or engine.classify(rec.tx)
+            out.append(self._line(rec.tx, rec, decision, resolver, pending, accountant_ids))
+        out.sort(key=lambda x: (x.on, x.id))
+        return out
+
+    def _line(self, tx: Transaction, rec: Any, decision: Any, resolver: Any, pending: set[str],
+              accountant_ids: list[str]) -> Line:
+        repo = self.repo
+        match = resolver.resolve_transaction(tx)
+        supplier = match.supplier
+        folded = fold(f"{tx.counterparty} {tx.description}")
+        kind = _KIND.get(decision.expectation, "cost")
+        if kind == "bank_fee" and not (tx.kind is TransactionKind.FEE or decision.rule.startswith("bank_fee")):
+            kind = "cost"  # "the bank statement is enough" taught for something that is not a bank charge
+        if tx.amount > 0:
+            kind = {"bank_fee": "interest", "tax": "tax_refund", "cost": "income"}.get(kind, kind)
+        own = next((e.name for e in repo.entities if tx.counterparty_iban and tx.counterparty_iban in e.own_ibans),
+                   None)
+        if kind == "tax":
+            merchant = "Social Security" if re.search(r"\bseg(?:uranca)? social\b|\bigfss\b", folded) else "Tax office"
+        elif kind == "transfer" and own:
+            merchant = own
+        elif kind in ("bank_fee", "interest") and repo.accounts.get(tx.account_id) is not None:
+            merchant = repo.accounts[tx.account_id].bank
+        else:
+            merchant = self.svc.orchestrator.merchant_name(tx)
+        # Which company: what the engine decided; the owner's answers win; history uses what was learned.
+        private = bool(rec is not None and rec.private)
+        waiting = rec is not None and rec.id in pending and not tx.entity_id
+        if private or waiting:
+            company = None
+        elif tx.entity_id:
+            company = tx.entity_id
+        elif rec is not None:
+            company = rec.company_id
+        else:
+            company = self._history_company(tx)
+            waiting = company is None
+        category = self._category(tx, kind, supplier, match.key, rec, folded, accountant_ids)
+        docs = tuple(rec.document_ids) if rec is not None else ()
+        return Line(
+            id=tx.id, on=tx.booked_on, amount=abs(tx.amount), direction="in" if tx.amount > 0 else "out",
+            currency=tx.currency, merchant=merchant, supplier_id=supplier.id if supplier else None,
+            company_id=company, pending=waiting, private=private, kind=kind, category=category,
+            evidence_id=rec.evidence_id if rec is not None else None, document_ids=docs,
+            history=rec is None, needs_document=bool(decision.requires_document) and kind in COST_KINDS,
+            has_document=bool(docs or (rec is not None and rec.proof_evidence_ids)),
+            description=tx.description,
+        )
+
+    def _history_company(self, tx: Transaction) -> str | None:
+        """History rows: the account's own company, else what the owner answered at onboarding (§6)."""
+        repo = self.repo
+        account = repo.accounts.get(tx.account_id)
+        if account is not None and account.owned:
+            return account.holder_id
+        key = counterparty_key(tx.counterparty)
+        answers = {company for k, company in repo.history_pairs if k == key}
+        return answers.pop() if len(answers) == 1 else None
+
+    def _category(self, tx: Transaction, kind: str, supplier: Any, key: str, rec: Any, folded: str,
+                  accountant_ids: list[str]) -> str:
+        repo = self.repo
+        if kind in ("transfer", "card_repayment") or kind in IN_KINDS:
+            return kind
+        try:
+            taught = repo.rulebook.evaluate(RuleSubject.from_transaction(tx, key=key), tenant_id=repo.tenant_id,
+                                            accountant_ids=accountant_ids).category
+        except Exception:  # a rule conflict never breaks an answer; the engine reports it elsewhere
+            taught = None
+        if taught:
+            wanted = fold(taught)
+            for c in CATEGORIES:
+                if wanted == fold(c.label) or wanted in c.asked:
+                    return c.id
+            return f"custom:{taught}"
+        if kind in _KIND_CATEGORY:
+            return _KIND_CATEGORY[kind]
+        text = folded
+        if supplier is not None:
+            text += " " + self._text_for_supplier(supplier)
+        if rec is not None:
+            for doc_id in rec.document_ids:
+                doc = repo.documents.get(doc_id)
+                if doc is not None:
+                    text += " " + self._document_text(doc)
+        for phrase, cat in _EVIDENCE_PHRASES:
+            if _has_phrase(text, phrase):
+                return cat
+        return OTHER.id
+
+    def _text_for_supplier(self, supplier: Any) -> str:
+        if supplier.id not in self._supplier_text:
+            parts = [fold(supplier.name), *(fold(a) for a in supplier.aliases)]
+            for doc in self.repo.documents.values():
+                if doc.supplier_id == supplier.id:
+                    parts.append(self._document_text(doc))
+            self._supplier_text[supplier.id] = " ".join(parts)
+        return self._supplier_text[supplier.id]
+
+    def _document_text(self, doc: Any) -> str:
+        parts = [doc.document.supplier_name or "", doc.message_text[:2000]]
+        for evidence_id in doc.evidence_ids[:3]:
+            try:
+                ev = self.repo.registry.get(self.repo.tenant_id, evidence_id)
+                if ev.mime_type and _TEXT_MIME.match(ev.mime_type):
+                    parts.append(self.repo.registry.open(self.repo.tenant_id, evidence_id)[:6000]
+                                 .decode("utf-8", errors="ignore"))
+            except Exception:  # unreadable evidence only means fewer words to go on
+                continue
+        return re.sub(r"[^a-z0-9]+", " ", fold(" ".join(parts)))
+
+    # -- coverage -------------------------------------------------------------
+
+    def coverage(self) -> tuple[date, date]:
+        """First day the bank records cover, and today."""
+        starts = [c.covered_from.date() for c in self.repo.connectors.values()
+                  if c.kind == "bank" and c.covered_from is not None]
+        if self.lines:
+            starts.append(self.lines[0].on)
+        return (min(starts) if starts else self.today), self.today
+
+    def tracked_from(self) -> date | None:
+        """First day of payments checked one by one (before it: the imported history)."""
+        tracked = [x.on for x in self.lines if not x.history]
+        return min(tracked) if tracked else None
+
+    def _history_months(self, lines: Iterable[Line]) -> list[str]:
+        months = sorted({(x.on.year, x.on.month) for x in lines if x.history})
+        return [MONTH_NAMES[m - 1] if y == self.today.year else f"{MONTH_NAMES[m - 1]} {y}" for y, m in months]
+
+    # -- queries --------------------------------------------------------------
+
+    def select(self, *, start: date | None = None, end: date | None = None, direction: str | None = None,
+               company_ids: Sequence[str] = (), supplier_ids: Sequence[str] = (), category: str | None = None,
+               amount: Decimal | None = None) -> list[Line]:
+        out = []
+        for x in self.lines:
+            if start and x.on < start or end and x.on > end:
+                continue
+            if direction and x.direction != direction:
+                continue
+            if company_ids and x.company_id not in company_ids:
+                continue
+            if supplier_ids and x.supplier_id not in supplier_ids:
+                continue
+            if category and x.category != category:
+                continue
+            if amount is not None and abs(x.amount - amount) > Decimal("0.005"):
+                continue
+            out.append(x)
+        return out
+
+    def money(self, start: date, end: date, *, direction: str = "out", company_ids: Sequence[str] = (),
+              supplier_ids: Sequence[str] = (), category: str | None = None, exclude: Sequence[str] = (),
+              group_by: str | None = None, compare: Any = None) -> Money:
+        """Money out (real costs) or in over a period, with what was left out and why.
+
+        ``compare`` is None, or a ``(start, end, label)`` for the period to compare with.
+        """
+        first, last = self.coverage()
+        covered = None if end < first or start > last else (max(start, first), min(end, last))
+        base = self.select(start=start, end=end, direction=direction, supplier_ids=supplier_ids)
+        wanted = COST_KINDS if direction == "out" else IN_KINDS
+        counted: list[Line] = []
+        left_out: list[Line] = []
+        pending: list[Line] = []
+        private = other_currency = 0
+        for x in base:
+            if x.private:
+                private += 1
+                continue
+            if x.kind in NOT_SPENDING:
+                if not company_ids or x.company_id in company_ids:
+                    left_out.append(x)
+                continue
+            if x.kind not in wanted:
+                continue
+            if category and x.category != category or x.category in exclude:
+                continue
+            if company_ids and x.company_id not in company_ids:
+                if x.pending:
+                    pending.append(x)
+                continue
+            if x.currency != CURRENCY:
+                other_currency += 1
+                continue
+            counted.append(x)
+        total = sum((x.amount for x in counted), Decimal(0))
+        by_kind: dict[str, Decimal] = defaultdict(Decimal)
+        for x in counted:
+            by_kind[x.kind] += x.amount
+        span = (end - start).days
+        group = group_by or ("month" if supplier_ids or span > 62 else "supplier")
+        result = Money(start=start, end=end, direction=direction, lines=counted, total=total, group_by=group,
+                       rows=self._rows(counted, group), by_kind=dict(by_kind), left_out=left_out, pending=pending,
+                       private_count=private, other_currency=other_currency, covered=covered,
+                       history_months=self._history_months(counted))
+        if compare is not None:
+            p_start, p_end, p_label = compare
+            result.previous = self.money(p_start, p_end, direction=direction, company_ids=company_ids,
+                                         supplier_ids=supplier_ids, category=category, exclude=exclude,
+                                         group_by=group)
+            result.previous_label = p_label
+        return result
+
+    def _rows(self, lines: Sequence[Line], group: str) -> list[tuple[str, Decimal, int]]:
+        sums: dict[str, list[Any]] = {}
+        for x in lines:
+            if group == "company":
+                key = label = (self.repo.company_name(x.company_id) or "Not decided yet")
+            elif group == "category":
+                key = label = x.category_label
+            elif group == "month":
+                key = f"{x.on.year:04d}-{x.on.month:02d}"
+                label = MONTH_NAMES[x.on.month - 1] if x.on.year == self.today.year else \
+                    f"{MONTH_NAMES[x.on.month - 1]} {x.on.year}"
+            else:
+                key, label = x.supplier_id or x.merchant, x.merchant
+            row = sums.setdefault(key, [label, Decimal(0), 0])
+            row[1] += x.amount
+            row[2] += 1
+        if group == "month":
+            return [(v[0], v[1], v[2]) for _, v in sorted(sums.items())]
+        return [(v[0], v[1], v[2]) for v in sorted(sums.values(), key=lambda r: (-r[1], r[0]))]
+
+    def vat(self, start: date, end: date, company_ids: Sequence[str] = ()) -> VatResult:
+        """VAT on purchase and sales documents dated in the period, and VAT paid to the tax office."""
+        repo = self.repo
+        own_tax_ids = {fold(t) for t in repo.own_tax_ids()}
+        purchases: list[dict[str, Any]] = []
+        sales: list[dict[str, Any]] = []
+        pending: list[dict[str, Any]] = []
+        for doc in sorted(repo.documents.values(), key=lambda d: (d.document.issue_date or date.min, d.id)):
+            d = doc.document
+            issued = d.issue_date or doc.received_at.date()
+            if not start <= issued <= end or d.vat_amount is None or d.doc_type not in _PURCHASE_DOCS:
+                continue
+            company = d.entity_id or next((repo.transactions[t].company_id for t in doc.matched_tx_ids
+                                           if t in repo.transactions and repo.transactions[t].tx.entity_id), None)
+            sign = Decimal(-1) if d.doc_type is DocumentType.CREDIT_NOTE else Decimal(1)
+            entry = {"id": d.id, "supplier": display_name(d.supplier_name), "number": d.invoice_number or "",
+                     "date": issued, "vat": d.vat_amount * sign, "gross": (d.gross_amount or Decimal(0)) * sign,
+                     "company": company, "onHold": doc.on_hold and not doc.hold_released,
+                     "evidenceId": doc.evidence_ids[0] if doc.evidence_ids else None}
+            is_sale = fold(d.supplier_tax_id or "") in own_tax_ids
+            if company_ids and company not in company_ids:
+                if company is None and not is_sale:
+                    pending.append(entry)
+                continue
+            (sales if is_sale else purchases).append(entry)
+        paid = [x for x in self.select(start=start, end=end, direction="out", company_ids=company_ids)
+                if x.kind == "tax" and re.search(r"\b(?:iva|vat)\b", fold(f"{x.description}"))]
+        return VatResult(start=start, end=end, purchases=purchases,
+                         purchase_vat=sum((p["vat"] for p in purchases), Decimal(0)), sales=sales,
+                         sales_vat=sum((s["vat"] for s in sales), Decimal(0)), paid_to_state=paid, pending=pending)
+
+    def missing(self, *, start: date | None = None, end: date | None = None,
+                company_ids: Sequence[str] = ()) -> list[tuple[Line, str]]:
+        """Tracked payments that need a document and have none yet, with the plan for each (§22)."""
+        repo = self.repo
+        out = []
+        for x in self.select(start=start, end=end, direction="out"):
+            rec = repo.transactions.get(x.id)
+            if rec is None or x.private or not x.needs_document or x.has_document:
+                continue
+            if repo.items[rec.item_id].is_done:
+                continue
+            if company_ids and x.company_id not in company_ids:
+                continue
+            out.append((x, self.svc.orchestrator.missing.plan(rec)))
+        return out
+
+    # -- presentation ---------------------------------------------------------
+
+    def payment_label(self, x: Line) -> str:
+        return f"{x.merchant} · {day_month(x.on, self.today)} · {format_money(x.amount, x.currency)}"
+
+    def payment_dict(self, x: Line) -> dict[str, Any]:
+        if x.history:
+            invoice = "history"
+        elif not x.needs_document:
+            invoice = "not needed"
+        elif x.kind == "tax":
+            invoice = "proof" if x.has_document else "missing"  # the tax letter or payment proof, not an invoice
+        else:
+            invoice = "matched" if x.has_document else "missing"
+        return {"id": x.evidence_id or "", "date": x.on.isoformat(), "label": x.merchant,
+                "company": self.repo.company_name(x.company_id) or ("Not decided yet" if x.pending else ""),
+                "amount": _num(x.amount), "invoice": invoice, "category": x.category_label}
+
+
+def _num(value: Decimal) -> float:
+    return float(value.quantize(Decimal("0.01")))

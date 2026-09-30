@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useId, useRef, useState, useSyncExternalStore } from "react";
 import { Icon } from "@/components/Icon";
+import { Disclosure } from "@/components/ui";
 import { call, download } from "@/lib/api";
 import { askClaude, claudeKey, looksLikeKey, setClaudeKey, subscribeClaudeKey } from "@/lib/claude";
 import { evidenceHref } from "@/lib/evidence";
@@ -25,7 +26,39 @@ interface TaskItem {
   company: string | null;
   status: string;
 }
+interface SpendingPayment {
+  /** Stored evidence of the bank line ("" for the imported history). */
+  id: string;
+  date: string;
+  label: string;
+  company: string;
+  amount: number;
+  /** "matched" | "proof" | "missing" | "not needed" | "history" | "on hold" */
+  invoice: string;
+  category: string;
+}
+interface SpendingCard {
+  type: "spending";
+  direction: "out" | "in";
+  title: string;
+  periodLabel: string;
+  from: string;
+  to: string;
+  totalLabel: string;
+  /** What `count` counts: "payment" or "document". */
+  unit: "payment" | "document";
+  total: number;
+  count: number;
+  groupBy: "supplier" | "company" | "category" | "month";
+  rows: { label: string; amount: number; count: number }[];
+  previous: { label: string; total: number; change: number } | null;
+  notes: string[];
+  coverageNote: string;
+  payments: SpendingPayment[];
+  more: number;
+}
 type Card =
+  | SpendingCard
   | { type: "documents"; items: DocItem[] }
   | { type: "tasks"; items: TaskItem[] }
   | { type: "evidence"; items: { id: string; label: string }[] }
@@ -184,8 +217,91 @@ function Tasks({ items }: { items: TaskItem[] }) {
   );
 }
 
+const INVOICE_STATE: Record<string, string> = {
+  matched: "Invoice matched",
+  proof: "Tax letter matched",
+  missing: "No invoice yet",
+  "not needed": "No invoice needed",
+  history: "Imported bank history",
+  "on hold": "On hold",
+};
+
+function comparison(previous: NonNullable<SpendingCard["previous"]>): string {
+  const change = Math.round(previous.change * 100) / 100;
+  if (change === 0) return `Same as ${previous.label} (${money(previous.total)})`;
+  return `${money(Math.abs(change))} ${change > 0 ? "more" : "less"} than ${previous.label} (${money(previous.total)})`;
+}
+
+/** Totals for a period, what they are made of, and the payments behind them (calm: no colour except for a missing invoice). */
+function Spending({ card }: { card: SpendingCard }) {
+  const max = Math.max(1, ...card.rows.map((r) => r.amount));
+  const unit = card.count === 1 ? card.unit : `${card.unit}s`;
+  return (
+    <div className="card card-pad" style={{ display: "grid", gap: 12 }}>
+      <div style={{ display: "grid", gap: 2 }}>
+        <span className="meta">{card.title}</span>
+        <span className="tabular" style={{ fontSize: 28, fontWeight: 600, lineHeight: 1.2 }}>
+          {money(card.total)}
+        </span>
+        <span className="meta">
+          {card.totalLabel} · {card.count} {unit}
+          {card.previous ? ` · ${comparison(card.previous)}` : ""}
+        </span>
+      </div>
+      {card.rows.length > 1 ? (
+        <ul aria-label={`By ${card.groupBy}`} style={{ listStyle: "none", padding: 0, margin: 0, display: "grid", gap: 6 }}>
+          {card.rows.map((r) => (
+            <li key={r.label} style={{ display: "grid", gridTemplateColumns: "minmax(0, 10rem) minmax(0, 1fr) auto", gap: 8, alignItems: "center" }}>
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={r.label}>
+                {r.label}
+              </span>
+              <span aria-hidden="true" style={{ height: 8, borderRadius: 4, background: "var(--surface-muted)" }}>
+                <span style={{ display: "block", height: "100%", borderRadius: 4, background: "var(--text-3)", width: `${Math.max(2, (r.amount / max) * 100)}%` }} />
+              </span>
+              <span className="tabular" style={{ textAlign: "right" }}>
+                {money(r.amount)}
+              </span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      {card.notes.length || card.coverageNote ? (
+        <div style={{ display: "grid", gap: 2 }}>
+          {card.notes.map((n) => (
+            <span key={n} className="meta">
+              {n}
+            </span>
+          ))}
+          {card.coverageNote ? <span className="meta">{card.coverageNote}</span> : null}
+        </div>
+      ) : null}
+      {card.payments.length ? (
+        <Disclosure summary={card.count === 1 ? `The ${unit} behind it` : `The ${card.count} ${unit} behind it`}>
+          <ul className="list" style={{ margin: 0 }}>
+            {card.payments.map((p, i) => (
+              <li key={`${p.id || p.date}-${i}`} className="list-row" style={{ padding: "6px 0", gap: 8 }}>
+                <span style={{ flex: 1, minWidth: 0, display: "grid" }}>
+                  <span style={{ fontWeight: 500, overflowWrap: "anywhere" }}>{p.label}</span>
+                  <span className="meta">
+                    {formatDayShort(p.date)}
+                    {p.company ? ` · ${p.company}` : ""} ·{" "}
+                    <span style={p.invoice === "missing" ? { color: "var(--attention)" } : undefined}>{INVOICE_STATE[p.invoice] ?? p.invoice}</span>
+                  </span>
+                </span>
+                <span className="tabular">{money(p.amount)}</span>
+              </li>
+            ))}
+            {card.more ? <li className="list-row meta">and {card.more} more</li> : null}
+          </ul>
+        </Disclosure>
+      ) : null}
+    </div>
+  );
+}
+
 function CardView({ card }: { card: Card }) {
   const [note, setNote] = useState<string | null>(null);
+  if (card.type === "spending") return <Spending card={card} />;
   if (card.type === "documents") return <Documents items={card.items} />;
   if (card.type === "tasks") return <Tasks items={card.items} />;
   if (card.type === "email") return <EmailDraft card={card} />;

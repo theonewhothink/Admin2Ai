@@ -38,7 +38,6 @@ from backoffice.learning import (
     OptionKind,
     day_month,
     display_name,
-    fold,
     format_money,
     learn_from_transactions,
     suggest_rule_from_answer,
@@ -74,11 +73,6 @@ def _default_vault() -> Any:
         return TokenVault(keys)
     except Exception:
         return None
-
-ANSWER_FALLBACK = ("I could not find a clear answer to that yet. Try asking about a supplier, a payment, "
-                   "or a month — for example, “Did we pay Vodafone?”")
-_MONTHS = ("january", "february", "march", "april", "may", "june", "july", "august", "september", "october",
-           "november", "december")
 
 
 class ServiceError(Exception):
@@ -550,12 +544,12 @@ class BackOfficeService:
         try:
             if brain is not None:
                 return brain.handle(message, history)
-            return RuleBrain(self.assistant).handle(message)
+            return RuleBrain(self.assistant).handle(message, history)
         except ValueError as exc:
             raise ServiceError(400, str(exc)) from None
         except Exception:
             if brain is not None:  # the model is unavailable: fall back to the rules
-                return RuleBrain(self.assistant).handle(message)
+                return RuleBrain(self.assistant).handle(message, history)
             raise
 
     def pipeline(self) -> dict[str, Any]:
@@ -1070,17 +1064,14 @@ class BackOfficeService:
     # ----------------------------------------------------------------- Ask (§39)
 
     def ask(self, question: str) -> dict[str, Any]:
+        """One question, answered from evidence (§39). The same understanding as the chat's built-in brain."""
         if not isinstance(question, str) or not question.strip():
             raise ServiceError(400, "Ask me about a supplier, a payment or a month.")
-        q = fold(question)
-        for handler in (self._ask_supplier, self._ask_accountant, self._ask_subscriptions, self._ask_attention,
-                        self._ask_amount, self._ask_month):
-            found = handler(q)
-            if found is not None:
-                self.orchestrator.log("ask", "answer_question", response={"question": question,
-                                                                          "evidence": [e["id"] for e in found["evidence"]]})
-                return found
-        return {"answer": ANSWER_FALLBACK, "evidence": []}
+        if len(question) > 4000:
+            raise ServiceError(400, "That is too long. Try a shorter question.")
+        from backoffice.assistant import RuleBrain
+
+        return RuleBrain(self.assistant).ask(question)
 
     def _tx_evidence(self, rec: TxRecord) -> dict[str, str]:
         account = self.repo.accounts.get(rec.tx.account_id)
@@ -1094,16 +1085,9 @@ class BackOfficeService:
     def _doc_evidence(doc: DocumentRecord) -> dict[str, str]:
         return {"label": f"{display_name(doc.document.supplier_name)} · {doc.label}", "id": doc.evidence_ids[0]}
 
-    def _ask_supplier(self, q: str) -> dict[str, Any] | None:
+    def _supplier_answer(self, supplier: Supplier) -> dict[str, Any]:
+        """'Did we pay Vodafone?': the latest payment, its invoice or the chase, and any hold (§39)."""
         repo = self.repo
-        supplier = None
-        for s in sorted(repo.suppliers.values(), key=lambda s: s.id):
-            names = [s.name, *s.aliases]
-            if any(re.search(rf"\b{re.escape(fold(n).split()[0])}\b", q) for n in names if n.strip()):
-                supplier = s
-                break
-        if supplier is None:
-            return None
         who = display_name(supplier.name)
         resolver = repo.resolver()
         payments = sorted((r for r in repo.transactions.values()
@@ -1139,9 +1123,7 @@ class BackOfficeService:
                 evidence.append(self._doc_evidence(doc))
         return {"answer": " ".join(parts), "evidence": evidence}
 
-    def _ask_accountant(self, q: str) -> dict[str, Any] | None:
-        if "accountant" not in q and "contabil" not in q:
-            return None
+    def _accountant_answer(self) -> dict[str, Any]:
         questions = sorted(self.repo.accountant_questions.values(), key=lambda x: (x.asked_at, x.id))
         if not questions:
             return {"answer": "Your accountant has not asked anything this month.", "evidence": []}
@@ -1161,9 +1143,7 @@ class BackOfficeService:
             evidence.append({"label": "Accountant question", "id": x.evidence_id})
         return {"answer": " ".join(parts), "evidence": evidence}
 
-    def _ask_subscriptions(self, q: str) -> dict[str, Any] | None:
-        if not any(w in q for w in ("subscription", "increase", "went up", "price", "more expensive")):
-            return None
+    def _price_answer(self) -> dict[str, Any]:
         changes = self.orchestrator.price_changes()
         if not changes:
             return {"answer": "None of your regular costs went up in the last three months.", "evidence": []}
@@ -1172,9 +1152,7 @@ class BackOfficeService:
         evidence = [{"label": f"{name} · {format_money(after)}", "id": ev[0]} for name, _, after, ev in changes if ev]
         return {"answer": f"{count} in the last three months. " + ". ".join(lines) + ".", "evidence": evidence}
 
-    def _ask_attention(self, q: str) -> dict[str, Any] | None:
-        if not any(w in q for w in ("attention", "need", "to do", "todo", "waiting", "pending")):
-            return None
+    def _attention_answer(self) -> dict[str, Any]:
         needs = self._open_needs()
         stale = self._stale_connectors()
         if not needs and not stale:
@@ -1199,22 +1177,12 @@ class BackOfficeService:
         head = "One thing." if count == 1 else f"{_count_word(count).capitalize()} things."
         return {"answer": " ".join([head, *parts]), "evidence": evidence}
 
-    def _ask_amount(self, q: str) -> dict[str, Any] | None:
-        m = re.search(r"(?:€\s?(\d[\d.,]*)|(\d[\d.,]*)\s?(?:€|eur|euro))", q) or (
-            re.search(r"\b(\d{2,}(?:[.,]\d{2})?)\b", q) if any(w in q for w in ("payment", "invoice", "transfer")) else None)
-        if m is None:
-            return None
-        raw = next(g for g in m.groups() if g)
-        raw = raw.rstrip(".,")
-        try:
-            amount = Decimal(raw.replace(",", "")) if re.fullmatch(r"\d{1,3}(,\d{3})*(\.\d+)?", raw) else \
-                Decimal(raw.replace(".", "").replace(",", ".")) if "," in raw else Decimal(raw)
-        except ArithmeticError:
-            return None
+    def _amount_answer(self, amount: Decimal) -> dict[str, Any] | None:
+        """The latest tracked payment of exactly ``amount``, its document and how they were matched; None if none."""
         matches = sorted((r for r in self.repo.transactions.values() if abs(r.tx.amount) == amount),
                          key=lambda r: (r.tx.booked_on, r.id), reverse=True)
         if not matches:
-            return {"answer": f"I can't find a payment of {format_money(amount)}.", "evidence": []}
+            return None
         rec = matches[0]
         who = self.orchestrator.merchant_name(rec.tx)
         when = day_month(rec.tx.booked_on, self._today())
@@ -1228,42 +1196,20 @@ class BackOfficeService:
             answer = (f"The {format_money(amount)} payment on {when} went to {who}. Its {_doc_phrase(doc)} "
                       f"arrived on {day_month(doc.received_at.astimezone(TZ).date(), self._today())}. "
                       f"{agreed[:1].upper()}{agreed[1:]} all agree.")
+        elif rec.proof_evidence_ids:
+            ob = next((o for o in self.repo.obligations.values() if rec.evidence_id in o.satisfied_by), None)
+            reference = f", reference {ob.reference}" if ob is not None and ob.reference else ""
+            answer = (f"The {format_money(amount)} payment on {when} went to the tax office. It pays the tax letter"
+                      f"{reference}, so nothing is missing.")
+            evidence.insert(0, {"label": "Tax letter", "id": rec.proof_evidence_ids[0]})
+        elif rec.decision is not None and not rec.decision.requires_document:
+            answer = f"The {format_money(amount)} payment on {when} went to {who}. {rec.decision.reason}"
         else:
             answer = f"The {format_money(amount)} payment on {when} went to {who}. " + \
                 self.orchestrator.missing.plan(rec)
         evidence.append({"label": f"{self._company_name(rec.company_id)} · {month.name}",
                          "id": f"month:{rec.company_id}:{month}"})
         return {"answer": answer, "evidence": evidence}
-
-    def _ask_month(self, q: str) -> dict[str, Any] | None:
-        named = next((i for i, name in enumerate(_MONTHS) if name in q), None)
-        if named is None and not any(w in q for w in ("complete", "closed", "close", "month", "done", "finished")):
-            return None
-        current = self._current_month()
-        month = current if named is None else Month(current.year if named + 1 <= current.month + 1 else current.year - 1,
-                                                    named + 1)
-        parts, evidence = [], []
-        statuses = {c: self._status(c, month) for c in self.repo.companies}
-        all_closed = all(s.closed for s in statuses.values())
-        parts.append(f"Yes. {month.name} is closed for every company." if all_closed else
-                     ("Almost." if any(s.closed for s in statuses.values()) or
-                      min(s.percent_closed for s in statuses.values()) >= 60 else "Not yet."))
-        for c, s in statuses.items():
-            name = self._company_name(c)
-            evidence.append({"label": f"{name} · {month.name} {'closed' if s.closed else f'{s.percent_closed}%'}",
-                             "id": f"month:{c}:{month}"})
-            if all_closed:
-                continue
-            if s.closed:
-                parts.append(f"{name} is closed.")
-            elif s.needs_you:
-                parts.append(f"{name} needs {'one answer' if s.needs_you == 1 else f'{s.needs_you} answers'} from you.")
-                evidence += [{"label": f"{name} · question", "id": f"needs:{n.id}"} for n in self._open_needs(c)
-                             if self.repo.item_month(self.repo.items[n.item_id]) == month]
-            else:
-                reason = s.reasons()[0] if s.reasons() else ""
-                parts.append(f"{name} is {s.percent_closed}% done. {reason}".strip())
-        return {"answer": " ".join(parts), "evidence": evidence}
 
     # ----------------------------------------------------------------- Evidence in
 
