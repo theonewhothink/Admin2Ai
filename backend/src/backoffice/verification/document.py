@@ -18,12 +18,20 @@ Before the fields are judged:
 After, the settled totals must add up (net + VAT = gross, else all three
 turn RED: which one is wrong is not guessed) and the VAT must fit an
 allowed rate (else the VAT cannot be GREEN).
+
+The due date (checklist F8) is a date like the others: read as a real
+calendar date, and compared across sources, so a structured source (an
+e-invoice) and the printed text that disagree make it RED. It must also fall
+on or after the document's own date: a due date before the issue date cannot
+be right, so it is kept on the record but not used (AMBER, no value), never
+turned into a question on its own.
 """
 
 from __future__ import annotations
 
 from collections.abc import Collection, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import date, datetime
 from decimal import Decimal
 from types import MappingProxyType
 from typing import Any
@@ -63,6 +71,7 @@ from .normalize import (
 __all__ = [
     "BANK_CONFIDENCE",
     "DEFAULT_REQUIREMENTS",
+    "DUE_BEFORE_ISSUE",
     "DocumentAssessment",
     "assess_document",
     "bank_observation",
@@ -280,6 +289,24 @@ def _check_rates(
     return tuple(checks)
 
 
+DUE_BEFORE_ISSUE = "The due date is before the document's date, so I don't use it."
+
+
+def _check_due_date(fields: dict[str, FieldAssessment]) -> None:
+    """A due date before the document's own date cannot be right: kept, not used (F8)."""
+    due, issue = fields.get(F.DUE_DATE.value), fields.get(F.ISSUE_DATE.value)
+    if due is None or issue is None:
+        return
+    on, issued = _settled(due), _settled(issue)
+    if not (isinstance(on, date) and isinstance(issued, date)):
+        return
+    if isinstance(on, datetime) or isinstance(issued, datetime):
+        on, issued = (on.date() if isinstance(on, datetime) else on), (
+            issued.date() if isinstance(issued, datetime) else issued)
+    if on < issued:
+        fields[F.DUE_DATE.value] = replace(due.demote(Quality.AMBER, DUE_BEFORE_ISSUE), value=None)
+
+
 def _quality(fields: Mapping[str, FieldAssessment], required: frozenset[str]) -> Quality:
     critical = [a for n, a in fields.items() if as_critical_field(n) is not None]
     if any(a.quality is Quality.RED for a in critical):
@@ -366,6 +393,7 @@ def assess_document(
     }
     sum_check = _check_totals(fields, tax_lines, other_charges, shown_currency)
     rate_checks = _check_rates(fields, rates, tax_lines)
+    _check_due_date(fields)
     quality = _quality(fields, required_names)
     return DocumentAssessment(
         quality=quality,

@@ -279,7 +279,7 @@ def _get_paths(h: Any, token: str, seen: dict[str, Any]) -> list[str]:
     for cc in seen["cost_centers"]:
         paths += [f"/api/cost-centers/{cc}", f"/api/cost-centers/{cc}?from=2026-09-01&to=2026-09-30",
                   f"/api/cost-centers/{cc}/statement?month=2026-09", f"/api/cost-centers/{cc}/statement"]
-    paths += ["/api/settings/accountant", "/api/accountant/invitations"]
+    paths += ["/api/settings/accountant", "/api/accountant/invitations", "/api/settings/mailboxes", "/api/onboarding"]
     return paths
 
 

@@ -200,10 +200,19 @@ class BackOfficeService:
         repo = Repository(tenant_id=tenant_id, owner=owner, now=now)
         svc = cls(Orchestrator(repo), vault=vault, authorizer=authorizer)
         svc.real_sources = True
+        # A business that signs up goes through onboarding: its first run learns before it asks (§5), and the
+        # time to first value and the owner's set-up time are measured from now (§58, §59).
+        svc.orchestrator.begin_onboarding(now)
+        svc.orchestrator.setup_step("account")
         return svc
 
-    def add_company(self, name: Any, tax_id: Any, legal_name: Any = None) -> dict[str, Any]:
-        """Add one of the owner's companies. A Portuguese NIF is checked with the country pack."""
+    def add_company(self, name: Any, tax_id: Any, legal_name: Any = None, address: Any = None,
+                    sector: Any = None) -> dict[str, Any]:
+        """Add one of the owner's companies. A Portuguese NIF is checked with the country pack.
+
+        ``address`` (its postal address) and ``sector`` (its line of business, in plain words) are optional:
+        they help tell which company an invoice is for (H3) and which purchases are clearly personal (X23).
+        """
         from backoffice.countries.pt.nif import validate_nif
 
         name = " ".join(str(name or "").split())
@@ -226,7 +235,11 @@ class BackOfficeService:
         company_id, n = base, 2
         while company_id in self.repo.companies:
             company_id, n = f"{base}-{n}", n + 1
-        self.repo.add_company(id=company_id, name=name, legal_name=legal, tax_id=nif)
+        self.repo.add_company(id=company_id, name=name, legal_name=legal, tax_id=nif,
+                              address=" ".join(str(address or "").split())[:200] or None,
+                              sector=" ".join(str(sector or "").split())[:80] or None)
+        self.orchestrator.milestone("company_added")
+        self.orchestrator.setup_step("company", entity_id=company_id)
         # Sources that read for every company (mailboxes) now cover this one too; the business's
         # accountant looks after it until it gets its own (§28).
         for c in self.repo.connectors.values():
@@ -262,6 +275,7 @@ class BackOfficeService:
         else:
             self.repo.company_accountants[company] = profile
         self._sync_accountant_connectors(fresh=address)
+        self.orchestrator.setup_step("accountant", entity_id=company)
         self.orchestrator.log("accountant", "accountant_set", subject_id=company or "accountant",
                               values={"company": company} if company else None,
                               actor=f"owner:{self.repo.owner.email}")
@@ -444,6 +458,18 @@ class BackOfficeService:
                 "id": f"due_{due.obligation_id}", "title": due.title,
                 "companyName": self._company_name(due.entity_id) or "", "due": _iso(due.due_on),
                 "note": note, "tone": tone,
+            })
+        for record in sorted(self.repo.documents.values(), key=lambda d: d.id):
+            # An unpaid invoice with a due date it states (F8): due soon, or overdue in plain words.
+            found = self.orchestrator.invoice_due(record, today)
+            if found is None or found["days"] > 21:
+                continue
+            who = display_name(record.document.supplier_name)
+            items.append({
+                "id": f"due_{record.id}", "title": f"{who} invoice",
+                "companyName": self._company_name(self.repo.item_company(self.repo.items[record.item_id])) or "",
+                "due": _iso(found["due"]), "note": found["line"],
+                "tone": "risk" if found["overdue"] else ("attention" if found["days"] <= 5 else "neutral"),
             })
         return sorted(items, key=lambda i: (i["due"], i["id"]))
 
@@ -701,6 +727,7 @@ class BackOfficeService:
             raise ServiceError(400, "I can add email, bank accounts, cards, suppliers, insurance, investments, "
                                     "loans and government offices.")
         result = handler(body)
+        self.orchestrator.setup_step(f"source:{kind}")
         self.orchestrator.log("discovery", "source_added", subject_id=result["id"], values={"kind": kind})
         self.orchestrator.run()
         return {"ok": True, **result}
@@ -744,9 +771,13 @@ class BackOfficeService:
             covered_until=now if simulated else None, last_synced_at=now if simulated else None))
         self.sign_in[cid] = {"provider": provider, "stored": secret_stored, "pending": pending}
         if simulated:
+            self.orchestrator.milestone("email_connected")
             self.orchestrator.activity(now, "checked", f"Connected {address} and read the last 90 days.",
                                        company if company else None)
         elif not pending:
+            self.orchestrator.milestone("email_connected")
+            if secret_stored:  # it can read now: the first run waits for its 90 days (§6)
+                self.orchestrator.connection_reading(cid)
             self.orchestrator.activity(now, "checked", f"Connected {address}. I'm reading the last 90 days now.",
                                        company if company else None)
         out: dict[str, Any] = {"id": cid, "message": "Almost done. Finish signing in." if pending else
@@ -786,6 +817,7 @@ class BackOfficeService:
         if not self.real_sources:
             until = (now + timedelta(days=BANK_CONSENT_DAYS)).date()
             self.sign_in[aid] = self.sign_in[cid] = {"provider": "open_banking", "consent_until": until}
+            self.orchestrator.milestone("bank_connected")
             self.orchestrator.activity(now, "checked", f"Connected {bank} for {entity.name} and imported 90 days.",
                                        company)
             return {"id": aid, "message": f"Done. {bank} is connected for {entity.name}."}
@@ -796,6 +828,9 @@ class BackOfficeService:
                                           "import its payments, or send me a bank export."}
         self.sign_in[aid] = self.sign_in[cid] = {"provider": "open_banking", "consent_until": consent_until}
         self._clear_reconnect(cid)
+        self.orchestrator.milestone("bank_connected")
+        if not (self.sync_states.get(cid) or {}).get("last_successful_sync"):
+            self.orchestrator.connection_reading(cid)  # the first run waits for its 90 days (§6)
         self.orchestrator.activity(now, "checked", f"Connected {bank} for {entity.name}. I'm importing the last "
                                    "90 days now.", company)
         return {"id": aid, "message": f"Done. {bank} is connected for {entity.name}."}
@@ -820,6 +855,7 @@ class BackOfficeService:
         cid = next((c.id for c in self.repo.connectors.values() if c.kind == "bank" and c.name == bank), None)
         if cid is not None:
             self.sign_in[cid] = {"provider": "open_banking", "consent_until": consent_until}
+        self.orchestrator.setup_step("bank", entity_id=company_id if company_id in self.repo.companies else None)
         self.orchestrator.log("discovery", "bank_linked", subject_id=cid, values={"accounts": len(ids)})
         self.orchestrator.run()
         return {"ok": True, "ids": ids, "connectionId": cid}
@@ -860,6 +896,7 @@ class BackOfficeService:
                                   "consent_until": expires.astimezone(TZ).date(), "pending": False}
         if not first:
             return None
+        self.orchestrator.connection_read(c.id)  # its first 90 days are in (§6)
         return max(1, round((end - start).total_seconds() / 86400)) if start and end else 90
 
     def sync_mail(self, connection_id: str, messages: Sequence[bytes], state: Mapping[str, Any] | None
@@ -902,6 +939,8 @@ class BackOfficeService:
         if c is None:
             raise ServiceError(404, "I can't find that connection.")
         self.sync_states[c.id] = dict(state)
+        if reconnect:
+            self.orchestrator.connection_read(c.id)  # it will not finish its first read on its own: don't wait
         if reconnect and c.healthy:
             return self.mark_connection_stale(c.id, since=c.last_synced_at or self._now())
         self.orchestrator.log("discovery", "connector_failed", subject_id=c.id, values={"reconnect": reconnect})
@@ -1280,6 +1319,11 @@ class BackOfficeService:
         }
         if not item.is_done and needs_document and not rec.document_ids:
             out["nextStep"] = self.orchestrator.missing.plan(rec)
+            if rec.tx.amount < 0:  # one tap teaches it for every later payment (J7): POST .../evidence {need}
+                out["evidenceChoices"] = [{"need": "none", "label": "It never has an invoice"},
+                                          {"need": "invoice", "label": "It always has one"}]
+        if rec.notes:  # plain facts worth knowing, never a hold ("paid with a different card than usual", L4)
+            out["notes"] = list(rec.notes)
         return out
 
     def document(self, document_id: str) -> dict[str, Any] | None:
@@ -1291,7 +1335,9 @@ class BackOfficeService:
         d = record.document
         item = repo.items[record.item_id]
         corrects = repo.documents.get(record.credit_for or "")
-        return {
+        due = self.orchestrator.invoice_due(record)
+        extra: dict[str, Any] = {"due": _iso(due["due"]), "dueLine": due["line"]} if due is not None else {}
+        return extra | {
             "id": d.id, "label": record.label, "supplier": display_name(d.supplier_name), "number": d.invoice_number or "",
             "type": d.doc_type.value.replace("_", " "), "date": _iso(d.issue_date or record.received_at.date()),
             "amount": _num(abs(d.gross_amount) if d.gross_amount is not None else None), "currency": d.currency,
@@ -1305,6 +1351,132 @@ class BackOfficeService:
             "history": self._history(item), "chain": self._chain(document_id=d.id),
             "evidenceIds": list(record.evidence_ids),
         }
+
+    def evidence_need(self, tx_id: str, body: Mapping[str, Any] | None) -> dict[str, Any]:
+        """``POST /api/transactions/{id}/evidence`` ``{need: "none" | "invoice"}``: the owner says this payment's
+        counterparty never has an invoice, or always needs one (J7). Remembered for every later payment to it."""
+        rec = self.repo.transactions.get(tx_id)
+        if rec is None:
+            raise ServiceError(404, "I can't find that payment.")
+        need = str((body or {}).get("need") or "").strip().lower()
+        if need not in ("none", "invoice"):
+            raise ServiceError(400, "Tell me if it never has an invoice or always needs one.")
+        if rec.tx.amount >= 0:
+            raise ServiceError(400, "That is money in: there is no invoice to wait for from them.")
+        if self.repo.items[rec.item_id].is_done or rec.document_ids:
+            raise ServiceError(409, "This payment is already settled.")
+        learned, changed = self.orchestrator.learn_evidence_need(tx_id, need, by="owner")
+        others = changed - 1 if changed else 0
+        tail = f" It also settles {others} other {'payment' if others == 1 else 'payments'}." if others > 0 else ""
+        return {"ok": True, "message": f"Done. {learned.reason} I will remember this.{tail}", "changed": changed}
+
+    def onboarding_status(self) -> dict[str, Any]:
+        """``GET /api/onboarding``: the first run (§5) and how onboarding went (§58), from what was recorded."""
+        from backoffice.learning import compute_coverage, confirm_line, coverage_items
+
+        repo = self.repo
+        ob = repo.onboarding
+        if not ob.started:
+            return {"started": False, "message": "Not measured yet: this business was set up by hand, not through "
+                                                 "onboarding."}
+        history = [r for r in repo.transactions.values() if r.id in ob.historical]
+        coverage = compute_coverage(coverage_items([r.tx for r in history],
+                                                   {r.id: r.assignment for r in history if r.assignment is not None}))
+        open_ids = [n for n in ob.asked if (need := repo.needs.get(n)) is not None and need.status == "open"]
+        report = self.orchestrator.activation()
+        minutes = [i for i in repo.interactions if i.kind.value == "onboarding"]
+        ttfv = report.time_to_first_value if report is not None else None
+        return {
+            "started": True, "startedAt": _iso(ob.started_at), "learning": ob.learning,
+            "headline": "Learning how your business works…" if ob.learning else coverage.headline,
+            "confirm": confirm_line(len(open_ids)), "questionIds": open_ids, "questionLimit": ob.question_limit,
+            "deferred": len(ob.deferred),
+            "activated": bool(report and report.activated),
+            "missing": [c.value for c in report.missing] if report is not None else [],
+            "timeToFirstValueSeconds": int(ttfv.total_seconds()) if ttfv is not None else None,
+            "onboardingSeconds": sum(i.active_seconds for i in minutes) if minutes else None,
+            "milestones": {k: v.isoformat() for k, v in sorted(ob.milestones.items(), key=lambda kv: kv[1])},
+            "finishedAt": _iso(ob.finished_at),
+        }
+
+    def onboarding_seen(self, body: Mapping[str, Any] | None) -> dict[str, Any]:
+        """``POST /api/onboarding/seen`` ``{what: "time_saved"}``: the app showed the owner the time saved (§58)."""
+        what = str((body or {}).get("what") or "time_saved")
+        if what != "time_saved":
+            raise ServiceError(400, "I only record that the time saved was shown.")
+        if not self.repo.onboarding.started:
+            raise ServiceError(409, "This business was not set up through onboarding: there is nothing to record.")
+        recorded = self.orchestrator.milestone("time_saved_seen")
+        self.orchestrator.run()
+        return {"ok": True, "recorded": recorded}
+
+    def mailboxes(self, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """``GET/POST /api/settings/mailboxes``: which mailbox or alias receives which company's mail (H5).
+
+        POST ``{address, companyId}`` sets one (``companyId`` empty removes it). Learned ones are listed too.
+        """
+        repo = self.repo
+        message = None
+        if body:
+            address = str(body.get("address") or "").strip().lower()
+            if not _EMAIL.match(address) or len(address) > 254:
+                raise ServiceError(400, "That doesn't look like an email address.")
+            company = self._company(body.get("companyId"), required=False)
+            if company is None:
+                repo.mailboxes.pop(address, None)
+                message = f"Done. {address} no longer points to one company."
+            else:
+                repo.mailboxes[address] = company
+                message = f"Done. Invoices sent to {address} are {self._company_name(company)}'s."
+            self.orchestrator.log("entity", "mailbox_set", subject_id=address, values={"company": company or ""},
+                                  actor=f"owner:{repo.owner.email}")
+            self.orchestrator.run()
+        mapped = repo.mailbox_map()
+        out: dict[str, Any] = {"mailboxes": [
+            {"address": a, "companyId": c, "companyName": self._company_name(c) or "",
+             "source": "you" if a in repo.mailboxes else "learned"} for a, c in sorted(mapped.items())]}
+        if message:
+            out["ok"], out["message"] = True, message
+        return out
+
+    def company_profile(self, company_id: str, body: Mapping[str, Any] | None) -> dict[str, Any]:
+        """``POST /api/companies/{id}/profile``: the company's address, line of business, and who runs its payroll.
+
+        ``{address?, sector?, payroll?: "owner" | "accountant"}``. The address helps tell which company an
+        invoice is for (H3); the line of business which purchases are clearly personal (X23); payroll who is
+        asked for a missing payslip (J3).
+        """
+        company = self._company(company_id)
+        assert company is not None
+        repo = self.repo
+        body = body or {}
+        if "address" in body:
+            address = " ".join(str(body.get("address") or "").split())[:200]
+            if address:
+                repo.company_addresses[company] = [address]
+            else:
+                repo.company_addresses.pop(company, None)
+        if "sector" in body:
+            sector = " ".join(str(body.get("sector") or "").split())[:80]
+            if sector:
+                repo.company_sectors[company] = sector
+            else:
+                repo.company_sectors.pop(company, None)
+        if "payroll" in body:
+            who = str(body.get("payroll") or "").strip().lower()
+            if who not in ("owner", "accountant"):
+                raise ServiceError(400, "Say who runs payroll: you or your accountant.")
+            repo.payroll_by[company] = who
+        self.orchestrator.log("entity", "company_profile", subject_id=company,
+                              values={"address": bool(repo.company_addresses.get(company)),
+                                      "sector": repo.company_sectors.get(company, ""),
+                                      "payroll": repo.payroll_by.get(company, "")},
+                              actor=f"owner:{repo.owner.email}")
+        self.orchestrator.run()
+        return {"ok": True, "message": f"Done. {self._company_name(company)} is updated.",
+                "profile": {"address": (repo.company_addresses.get(company) or [None])[0],
+                            "sector": repo.company_sectors.get(company),
+                            "payroll": self.orchestrator.payroll.runner(company)}}
 
     # ----------------------------------------------------------------- deadlines from letters (§24)
 
@@ -1498,6 +1670,11 @@ class BackOfficeService:
         else:
             c.healthy, c.covered_from, c.covered_until, c.last_synced_at = True, now - timedelta(days=90), now, now
         self.sign_in[connection_id] = {**self.sign_in.get(connection_id, {}), "pending": False, "stored": True}
+        if c.kind == "email" and not reconnecting:
+            self.orchestrator.milestone("email_connected")
+            if self.real_sources and not (self.sync_states.get(connection_id) or {}).get("last_successful_sync"):
+                self.orchestrator.connection_reading(connection_id)
+            self.orchestrator.setup_step("email_sign_in")
         if reconnecting and self.real_sources:
             self.orchestrator.activity(now, "checked", f"You signed in to {c.account} again. I'm catching up now.")
         else:
@@ -1531,6 +1708,7 @@ class BackOfficeService:
         if name is None:
             raise ServiceError(404, "I can't find that source.")
         self.sign_in.pop(source_id, None)
+        self.orchestrator.connection_read(source_id)
         if self.vault is not None:
             self.vault.delete(repo.tenant_id, source_id)  # stored sign-in is destroyed with the source
         self.orchestrator.log("discovery", "source_removed", subject_id=source_id)
@@ -1666,6 +1844,11 @@ class BackOfficeService:
                 lines.append({"id": f"r_{doc.id}", "tone": "neutral",
                               "text": f"The payout report from {who} arrived. I'm waiting for that payout to reach "
                                       "your bank."})
+                continue
+            due = self.orchestrator.invoice_due(doc)
+            if due is not None:  # it states when it is due (F8)
+                lines.append({"id": f"r_{doc.id}", "tone": "attention" if due["overdue"] else "neutral",
+                              "text": due["line"]})
                 continue
             lines.append({"id": f"r_{doc.id}", "tone": "neutral",
                           "text": f"The {display_name(doc.document.supplier_name)} {doc.label.split(' ')[0].lower()} "
@@ -3183,6 +3366,12 @@ class BackOfficeService:
             ("GET", r(f"/api/documents/{seg}/file"), lambda b, did: self.document_download(did)),
             ("GET", r(f"/api/documents/{seg}"), lambda b, did: self.document_detail(did)),
             ("GET", r(f"/api/transactions/{seg}"), lambda b, tid: self.transaction(tid)),
+            ("POST", r(f"/api/transactions/{seg}/evidence"), lambda b, tid: self.evidence_need(tid, b)),
+            ("GET", r("/api/onboarding"), lambda b: self.onboarding_status()),
+            ("POST", r("/api/onboarding/seen"), lambda b: self.onboarding_seen(b)),
+            ("GET", r("/api/settings/mailboxes"), lambda b: self.mailboxes()),
+            ("POST", r("/api/settings/mailboxes"), lambda b: self.mailboxes(b or {"address": ""})),
+            ("POST", r(f"/api/companies/{seg}/profile"), lambda b, c: self.company_profile(c, b)),
             ("GET", r("/api/obligations"), lambda b: self.obligations()),
             ("POST", r(f"/api/obligations/{seg}/done"), lambda b, oid: self.obligation_done(oid, b)),
             ("POST", r(f"/api/expected-invoices/{seg}/not-coming"), lambda b, eid: self.expected_not_coming(eid)),

@@ -33,7 +33,15 @@ unfavourable side, like ``closure.metrics``, so nothing looks better than it is)
   (under 15 minutes);
 * evidence quality — of all finished items, the share that are GREEN and whose
   every step carries evidence (§3, §57);
-* connection health — connectors syncing, over all connectors (§47).
+* connection health — connectors syncing, over all connectors (§47);
+* time to first value, activated, onboarding active time (§58, §59) — from the
+  milestones each business recorded while it went through onboarding
+  (backoffice.onboarding): the first document found, the first payment matched
+  by the system or the owner seeing the time saved, counted from the account's
+  creation (the slowest business is shown); activated once all six §58
+  conditions were met; the owner's onboarding spans summed (an estimate: 40
+  seconds per step until the apps measure real time). A business set up by hand
+  (the demo) went through no onboarding: "Not measured yet".
 """
 
 from __future__ import annotations
@@ -48,7 +56,15 @@ from fractions import Fraction
 from typing import TYPE_CHECKING, Any
 
 from backoffice.closure import ItemState, Metric, Month, classify_item, customer_success, due_soon, owner_touched
-from backoffice.closure.metrics import AUTO_RESOLVED_TARGET, OWNER_MINUTES_TARGET, UNRESOLVED_TARGET, ZERO_TOUCH_TARGET
+from backoffice.closure.metrics import (
+    AUTO_RESOLVED_TARGET,
+    ONBOARDING_MINUTES_TARGET,
+    OWNER_MINUTES_TARGET,
+    TIME_TO_FIRST_VALUE_TARGET,
+    UNRESOLVED_TARGET,
+    ZERO_TOUCH_TARGET,
+    ActivationCondition,
+)
 from backoffice.domain.lifecycle import TERMINAL, Stage, TrackedItem
 from backoffice.domain.models import Quality
 from backoffice.learning import display_name, format_money
@@ -451,6 +467,7 @@ def _targets(tenants: Sequence[_Tenant], golden: Sequence[Mapping[str, Any]]) ->
     onboarding = [r.get(Metric.ONBOARDING_ACTIVE_MINUTES).value for r in reports]
     onboarding_known = [int(v) for v in onboarding if v is not None]
     accountant = sum(int(r.get(Metric.ACCOUNTANT_QUESTIONS_NEEDING_OWNER).numerator or 0) for r in reports)
+    first_value, activated = _activation_rows(tenants)
 
     def from_golden(id_: str, definition: str) -> dict[str, Any]:
         g = by_id[id_]
@@ -476,15 +493,85 @@ def _targets(tenants: Sequence[_Tenant], golden: Sequence[Mapping[str, Any]]) ->
         from_golden("unresolved", "Items of the month not finished yet, over all of the month's items."),
         {"id": "onboarding_minutes", "label": "Onboarding active time",
          "value": max(onboarding_known) if onboarding_known else None,
-         "display": f"{max(onboarding_known)} min" if onboarding_known else "–", "target": "Under 10 min",
-         "onTarget": (max(onboarding_known) < 10) if onboarding_known else None, "estimate": False,
-         "evidence": "measured during sign-up" if onboarding_known else "No onboarding recorded (demo tenant).",
-         "definition": "Owner time spent setting up, from account creation to the first month running."},
+         "display": f"{max(onboarding_known)} min" if onboarding_known else NOT_MEASURED,
+         "target": f"Under {ONBOARDING_MINUTES_TARGET} min",
+         "onTarget": (max(onboarding_known) < ONBOARDING_MINUTES_TARGET) if onboarding_known else None,
+         "estimate": bool(onboarding_known),
+         "evidence": (f"Recorded from {_plural(_onboarding_spans(tenants), 'owner step', 'owner steps')} during "
+                      f"onboarding, {ANSWER_SECONDS} seconds each" if onboarding_known else NO_ONBOARDING),
+         "definition": "The owner's active time while onboarding was open: each set-up step (sign-up, company, email, "
+                       "bank, accountant) and each answer to a first-run question is one span. "
+                       f"{ANSWER_SECONDS} seconds are recorded per span until the apps measure real time."},
+        first_value,
+        activated,
         {"id": "accountant_owner", "label": "Accountant questions needing the owner", "value": accountant,
          "display": str(accountant), "target": "Under 20% of baseline", "onTarget": None, "estimate": False,
          "evidence": "No baseline recorded yet, so the share cannot be worked out.",
          "definition": "Accountant questions the owner had to answer, against how many they used to get."},
     ]
+
+
+NOT_MEASURED = "Not measured yet"
+NO_ONBOARDING = "Not measured yet: no business here went through onboarding (the demo was set up by hand)."
+_CONDITION_WORDS = {
+    ActivationCondition.EMAIL_CONNECTED: "email connected",
+    ActivationCondition.BANK_CONNECTED: "bank connected",
+    ActivationCondition.HISTORICAL_SCAN_COMPLETE: "last 90 days read",
+    ActivationCondition.DOCUMENT_FOUND: "a document found",
+    ActivationCondition.TRANSACTION_AUTO_MATCHED: "a payment matched by itself",
+    ActivationCondition.TIME_SAVED_SEEN: "the owner saw the time saved",
+}
+
+
+def _onboarding_spans(tenants: Sequence[_Tenant]) -> int:
+    return sum(t.svc.repo.onboarding.estimated_spans for t in tenants)
+
+
+def _activation_rows(tenants: Sequence[_Tenant]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Time to first value and activated (§58), from each business's recorded onboarding milestones."""
+    reports = [r for t in tenants if (r := t.svc.orchestrator.activation()) is not None]
+    firsts = [r.time_to_first_value for r in reports if r.time_to_first_value is not None]
+    target_minutes = int(TIME_TO_FIRST_VALUE_TARGET.total_seconds() // 60)
+    if firsts:
+        slowest = max(firsts)
+        minutes = math.ceil(slowest.total_seconds() / 6) / 10  # one decimal, rounded up: never better than it was
+        first_value = {
+            "id": "time_to_first_value", "label": "Time to first value", "value": minutes,
+            "display": f"{minutes:g} min", "target": f"Under {target_minutes} min",
+            "onTarget": all(r.first_value_on_target for r in reports if r.time_to_first_value is not None),
+            "estimate": False,
+            "evidence": (f"Slowest of {_plural(len(firsts), 'business', 'businesses')}: from account creation to the "
+                         "first document found or payment matched"),
+            "definition": "From account creation to the first concrete result the owner can see: a document found, a "
+                          "payment matched by itself, or the time saved shown.",
+        }
+    else:
+        first_value = {
+            "id": "time_to_first_value", "label": "Time to first value", "value": None, "display": NOT_MEASURED,
+            "target": f"Under {target_minutes} min", "onTarget": None, "estimate": False,
+            "evidence": NO_ONBOARDING if not reports else "No document found or payment matched yet.",
+            "definition": "From account creation to the first concrete result the owner can see: a document found, a "
+                          "payment matched by itself, or the time saved shown.",
+        }
+    if reports:
+        done = sum(1 for r in reports if r.activated)
+        missing = sorted({_CONDITION_WORDS[c] for r in reports for c in r.missing})
+        activated = {
+            "id": "activated", "label": "Activated", "value": done,
+            "display": ("Yes" if done else "No") if len(reports) == 1 else f"{done} of {len(reports)}",
+            "target": "All six conditions met", "onTarget": done == len(reports), "estimate": False,
+            "evidence": "All six conditions met" if not missing else f"Not yet: {', '.join(missing)}",
+            "definition": "Email and bank connected, the last 90 days read, a document found, a payment matched by "
+                          "itself, and the owner saw the time saved.",
+        }
+    else:
+        activated = {
+            "id": "activated", "label": "Activated", "value": None, "display": NOT_MEASURED,
+            "target": "All six conditions met", "onTarget": None, "estimate": False, "evidence": NO_ONBOARDING,
+            "definition": "Email and bank connected, the last 90 days read, a document found, a payment matched by "
+                          "itself, and the owner saw the time saved.",
+        }
+    return first_value, activated
 
 
 # --------------------------------------------------------------------------- the views

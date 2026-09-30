@@ -14,7 +14,12 @@ counterparty this module learns:
 * a price change between two stable price levels ("Adobe went from €24.59 to
   €27.06.");
 * the next expected date and, given today, a plain overdue notice ("Vodafone
-  normally issues an invoice by the 26th. Today is the 29th. Invoice missing.").
+  normally issues an invoice by the 26th. Today is the 29th. Invoice missing.");
+* for payments, the usual card or account it is paid from (checklist L4): the
+  method at least ``USUAL_METHOD_SHARE`` of the regular payments used (two at
+  least). A payment from another card or account is *noted* in plain words
+  (:func:`payment_method_note`), never held; and the series looks for its
+  payment on the usual card or account first (:func:`find_payment`).
 
 A series is only *trusted* (GREEN) once it has the minimum number of
 observations for its cadence (plus one more for every off-cycle extra that
@@ -57,7 +62,11 @@ __all__ = [
     "OverdueNotice",
     "PriceChange",
     "RecurringSeries",
+    "USUAL_METHOD_SHARE",
     "check_overdue",
+    "find_payment",
+    "method_of",
+    "payment_method_note",
     "detect_price_change",
     "learn_from_documents",
     "learn_from_transactions",
@@ -104,6 +113,7 @@ MIN_FIT_RATIO = Decimal("0.75")  # share of gaps that must fit the cadence
 MAX_OFF_CYCLE_SHARE = Decimal("0.25")  # arrival days allowed off the rhythm (one-off extras)
 PRICE_STABLE_TOLERANCE = Decimal("0.005")  # 0.5%: FX-billed subscriptions wobble a little
 PRICE_MIN_CHANGE = Decimal("0.01")  # 1%: smaller moves are noise, not a price change
+USUAL_METHOD_SHARE = Decimal("0.8")  # the usual card or account pays at least 80% of the regular payments
 
 
 @dataclass(frozen=True)
@@ -115,6 +125,7 @@ class Occurrence:
     currency: str = "EUR"
     label: str | None = None  # the raw counterparty name as seen
     ref: str | None = None  # transaction/document id (internal, never shown)
+    method: str | None = None  # how it was paid: "card:4817" or "account:<account id>" (payments only)
 
     def __post_init__(self) -> None:
         if isinstance(self.amount, float):
@@ -164,6 +175,7 @@ class RecurringSeries(BaseModel):
     amount_max: Decimal | None = None
     fixed_amount: bool = False
     price_change: PriceChange | None = None
+    usual_method: str | None = None  # the card or account it is usually paid from (L4)
 
     @property
     def quality(self) -> Quality:
@@ -456,6 +468,7 @@ def learn_series(
     label = _series_name(unique, key, name)
     amounts = _amount_profile(in_cycle, label)
     return RecurringSeries(
+        usual_method=_usual_method(in_cycle),
         key=key,
         display_name=label,
         basis=basis,
@@ -485,13 +498,31 @@ def learn_series(
 KeyFunction = Callable[[str], "str | None"]
 
 
+def method_of(tx: Transaction) -> str:
+    """How a payment was made: its card ("card:4817"), else the account it left ("account:<id>")."""
+    return f"card:{tx.card_last4}" if tx.card_last4 else f"account:{tx.account_id}"
+
+
+def _usual_method(occurrences: Sequence[Occurrence]) -> str | None:
+    """The card or account most regular payments came from, when it is clearly the usual one (L4)."""
+    methods = Counter(o.method for o in occurrences if o.method)
+    if not methods:
+        return None
+    best = min(methods, key=lambda m: (-methods[m], m))
+    total = sum(methods.values())
+    if methods[best] < 2 or Decimal(methods[best]) / Decimal(total) < USUAL_METHOD_SHARE:
+        return None
+    return best
+
+
 def learn_from_transactions(
     transactions: Iterable[Transaction],
     *,
     key: KeyFunction = counterparty_key,
     names: Mapping[str, str] | None = None,
 ) -> list[RecurringSeries]:
-    """Series of payments per counterparty and direction (internal transfers excluded)."""
+    """Series of payments per counterparty and direction (internal transfers excluded), each with the card or
+    account it is usually paid from."""
     groups: dict[tuple[str, Direction], list[Occurrence]] = defaultdict(list)
     for tx in transactions:
         if tx.kind is TransactionKind.INTERNAL or tx.amount == 0:
@@ -502,7 +533,7 @@ def learn_from_transactions(
         direction = Direction.OUT if tx.amount < 0 else Direction.IN
         groups[(series_key, direction)].append(
             Occurrence(on=tx.booked_on, amount=abs(tx.amount), currency=tx.currency,
-                       label=tx.counterparty, ref=tx.id)
+                       label=tx.counterparty, ref=tx.id, method=method_of(tx))
         )  # fmt: skip
     return _learn_groups(groups, Basis.PAYMENTS, names)
 
@@ -649,3 +680,69 @@ def _lead(series: RecurringSeries, when: str) -> str:
     if series.direction is Direction.OUT:
         return f"{name} is normally paid {when}."
     return f"{name} normally pays you {when}."
+
+
+# --------------------------------------------------------------------------- payment method (L4)
+
+
+def payment_method_note(series: RecurringSeries, tx: Transaction, labels: Mapping[str, str] | None = None
+                        ) -> str | None:
+    """'Paid with a different card than usual: card •••• 4817 this time, usually card •••• 2291.' — or None
+    when ``tx`` was paid the usual way, or the series has no usual card or account. A note, never a hold.
+
+    ``labels`` gives the plain name of each method ("card:2291" -> "card •••• 2291"); the raw method is
+    never shown.
+    """
+    usual = series.usual_method
+    method = method_of(tx)
+    if usual is None or method == usual:
+        return None
+
+    def label(m: str) -> str:
+        found = (labels or {}).get(m)
+        if found:
+            return found
+        kind, _, ref = m.partition(":")
+        return f"card •••• {ref}" if kind == "card" else "another account"
+
+    both_cards = usual.startswith("card:") and method.startswith("card:")
+    what = "card" if both_cards else "card or account"
+    verb = "Paid with" if method.startswith("card:") else "Paid from"
+    return f"{verb} a different {what} than usual: {label(method)} this time, usually {label(usual)}."
+
+
+def find_payment(
+    series: RecurringSeries,
+    transactions: Iterable[Transaction],
+    *,
+    around: date,
+    key: KeyFunction = counterparty_key,
+    within_days: int | None = None,
+) -> tuple[Transaction | None, int]:
+    """The series' payment nearest ``around`` and how many payments were looked at to find it.
+
+    The usual card or account is searched first (L4): when the payment is there, nothing else is
+    looked at. Only then are the other payments of the business searched. A payment belongs to the
+    series by its counterparty key and direction, within the cadence tolerance of ``around``
+    (``within_days`` overrides it), and, for a fixed-amount series, only at that amount.
+    """
+    window = series.spec.tolerance_days if within_days is None else within_days
+    ordered = sorted(transactions, key=lambda t: (t.booked_on, t.id))
+    usual = [t for t in ordered if series.usual_method and method_of(t) == series.usual_method]
+    rest = [t for t in ordered if not (series.usual_method and method_of(t) == series.usual_method)]
+    looked = 0
+    for pool in (usual, rest):
+        best: Transaction | None = None
+        for tx in pool:
+            looked += 1
+            if key(tx.counterparty) != series.key or (tx.amount < 0) != (series.direction is Direction.OUT):
+                continue
+            if abs((tx.booked_on - around).days) > window:
+                continue
+            if series.fixed_amount and series.typical_amount is not None and abs(tx.amount) != series.typical_amount:
+                continue
+            if best is None or (abs((tx.booked_on - around).days), tx.id) < (abs((best.booked_on - around).days), best.id):
+                best = tx
+        if best is not None:
+            return best, looked
+    return None, looked

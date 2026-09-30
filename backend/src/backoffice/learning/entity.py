@@ -13,25 +13,43 @@ Facts ("votes") considered, strongest first:
 * **Account / card ownership** — the account or card belongs to a company.
   A *personal* account or card is only a hint: owners connect personal cards
   precisely because some business costs end up there.
+* **Billing name, billing address, receiving mailbox** (checklist H2, H3, H5) —
+  the customer name printed on the invoice equals one company's legal or trade
+  name; the billing address printed on it is one company's address; it was sent
+  to a mailbox or alias that belongs to one company (set by the owner, a mailbox
+  connected for one company only, or learned from earlier invoices). These are
+  documentary *hints*: they never override a tax number, and a hint that
+  disagrees with the tax number, the account or card, a rule or another hint
+  becomes the one question, never a silent choice.
 * **History** — how this counterparty was assigned before (>= 3 times, >= 80%).
 
 Outcome quality (§57):
 
-* GREEN — a rule nothing documentary contradicts, or company-ownership facts
-  that all agree with no weaker fact disagreeing.
+* GREEN — a rule nothing documentary contradicts, company-ownership facts
+  that all agree with no weaker fact disagreeing, or two different hints
+  (name, address, mailbox) that agree with nothing against them.
 * AMBER — likely: only history agrees, a weak fact disagrees, a rule is
   contradicted by an ownership fact it did not match on, or the tenant has
-  a single company and nothing points anywhere.
-* RED — strong facts disagree, or saved answers disagree (§19): no
-  assignment, the owner is asked.
+  a single company and nothing points anywhere. A single hint on its own is
+  AMBER and asked.
+* RED — strong facts disagree, a hint disagrees with a stronger fact or with
+  another hint, or saved answers disagree (§19): no assignment, the owner is
+  asked.
 
-When unsure (RED, nothing to go on, only a personal-card hint, or an invoice
-addressed to another company) a question is produced with options: each
-company, Personal, Another company.
+When unsure (RED, nothing to go on, only a personal-card hint, one hint alone,
+or an invoice addressed to another company) a question is produced with
+options: each company, Personal, Another company.
+
+A company card at a shop that is clearly personal for that company (a
+streaming service, a supermarket for a business that does not sell food,
+:mod:`.personal`), with no rule, no invoice naming the company and no history of
+the company paying that merchant, is asked as "Was this Netflix payment for
+Hazel Tree or personal?" (checklist X23) rather than booked on the card's word.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
@@ -42,7 +60,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from backoffice.domain.models import Document, LegalEntity, Quality, Transaction
 
-from .keys import counterparty_key, display_name, qualified_tax_id, same_tax_id
+from .keys import counterparty_key, display_name, fold, qualified_tax_id, same_tax_id
 from .plain import card_mask
 from .questions import (
     OptionKind,
@@ -59,12 +77,15 @@ __all__ = [
     "HISTORY_MIN_COUNT",
     "HISTORY_MIN_SHARE",
     "UNSURE_PROMPT",
+    "Addressee",
+    "CompanyDirectory",
     "EntityAssignment",
     "OwnershipBook",
     "Vote",
     "VoteKind",
     "assign_entity",
     "build_history",
+    "same_address",
 ]
 
 ANOTHER_COMPANY = "another_company"
@@ -83,12 +104,51 @@ class OwnershipBook(BaseModel):
     account_labels: dict[str, str] = Field(default_factory=dict)  # "Millennium •••• 1234"
 
 
+class CompanyDirectory(BaseModel):
+    """What the owner's companies are known by besides their tax numbers (checklist H2, H3, H5).
+
+    ``names``: each company's legal and trade names (the company's own ``name`` always counts too);
+    ``addresses``: its postal addresses; ``mailboxes``: a mailbox or alias (lower case) -> the company
+    whose mail it receives.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    names: dict[str, tuple[str, ...]] = Field(default_factory=dict)
+    addresses: dict[str, tuple[str, ...]] = Field(default_factory=dict)
+    mailboxes: dict[str, str] = Field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Addressee:
+    """Who a document is made out to besides the tax number, and where it arrived.
+
+    ``name``: the customer (billing) name printed on it; ``address``: the billing address printed
+    on it; ``mailboxes``: the addresses the email carrying it was sent to.
+    """
+
+    name: str | None = None
+    address: str | None = None
+    mailboxes: tuple[str, ...] = ()
+
+    @property
+    def empty(self) -> bool:
+        return not (self.name or self.address or self.mailboxes)
+
+
 class VoteKind(str, Enum):
     RULE = "rule"
     INVOICE_ADDRESSEE = "invoice_addressee"
     ACCOUNT = "account"
     CARD = "card"
     HISTORY = "history"
+    BILLING_NAME = "billing_name"
+    BILLING_ADDRESS = "billing_address"
+    MAILBOX = "mailbox"
+
+
+# Documentary hints: never override a tax number; a disagreement becomes the one question.
+_HINTS = frozenset({VoteKind.BILLING_NAME, VoteKind.BILLING_ADDRESS, VoteKind.MAILBOX})
 
 
 @dataclass(frozen=True)
@@ -196,6 +256,72 @@ def _ownership_votes(tx: Transaction, ownership: OwnershipBook, ctx: _Context) -
     return votes
 
 
+def _names_of(entity_id: str, ctx: _Context, directory: CompanyDirectory) -> set[str]:
+    names = [ctx.entities[entity_id].name, *directory.names.get(entity_id, ())]
+    return {k for n in names if (k := counterparty_key(n))}
+
+
+def _billing_name_vote(name: str | None, ctx: _Context, directory: CompanyDirectory) -> Vote | None:
+    """The customer name printed on the invoice is exactly one company's legal or trade name (H2)."""
+    key = counterparty_key(name)
+    if not key:
+        return None
+    hits = sorted(e for e in ctx.entities if key in _names_of(e, ctx, directory))
+    if len(hits) != 1:
+        return None  # nobody's, or two companies share it: not evidence of either
+    shown = " ".join((name or "").split())
+    return Vote(VoteKind.BILLING_NAME, hits[0], f"Made out to {shown}", strong=False)
+
+
+_POSTAL_CODE = re.compile(r"(?<!\d)(\d{4})\s*-\s*(\d{3})(?!\d)")  # Portuguese postal code 1200-384
+_ADDRESS_FILLER = frozenset({"n", "no", "nr", "num", "numero", "number", "o", "a", "de", "da", "do", "das", "dos",
+                             "e", "the", "of"})
+
+
+def _address_parts(text: str) -> tuple[str | None, frozenset[str]]:
+    folded = fold(text)
+    found = _POSTAL_CODE.search(folded)
+    code = f"{found.group(1)}-{found.group(2)}" if found else None
+    rest = _POSTAL_CODE.sub(" ", folded)
+    return code, frozenset(t for t in re.split(r"[^a-z0-9]+", rest) if t and t not in _ADDRESS_FILLER)
+
+
+def same_address(known: str, printed: str) -> bool:
+    """``printed`` is the address ``known``: every word and number of ``known`` is in it (the house number
+    included), and the postal codes agree when both show one. Never a fuzzy match."""
+    known_code, known_words = _address_parts(known)
+    printed_code, printed_words = _address_parts(printed)
+    if len(known_words) < 3 or not any(w.isdigit() for w in known_words | ({known_code} if known_code else set())):
+        return False  # too little to tell one address from another
+    if known_code and printed_code and known_code != printed_code:
+        return False
+    return known_words <= printed_words
+
+
+def _billing_address_vote(address: str | None, ctx: _Context, directory: CompanyDirectory) -> Vote | None:
+    """The billing address printed on the invoice is one company's address (H3)."""
+    if not address or not address.strip():
+        return None
+    hits = sorted(e for e in ctx.entities if any(same_address(a, address) for a in directory.addresses.get(e, ())))
+    if len(hits) != 1:
+        return None
+    shown = " ".join(address.split())
+    return Vote(VoteKind.BILLING_ADDRESS, hits[0], f"Billed to {ctx.names[hits[0]]}'s address ({shown})", strong=False)
+
+
+def _mailbox_votes(mailboxes: Sequence[str], ctx: _Context, directory: CompanyDirectory) -> list[Vote]:
+    """It was sent to a mailbox or alias that belongs to one company (H5): one vote per company named."""
+    votes: dict[str, Vote] = {}
+    for raw in mailboxes:
+        address = (raw or "").strip().lower()
+        target = directory.mailboxes.get(address)
+        if target is None or target not in ctx.entities or target in votes:
+            continue
+        votes[target] = Vote(VoteKind.MAILBOX, target, f"Sent to {address}, {ctx.names[target]}'s mailbox",
+                             strong=False)
+    return [votes[t] for t in sorted(votes)]
+
+
 def _history_vote(key: str | None, history: Mapping[str, Mapping[str, int]], ctx: _Context) -> Vote | None:
     counts = history.get(key or "", {})
     total = sum(counts.values())
@@ -227,11 +353,14 @@ def _resolve(votes: Sequence[Vote], *, rule_conflict: bool, single_entity: str |
         return _Resolution(None, Quality.RED, ask=True)
     rule = next((v for v in votes if v.kind is VoteKind.RULE), None)
     facts = [v for v in votes if v.kind is not VoteKind.RULE]
+    hints = [v for v in facts if v.kind in _HINTS]
     strong = [v for v in facts if v.strong]
-    weak = [v for v in facts if not v.strong]
+    weak = [v for v in facts if not v.strong and v.kind not in _HINTS]
+    if len({v.target for v in hints}) > 1:
+        return _Resolution(None, Quality.RED, ask=True)  # the name, address or mailbox disagree
     if rule is not None:
         against = [v for v in strong if v.target != rule.target]
-        if any(v.kind is VoteKind.INVOICE_ADDRESSEE for v in against):
+        if any(v.kind is VoteKind.INVOICE_ADDRESSEE for v in against) or any(v.target != rule.target for v in hints):
             return _Resolution(None, Quality.RED, ask=True)
         uncovered = [v for v in against if v.kind not in rule.covers]
         return _Resolution(rule.target, Quality.AMBER if uncovered else Quality.GREEN, ask=False)
@@ -240,10 +369,18 @@ def _resolve(votes: Sequence[Vote], *, rule_conflict: bool, single_entity: str |
         if len(targets) > 1:
             return _Resolution(None, Quality.RED, ask=True)
         target = targets.pop()
+        if any(v.target != target for v in hints):
+            # A hint never overrides the tax number, the account or the card: the disagreement is asked.
+            return _Resolution(None, Quality.RED, ask=True)
         if target == ANOTHER_COMPANY:
             return _Resolution(None, Quality.AMBER, ask=True)
         disagreeing = any(v.target != target for v in weak)
         return _Resolution(target, Quality.AMBER if disagreeing else Quality.GREEN, ask=False)
+    if hints:
+        target = hints[0].target
+        confirmed = len({v.kind for v in hints}) >= 2 and not any(v.target != target for v in weak)
+        # Two different documentary hints agree: enough. One alone is likely, and asked.
+        return _Resolution(target, Quality.GREEN if confirmed else Quality.AMBER, ask=not confirmed)
     history = [v for v in weak if v.kind is VoteKind.HISTORY]
     if history and len({v.target for v in weak}) == 1:
         return _Resolution(history[0].target, Quality.AMBER, ask=False)
@@ -267,10 +404,16 @@ def assign_entity(
     history: Mapping[str, Mapping[str, int]] | None = None,
     key: str | None = None,
     today: date | None = None,
+    addressee: Addressee | None = None,
+    directory: CompanyDirectory | None = None,
+    personal_signal: str | None = None,
 ) -> EntityAssignment:
     """Assign a transaction, a document, or a matched pair of both (§46 Entity Agent).
 
-    ``key`` overrides the counterparty key (e.g. a resolved supplier id).
+    ``key`` overrides the counterparty key (e.g. a resolved supplier id). ``addressee`` is the
+    document's billing name and address and the mailboxes it was sent to, compared with what the
+    companies are known by (``directory``). ``personal_signal``: the purchase is at a shop that is
+    clearly personal for the card's company ("a streaming service", :func:`.personal.personal_signal`).
     """
     if transaction is None and document is None:
         raise ValueError("assign a transaction, a document, or both")
@@ -302,6 +445,13 @@ def assign_entity(
             rule_id = entity_decision.rule_id  # type: ignore[union-attr]
     if document is not None and (vote := _addressee_vote(document, ctx)):
         votes.append(vote)
+    if addressee is not None and not addressee.empty:
+        known = directory or CompanyDirectory()
+        for found in (_billing_name_vote(addressee.name, ctx, known),
+                      _billing_address_vote(addressee.address, ctx, known)):
+            if found is not None:
+                votes.append(found)
+        votes.extend(_mailbox_votes(addressee.mailboxes, ctx, known))
     if transaction is not None:
         votes.extend(_ownership_votes(transaction, ownership or OwnershipBook(), ctx))
     if history and (vote := _history_vote(series_key, history, ctx)):
@@ -319,7 +469,19 @@ def assign_entity(
 
     subject_type, subject_id = ("transaction", transaction.id) if transaction else ("document", document.id)  # type: ignore[union-attr]
     question = None
-    if resolution.ask:
+    personal = _personal_purchase(resolution, votes, transaction, personal_signal, series_key, history)
+    if personal is not None:
+        # A company card at a shop that is clearly personal, with nothing else saying it is the company's:
+        # one plain question, never booked to the company on the card's word (checklist X23).
+        company = personal
+        shop = _WEB_SUFFIX.sub("", ctx.counterparty) or ctx.counterparty  # "Netflix.com" -> "Netflix"
+        why += [f"{shop} is {personal_signal}, usually a personal cost",
+                f"Nothing shows {ctx.names[company]} paying {shop} before"]
+        facts = _facts(subject_type, subject_id, transaction, document, series_key, ctx, ownership)
+        facts = facts.model_copy(update={"counterparty_label": shop})
+        question = _personal_question(tenant_id, facts, ctx, own, company, why, today)
+        resolution = _Resolution(None, Quality.AMBER, ask=True)
+    elif resolution.ask:
         facts = _facts(subject_type, subject_id, transaction, document, series_key, ctx, ownership)
         question = _question(tenant_id, facts, ctx, own, why, today)
     target = resolution.target
@@ -367,6 +529,62 @@ def _facts(
         amount=amount,
         currency=tx.currency if tx is not None else doc.currency,  # type: ignore[union-attr]
         on=tx.booked_on if tx is not None else doc.issue_date,  # type: ignore[union-attr]
+    )
+
+
+_WEB_SUFFIX = re.compile(r"\.(?:com|net|org|pt|es|eu|io|co\.uk)$", re.IGNORECASE)
+
+
+def _personal_purchase(
+    resolution: _Resolution,
+    votes: Sequence[Vote],
+    transaction: Transaction | None,
+    signal: str | None,
+    key: str | None,
+    history: Mapping[str, Mapping[str, int]] | None,
+) -> str | None:
+    """The card's company, when a purchase at a clearly personal shop would otherwise go to it on the card
+    alone: no rule, no invoice naming a company, no billing hint and no history of that company paying it."""
+    if not signal or transaction is None or transaction.amount >= 0 or resolution.target in (None, PERSONAL):
+        return None
+    if resolution.quality is not Quality.GREEN:
+        return None
+    if not any(v.kind is VoteKind.CARD and v.target == resolution.target for v in votes):
+        return None  # only a company card is questioned: a transfer from an account is not a shop purchase
+    if any(v.kind in (VoteKind.RULE, VoteKind.INVOICE_ADDRESSEE, *_HINTS) for v in votes):
+        return None
+    earlier = (history or {}).get(key or "", {})
+    if any(target != PERSONAL and count > 0 for target, count in earlier.items()):
+        return None  # the business has paid this merchant before: ordinary business history
+    return resolution.target
+
+
+def _personal_question(
+    tenant_id: str,
+    facts: SubjectFacts,
+    ctx: _Context,
+    entities: Sequence[LegalEntity],
+    company: str,
+    why: Sequence[str],
+    today: date | None,
+) -> Question:
+    """'Was this Netflix payment for Hazel Tree or personal?' The card's company first, then Personal,
+    then the owner's other companies. Answering can become a one-tap rule (§38)."""
+    others = sorted((e for e in entities if e.id != company), key=lambda e: (ctx.names[e.id].casefold(), e.id))
+    options = [QuestionOption(id=f"entity:{company}", label=ctx.names[company], kind=OptionKind.ENTITY,
+                              entity_id=company),
+               QuestionOption(id="personal", label="Personal", kind=OptionKind.PERSONAL)]
+    options += [QuestionOption(id=f"entity:{e.id}", label=ctx.names[e.id], kind=OptionKind.ENTITY, entity_id=e.id)
+                for e in others]
+    return Question(
+        tenant_id=tenant_id,
+        kind=QuestionKind.WHICH_COMPANY,
+        prompt=f"Was this {facts.counterparty_label} payment for {ctx.names[company]} or personal?",
+        detail=describe_subject(facts, today),
+        options=tuple(options),
+        why=tuple(why),
+        facts=facts,
+        series_key=facts.counterparty_key,
     )
 
 
