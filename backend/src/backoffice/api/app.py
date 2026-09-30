@@ -93,6 +93,19 @@ def _service_from_env() -> BackOfficeService:
 
 
 def create_app(service: BackOfficeService | None = None) -> FastAPI:
+    """The demo app for ``service`` (or the demo tenant); the production app when BACKOFFICE_MODE=production.
+
+    ``BACKOFFICE_MODE=demo`` (the default) serves exactly the one frozen demo
+    tenant, without sign-in, as the static site and the tests expect.
+    """
+    if service is None:
+        from backoffice.server.config import PRODUCTION, mode_from_env
+
+        if mode_from_env() == PRODUCTION:
+            from backoffice.server.config import ServerConfig
+            from backoffice.server.http import build_production_app
+
+            return build_production_app(ServerConfig.from_env())
     svc = service if service is not None else _service_from_env()
     app = FastAPI(title="Back Office", version="0.1.0", docs_url=None, redoc_url=None)
     app.state.service = svc
