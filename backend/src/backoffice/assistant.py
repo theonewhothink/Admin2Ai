@@ -145,32 +145,39 @@ class Operator:
             hay = " ".join(filter(None, [name, d.invoice_number, d.doc_type.value, self._company(d.entity_id)])).lower()
             if q and not all(t in hay for t in q.split()):
                 continue
-            ev = self.repo.registry.get(self.repo.tenant_id, rec.evidence_ids[0]) if rec.evidence_ids else None
-            if rec.on_hold and not rec.hold_released:
-                status = "on hold"
-            elif rec.supporting:
-                status = "supporting evidence, not an invoice"
-            elif rec.matched_tx_ids:
-                status = "matched"
-            elif rec.paid_in_cash:
-                status = "paid in cash"
-            else:
-                status = "waiting for payment"
-            out.append({
-                "id": d.id, "supplier": name or "Unknown", "number": d.invoice_number or "",
-                "type": d.doc_type.value.replace("_", " "), "date": issued.isoformat(),
-                "amount": float(d.gross_amount) if d.gross_amount is not None else None,
-                "currency": d.currency, "companyId": d.entity_id or "", "company": self._company(d.entity_id),
-                "status": status,
-                # For the accountant (§28): a pro-forma, quote, delivery note, order or account statement
-                # is supporting evidence only and is never booked.
-                "booking": "supporting" if rec.supporting else "booked",
-                "quality": d.quality.name.lower(), "origin": rec.origin,
-                "filename": (ev.filename if ev and ev.filename else f"{d.id}.bin"),
-                "evidenceIds": list(rec.evidence_ids),
-            })
+            out.append(self.document_item(rec))
         out.sort(key=lambda x: (x["date"], x["supplier"]), reverse=True)
         return out
+
+    def document_item(self, rec: Any) -> dict[str, Any]:
+        """One document as the documents list and the accountant's export show it."""
+        d = rec.document
+        issued = d.issue_date or rec.received_at.date()
+        name = d.supplier_name or ""
+        ev = self.repo.registry.get(self.repo.tenant_id, rec.evidence_ids[0]) if rec.evidence_ids else None
+        if rec.on_hold and not rec.hold_released:
+            status = "on hold"
+        elif rec.supporting:
+            status = "supporting evidence, not an invoice"
+        elif rec.matched_tx_ids:
+            status = "matched"
+        elif rec.paid_in_cash:
+            status = "paid in cash"
+        else:
+            status = "waiting for payment"
+        return {
+            "id": d.id, "supplier": name or "Unknown", "number": d.invoice_number or "",
+            "type": d.doc_type.value.replace("_", " "), "date": issued.isoformat(),
+            "amount": float(d.gross_amount) if d.gross_amount is not None else None,
+            "currency": d.currency, "companyId": d.entity_id or "", "company": self._company(d.entity_id),
+            "status": status,
+            # For the accountant (§28): a pro-forma, quote, delivery note, order or account statement
+            # is supporting evidence only and is never booked.
+            "booking": "supporting" if rec.supporting else "booked",
+            "quality": d.quality.name.lower(), "origin": rec.origin,
+            "filename": (ev.filename if ev and ev.filename else f"{d.id}.bin"),
+            "evidenceIds": list(rec.evidence_ids),
+        }
 
     def document_file(self, document_id: str) -> tuple[str, str, bytes] | None:
         rec = self.repo.documents.get(document_id)
@@ -513,6 +520,8 @@ _OPTION_WORDS = {
     "payment_lookup": r"\b(?:payments?)\b",
 }
 _ACTIONS = frozenset({"report"})
+# A question about a supplier's account statement ("Does our Vodafone statement match?").
+_STATEMENT_Q = re.compile(r"\b(?:account\s+)?statements?\b|\bextratos?\b|\bconta\s+corrente\b", re.I)
 _CADENCE = {"weekly": "a week", "monthly": "a month", "quarterly": "a quarter", "annual": "a year"}
 
 HELP_TEXT = ("I answer from your records and prepare things for you to confirm. Ask what you spent or received in "
@@ -608,6 +617,11 @@ class RuleBrain:
         if actions and _ASSIGN.match(t) and not t.endswith("?") and (answer := self._assign(t)) is not None:
             return answer
         u = self.understand(t, history)
+        if _STATEMENT_Q.search(t) and (answer := self._statements(u)) is not None:
+            self.svc.orchestrator.log("ask", "answer_question", response={
+                "question": t[:500], "intent": "supplier_statement",
+                "evidence": [e["id"] for e in answer.all_evidence()]})
+            return answer
         if not actions and (u.intent in _ACTIONS or u.slots.emails or u.slots.to_accountant):
             return _Answer("I can prepare that in the chat, where you check it and confirm with one tap.")
         answer: _Answer = getattr(self, f"_i_{u.intent}")(u)
@@ -914,6 +928,11 @@ class RuleBrain:
                 line += f" The biggest was {self.svc.orchestrator.merchant_name(biggest.tx)}, {self._m(share)}."
             if any(rec.tx.cost_allocation is not None and rec.tx.cost_allocation.is_split for rec, _ in found):
                 line += " Shared costs count only their part."
+            recharged = sum((rec.tx.cost_allocation.recharge_for(cid) for rec, _ in found
+                             if rec.tx.cost_allocation is not None), Decimal(0))
+            if direction == "out" and recharged:
+                line += (" All of it is theirs to pay back." if recharged == total else
+                         f" {self._m(recharged)} of it is theirs to pay back.")
             texts.append(line)
             chips += [self.svc._tx_evidence(rec) for rec, _ in sorted(found, key=lambda x: (-x[1], x[0].id))[:6]]
         waiting = [n for n in self.repo.open_needs() if n.kind == "cost_center" and any(
@@ -954,7 +973,11 @@ class RuleBrain:
         if m.covered is None:
             return f"I have no payment records {p.phrase}. {self._coverage_line()}"
         parts: list[str] = []
-        if not m.lines:
+        if not m.lines and m.recharged:
+            # Everything that went out was bought for clients: none of it is the business's own cost.
+            parts.append(f"Your payments to {sup} {p.phrase} were all bought for clients." if sup else
+                         f"{who or 'You'} had no costs of your own {p.phrase}.")
+        elif not m.lines:
             if sup:
                 parts.append(f"I found no payments to {sup}{' from ' + who if who else ''} {p.phrase}.")
             elif cat:
@@ -1014,6 +1037,7 @@ class RuleBrain:
                 parts.append(f"I left out {self._m(moved)} moved between {between}.")
             if cards:
                 parts.append(f"I left out {self._m(cards)} paying off cards: their purchases are counted one by one.")
+        parts += self._recharge_lines(m)
         parts += self._pending_lines(m, s)
         if m.private_count:
             parts.append(f"I left out {count_phrase(m.private_count, 'payment')} you marked as not for your companies.")
@@ -1133,11 +1157,110 @@ class RuleBrain:
             if moved:
                 parts.append(f"I left out {self._m(sum((x.amount for x in moved), Decimal(0)))} moved between your "
                              "own accounts and companies.")
+        parts += self._paid_back_lines(m)
         parts += self._waiting_payout_lines(m)
         if m.previous is not None and u.slots.compare:
             parts.append(self._comparison(m))
         parts += self._coverage_notes(m, p)
         return " ".join(parts)
+
+    def _statements(self, u: Understanding) -> _Answer | None:
+        """'Does our Vodafone statement match?': each supplier's latest account statement, checked (§20, §28)."""
+        from backoffice.supplier_statements import summary
+
+        repo = self.repo
+        if re.search(r"\b(?:bank|card|credit card|owner'?s?)\s+statements?\b", u.text) or u.slots.cost_center_ids:
+            return None  # a bank or card statement, or a property's owner statement, is not a supplier's
+        wanted = set(u.slots.supplier_ids)
+        found = [sr for sr in repo.statements.values()
+                 if sr.document_id in repo.documents and (not wanted or sr.supplier_id in wanted)]
+        if not found:
+            if not wanted and not repo.statements and not re.search(r"\bsuppliers?\b|\bextratos?\b", u.text):
+                return None
+            who = self._suppliers(sorted(wanted))
+            return _Answer(f"I don't have an account statement from {who}." if who else
+                           "I don't have any supplier account statements yet.")
+        latest: dict[str, Any] = {}
+        for sr in sorted(found, key=lambda s: (s.statement.end or date.min, s.document_id)):
+            latest[sr.supplier_id or sr.document_id] = sr
+        texts: list[str] = []
+        chips: list[dict[str, str]] = []
+        for sr in latest.values():
+            record = repo.documents[sr.document_id]
+            if sr.check is None:
+                texts.append(f"I couldn't tell which supplier the statement {record.label.lower()} is from, so I "
+                             "haven't checked it.")
+            else:
+                text = summary(sr.check, self.today)
+                request = self.svc.orchestrator.statements.request_line(sr)
+                if sr.check.missing and request:
+                    text += f" {request}"
+                texts.append(text)
+            chips.append({"label": f"{display_name(record.document.supplier_name)} · account statement",
+                          "id": record.evidence_ids[0]})
+            if sr.check is not None:
+                for row in (*sr.check.differences, *sr.check.matched):
+                    if row.document_id and row.document_id in repo.documents and len(chips) < 8:
+                        chips.append(self.svc._doc_evidence(repo.documents[row.document_id]))
+            needs = repo.needs.get(sr.needs_id or "")
+            if needs is not None and needs.status == "open":
+                chips.append({"label": "Needs you", "id": f"needs:{needs.id}"})
+        return _Answer(" ".join(texts), [], chips)
+
+    def _client_label(self, cost_center_id: str) -> str:
+        center = self.repo.cost_centers.get(cost_center_id)
+        return center.label if center is not None else "a client"
+
+    def _recharge_lines(self, m: Money) -> list[str]:
+        """'I left out €2,400.00 bought for Client Lume, to recharge to them; €1,800.00 of it is already paid back.'"""
+        if not m.recharged:
+            return []
+        by_client: dict[str, list[Decimal]] = {}
+        for x in m.recharged:
+            sums = by_client.setdefault(x.client, [Decimal(0), Decimal(0)])
+            sums[0] += x.amount
+            sums[1] += x.recovered
+        out = []
+        book = self.ledger.recharges
+        for cid, (bought, back) in sorted(by_client.items(), key=lambda kv: (-kv[1][0], kv[0]))[:3]:
+            client = book.for_center(cid) if book is not None else None
+            if client is not None and client.client_money:
+                line = (f"I left out {self._m(bought)} paid for {self._client_label(cid)} out of their own money: it "
+                        "is not your cost.")
+                if back < bought:
+                    line += f" {self._m(bought - back)} of it is still to come from them."
+                out.append(line)
+                continue
+            line = f"I left out {self._m(bought)} bought for {self._client_label(cid)}, to recharge to them"
+            if back >= bought:
+                line += "; all of it is already paid back"
+            elif back:
+                line += f"; {self._m(back)} of it is already paid back"
+            out.append(line + ".")
+        if len(by_client) > 3:
+            rest = sum((v[0] for k, v in by_client.items()), Decimal(0)) - sum(
+                (v[0] for _, v in sorted(by_client.items(), key=lambda kv: (-kv[1][0], kv[0]))[:3]), Decimal(0))
+            out.append(f"And {self._m(rest)} bought for {len(by_client) - 3} more clients, to recharge to them.")
+        return out
+
+    def _paid_back_lines(self, m: Money) -> list[str]:
+        """Money from clients that is not revenue: costs they paid back, and client money held for them."""
+        out = []
+        by_client: dict[tuple[str, str], Decimal] = {}
+        for x in m.paid_back:
+            by_client[(x.client, x.kind)] = by_client.get((x.client, x.kind), Decimal(0)) + x.amount
+        book = self.ledger.recharges
+        for (cid, kind), amount in sorted(by_client.items()):
+            who = self._client_label(cid)
+            if kind == "client_money":
+                line = f"I left out {self._m(amount)} of client money from {who}: it is theirs, not revenue."
+                client = book.for_center(cid) if book is not None else None
+                if client is not None and client.held > 0:
+                    line += f" {self._m(client.held)} of their money is still held for them."
+                out.append(line)
+            else:
+                out.append(f"I left out {self._m(amount)} that {who} paid back for costs you bought for them.")
+        return out
 
     def _sales_totals(self, m: Money) -> dict[str, Decimal] | None:
         """Gross sales proven by payout reports, and what the providers kept from them."""

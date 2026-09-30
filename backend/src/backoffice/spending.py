@@ -29,6 +29,13 @@ fees, salaries and loan instalments. Answers name taxes and bank fees
 separately and say what was left out. Totals are in euros; a payment in
 another currency is left out of a total and mentioned.
 
+**Recharged costs and client money** (backoffice.recharges): the part of a payment bought for a client
+to pay back (a reimbursable cost, a disbursement, media bought for them, a pass-through licence) is not
+the business's own cost: it is its own line, kind ``recharge``, left out of spending and reported
+separately with what the client already paid back. Money a client pays back for such costs (kind
+``paid_back``), or pays in as client money (kind ``client_money``: a travel agency's trip money), is not
+revenue either.
+
 **Payouts** from card terminals and payment / sales platforms (SIBS, Stripe,
 PayPal, Booking.com, Glovo, ...) are net settlements, never customer revenue
 on their own. Once the provider's payout report has matched the bank payout
@@ -48,7 +55,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -212,6 +219,8 @@ class Line:
     provider: str = ""  # the payout provider in a sentence ("Stripe", "your card terminal")
     fee_word: str = ""  # what that provider calls what it keeps: "fees" or "commission"
     status: str = ""  # payouts: "settled" | "report_missing" | "report_disagrees" | "report_does_not_add_up"
+    client: str = ""  # recharge / paid_back / client_money: the client's cost center
+    recovered: Decimal = _ZERO  # recharge: the part the client has already paid back
 
     @property
     def category_label(self) -> str:
@@ -240,6 +249,10 @@ class Money:
     previous_label: str = ""
     # Money in only: payouts not counted because their payout report has not proven them yet.
     waiting_payouts: list[Line] = field(default_factory=list)
+    # Not the business's own: costs bought for clients to pay back (out), and what clients paid back or
+    # paid in as client money (in).
+    recharged: list[Line] = field(default_factory=list)
+    paid_back: list[Line] = field(default_factory=list)
 
     @property
     def count(self) -> int:
@@ -276,6 +289,7 @@ class Ledger:
         self._supplier_text: dict[str, str] = {}
         # Payout reports by the bank payout they were paired with (settled, or disagreeing with it).
         self._payout_reports: dict[str, Any] = {}
+        self.recharges: Any = None  # backoffice.recharges.RechargeBook, when any cost is on a client
         for s in sorted(getattr(self.repo, "settlements", {}).values(), key=lambda s: s.document_id):
             if s.transaction_id and (s.settled or s.transaction_id not in self._payout_reports):
                 self._payout_reports[s.transaction_id] = s
@@ -299,8 +313,36 @@ class Ledger:
             cash = self._cash_line(record)
             if cash is not None:
                 out.append(cash)
+        out = self._client_parts(out)
         out += self._settled_payouts({x.id: x for x in out})
         out.sort(key=lambda x: (x.on, x.id))
+        return out
+
+    def _client_parts(self, lines: list[Line]) -> list[Line]:
+        """The parts of payments that are a client's, not the business's own (module docstring)."""
+        from backoffice.recharges import RechargeBook
+
+        if not any(getattr(r.tx.cost_allocation, "shares", None) for r in self.repo.transactions.values()):
+            return lines
+        book = self.recharges = RechargeBook(self.repo)
+        out: list[Line] = []
+        for x in lines:
+            parts = book.out_parts.get(x.id) if x.direction == "out" else book.in_parts.get(x.id)
+            if x.history or not parts:
+                out.append(x)
+                continue
+            client_money = x.direction == "in" and all(book.clients[cid].client_money for cid, _ in parts)
+            kind = "recharge" if x.direction == "out" else "client_money" if client_money else "paid_back"
+            taken = sum((part for _, part in parts), _ZERO)
+            for i, (cid, part) in enumerate(parts):
+                recovered = book.clients[cid].recovered.get(x.id, _ZERO) if kind == "recharge" else _ZERO
+                whole = taken >= x.amount and i == 0
+                # The whole payment keeps its own id (so a missing invoice is still found); a part gets its own.
+                out.append(replace(x, id=x.id if whole else f"{x.id}:{kind}:{cid}", amount=part, kind=kind,
+                                   client=cid, recovered=recovered,
+                                   needs_document=x.needs_document if whole else False))
+            if taken < x.amount:
+                out.append(replace(x, amount=x.amount - taken))
         return out
 
     def _cash_line(self, record: Any) -> Line | None:
@@ -540,10 +582,17 @@ class Ledger:
         left_out: list[Line] = []
         pending: list[Line] = []
         waiting: list[Line] = []
+        clients: list[Line] = []
         private = other_currency = 0
         for x in base:
             if x.private:
                 private += 1
+                continue
+            if x.kind in ("recharge", "paid_back", "client_money"):
+                # A client's money, not the business's own: reported on its own, never in a total.
+                if (not company_ids or x.company_id in company_ids) and (not category or x.category == category
+                                                                          or x.kind != "recharge"):
+                    clients.append(x)
                 continue
             if x.kind == "payout":
                 # A net settlement: counted through its report's sales and fees, or not at all yet.
@@ -575,7 +624,9 @@ class Ledger:
         result = Money(start=start, end=end, direction=direction, lines=counted, total=total, group_by=group,
                        rows=self._rows(counted, group), by_kind=dict(by_kind), left_out=left_out, pending=pending,
                        private_count=private, other_currency=other_currency, covered=covered,
-                       history_months=self._history_months(counted), waiting_payouts=waiting)
+                       history_months=self._history_months(counted), waiting_payouts=waiting,
+                       recharged=[x for x in clients if x.kind == "recharge"],
+                       paid_back=[x for x in clients if x.kind != "recharge"])
         if compare is not None:
             p_start, p_end, p_label = compare
             result.previous = self.money(p_start, p_end, direction=direction, company_ids=company_ids,

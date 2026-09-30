@@ -270,8 +270,10 @@ def _get_paths(h: Any, token: str, seen: dict[str, Any]) -> list[str]:
                   f"/api/accountant/clients/{c}", f"/api/companies/{c}/cost-centers",
                   f"/api/companies/{c}/cost-centers?month=2026-09"]
     paths += [f"/api/documents/{d}/file" for d in seen["documents"]]
+    paths += [f"/api/documents/{d}" for d in seen["documents"]]
     for cc in seen["cost_centers"]:
-        paths += [f"/api/cost-centers/{cc}", f"/api/cost-centers/{cc}?from=2026-09-01&to=2026-09-30"]
+        paths += [f"/api/cost-centers/{cc}", f"/api/cost-centers/{cc}?from=2026-09-01&to=2026-09-30",
+                  f"/api/cost-centers/{cc}/statement?month=2026-09", f"/api/cost-centers/{cc}/statement"]
     return paths
 
 
