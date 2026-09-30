@@ -208,8 +208,10 @@ def readable_files(tenant_id: str, data: bytes, *, filename: str | None, mime_ty
     return list(found.values())
 
 
-def pre_read(svc: Any, reader: Any, uploads: Sequence[tuple[bytes, str | None, str | None]]) -> dict[str, Any]:
-    """Read every PDF or photo in ``uploads`` (bytes, filename, mime type) with the live reader.
+def pre_read(svc: Any, reader: Any, uploads: Sequence[tuple[Any, ...]]) -> dict[str, Any]:
+    """Read every PDF or photo in ``uploads`` (bytes, filename, mime type[, the phone's quality hints]) with the
+    live reader. The hints are the phone's (blurry, glare, too dark): with the reader's own estimate of the
+    image they route a poor photo to the stronger engine (§11, §15); the recorded reading keeps their effect.
 
     Returns ``{sha256: encoded ReadOutcome}`` for the event. Files the tenant
     has already read keep their earlier reading (no second OCR bill).
@@ -221,7 +223,9 @@ def pre_read(svc: Any, reader: Any, uploads: Sequence[tuple[bytes, str | None, s
     repo = svc.repo
     documents = svc.orchestrator.documents
     out: dict[str, Any] = {}
-    for data, filename, mime_type in uploads:
+    for upload in uploads:
+        data, filename, mime_type = upload[:3]
+        hints = tuple(upload[3]) if len(upload) > 3 else ()
         for evidence_id, blob, mime in readable_files(repo.tenant_id, data, filename=filename, mime_type=mime_type):
             digest = sha(blob)
             if digest in out or evidence_id in repo.reads:
@@ -229,7 +233,7 @@ def pre_read(svc: Any, reader: Any, uploads: Sequence[tuple[bytes, str | None, s
             request = ReadRequest(
                 tenant_id=repo.tenant_id, evidence_id=evidence_id, data=blob, mime_type=mime,
                 stage0_fields=lambda text, method, _id=evidence_id: documents.stage0_fields(text, _id, method),
-                extractor=documents.text_extractor(),
+                extractor=documents.text_extractor(), quality_hints=hints,
             )
             try:
                 outcome = reader.read(request)

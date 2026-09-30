@@ -284,7 +284,7 @@ def _get_paths(h: Any, token: str, seen: dict[str, Any]) -> list[str]:
     paths += ["/api/employees", "/api/expense-claims"]
     paths += [f"/api/employee/card-payments?employee={e['id']}"
               for e in h.client.get("/api/employees", headers=H).json()["employees"]]
-    paths += ["/api/settings/mailboxes", "/api/onboarding"]
+    paths += ["/api/settings/mailboxes", "/api/onboarding", "/api/settings/automation"]
     return paths
 
 

@@ -48,6 +48,7 @@ AUTO = "auto"
 Stage0Fields = Callable[[str, ExtractionMethod], Mapping[Any, Sequence[FieldObservation]]]
 
 _READING_METHODS = frozenset({ExtractionMethod.OCR, ExtractionMethod.VLM})
+_RETAKE_FLAGS = ("blurry", "glare", "too_dark", "overexposed", "low_resolution")
 _VLM_TYPES = {
     "invoice": DocumentType.INVOICE,
     "invoice_receipt": DocumentType.INVOICE_RECEIPT,
@@ -88,6 +89,9 @@ class ReadRequest:
     stage0_fields: Stage0Fields | None = None
     extractor: FieldExtractor | None = None
     required_fields: Collection[CriticalField] | None = None
+    # What the phone noticed when the photo was taken ("blurry", "glare", "too_dark"; §11). Advisory only: with
+    # the reader's own estimate of the image they route a poor photo to the stronger engine (§15), never a value.
+    quality_hints: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -105,6 +109,16 @@ class ReadOutcome:
     page_count: int | None = None
     steps: tuple[ReadStep, ...] = ()
     cost: Decimal = Decimal("0")
+    # The image's problems (the phone's hints and the reader's own estimate: "blurry", "glare", "too_dark",
+    # "overexposed", "low_resolution", "rotated", "skewed"), as the OCR chain was routed with them.
+    image_quality: tuple[str, ...] = ()
+    # Every engine that could run did, and required fields are still missing or disagree (§17: a person's turn).
+    needs_person: bool = False
+
+    @property
+    def retake_worthy(self) -> tuple[str, ...]:
+        """The problems a new photo would fix (§11): blur, glare, too dark or too bright, too small."""
+        return tuple(f for f in self.image_quality if f in _RETAKE_FLAGS)
 
     @property
     def found_anything(self) -> bool:
@@ -161,11 +175,13 @@ class DocumentReader:
             return ReadOutcome(steps=(ReadStep("read", StepState.SKIPPED, "not a PDF or an image"),))
         structured = self._structured(stage0, request)
         steps = list(stage0.steps)
+        quality = self._quality(request, mime)
+        flags = tuple(sorted(f.value for f in quality.flags)) if quality is not None else ()
         outcome = ReadOutcome(text=stage0.text, text_method=stage0.method, embedded_xml=stage0.embedded_xml,
-                              page_count=stage0.page_count)
+                              page_count=stage0.page_count, image_quality=flags)
         if any(s.step == "pdf_text" and s.state is StepState.FAILED for s in stage0.steps):
             return replace(outcome, steps=tuple(steps))  # encrypted or damaged: no engine will do better
-        ocr = self._ocr(request, mime, stage0, structured)
+        ocr = self._ocr(request, mime, stage0, structured, quality)
         if ocr is None:
             steps.append(self._no_ocr_step(structured, request))
             return replace(outcome, steps=tuple(steps))
@@ -173,7 +189,25 @@ class DocumentReader:
             outcome,
             readings=ocr["readings"], reading_text=ocr["text"], supplier_name=ocr["supplier"],
             doc_type=ocr["doc_type"], steps=(*steps, *ocr["steps"]), cost=ocr["cost"],
+            needs_person=ocr["needs_person"],
         )
+
+    @staticmethod
+    def _quality(request: ReadRequest, mime: str) -> Any:
+        """The image's quality report (§11, §15): the reader's own estimate from the photo's header (size,
+        resolution, orientation) plus what the phone measured when it was taken. None for a PDF the phone
+        said nothing about."""
+        from backoffice.extraction.quality import ImageMetrics, QualityFlag, QualityReport, assess_image
+
+        known = {f.value for f in QualityFlag}
+        phone = frozenset(QualityFlag(h) for h in request.quality_hints if h in known)
+        if mime in IMAGE_MIME_TYPES:
+            report = assess_image(request.data)
+        elif phone:
+            report = QualityReport(frozenset(), ImageMetrics(), frozenset())
+        else:
+            return None
+        return replace(report, flags=report.flags | phone) if phone else report
 
     def _structured(self, stage0: Stage0, request: ReadRequest) -> dict[CriticalField, list[FieldObservation]]:
         """Stage 0 observations for routing: the pack's reading of text and QR, plus embedded XML."""
@@ -208,7 +242,8 @@ class DocumentReader:
         return ReadStep("ocr", StepState.NOT_AVAILABLE, "no OCR engine is configured")
 
     def _ocr(self, request: ReadRequest, mime: str, stage0: Stage0,
-             structured: Mapping[CriticalField, Sequence[FieldObservation]]) -> dict[str, Any] | None:
+             structured: Mapping[CriticalField, Sequence[FieldObservation]], quality: Any = None
+             ) -> dict[str, Any] | None:
         registry = self._registry
         if registry is None or not len(registry) or request.extractor is None:
             return None
@@ -227,6 +262,7 @@ class DocumentReader:
             tenant_id=request.tenant_id, evidence_id=request.evidence_id, pages=[page],
             structured={f: tuple(o) for f, o in structured.items()},
             hints=OCRHints(page_count=stage0.page_count), required_fields=self._required(request),
+            image_quality=quality,  # a poor photo goes to the complex-document engine too (§15)
         )
 
         async def route() -> Any:
@@ -250,6 +286,7 @@ class DocumentReader:
                               if r.document_type in _VLM_TYPES), None),
             "steps": [*extra, *_steps(result)],
             "cost": result.total_cost,
+            "needs_person": result.needs_human,
         }
 
 
@@ -284,9 +321,10 @@ def _steps(outcome: Any) -> list[ReadStep]:
     warnings = {r.engine: r.warnings for r in outcome.results}
     steps = []
     for s in outcome.steps:
-        if s.stage is RouteStage.HUMAN:
-            continue
         detail = ", ".join(r.code.value + (f":{r.detail}" if r.detail else "") for r in s.reasons)
+        if s.stage is RouteStage.HUMAN:  # kept: the owner is asked (a retake, or the reading to check)
+            steps.append(ReadStep("ocr_human", StepState.NEEDS_PERSON, detail))
+            continue
         if s.status is StepStatus.RAN:
             state = StepState.DONE
             extra = warnings.get(s.engine or "", ())

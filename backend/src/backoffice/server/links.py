@@ -133,16 +133,17 @@ class RecordedLinks:
 # --------------------------------------------------------------------------- before recording
 
 
-def links_in_files(tenant_id: str, files: Sequence[tuple[bytes, str | None, str | None]]) -> list[str]:
-    """The links the engine will follow in these files (bytes, file name, declared type): the invoice links
-    of every email among them (and of the emails attached to those), found with the engine's own intake on
-    a scratch registry, so nothing is stored for the tenant."""
+def links_in_files(tenant_id: str, files: Sequence[tuple[Any, ...]]) -> list[str]:
+    """The links the engine will follow in these files (bytes, file name, declared type[, hints]): the invoice
+    links of every email among them (and of the emails attached to those), found with the engine's own intake
+    on a scratch registry, so nothing is stored for the tenant."""
     from backoffice.evidence import EvidenceRegistry, ShareIntake
     from backoffice.evidence.retrieval import all_invoice_links
     from backoffice.orchestrator import MemoryObjectStore
 
     found: dict[str, None] = {}
-    for data, filename, mime_type in files:
+    for upload in files:
+        data, filename, mime_type = upload[:3]
         registry = EvidenceRegistry(MemoryObjectStore())
         try:
             outcome = ShareIntake(registry).ingest_file(tenant_id, bytes(data), filename=filename,

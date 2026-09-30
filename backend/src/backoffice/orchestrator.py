@@ -80,6 +80,7 @@ import re
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -215,7 +216,6 @@ from backoffice.learning import (
     RuleBook,
     RuleScope,
     assign_entity,
-    build_history,
     candidates_from_assignments,
     check_overdue,
     compute_coverage,
@@ -379,6 +379,17 @@ CHASE_AFTER_DAYS = 3  # a payment this old without its invoice is worth a polite
 LINK_GIVE_UP_AFTER = timedelta(days=3)  # an invoice link whose site has not answered for this long: another way
 ANSWER_SECONDS = 40  # owner time recorded for one tap on a Needs-You item (§59)
 MESSAGE_ID_DOMAIN = "backoffice.example"  # right-hand side of the Message-IDs of the emails we write
+# Emails the back office writes on its own, and the permission each needs (§25). It is checked again when the
+# email is sent: switched off in the owner's settings meanwhile, what was written but not sent is held back.
+GATED_MESSAGES: Mapping[str, ActionKind] = {
+    "supplier_request": ActionKind.SUPPLIER_INVOICE_REQUEST,
+    "link_request": ActionKind.SUPPLIER_INVOICE_REQUEST,
+    "expected_invoice_request": ActionKind.SUPPLIER_INVOICE_REQUEST,
+    "statement_request": ActionKind.SUPPLIER_INVOICE_REQUEST,
+    "accountant_answer": ActionKind.ROUTINE_ACCOUNTANT_RESPONSE,
+    "payslip_request": ActionKind.ROUTINE_ACCOUNTANT_RESPONSE,
+    "accountant_package": ActionKind.DOCUMENT_DELIVERY,
+}
 
 _ZERO = Decimal("0")
 
@@ -1028,6 +1039,11 @@ class OutgoingMessage:
     sent_at: datetime | None = None
     announced: bool = False  # the owner was told it is waiting to be sent
     failures: int = 0
+    # Attachments (file name, content type, bytes), e.g. the monthly accountant package. The bytes are let go
+    # once a transport accepted the email; ``attached`` keeps the file names.
+    files: tuple[tuple[str, str, bytes], ...] = field(default=(), repr=False)
+    attached: tuple[str, ...] = ()
+    cc: tuple[str, ...] = ()  # further recipients of the same email (e.g. the owner's copy of the package)
 
     @property
     def sent(self) -> bool:
@@ -1089,6 +1105,7 @@ class IngestReport:
     transaction_ids: list[str] = field(default_factory=list)
     obligation_ids: list[str] = field(default_factory=list)
     question_ids: list[str] = field(default_factory=list)
+    needs_ids: list[str] = field(default_factory=list)  # questions for the owner this arrival raised (Needs You)
     pending_links: list[str] = field(default_factory=list)
     stored_only: bool = False
     already_known: bool = False  # every document in it was already on file
@@ -1227,6 +1244,14 @@ class Repository:
         self.payroll_employees: dict[str, str] = {}
         self.payroll_by: dict[str, str] = {}
         self.payslip_requests: dict[str, str] = {}
+        # The monthly accountant package (backoffice.package_delivery): the owner's report settings as last saved
+        # (None: the defaults), and every package written, by its own id.
+        self.package_settings: dict[str, Any] | None = None
+        self.packages: dict[str, Any] = {}
+        # Photos from the phone (backoffice.captures): the pages of multi-page scans, by capture id, and documents
+        # read without their number that look like one on file, waiting for the owner, by question id.
+        self.captures: dict[str, Any] = {}
+        self.pending_copies: dict[str, Any] = {}
 
     # ----------------------------------------------------------------- set-up
 
@@ -1413,7 +1438,11 @@ class Repository:
         """
         shared = self.shared_mailboxes()
         counts: dict[str, dict[str, int]] = {}
-        for d in sorted(self.documents.values(), key=lambda d: d.id):
+        # Only documents that came to a mailbox count; their order does not matter (the result is sorted), so
+        # the rest are skipped before any tax number is looked at (high volume, checklist X33).
+        for d in self.documents.values():
+            if not d.recipients:
+                continue
             company = None if d.sales else self.company_for_tax_id(d.document.customer_tax_id)
             if company is None:
                 continue
@@ -2091,6 +2120,25 @@ class EntityAgent(_Agent):
         return personal_signal(tx.counterparty, tx.description, sector=self.repo.company_sectors.get(owner),
                                known_supplier=known)
 
+    _history_cache: tuple[list[tuple[str, str]], int, dict[str, dict[str, int]]] | None = None
+
+    def _history(self) -> dict[str, dict[str, int]]:
+        """``build_history(repo.history_pairs)``, kept up to date as pairs are appended rather than rebuilt for every
+        payment (the list only ever grows; a new or shorter list is built afresh). Read-only for its users."""
+        pairs = self.repo.history_pairs
+        cached = self._history_cache
+        if cached is None or cached[0] is not pairs or cached[1] > len(pairs):
+            history: dict[str, dict[str, int]] = {}
+            seen = 0
+        else:
+            _, seen, history = cached
+        if seen < len(pairs):
+            for key, target in pairs[seen:]:
+                bucket = history.setdefault(key, {})
+                bucket[target] = bucket.get(target, 0) + 1
+        self._history_cache = (pairs, len(pairs), history)
+        return history
+
     def assign(self, rec: TxRecord) -> EntityAssignment:
         docs = [self.repo.documents[d] for d in rec.document_ids if d in self.repo.documents]
         record = docs[0] if len(docs) == 1 else None
@@ -2101,7 +2149,7 @@ class EntityAgent(_Agent):
         result = assign_entity(
             entities=self.repo.entities, transaction=rec.tx, document=document, ownership=self.repo.ownership(),
             rulebook=self.repo.rulebook, accountant_ids=accountant_ids,
-            history=build_history(self.repo.history_pairs), today=self.repo.today(),
+            history=self._history(), today=self.repo.today(),
             addressee=addressee if document is not None and hinted else None,
             directory=self.repo.directory() if document is not None and hinted else None,
             personal_signal=self.personal_hint(rec),
@@ -2138,10 +2186,13 @@ class ReconciliationAgent(_Agent):
                                       employee_ibans=sorted(self.repo.payroll_employees))
 
     def classify(self, records: Sequence[TxRecord]) -> None:
+        if not records:
+            return
         engine = self.engine()
+        customers = self.o.customer_payments()  # who paid your own invoices, looked up once (high volume, X33)
         for rec in records:
             decision = engine.classify(rec.tx)
-            decision = self._customer_refund(rec, decision) or decision
+            decision = self._customer_refund(rec, decision, customers) or decision
             rec.decision = decision
             self.log("expect", subject_id=rec.id, evidence_ids=[rec.evidence_id],
                      values={"expectation": decision.expectation.value, "rule": decision.rule},
@@ -2151,10 +2202,11 @@ class ReconciliationAgent(_Agent):
         """Money out already decided as needing a supplier's invoice, now known to go back to one of your
         customers (their payment of your own invoice arrived since): it needs your own credit note (§20)."""
         moved = 0
+        customers = self.o.customer_payments()  # deciding refunds changes none of them: looked up once
         for rec in sorted(self.repo.transactions.values(), key=lambda r: r.id):
             if rec.decision is None or rec.document_ids or self.repo.items[rec.item_id].is_done:
                 continue
-            found = self._customer_refund(rec, rec.decision)
+            found = self._customer_refund(rec, rec.decision, customers)
             if found is None:
                 continue
             rec.decision = found
@@ -2164,12 +2216,13 @@ class ReconciliationAgent(_Agent):
             moved += 1
         return moved
 
-    def _customer_refund(self, rec: TxRecord, decision: ExpectationDecision) -> ExpectationDecision | None:
+    def _customer_refund(self, rec: TxRecord, decision: ExpectationDecision,
+                         customers: Sequence[TxRecord] | None = None) -> ExpectationDecision | None:
         """Money out to someone who paid one of your own sales invoices: a refund to your customer, covered
         by your own credit note, not by a supplier's invoice. Same bank account: GREEN; same name: AMBER."""
         if rec.tx.amount >= 0 or decision.rule not in ("payment_out", "card_in_shop"):
             return None
-        customer = self.o.customer_of(rec.tx)
+        customer = self.o.customer_of(rec.tx, customers)
         if customer is None:
             # Money back to someone whose deposit you hold (a cancelled booking): linked to that deposit (X8).
             payer = self.o.staged.deposit_payer(rec)
@@ -3423,6 +3476,10 @@ class MissingEvidenceAgent(_Agent):
         if chase is not None and chase.sent:
             return (f"I asked {who} for the invoice for the {amount} payment on {when}. "
                     "Suppliers usually reply within a few days.")
+        written = self.repo.outbox.get(chase.outbox_id) if chase is not None else None
+        if written is not None and self.o.held_back(written):
+            return (f"I wrote to {who} asking for the invoice for the {amount} payment on {when}, but asking "
+                    "suppliers for invoices is switched off, so I have not sent it.")
         if chase is not None:
             return (f"I wrote to {who} asking for the invoice for the {amount} payment on {when}. "
                     "It is waiting to be sent.")
@@ -5784,9 +5841,16 @@ class ClosureAgent(_Agent):
         """An invoice fully cancelled by its linked credit notes: both close together, no payment due."""
         repo = self.repo
         moved = 0
+        # Each invoice's linked credit notes, looked up once (closing changes no link; high volume, X33).
+        linked: dict[str, list[DocumentRecord]] = {}
+        for d in sorted(repo.documents.values(), key=lambda d: d.id):
+            if d.credit_for:
+                linked.setdefault(d.credit_for, []).append(d)
+        if not linked:
+            return 0
         for record in sorted(repo.documents.values(), key=lambda d: d.id):
             item = repo.items[record.item_id]
-            notes = self.o.credits_for(record.id)
+            notes = linked.get(record.id, [])
             if not notes or item.is_done or record.matched_tx_ids or record.on_hold:
                 continue
             docs = [record, *notes]
@@ -6528,6 +6592,11 @@ class Orchestrator:
 
         self.staff = StaffAgent(self)
         self.payroll = PayrollAgent(self)
+        from backoffice.captures import CaptureAgent  # phone photos: pages together, retakes, copies (§11)
+        from backoffice.package_delivery import PackageAgent  # the monthly package (§27 Day 0 / Day +1)
+
+        self.packages = PackageAgent(self)
+        self.captures = CaptureAgent(self)
         self._activity_seq = 0
         # What sends the emails the back office writes itself (backoffice.mailer): the demo's simulated
         # outbox, or None. With None they wait in ``repo.outbox``; the production server sends each one
@@ -6571,18 +6640,34 @@ class Orchestrator:
     # ----------------------------------------------------------------- the emails we write (§22, §25, §28)
 
     def write_email(self, kind: str, subject_id: str, company_id: str | None, to: str, subject: str, body: str,
-                    at: datetime, *, headers: Sequence[tuple[str, str]] = ()) -> OutgoingMessage:
+                    at: datetime, *, headers: Sequence[tuple[str, str]] = (),
+                    files: Sequence[tuple[str, str, bytes]] = (), cc: Sequence[str] = ()) -> OutgoingMessage:
         """Put one email in the outbox. It is written, not sent: :meth:`deliver` sends it."""
         message = OutgoingMessage(id=f"mail_{len(self.repo.outbox) + 1:04d}", kind=kind, subject_id=subject_id,
                                   company_id=company_id, to=to, subject=subject, body=body, written_at=at,
-                                  headers=tuple(headers))
+                                  headers=tuple(headers), files=tuple(files),
+                                  attached=tuple(name for name, _, _ in files), cc=tuple(cc))
         self.repo.outbox[message.id] = message
-        self.log("mailer", "write_email", subject_id=subject_id,
-                 values={"id": message.id, "kind": kind, "to": to, "subject": subject})
+        values: dict[str, Any] = {"id": message.id, "kind": kind, "to": to, "subject": subject}
+        if cc:
+            values["cc"] = list(cc)
+        if files:
+            values["files"] = [{"name": name, "sha256": sha256_hex(data), "size": len(data)}
+                               for name, _, data in files]
+        self.log("mailer", "write_email", subject_id=subject_id, values=values)
         return message
 
     def waiting_messages(self) -> list[OutgoingMessage]:
         return [m for m in self.repo.outbox.values() if not m.sent]
+
+    def held_back(self, message: OutgoingMessage) -> bool:
+        """Written on the owner's standing permission, which is switched off now: it is not sent (§25)."""
+        action = GATED_MESSAGES.get(message.kind)
+        return action is not None and not message.sent and not self.repo.policy.allows(action, message.company_id)
+
+    def sendable_messages(self) -> list[OutgoingMessage]:
+        """Waiting emails that may go out now (none held back by a permission switched off since)."""
+        return [m for m in self.waiting_messages() if not self.held_back(m)]
 
     def deliver(self, at: datetime | None = None) -> list[str]:
         """Send every waiting email through ``self.transport``. Only what it accepted counts as sent."""
@@ -6590,7 +6675,7 @@ class Orchestrator:
             return []
         now = at or self.repo.clock.now()
         sent = []
-        for message in self.waiting_messages():
+        for message in self.sendable_messages():
             try:
                 self._transmit(message, self.transport)
             except Exception as exc:  # it stays waiting; the owner is told (never "sent")
@@ -6607,7 +6692,7 @@ class Orchestrator:
         A transport that refuses raises: the caller's change is then void and the email stays waiting.
         """
         message = self.repo.outbox.get(message_id)
-        if message is None or message.sent:
+        if message is None or message.sent or self.held_back(message):
             return False
         self._transmit(message, transport)
         self._sent(message, at or self.repo.clock.now(), transport)
@@ -6616,11 +6701,13 @@ class Orchestrator:
 
     @staticmethod
     def _transmit(message: OutgoingMessage, transport: Any) -> None:
-        transport.send([message.to], message.subject, message.body, [], headers=dict(message.headers))
+        transport.send([message.to, *message.cc], message.subject, message.body, list(message.files),
+                       headers=dict(message.headers))
 
     def _sent(self, message: OutgoingMessage, at: datetime, transport: Any) -> None:
         message.status = "sent"
         message.sent_at = at
+        message.files = ()  # the transport has them now; the audit log keeps their names and hashes
         self.log("mailer", "sent", subject_id=message.id, values={"kind": message.kind, "to": message.to},
                  response={"simulated": is_simulated(transport)})
         if message.kind == "supplier_request" and message.subject_id in self.repo.chases:
@@ -6642,6 +6729,8 @@ class Orchestrator:
             self.statements.sent(message, at)
         elif message.kind in self.staff.MESSAGE_KINDS:
             self.staff.sent(message, at)
+        elif message.kind == "accountant_package":
+            self.packages.sent(message, at)
         elif message.kind == "correction_request" and message.subject_id in self.repo.documents:
             record = self.repo.documents[message.subject_id]
             who = display_name(record.document.supplier_name)
@@ -6694,6 +6783,8 @@ class Orchestrator:
                 evidence = list(self.repo.documents[message.subject_id].evidence_ids)
             elif message.kind in self.staff.MESSAGE_KINDS:
                 text, evidence = self.staff.waiting_line(message)
+            elif message.kind == "accountant_package" and (package := self.packages.by_outbox(message.id)):
+                text = f"{package.month.name} is ready for your accountant. It is waiting to be sent."
             self.activity(at, "waiting", text, message.company_id, evidence_ids=evidence)
 
     def evidence_text(self, evidence_id: str) -> str:
@@ -6823,9 +6914,34 @@ class Orchestrator:
                                                    mime_type=evidence.mime_type, at=at)
             report = self._process_outcome(outcome, at=at, origin="scan")
         else:
-            self._process_evidence(evidence, at=at, origin="scan", report=report)
+            pages = self.captures.add_page(evidence, at)  # one page of a multi-page scan (D2): read together
+            if pages is None:
+                self._process_evidence(evidence, at=at, origin="scan", report=report)
+            elif pages:
+                report.evidence_ids = list(pages)
+                self._process_pages(pages, at=at, origin="scan", report=report)
+            else:
+                # Read now, while this page's reading is at hand (on the server it is recorded with this upload's
+                # event); it becomes part of the document once the other pages are here.
+                self._parts_for(evidence.id)
+                report.message = "Got it. I'll read it once the other pages of this scan are here."
         self.run(at)
         return receipt, report
+
+    def _process_pages(self, evidence_ids: Sequence[str], *, at: datetime, origin: str, report: IngestReport) -> None:
+        """Every page of one scan, read together as one document (D2): the pages' readings join, each page is
+        its evidence. A letter or payslip over several pages is read the same way."""
+        parts = [p for e in evidence_ids for p in self._parts_for(e)]
+        used = bool(parts) and (
+            self.payroll.accept(parts, at=at, origin=origin, report=report)
+            or bool((letter := _letter_text(parts)) and self._read_letter(letter, evidence_ids[0], at=at,
+                                                                          report=report))
+            or self._document_from_parts(parts, at=at, origin=origin, retrieved=False, report=report) is not None
+            or bool(report.needs_ids))
+        if not used:
+            report.stored_only = True
+            if not self.captures.unreadable(evidence_ids, at=at, report=report):
+                report.message = "Got it. I stored the pages, but I couldn't find invoice details in them."
 
     def ingest_bank(self, rows: Sequence[BankRow], *, at: datetime | None = None) -> IngestReport:
         at = self.repo.clock.advance_to(at) if at else self.repo.clock.now()
@@ -6872,15 +6988,18 @@ class Orchestrator:
             report.message = self._unread_message(evidence)
             self.discovery.log("stored_for_reading", subject_id=evidence.id, evidence_ids=[evidence.id],
                                values={"format": evidence.format.value})
+            self.captures.unreadable([evidence.id], at=at, report=report)  # a poor photo: one task to retake it
             return
         if self.payroll.accept(parts, at=at, origin=origin, report=report):
             return  # a payslip: the evidence a salary needs (J3), never a letter or an invoice
         letter = _letter_text(parts)
         if letter and self._read_letter(letter, evidence.id, at=at, report=report):
             return
+        asked = len(report.needs_ids)
         record = self._document_from_parts(parts, at=at, origin=origin, retrieved=False, report=report)
-        if record is None and any(p.kind == "read" for p in parts):
+        if record is None and len(report.needs_ids) == asked and any(p.kind == "read" for p in parts):
             report.message = "Got it. I stored it, but I couldn't find invoice details in it."
+            self.captures.unreadable([evidence.id], at=at, report=report)
 
     def _read_letter(self, text: str, evidence_id: str, *, at: datetime, report: IngestReport,
                      sender: str = "") -> bool:
@@ -6953,9 +7072,9 @@ class Orchestrator:
     def _read_file(self, evidence: Evidence) -> list[_Part]:
         """Stage 0 and the OCR chain for a PDF or photo (§13-17); nothing when no reader is configured."""
         repo = self.repo
-        if repo.reader is None:
+        outcome = repo.reads.get(evidence.id)  # read before (e.g. a scan's first page, read when it arrived)
+        if outcome is None and repo.reader is None:
             return []
-        outcome = repo.reads.get(evidence.id)
         if outcome is None:
             from backoffice.reading import ReadRequest  # server only: the browser demo has no reader
 
@@ -6965,6 +7084,7 @@ class Orchestrator:
                 tenant_id=repo.tenant_id, evidence_id=evidence.id, data=data, mime_type=evidence.mime_type,
                 stage0_fields=lambda text, method: self.documents.stage0_fields(text, evidence.id, method, hint),
                 extractor=self.documents.text_extractor(hint),
+                quality_hints=tuple(self.captures.capture_of(evidence).get("quality") or ()),  # the phone's (§11)
             )
             try:
                 outcome = repo.reader.read(request)
@@ -7006,6 +7126,7 @@ class Orchestrator:
         message_id = result.message.evidence.id
         email = self._email_facts(parsed, message_id)
         sender, text, body_part, recipients = email.sender, email.text, email.body, email.recipients
+        self.packages.acknowledged(parsed, message_id, at)  # a reply in a monthly package's thread confirms it
         accountant = self.repo.accountant_by_email(sender)
         if accountant is not None:
             questions = self.accountant.receive(body_part.text if body_part else "", message_id, at, accountant,
@@ -7128,8 +7249,10 @@ class Orchestrator:
     def _document_from_parts(self, parts: list[_Part], *, at: datetime, origin: str, retrieved: bool,
                              report: IngestReport, sender: str | None = None, message_text: str = "",
                              body: _Part | None = None, recipients: tuple[str, ...] = (),
-                             shared_link: bool = False, known_supplier: Supplier | None = None
-                             ) -> DocumentRecord | None:
+                             shared_link: bool = False, known_supplier: Supplier | None = None,
+                             owner_says_separate: bool = False) -> DocumentRecord | None:
+        """One document from what was read. ``owner_says_separate``: the owner answered that this unnumbered
+        document is not the look-alike on file (backoffice.captures), so it is recorded on its own."""
         extracted = self.documents.read(parts)
         if extracted is None:
             report.stored_only = True
@@ -7167,6 +7290,21 @@ class Orchestrator:
         existing = self._duplicate_of(values, extracted.doc_type, supplier.id if supplier else None)
         if existing is not None:
             return self._merge_duplicate(existing, extracted, report)
+        copy = None if owner_says_separate or extracted.statement is not None else self.captures.near_copy(
+            values, extracted.doc_type, supplier.id if supplier else None, extracted.text, sales)
+        if copy is not None and not set(extracted.evidence_ids) <= set(copy.evidence_ids):
+            # No number read, but the same supplier, date and total as an invoice on file (checklist G3): the
+            # same document only when the rules prove it; otherwise one plain question, never a second expense.
+            if self.captures.proven_copy(extracted.text, copy):
+                self.documents.log("same_document_proven", subject_id=copy.id,
+                                   evidence_ids=[*copy.evidence_ids, *extracted.evidence_ids],
+                                   response={"rule": "same ATCUD"})
+                return self._merge_duplicate(copy, extracted, report)
+            self.captures.ask_same(copy, parts, extracted.evidence_ids, at=at, origin=origin, retrieved=retrieved,
+                                   options={"sender": sender, "message_text": message_text, "body": body,
+                                            "recipients": recipients, "shared_link": shared_link,
+                                            "known_supplier": known_supplier}, report=report)
+            return None
         doc_id = "doc_" + extracted.evidence_ids[0][3:19]
         if extracted.statement is not None and doc_id in self.repo.documents:
             return self._merge_duplicate(self.repo.documents[doc_id], extracted, report)  # the same statement again
@@ -7792,6 +7930,9 @@ class Orchestrator:
         """Run every agent in the fixed order until nothing moves (at most ``MAX_PASSES``)."""
         now = self.repo.clock.advance_to(at) if at else self.repo.clock.now()
         report = RunReport()
+        for pending in self.captures.stale(now) if self.repo.captures else ():  # scans missing pages for a day
+            self._process_pages(pending.evidence_ids(), at=now, origin="scan",
+                                report=IngestReport(route="upload", message="Got it."))
         self.staff.learn(now)  # cardholders the bank's card details name (employee cards)
         for _ in range(self.MAX_PASSES):
             report.passes += 1
@@ -7831,6 +7972,9 @@ class Orchestrator:
         self._announce_waiting(now)
         report.reopened = self.auditor.recheck()
         report.closed_months = self.closure.record_closures(now)
+        if self.packages.deliver_due(now):  # each month's package for the accountant, on its working day (§27)
+            report.sent += self.deliver(now)
+            self._announce_waiting(now)
         self._record_recovered(now)
         self._onboarding_progress(now)
         return report
@@ -8115,15 +8259,22 @@ class Orchestrator:
         """What of a supplier's credit note has not come back to the bank yet."""
         return abs(note.document.gross_amount or _ZERO) - self.refunded(note)
 
-    def customer_of(self, tx: Transaction) -> tuple[str, bool] | None:
-        """(name, same bank account) when this counterparty paid one of your own sales invoices (§20)."""
+    def customer_payments(self) -> list[TxRecord]:
+        """Money in that paid one of your own sales invoices, oldest first (who your customers are, §20)."""
         repo = self.repo
+        return [r for r in sorted(repo.transactions.values(), key=lambda r: (r.tx.booked_on, r.id))
+                if r.tx.amount > 0 and any(repo.documents[d].sales for d in r.document_ids if d in repo.documents)]
+
+    def customer_of(self, tx: Transaction, payments: Sequence[TxRecord] | None = None) -> tuple[str, bool] | None:
+        """(name, same bank account) when this counterparty paid one of your own sales invoices (§20).
+
+        ``payments``: :meth:`customer_payments`, when the caller asks about many payments at once.
+        """
         key = counterparty_key(tx.counterparty)
         iban = normalize_iban(tx.counterparty_iban) if tx.counterparty_iban else None
         by_name = None
-        for r in sorted(repo.transactions.values(), key=lambda r: (r.tx.booked_on, r.id)):
-            if r.id == tx.id or r.tx.amount <= 0 or not any(
-                    repo.documents[d].sales for d in r.document_ids if d in repo.documents):
+        for r in (self.customer_payments() if payments is None else payments):
+            if r.id == tx.id:
                 continue
             if iban and r.tx.counterparty_iban and normalize_iban(r.tx.counterparty_iban) == iban:
                 return display_name(r.tx.counterparty), True
@@ -8794,8 +8945,8 @@ class Orchestrator:
         if needs.kind == "cost_center":
             # Checked before anything is recorded: a split that doesn't add up changes nothing.
             chosen = self._cost_center_choice(needs, option_id, split)
-        elif needs.kind in ("statement", "recharge", *_STAGED_QUESTIONS, *self.staff.NEEDS_KINDS) and \
-                option_id not in {o.id for o in needs.options}:
+        elif needs.kind in ("statement", "recharge", *_STAGED_QUESTIONS, *self.staff.NEEDS_KINDS,
+                            *self.captures.NEEDS_KINDS) and option_id not in {o.id for o in needs.options}:
             raise ValueError("not one of the options")
         answer_ev = self._record_answer(needs, option_id, now, split=split if needs.kind == "cost_center" else None)
         self.owner_time(now, kind=InteractionKind.APPROVAL if needs.kind == "approval" else InteractionKind.ANSWER,
@@ -8825,6 +8976,8 @@ class Orchestrator:
             outcome = self.staged.answer(needs, option_id, answer_ev, now)
         elif needs.kind in self.staff.NEEDS_KINDS:
             outcome = self.staff.answer(needs, option_id, answer_ev, now)
+        elif needs.kind in self.captures.NEEDS_KINDS:  # a photo to take again; is this copy the same invoice?
+            outcome = self.captures.answer(needs, option_id, answer_ev, now)
         else:
             outcome = self._answer_choice(needs, option_id, remember, answer_ev, now)
         self.run(now)
@@ -10007,9 +10160,17 @@ def _first_value(observations: Mapping[str, list[FieldObservation]], f: Critical
     return ranked[0].value if ranked else None
 
 
+_NUMBER_NOISE = re.compile(r"[\s/_-]+")
+
+
+@lru_cache(maxsize=65536)
+def _number_key(number: str) -> str:
+    """A document number without spaces, slashes, dashes or underscores, upper case (pure: cached)."""
+    return _NUMBER_NOISE.sub("", number).upper()
+
+
 def _same_number(a: str, b: str) -> bool:
-    norm = lambda s: re.sub(r"[\s/_-]+", "", s).upper()  # noqa: E731
-    return norm(a) == norm(b)
+    return _number_key(a) == _number_key(b)
 
 
 def _text(value: Any) -> str | None:

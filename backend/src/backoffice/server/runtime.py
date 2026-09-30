@@ -213,9 +213,13 @@ def clean_history(history: Any) -> list[dict[str, str]]:
     return turns[-HISTORY_TURNS:]
 
 
-def _uploads(body: Mapping[str, Any], env: Env) -> list[tuple[bytes, str | None, str | None]]:
-    """The files a request body carries (bytes just stored, file name, declared type), for reading first."""
-    out = []
+def _uploads(body: Mapping[str, Any], env: Env) -> list[tuple[Any, ...]]:
+    """The files a request body carries (bytes just stored, file name, declared type, the quality the phone
+    noticed when it took the photo), for reading first."""
+    from backoffice.service import capture_fields
+
+    out: list[tuple[Any, ...]] = []
+    hints = tuple(capture_fields(body).get("quality") or ())
     for name in FILE_FIELDS:
         ref = body.get(name)
         if isinstance(ref, Mapping) and isinstance(ref.get(OBJECT), Mapping):
@@ -223,7 +227,7 @@ def _uploads(body: Mapping[str, Any], env: Env) -> list[tuple[bytes, str | None,
             if data is not None:
                 mime = body.get("contentType") or body.get("content_type") or body.get("mimeType") or \
                     body.get("mime_type")
-                out.append((data, _text_or_none(body.get("filename")), _text_or_none(mime)))
+                out.append((data, _text_or_none(body.get("filename")), _text_or_none(mime), hints))
     return out
 
 
