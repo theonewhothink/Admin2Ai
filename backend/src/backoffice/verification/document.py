@@ -67,6 +67,7 @@ __all__ = [
     "assess_document",
     "bank_observation",
     "group_by_field",
+    "regraded",
     "required_fields",
     "verify_document",
 ]
@@ -385,3 +386,21 @@ def verify_document(
 ) -> tuple[dict[str, VerifiedField], Quality]:
     """``(fields, quality)`` for one document; options as in :func:`assess_document`."""
     return assess_document(observations_by_field, allowed_rates, bank_amount, **options).as_tuple()
+
+
+def regraded(assessment: DocumentAssessment, fields: Mapping[str, FieldAssessment]) -> DocumentAssessment:
+    """The same document with some fields judged again by a rule that holds for it (e.g. the rules for a
+    document from abroad, :mod:`.foreign`): its quality and summary follow the fields; other notes stay."""
+    old_summary = _summary(assessment.quality, assessment.fields, assessment.required)
+    notes = [r for r in assessment.reasons if r not in old_summary]
+    table = dict(fields)
+    quality = _quality(table, assessment.required)
+    return DocumentAssessment(
+        quality=quality,
+        doc_type=assessment.doc_type,
+        fields=MappingProxyType(table),
+        required=assessment.required,
+        sum_check=assessment.sum_check,
+        rate_checks=assessment.rate_checks,
+        reasons=(*_summary(quality, table, assessment.required), *notes),
+    )

@@ -12,9 +12,11 @@ Pipeline for one piece of evidence::
     Retrieval      invoice links in emails, followed through registered portal adapters (§9, §10)
     Document       structured extraction: UBL, Portuguese fiscal QR + text fields (§13, §19); uploaded
                    PDFs and photos through the repository's document reader (backoffice.reading:
-                   text layer, QR, then the OCR chain), when one is configured (§13-17)
+                   text layer, QR, then the OCR chain), when one is configured (§13-17). The issuer's
+                   country comes first: a document from abroad is read with its own labels (P7)
     Verification   field-level GREEN / AMBER / RED (§18, §57); a disagreement becomes one plain
-                   question for the owner, whose answer is stored as evidence (§19, §37)
+                   question for the owner, whose answer is stored as evidence (§19, §37). A document
+                   from abroad is checked by rules that hold anywhere, the bank confirming it (P7)
     Fraud          hard stops: changed IBAN, recipient mismatch, ... (§26)
     Entity         which company (§51), taught rules (§38)
     Reconciliation expected evidence (§21), then transaction <-> document matching (§20): only accounting
@@ -60,7 +62,7 @@ import json
 import re
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -85,6 +87,8 @@ from backoffice.closure import (
     satisfy,
 )
 from backoffice.closure.month import EXPECTED_INVOICE
+from backoffice.countries.foreign import IssuerProfile, detect_issuer, read_foreign_text
+from backoffice.countries.foreign import vat_rates as foreign_vat_rates
 from backoffice.countries.pt import (
     PACK,
     PTQRCode,
@@ -161,6 +165,7 @@ from backoffice.fraud import (
     registrable_domain,
     trust_iban,
 )
+from backoffice.fraud.engine import COUNTRY_NAMES
 from backoffice.learning import (
     Answer,
     Basis,
@@ -185,6 +190,7 @@ from backoffice.learning import (
     next_expected,
     join_and,
     match_key,
+    qualified_tax_id,
     same_tax_id,
     suggest_rule_from_answer,
 )
@@ -231,6 +237,7 @@ from backoffice.reconciliation import (
     PayoutProvider,
     SupplierResolver,
     compatible_providers,
+    fx_from_text,
     payout_provider,
     provider_named,
     reconcile,
@@ -259,7 +266,17 @@ from backoffice.supplier_statements import (
     check_statement,
     read_statement,
 )
-from backoffice.verification import DocumentAssessment, assess_document, check_sum, currency_mark, lineage
+from backoffice.verification import (
+    BankCharge,
+    DocumentAssessment,
+    ForeignRules,
+    assess_document,
+    assess_foreign,
+    check_sum,
+    currency_mark,
+    lineage,
+)
+from backoffice.verification.foreign import PAYMENT_LAG_DAYS, PAYMENT_LEAD_DAYS
 from backoffice.verification._display import field_label, join, method_label, show_many
 from backoffice.verification.duplicates import same_document_kind
 
@@ -522,10 +539,17 @@ class DocumentRecord:
     owner_confirmed: str | None = None  # evidence id of the owner's answer confirming a cash receipt
     hold_reason: str = ""  # plain reason it waits although nothing is missing (e.g. a large first purchase)
     recipients: tuple[str, ...] = ()  # addresses the email was sent to (an alias can point to a cost center)
+    # Who issued it and from which country (checklist P7): a foreign issuer is checked by rules that
+    # hold anywhere, never by Portuguese ones. None, or a Portuguese issuer: the Portuguese rules.
+    issuer: IssuerProfile | None = None
 
     @property
     def id(self) -> str:
         return self.document.id
+
+    @property
+    def is_foreign(self) -> bool:
+        return self.issuer is not None and self.issuer.is_foreign
 
     @property
     def supporting(self) -> bool:
@@ -1147,6 +1171,7 @@ class _Extracted:
     paid_in_cash: bool = False
     text: str = ""
     statement: SupplierStatement | None = None  # a supplier's account statement, read line by line
+    issuer: IssuerProfile | None = None
 
 
 class DiscoveryAgent(_Agent):
@@ -1235,9 +1260,19 @@ _MONEY_WITH_CURRENCY = re.compile(r"(?:€|EUR)\s?-?\d[\d.,\u00a0 ]*\d|-?\d[\d.,
 
 class DocumentAgent(_Agent):
     """Stage 0 extraction: UBL e-invoices, Portuguese fiscal QR codes and text fields (§13, §19),
-    plus the readings of uploaded PDFs and photos (§13-17)."""
+    plus the readings of uploaded PDFs and photos (§13-17).
+
+    The issuer's country is decided first (checklist P7): a document from abroad is read with the
+    international labels and its own conventions (day order, currency, VAT number), never as if it
+    were Portuguese because the company is. A document one of the business's own companies issued
+    (its own sales invoice) keeps the Portuguese reading.
+    """
 
     name = "document"
+
+    def own_tax_ids(self) -> list[str]:
+        """The business's own tax numbers with their country ("PT516123459"): on a purchase, the customer."""
+        return [qualified_tax_id(e.tax_id, e.country) or e.tax_id for e in self.repo.entities]
 
     def stage0_fields(self, text: str, source: str, method: ExtractionMethod,
                       hint: dict[str, str] | None = None) -> dict[str, list[FieldObservation]]:
@@ -1252,12 +1287,22 @@ class DocumentAgent(_Agent):
         return {} if extracted is None else {k: list(v) for k, v in extracted.observations.items()}
 
     def text_extractor(self, hint: Mapping[str, str] | None = None) -> Any:
-        """Reads Portuguese fields from an OCR engine's text (the router labels them with the engine)."""
+        """Reads fields from an OCR engine's text (the router labels them with the engine): Portuguese
+        fields, or the international labels when the text comes from abroad."""
+        own = self.own_tax_ids()
 
         def extract(text: str, source: str, method: ExtractionMethod) -> dict[CriticalField, list[FieldObservation]]:
             issuer = (hint or {}).get("issuer") or self.own_issuer([_Part(source, "text", text=text, method=method)])
-            customers, suppliers = self._roles(issuer)
             found: dict[CriticalField, list[FieldObservation]] = {}
+            if issuer is None:  # not the business's own sale: who issued it, and from which country (P7)
+                payloads, rest = _split_qr(text)
+                profile = detect_issuer(rest, own_tax_ids=own, fiscal_qr=bool(payloads))
+                if profile.reads_foreign:
+                    for name, obs in read_foreign_text(rest, source, method=method, issuer=profile,
+                                                       own_tax_ids=own).observations.items():
+                        found.setdefault(name, []).extend(obs)
+                    return found
+            customers, suppliers = self._roles(issuer)
             for obs in extract_text_fields(text, source, method=method, known_customer_tax_ids=customers,
                                            known_supplier_tax_ids=suppliers).observations:
                 found.setdefault(obs.field, []).append(obs)
@@ -1313,6 +1358,25 @@ class DocumentAgent(_Agent):
                 return mine
         return None
 
+    def issuer_of(self, parts: Sequence[_Part], structured: Mapping[int, Any]) -> IssuerProfile:
+        """Who issued the document, from all its readable parts together (a fiscal QR code means Portugal)."""
+        texts: list[str] = []
+        fiscal_qr = False
+        numbers: list[str] = []
+        for i, part in enumerate(parts):
+            if part.kind == "ubl":
+                result = structured.get(i)
+                if result is not None:
+                    numbers += [str(o.value) for o in result.fields.get(CriticalField.SUPPLIER_TAX_ID, ())]
+                continue
+            payloads, rest = _split_qr(part.text)
+            fiscal_qr = fiscal_qr or bool(payloads)
+            texts.append(rest)
+            if part.kind == "read":
+                texts.append(part.reading_text)
+        return detect_issuer("\n".join(texts), own_tax_ids=self.own_tax_ids(), fiscal_qr=fiscal_qr,
+                             structured_tax_ids=numbers)
+
     def read(self, parts: Sequence[_Part]) -> _Extracted | None:
         observations: dict[str, list[FieldObservation]] = {}
         # The document's kind by where it was read, most trusted first when choosing (§13: structured first).
@@ -1322,8 +1386,22 @@ class DocumentAgent(_Agent):
         qr: PTQRCode | None = None
         final_consumer = False
         parsers: list[str] = []
-        issuer = self.own_issuer(parts)
-        customers, suppliers = self._roles(issuer)
+        structured: dict[int, Any] = {}
+        for i, part in enumerate(parts):
+            if part.kind == "ubl":
+                try:
+                    structured[i] = parse_einvoice(part.data, source=part.evidence_id)
+                except (StructuredFormatError, XMLSyntaxError):
+                    continue
+        own_issuer = self.own_issuer(parts)
+        customers, suppliers = self._roles(own_issuer)
+        # Who issued it and from which country (checklist P7). The business's own sale is its own
+        # company's document: read the Portuguese way, with its roles, never as a purchase from abroad.
+        issuer = None if own_issuer is not None else self.issuer_of(parts, structured)
+        # From abroad (or in English/Spanish with no country to go by): its own labels and conventions.
+        abroad = issuer is not None and issuer.reads_foreign
+        own = self.own_tax_ids() if abroad else []
+        stated: list[Decimal] = []
         texts: list[str] = []
         reference: str | None = None
 
@@ -1331,11 +1409,10 @@ class DocumentAgent(_Agent):
             key = field_.value if isinstance(field_, CriticalField) else str(field_)
             observations.setdefault(key, []).append(obs)
 
-        for part in parts:
+        for i, part in enumerate(parts):
             if part.kind == "ubl":
-                try:
-                    result = parse_einvoice(part.data, source=part.evidence_id)
-                except (StructuredFormatError, XMLSyntaxError):
+                result = structured.get(i)
+                if result is None:
                     continue
                 parsers.append(result.kind)
                 for f, found in result.fields.items():
@@ -1372,26 +1449,39 @@ class DocumentAgent(_Agent):
                     location="qr:amounts are in euro"))
                 kinds.setdefault("qr", code.doc_type)
             method = part.method
-            fields = extract_text_fields(rest, part.evidence_id, method=method, known_customer_tax_ids=customers,
-                                         known_supplier_tax_ids=suppliers)
-            if fields.observations:
-                parsers.append({"text": "pt_text_fields", "read": "pt_text_fields:pdf_text"}.get(
-                    part.kind, "pt_text_fields:email_body"))
-            final_consumer = final_consumer or fields.buyer_is_final_consumer
-            for obs in fields.observations:
-                add(obs.field, obs)
-            if fields.buyer_is_final_consumer and len(fields.unassigned_tax_ids) == 1 and not any(
-                    o.field is CriticalField.SUPPLIER_TAX_ID for o in fields.observations):
-                # Sold to a final consumer: the one other tax number printed is the seller's.
-                add(CriticalField.SUPPLIER_TAX_ID, FieldObservation(
-                    value=fields.unassigned_tax_ids[0], source=part.evidence_id, method=method, confidence=0.5,
-                    location="text:the only tax number besides the final consumer"))
-            currency = _text_currency(rest, part.evidence_id, method)
-            if currency is not None:
-                add(CriticalField.CURRENCY, currency)
-            supplier_name = supplier_name or _first_line(rest)
-            if fields.observations:
-                named = _text_doc_type(rest)
+            if abroad:
+                assert issuer is not None
+                foreign = read_foreign_text(rest, part.evidence_id, method=method, issuer=issuer, own_tax_ids=own)
+                if foreign.observations:
+                    parsers.append({"text": "intl_text_fields", "read": "intl_text_fields:pdf_text"}.get(
+                        part.kind, "intl_text_fields:email_body"))
+                for name, found in foreign.observations.items():
+                    for obs in found:
+                        add(name, obs)
+                stated += foreign.stated_rates
+                read_any = bool(foreign.observations)
+            else:
+                fields = extract_text_fields(rest, part.evidence_id, method=method, known_customer_tax_ids=customers,
+                                             known_supplier_tax_ids=suppliers)
+                if fields.observations:
+                    parsers.append({"text": "pt_text_fields", "read": "pt_text_fields:pdf_text"}.get(
+                        part.kind, "pt_text_fields:email_body"))
+                final_consumer = final_consumer or fields.buyer_is_final_consumer
+                for obs in fields.observations:
+                    add(obs.field, obs)
+                if fields.buyer_is_final_consumer and len(fields.unassigned_tax_ids) == 1 and not any(
+                        o.field is CriticalField.SUPPLIER_TAX_ID for o in fields.observations):
+                    # Sold to a final consumer: the one other tax number printed is the seller's.
+                    add(CriticalField.SUPPLIER_TAX_ID, FieldObservation(
+                        value=fields.unassigned_tax_ids[0], source=part.evidence_id, method=method, confidence=0.5,
+                        location="text:the only tax number besides the final consumer"))
+                currency = _text_currency(rest, part.evidence_id, method)
+                if currency is not None:
+                    add(CriticalField.CURRENCY, currency)
+                read_any = bool(fields.observations)
+            supplier_name = supplier_name or _first_line(rest, foreign=abroad)
+            if read_any:
+                named = _text_doc_type(rest, foreign=abroad)
                 if named is not None:
                     kinds.setdefault("text", named)
                 receipt_fallback = True
@@ -1399,8 +1489,8 @@ class DocumentAgent(_Agent):
                 texts.append(rest)
                 reference = reference or _referenced_invoice(rest)
             if part.kind == "read" and part.observations:
-                supplier_name = supplier_name or _first_line(part.reading_text)
-                named = _text_doc_type(part.reading_text)
+                supplier_name = supplier_name or _first_line(part.reading_text, foreign=abroad)
+                named = _text_doc_type(part.reading_text, foreign=abroad)
                 if named is not None:
                     kinds.setdefault("reading_text", named)
                 receipt_fallback = True
@@ -1429,13 +1519,15 @@ class DocumentAgent(_Agent):
             number = None  # the numbers and amounts on a statement are its lines' documents, never its own
             for name in _NOT_A_STATEMENT_FIELD:
                 observations.pop(name, None)
+        if stated and issuer is not None:
+            issuer = replace(issuer, stated_rates=tuple(dict.fromkeys(stated)))
         return _Extracted(
             observations=observations, doc_type=doc_type, supplier_name=supplier_name,
             evidence_ids=list(dict.fromkeys(p.evidence_id for p in parts)), qr=qr,
             buyer_is_final_consumer=final_consumer, parsers=[*parsers, *(["supplier_statement"] if statement else [])],
             invoice_number=str(number) if number is not None else None,
-            issuer_tax_id=issuer, referenced_number=reference, paid_in_cash=_says_paid_in_cash(joined),
-            text=joined[:_TEXT_KEPT], statement=statement,
+            issuer_tax_id=own_issuer, referenced_number=reference, paid_in_cash=_says_paid_in_cash(joined),
+            text=joined[:_TEXT_KEPT], statement=statement, issuer=issuer,
         )
 
 
@@ -1455,20 +1547,38 @@ class VerificationAgent(_Agent):
     def assess(self, observations: Mapping[str, list[FieldObservation]], doc_type: DocumentType,
                bank_amount: Decimal | None = None, *, subject_id: str | None = None,
                evidence_ids: Sequence[str] = (),
-               owner: Mapping[str, FieldObservation] | None = None) -> DocumentAssessment:
+               owner: Mapping[str, FieldObservation] | None = None, bank_currency: str | None = None,
+               issuer: IssuerProfile | None = None, bank: BankCharge | None = None,
+               log: bool = True) -> DocumentAssessment:
         """Every field graded with the observations behind it (§18). A value the owner confirmed
-        replaces the readings that disagree with it (they stay on the record, §55)."""
+        replaces the readings that disagree with it (they stay on the record, §55).
+
+        A document from abroad (``issuer``) is checked by rules that hold anywhere, with its own
+        country's VAT rates, and ``bank`` (the matching payment, in the document's currency) as the
+        independent source (checklist P7). Portuguese documents keep the Portuguese rules.
+        """
         observations = _with_owner(observations, owner or {})
         issue = _first_value(observations, CriticalField.ISSUE_DATE)
-        try:
-            rates = PACK.vat_rates(issue) if isinstance(issue, date) else PACK.vat_rates(self.repo.today())
-        except RateDataUnavailable:
-            rates = ()
-        assessment = assess_document(observations, rates, bank_amount, doc_type=doc_type)
-        self.log("verify", subject_id=subject_id, evidence_ids=evidence_ids,
-                 values={name: a.value for name, a in assessment.fields.items() if a.value is not None},
-                 validations=[_validation(n, a) for n, a in sorted(assessment.fields.items())],
-                 response={"quality": assessment.quality.value, "with_bank_amount": bank_amount is not None})
+        foreign = issuer is not None and issuer.is_foreign
+        if foreign:
+            assert issuer is not None
+            on = issue if isinstance(issue, date) else self.repo.today()
+            assessment = assess_foreign(observations, _foreign_rules(issuer, on), doc_type=doc_type, bank=bank)
+            response: dict[str, Any] = {"quality": assessment.quality.value, "with_bank_amount": bank is not None,
+                                        "issuer_country": issuer.country}
+        else:
+            try:
+                rates = PACK.vat_rates(issue) if isinstance(issue, date) else PACK.vat_rates(self.repo.today())
+            except RateDataUnavailable:
+                rates = ()
+            assessment = assess_document(observations, rates, bank_amount, doc_type=doc_type,
+                                         bank_currency=bank_currency)
+            response = {"quality": assessment.quality.value, "with_bank_amount": bank_amount is not None}
+        if log:
+            self.log("verify", subject_id=subject_id, evidence_ids=evidence_ids,
+                     values={name: a.value for name, a in assessment.fields.items() if a.value is not None},
+                     validations=[_validation(n, a) for n, a in sorted(assessment.fields.items())],
+                     response=response)
         return assessment
 
 
@@ -1634,21 +1744,31 @@ class ReconciliationAgent(_Agent):
             flow = document_flow(repo.documents[invoice_id].document, own) or _ZERO
             balances[invoice_id] = flow + sum((document_flow(n.document, own) or _ZERO for n in notes), _ZERO)
         decisions = {r.id: r.decision for r in txs if r.decision is not None}
+        # A document from abroad has no second source of its own: the one payment that confirms it
+        # may match it, and only that payment (checklist P7).
+        confirmed = self.o.bank_confirmations(txs, pool)
         result = reconcile(
             [r.tx for r in sorted(txs, key=lambda r: r.id)],
-            [d.document for d in sorted(pool, key=lambda d: d.id)],
+            [d.document.model_copy(update={"quality": Quality.GREEN}) if d.id in confirmed else d.document
+             for d in sorted(pool, key=lambda d: d.id)],
             suppliers=repo.resolver(), own_tax_ids=own, expectations=decisions, document_balances=balances,
         )
         accepted = []
         for m in result.matches:
+            green = m.quality is Quality.GREEN and not m.is_ambiguous
+            abroad = [d for d in m.document_ids if d in confirmed]
+            if green and abroad:
+                green = (len(m.transaction_ids) == 1 and len(m.document_ids) == 1
+                         and confirmed[m.document_ids[0]] == m.transaction_ids[0])
+            quality = Quality.AMBER if abroad and not green else m.quality
             evidence = [repo.transactions[t].evidence_id for t in m.transaction_ids]
             for d in m.document_ids:
                 evidence += repo.documents[d].evidence_ids
             self.log("match", subject_id=m.id, evidence_ids=evidence,
                      values={"transactions": list(m.transaction_ids), "documents": list(m.document_ids)},
-                     validations=list(m.why), response={"quality": m.quality.value, "kind": m.kind.value})
-            refused = self._wrong_kind(m) if m.quality is Quality.GREEN and not m.is_ambiguous else None
-            if m.quality is Quality.GREEN and not m.is_ambiguous and refused is None:
+                     validations=list(m.why), response={"quality": quality.value, "kind": m.kind.value})
+            refused = self._wrong_kind(m) if green else None
+            if green and refused is None:
                 accepted.append(m)
                 notes = [n for d in m.document_ids for n in netted.get(d, [])]
                 why = tuple(m.why) + tuple(
@@ -2084,7 +2204,7 @@ class SettlementAgent(_Agent):
             value=fees, source=report_evidence[0], method=ExtractionMethod.API, confidence=0.95, location=where))
         assessment = self.o.verification.assess(doc.observations, doc.document.doc_type, subject_id=doc.id,
                                                 evidence_ids=[*doc.evidence_ids, *report_evidence],
-                                                owner=doc.owner_values)
+                                                owner=doc.owner_values, issuer=doc.issuer)
         self.o._apply_assessment(doc, assessment)
         tx_ids = [s.transaction_id for s in chosen if s.transaction_id]
         doc.matched_tx_ids = list(tx_ids)
@@ -3673,7 +3793,9 @@ class AuditorAgent(_Agent):
         elif len(primary) == 1:
             owed = (primary[0].document.gross_amount or _ZERO) - sum(
                 (abs(c.document.gross_amount or _ZERO) for c in credits), _ZERO)
-            if owed != abs(rec.tx.amount):
+            # What the bank paid in the document's own currency: a euro amount is never compared as if it
+            # were dollars (the bank's conversion line gives the original amount, checklist P7).
+            if owed != self.o.paid_in_document_currency(rec, primary[0]):
                 return "The amounts of the payment and its document no longer agree."
         if rec.tx.entity_id is None:
             return "It is no longer clear which company this belongs to."
@@ -4655,14 +4777,25 @@ class Orchestrator:
         self.documents.log("extract", evidence_ids=extracted.evidence_ids,
                            values={k: [o.value for o in v] for k, v in sorted(extracted.observations.items())},
                            parser=",".join(dict.fromkeys(extracted.parsers)) or None)
+        # Who issued it and from which country (checklist P7): a document from abroad is checked by its
+        # own country's rules; None, or a Portuguese issuer, keeps the Portuguese ones.
+        profile = extracted.issuer
         assessment = self.verification.assess(extracted.observations, extracted.doc_type,
-                                              evidence_ids=extracted.evidence_ids)
+                                              evidence_ids=extracted.evidence_ids, issuer=profile)
         values, quality, reasons = _settled_values(assessment), assessment.quality, assessment.reasons
         # The business's own sales invoice (§20 "money in"): issued by one of its companies.
         issuer = extracted.issuer_tax_id or next(
             (t for t in self.repo.own_tax_ids() if same_tax_id(t, _text(values.get("supplier_tax_id")))), None)
         sales = issuer is not None
-        supplier = None if sales else self.repo.supplier_for_tax_id(values.get("supplier_tax_id"))
+        supplier_tax_id = _text(values.get("supplier_tax_id"))
+        if sales:
+            supplier = None
+        elif profile is not None and profile.is_foreign and supplier_tax_id:
+            # A foreign VAT number keeps its country ("IE9692928F"): the digits alone could be anyone's.
+            supplier_tax_id = qualified_tax_id(supplier_tax_id, profile.country)
+            supplier = self.repo.supplier_for_tax_id(supplier_tax_id)
+        else:
+            supplier = self.repo.supplier_for_tax_id(values.get("supplier_tax_id"))
         existing = self._duplicate_of(values, extracted.doc_type)
         if existing is not None:
             return self._merge_duplicate(existing, extracted, report)
@@ -4680,7 +4813,7 @@ class Orchestrator:
         document = Document(
             id=doc_id, tenant_id=self.repo.tenant_id, evidence_ids=extracted.evidence_ids,
             doc_type=extracted.doc_type, supplier_name=name,
-            supplier_tax_id=_text(values.get("supplier_tax_id")), customer_tax_id=_text(customer),
+            supplier_tax_id=supplier_tax_id, customer_tax_id=_text(customer),
             invoice_number=_text(values.get("invoice_number")), issue_date=_date(values.get("issue_date")),
             due_date=_date(values.get("due_date")), currency=_text(values.get("currency")) or "EUR",
             net_amount=_dec(values.get("net_amount")), vat_amount=_dec(values.get("vat_amount")),
@@ -4698,7 +4831,7 @@ class Orchestrator:
             sales=sales, text=extracted.text,
             paid_in_cash=extracted.paid_in_cash and not sales and document.doc_type in _CASH_DOCUMENTS,
             referenced_number=extracted.referenced_number if document.doc_type is DocumentType.CREDIT_NOTE else None,
-            recipients=recipients,
+            recipients=recipients, issuer=profile,
         )
         self.repo.documents[doc_id] = record
         evidence = extracted.evidence_ids
@@ -4742,6 +4875,11 @@ class Orchestrator:
         else:
             self.activity(at, "collected", f"Collected the {who} {kind} from {source}.", company,
                           amount=document.gross_amount, currency=document.currency, evidence_ids=evidence)
+        unusual = record.fraud.of_kind(SignalKind.UNUSUAL_CURRENCY) if record.fraud is not None else ()
+        if unusual and not record.on_hold:
+            # Surfaced as a check, not a hold (checklist Q6): the owner reads it; nothing is blocked.
+            self.activity(at, "checked", f"Checked the {who} invoice. {unusual[0].owner_line}", company,
+                          evidence_ids=evidence)
         report.document_ids.append(doc_id)
         if record.on_hold and record.fraud is not None:
             report.message = f"Got it. I put the {who} payment on hold: {record.fraud.owner_message}"
@@ -4787,7 +4925,8 @@ class Orchestrator:
             record.observations.setdefault(name, []).extend(obs)
         record.evidence_ids = [*record.evidence_ids, *new]
         assessment = self.verification.assess(record.observations, record.document.doc_type, subject_id=record.id,
-                                              evidence_ids=record.evidence_ids, owner=record.owner_values)
+                                              evidence_ids=record.evidence_ids, owner=record.owner_values,
+                                              issuer=record.issuer)
         record.document = record.document.model_copy(update={"quality": assessment.quality,
                                                              "evidence_ids": record.evidence_ids})
         record.reasons = assessment.reasons
@@ -4847,7 +4986,7 @@ class Orchestrator:
     def _conflict_question(self, record: DocumentRecord) -> tuple[str, tuple[CheckOption, ...], tuple[str, ...]]:
         assessment = self.verification.assess(record.observations, record.document.doc_type,
                                               subject_id=record.id, evidence_ids=record.evidence_ids,
-                                              owner=record.owner_values)
+                                              owner=record.owner_values, issuer=record.issuer)
         red = [name for name in _CONFLICT_ORDER
                if name in assessment.fields and assessment.fields[name].quality is Quality.RED]
         red += sorted(n for n, a in assessment.fields.items() if a.quality is Quality.RED and n not in red)
@@ -4887,6 +5026,8 @@ class Orchestrator:
         update: dict[str, Any] = {"quality": assessment.quality}
         for name in ("supplier_tax_id", "invoice_number", "iban", "payment_reference"):
             update[name] = _text(values.get(name))
+        if record.issuer is not None and record.issuer.is_foreign and update["supplier_tax_id"]:
+            update["supplier_tax_id"] = qualified_tax_id(update["supplier_tax_id"], record.issuer.country)
         for name in ("net_amount", "vat_amount", "gross_amount"):
             update[name] = _dec(values.get(name))
         for name in ("issue_date", "due_date"):
@@ -5746,17 +5887,80 @@ class Orchestrator:
             return
         rec = self.repo.transactions[match.transaction_ids[0]]
         doc = self.repo.documents[match.document_ids[0]]
+        evidence = [*doc.evidence_ids, rec.evidence_id]
         # Paid net of a linked credit note: the payment plus the credit is what the invoice's total must show.
         credit = sum((abs(c.document.gross_amount or _ZERO) for c in self.credits_for(doc.id)
                       if c.id in rec.document_ids), _ZERO)
-        assessment = self.verification.assess(
-            doc.observations, doc.document.doc_type, bank_amount=abs(rec.tx.amount) + credit, subject_id=doc.id,
-            evidence_ids=[*doc.evidence_ids, rec.evidence_id], owner=doc.owner_values)
+        charge = self.bank_charge(rec, doc)
+        if doc.is_foreign:
+            # From abroad: the bank, in the document's own currency, is the independent source (checklist P7).
+            if charge is not None and credit:
+                charge = replace(charge, amount=charge.amount + credit)
+            assessment = self.verification.assess(
+                doc.observations, doc.document.doc_type, subject_id=doc.id, evidence_ids=evidence,
+                owner=doc.owner_values, issuer=doc.issuer, bank=charge)
+        else:
+            same = rec.tx.currency.strip().upper() == doc.document.currency.strip().upper()
+            # Another currency without the bank's conversion line: stated, never compared as if equal.
+            amount, currency = ((abs(rec.tx.amount) + credit, None) if same else
+                                (charge.amount + credit, charge.currency) if charge is not None else
+                                (abs(rec.tx.amount), rec.tx.currency))
+            assessment = self.verification.assess(
+                doc.observations, doc.document.doc_type, bank_amount=amount, subject_id=doc.id,
+                evidence_ids=evidence, owner=doc.owner_values, bank_currency=currency)
         doc.document = doc.document.model_copy(update={"quality": assessment.quality})
         doc.reasons = assessment.reasons
         doc.checks = assessment.verified_fields
         if doc.document.entity_id is None and rec.tx.entity_id:
             doc.document = doc.document.model_copy(update={"entity_id": rec.tx.entity_id})
+
+    def bank_charge(self, rec: TxRecord, doc: DocumentRecord) -> BankCharge | None:
+        """What the bank says was paid, in the document's currency: the booked amount, or the original
+        amount on the bank's conversion line ("USD 125,00 TAXA 0,9215"). None when it says neither."""
+        tx = rec.tx
+        currency = (doc.document.currency or "EUR").strip().upper()
+        if tx.currency.strip().upper() == currency:
+            return BankCharge(abs(tx.amount), currency, tx.booked_on, rec.evidence_id)
+        fx = fx_from_text(f"{tx.counterparty} {tx.description}", tx.currency)
+        if fx is not None and fx.original_currency == currency:
+            return BankCharge(fx.original_amount, currency, tx.booked_on, rec.evidence_id, converted=True)
+        return None
+
+    def paid_in_document_currency(self, rec: TxRecord, doc: DocumentRecord) -> Decimal | None:
+        charge = self.bank_charge(rec, doc)
+        return charge.amount if charge is not None else None
+
+    def bank_confirmations(self, txs: Sequence[TxRecord], docs: Sequence[DocumentRecord]) -> dict[str, str]:
+        """Documents from abroad that exactly one payment confirms: {document id: that payment's id}.
+
+        Such a document has no fiscal QR code, so no second source of its own, and reconciliation
+        would never match it GREEN. When the bank alone proves it (amount, currency, date, with the
+        rules that hold anywhere, checklist P7) it is offered to reconciliation as confirmed, and only
+        a GREEN 1-to-1 match with that one payment keeps it (see ``ReconciliationAgent.match``).
+        """
+        out: dict[str, str] = {}
+        for record in sorted(docs, key=lambda d: d.id):
+            doc = record.document
+            if not record.is_foreign or doc.quality is not Quality.AMBER or doc.gross_amount is None:
+                continue
+            outgoing = doc.doc_type is not DocumentType.CREDIT_NOTE
+            agreeing = []
+            for rec in sorted(txs, key=lambda r: r.id):
+                if (rec.tx.amount < 0) != outgoing:
+                    continue
+                charge = self.bank_charge(rec, record)
+                if charge is None or charge.amount != abs(doc.gross_amount):
+                    continue
+                if doc.issue_date is not None and not (
+                        -PAYMENT_LEAD_DAYS <= (charge.booked_on - doc.issue_date).days <= PAYMENT_LAG_DAYS):
+                    continue
+                assessment = self.verification.assess(record.observations, doc.doc_type, owner=record.owner_values,
+                                                      issuer=record.issuer, bank=charge, log=False)
+                if assessment.quality is Quality.GREEN:
+                    agreeing.append(rec.id)
+            if len(agreeing) == 1:
+                out[record.id] = agreeing[0]
+        return out
 
     def _record_recovered(self, now: datetime) -> None:
         for rec in self.repo.transactions.values():
@@ -6217,7 +6421,7 @@ class Orchestrator:
                 location="owner answer: " + option.label)
         assessment = self.verification.assess(record.observations, record.document.doc_type, subject_id=record.id,
                                               evidence_ids=[*record.evidence_ids, answer_ev],
-                                              owner=record.owner_values)
+                                              owner=record.owner_values, issuer=record.issuer)
         self._apply_assessment(record, assessment)
         self.activity(now, "answered", f"You told me which values on the {who} invoice are right.", needs.company_id,
                       amount=record.document.gross_amount, currency=record.document.currency,
@@ -6303,7 +6507,7 @@ class Orchestrator:
         if record.owner_values:
             assessment = self.verification.assess(record.observations, record.document.doc_type, subject_id=record.id,
                                                   evidence_ids=[*record.evidence_ids, answer_ev],
-                                                  owner=record.owner_values)
+                                                  owner=record.owner_values, issuer=record.issuer)
             self._apply_assessment(record, assessment)
         record.document = record.document.model_copy(update={"entity_id": company})
         record.owner_confirmed = answer_ev
@@ -6475,15 +6679,23 @@ _KIND_ANYWHERE = tuple(
 )
 
 
-def _text_doc_type(text: str) -> DocumentType | None:
+# Spanish names of a credit note ("Factura rectificativa" would otherwise read as an invoice): checked first
+# on a document from abroad (checklist P7).
+_FOREIGN_CREDIT_NOTE = re.compile(r"(?<![a-z])(?:factura\s+rectificativa|nota\s+de\s+abono)(?![a-z])")
+
+
+def _text_doc_type(text: str, *, foreign: bool = False) -> DocumentType | None:
     """The kind a document's own title gives it, or None when its text never names one.
 
     The title is the first line that starts with a document name ("Fatura n.º FT 2026/183",
     "Guia de remessa GR 2026/33", "Orçamento"). Without one, only names that are not
-    mere references to other documents count.
+    mere references to other documents count. A document from abroad (``foreign``) is
+    also a credit note when it uses the Spanish names for one.
     """
     from backoffice.learning import fold
 
+    if foreign and _FOREIGN_CREDIT_NOTE.search(fold(text or "")):
+        return DocumentType.CREDIT_NOTE
     for raw in (text or "").splitlines():
         line = fold(raw)
         for kind, pattern in _KIND_TITLES:
@@ -6538,12 +6750,36 @@ def _says_paid_in_cash(text: str) -> bool:
     return bool(_CASH_WORDS.search(folded)) and not _NOT_CASH_WORDS.search(folded)
 
 
-def _first_line(text: str) -> str | None:
+_TITLE_WORDS = ("nif", "fatura", "invoice", "data", "atcud")
+_FOREIGN_TITLE_WORDS = (*_TITLE_WORDS, "tax invoice", "factura", "receipt", "recibo", "bill to", "page", "vat ")
+
+
+def _first_line(text: str, *, foreign: bool = False) -> str | None:
+    words = _FOREIGN_TITLE_WORDS if foreign else _TITLE_WORDS
     for line in (text or "").splitlines():
         line = line.strip()
-        if line and not line.lower().startswith(("nif", "fatura", "invoice", "data", "atcud")):
+        if line and not line.lower().startswith(words):
             return line
     return None
+
+
+def _foreign_rules(issuer: IssuerProfile, on: date) -> ForeignRules:
+    """What the issuer's country allows on ``on``, for :func:`backoffice.verification.assess_foreign`."""
+    country = issuer.country or ""
+    name = COUNTRY_NAMES.get(country, country)
+    number = issuer.tax_number
+    valid = number is not None and number.valid and number.country == country
+    if number is not None and number.kind == "ein":
+        check = "A valid US tax number: it has the right format."
+    elif number is not None and number.checksum:
+        check = f"A valid VAT number from {name}: its check digits are right."
+    else:
+        check = f"A valid VAT number from {name}: it has the right format."
+    return ForeignRules(
+        country=country, country_name=name, rates=foreign_vat_rates(country, on), zero_vat=issuer.zero_vat_reason,
+        vat_number=number.printed if valid and number is not None else None, vat_number_check=check,
+        vat_number_required=issuer.needs_vat_number, stated_rates=issuer.stated_rates,
+    )
 
 
 _READABLE_FILES = frozenset({EvidenceFormat.PDF, EvidenceFormat.IMAGE, EvidenceFormat.SCREENSHOT})

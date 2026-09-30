@@ -33,8 +33,12 @@ from backoffice.domain.cost_centers import CostCenter, CostCenterIdentifiers, Sp
 from backoffice.domain.lifecycle import Stage
 from backoffice.domain.models import DocumentType, SourceKind
 from backoffice.evidence import SharePayload, UploadRequest
-from backoffice.fraud import mask_iban, normalize_iban
+from backoffice.countries.foreign import vat_rates as foreign_vat_rates
+from backoffice.fraud import SignalKind, mask_iban, normalize_iban
+from backoffice.fraud.engine import COUNTRY_NAMES
 from backoffice.fraud.iban import is_valid_iban
+from backoffice.verification import RateFit, check_rate
+from backoffice.verification._display import percent
 from backoffice.language import connector_problem, greeting, since_phrase, status_headline
 from backoffice.learning import (
     Answer,
@@ -2337,6 +2341,14 @@ class BackOfficeService:
                 anomalies.append({"id": f"an_price_{name.lower()}", "title": f"{name} price went up {pct}%",
                                   "detail": f"{format_money(before)} → {format_money(after)}.", "tone": "attention"})
         anomalies += self._statement_anomalies(company_id)
+        for record in self._month_documents(company_id, month, txs):
+            # An unusual currency is a check, not a hold (checklist Q6): the accountant sees it here.
+            signal = next((s for s in (record.fraud.signals if record.fraud else ())
+                           if s.kind is SignalKind.UNUSUAL_CURRENCY and not s.hard_stop), None)
+            if signal is not None:
+                who = display_name(record.document.supplier_name)
+                anomalies.append({"id": f"an_currency_{record.id}", "title": f"{who} invoice in an unusual currency",
+                                  "detail": signal.owner_line, "tone": "attention"})
         # Answered only once the answer reached the accountant's mailbox (the send path accepted it).
         questions = [{"id": q.id, "question": q.text, "status": "answered" if q.status == "answered" else "waiting",
                       **({"answer": q.answer} if q.answer and q.status == "answered" else {})}
@@ -2378,6 +2390,13 @@ class BackOfficeService:
                         "detail": detail, "tone": "attention"})
         return out
 
+    def _month_documents(self, company_id: str, month: Month, txs: list[TxRecord]) -> list[DocumentRecord]:
+        """The company's documents for the month: those its payments matched, and those dated in it."""
+        repo = self.repo
+        ids = [d for rec in txs for d in rec.document_ids]
+        ids += [i.subject_id for i in repo.items_for(company_id, month) if i.subject_type == "document"]
+        return [repo.documents[d] for d in sorted(dict.fromkeys(ids)) if d in repo.documents]
+
     def _tax_flags(self, company_id: str, txs: list[TxRecord], month: Month | None = None) -> list[dict[str, str]]:
         """What the accountant should look at (§28). Accountant-facing only: the owner is never asked."""
         repo = self.repo
@@ -2406,6 +2425,9 @@ class BackOfficeService:
                               "detail": f"{display_name(doc.supplier_name)} invoice"
                                         f"{' ' + doc.invoice_number if doc.invoice_number else ''}. It may be "
                                         f"equipment to depreciate rather than a cost of the month.{paid}"})
+            foreign = _foreign_vat_flag(record)  # reverse charge, or VAT charged abroad (checklist X31)
+            if foreign is not None:
+                flags.append(foreign)
         for rec in sorted(repo.transactions.values(), key=lambda r: (r.tx.booked_on, r.id)):
             note = rec.company_note
             if note is None or company_id not in note or (month is not None and Month.of(rec.tx.booked_on) != month):
@@ -2632,6 +2654,46 @@ def _count_word(n: int) -> str:
 
 def _article(word: str) -> str:
     return "an" if word[:1].lower() in "aeiou" else "a"
+
+
+REVERSE_CHARGE_FLAG = "Possible reverse charge: VAT to be declared by you"
+FOREIGN_VAT_FLAG = "Foreign VAT charged — may be reclaimable abroad, not deductible in Portugal"
+
+
+def _foreign_vat_flag(record: DocumentRecord) -> dict[str, str] | None:
+    """The accountant's VAT flag for a document from abroad (checklist X31); never shown to the owner.
+
+    VAT charged by a foreign supplier cannot be deducted in Portugal (it may be reclaimed in the
+    supplier's country). No VAT charged by an EU supplier with a valid VAT number, an invoice saying
+    the VAT is reverse-charged, or a supplier outside the EU: the business may have to declare the
+    VAT itself. Which applies (goods or services, B2B or not) is the accountant's call.
+    """
+    issuer = record.issuer
+    if issuer is None or not issuer.is_foreign:
+        return None
+    doc = record.document
+    who = display_name(doc.supplier_name)
+    where = COUNTRY_NAMES.get(issuer.country or "", issuer.country or "abroad")
+    invoice = f"invoice {doc.invoice_number}" if doc.invoice_number else "the invoice"
+    total = f" ({format_money(doc.gross_amount, doc.currency)})" if doc.gross_amount is not None else ""
+    if doc.vat_amount is not None and doc.vat_amount > 0:
+        detail = f"{who} ({where}) charged {format_money(doc.vat_amount, doc.currency)} of VAT on {invoice}{total}."
+        valid = foreign_vat_rates(issuer.country, doc.issue_date)
+        if valid and doc.net_amount and check_rate(doc.net_amount, doc.vat_amount, valid).fit is not RateFit.MATCHES:
+            rate = (doc.vat_amount / doc.net_amount).quantize(Decimal("0.001"))
+            detail += f" {percent(rate)} is not a VAT rate used in {where}."
+        return {"id": f"t_foreign_vat_{doc.id}", "title": FOREIGN_VAT_FLAG, "detail": detail}
+    if not issuer.reverse_charge_candidate:
+        return None
+    if issuer.reverse_charge:
+        why = "The invoice says the VAT is reverse-charged."
+    elif issuer.in_eu:
+        number = issuer.tax_number.printed if issuer.tax_number is not None else ""
+        why = f"EU supplier with a valid VAT number ({number}), no VAT charged."
+    else:
+        why = "Supplier outside the EU, no VAT charged."
+    return {"id": f"t_reverse_charge_{doc.id}", "title": REVERSE_CHARGE_FLAG,
+            "detail": f"{who} ({where}), {invoice}{total}. {why}"}
 
 
 def _doc_phrase(doc: DocumentRecord) -> str:

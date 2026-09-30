@@ -7,6 +7,12 @@
     pack.extract_text_fields(text, evidence_id) # -> list[NamedObservation]
 
 Importing this package does not import any country.
+
+Documents from countries without a pack (checklist P7) are handled by
+:mod:`backoffice.countries.foreign`, which is not a pack: it says which country
+issued a document, checks foreign VAT numbers, lists EU and UK VAT rates and
+reads English and Spanish invoice labels, so nothing is read as Portuguese
+merely because the company is.
 """
 
 from .base import (

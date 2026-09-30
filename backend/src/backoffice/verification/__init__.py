@@ -22,6 +22,13 @@ Documents::
         options: doc_type=, required=, requirements=, bank_currency=, bank_source=,
                  breakdowns=[TaxBreakdown], other_charges=, hints=, policy=
     required_fields(doc_type) / DEFAULT_REQUIREMENTS, bank_observation(amount), group_by_field(named)
+    regraded(assessment, fields) -> DocumentAssessment   # quality and summary after fields are judged again
+
+Documents from abroad (checklist P7)::
+
+    assess_foreign(observations_by_field, ForeignRules(...), *, doc_type=, bank=BankCharge(...))
+        -> DocumentAssessment   # rules that hold anywhere: bank-confirmed total, net + VAT = total,
+                                # a VAT rate valid in the issuer's country, the issuer's VAT number
 
 Arithmetic::
 
@@ -74,8 +81,18 @@ from .document import (
     assess_document,
     bank_observation,
     group_by_field,
+    regraded,
     required_fields,
     verify_document,
+)
+from .foreign import (
+    PAYMENT_LAG_DAYS,
+    PAYMENT_LEAD_DAYS,
+    BankCharge,
+    ForeignRules,
+    assess_foreign,
+    confirm_foreign,
+    foreign_requirements,
 )
 from .duplicates import (
     DEFAULT_NEAR_DAYS,
@@ -132,6 +149,14 @@ from .tamper import (
 
 __all__ = [
     "BANK_CONFIDENCE",
+    "PAYMENT_LAG_DAYS",
+    "PAYMENT_LEAD_DAYS",
+    "BankCharge",
+    "ForeignRules",
+    "assess_foreign",
+    "confirm_foreign",
+    "foreign_requirements",
+    "regraded",
     "CurrencyMark",
     "DEFAULT_NEAR_DAYS",
     "DEFAULT_POLICY",

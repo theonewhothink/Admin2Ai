@@ -15,6 +15,12 @@ payment recipient, changed or lookalike sender domain, unusual amount,
 duplicate invoice with different IBAN, unusual country, invoice recipient
 mismatch, suspicious payment instructions, altered document.
 
+Unusual currency (checklist Q6) is a check, not a hard stop: an invoice in a
+currency the supplier has never used (with enough history), or bank details
+in a country whose currency does not fit the invoice's, is a WARNING. Next
+to a bank-detail change it becomes a hard stop (HIGH): the two together are
+how a diverted payment usually looks.
+
 The engine is read-only. It never adds an IBAN to a supplier profile and has
 no switch to accept changed beneficiary information: only a recorded human
 hard approval, verified out of band, can do that
@@ -42,6 +48,8 @@ from .phrases import PhraseCategory, find_suspicious_phrases
 
 __all__ = [
     "COUNTRY_NAMES",
+    "CURRENCY_NAMES",
+    "IBAN_CURRENCY",
     "DEFAULT_CONFIG",
     "HARD_STOP_SEVERITIES",
     "AlteredDocumentHint",
@@ -81,6 +89,7 @@ class SignalKind(str, Enum):
     UNUSUAL_AMOUNT = "unusual_amount"
     DUPLICATE_INVOICE = "duplicate_invoice"
     NOT_ENOUGH_HISTORY = "not_enough_history"
+    UNUSUAL_CURRENCY = "unusual_currency"
 
 
 _KIND_ORDER = {kind: i for i, kind in enumerate(SignalKind)}
@@ -101,8 +110,40 @@ COUNTRY_NAMES: dict[str, str] = {
 }  # fmt: skip
 
 
+# Owner-facing currency names ("in US dollars"). Unlisted codes are shown as-is.
+CURRENCY_NAMES: dict[str, str] = {
+    "EUR": "euros", "USD": "US dollars", "GBP": "pounds", "CHF": "Swiss francs", "SEK": "Swedish kronor",
+    "DKK": "Danish kroner", "NOK": "Norwegian kroner", "PLN": "Polish zloty", "CZK": "Czech koruna",
+    "HUF": "Hungarian forint", "RON": "Romanian lei", "BGN": "Bulgarian lev", "ISK": "Icelandic kronur",
+    "CAD": "Canadian dollars", "AUD": "Australian dollars", "NZD": "New Zealand dollars", "JPY": "Japanese yen",
+    "ILS": "shekels", "BRL": "Brazilian reais", "TRY": "Turkish lira", "AED": "UAE dirhams",
+}  # fmt: skip
+
+# The currency a bank account in each country normally holds (IBAN country -> ISO 4217):
+# the euro area (Bulgaria since 2026-01-01) and the micro-states using the euro, then the
+# others. verified_as_of: 2026-09 (author knowledge). Unlisted countries are not judged.
+_EURO_IBAN_COUNTRIES = frozenset(
+    "AT BE BG CY DE EE ES FI FR GR HR IE IT LT LU LV MT NL PT SI SK AD MC SM VA ME XK".split()
+)
+IBAN_CURRENCY: dict[str, str] = {
+    **{c: "EUR" for c in sorted(_EURO_IBAN_COUNTRIES)},
+    "GB": "GBP", "GI": "GBP", "CH": "CHF", "LI": "CHF", "SE": "SEK", "DK": "DKK", "FO": "DKK", "GL": "DKK",
+    "NO": "NOK", "PL": "PLN", "CZ": "CZK", "HU": "HUF", "RO": "RON", "IS": "ISK", "IL": "ILS", "TR": "TRY",
+    "AE": "AED", "BR": "BRL",
+}  # fmt: skip
+
+
 def _country(code: str) -> str:
     return COUNTRY_NAMES.get(code.upper(), code.upper())
+
+
+def _currency_name(code: str) -> str:
+    return CURRENCY_NAMES.get(code.upper(), code.upper())
+
+
+def _currencies(codes: Sequence[str]) -> str:
+    names = [_currency_name(c) for c in sorted(codes)]
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} or {names[-1]}"
 
 
 def _countries(codes: Sequence[str]) -> str:
@@ -229,6 +270,7 @@ def assess(case: FraudCase, config: FraudConfig = DEFAULT_CONFIG) -> FraudAssess
     _check_recipient(case, found)
     _check_language(case, found)
     _check_altered(case, found)
+    _check_currency(beneficiaries, known, case, config, found)
     signals = tuple(sorted(found.signals, key=lambda s: (_SEVERITY_ORDER[s.severity], _KIND_ORDER[s.kind])))
     return FraudAssessment(
         hard_stop=any(s.hard_stop for s in signals),
@@ -497,6 +539,53 @@ def _check_country(
     if beneficiaries and not reported:
         where = _countries(sorted({iban_country(b.iban) for b in beneficiaries}))
         found.passed.append(f"The bank account is in {where}, as usual.")
+
+
+# --------------------------------------------------------------------------- currency
+
+
+def _check_currency(
+    beneficiaries: Sequence[_Beneficiary], known: frozenset[str], case: FraudCase, config: FraudConfig,
+    found: _Findings,
+) -> None:
+    """An unusual currency is a check; next to a bank-detail change, a hard stop (module docstring)."""
+    doc = case.document
+    if doc is not None and doc.gross_amount is not None:
+        currency, what = doc.currency.strip().upper(), "invoice"
+    elif case.payment_amount is not None:
+        currency, what = case.payment_currency.strip().upper(), "payment"
+    else:
+        return
+    changed = any(s.kind in _BENEFICIARY_KINDS for s in found.signals)
+    severity = Severity.HIGH if changed else Severity.WARNING
+    if doc is not None and doc.gross_amount is not None and doc.doc_type is not DocumentType.CREDIT_NOTE:
+        past = [d.currency.strip().upper() for d in case.history
+                if d.id != doc.id and d.gross_amount is not None and d.doc_type is not DocumentType.CREDIT_NOTE]
+        if len(past) >= config.min_history and currency not in past:
+            usual = sorted(set(past))
+            found.add(SignalKind.UNUSUAL_CURRENCY, severity,
+                      f"{found.name} usually bills you in {_currencies(usual)}. "
+                      f"This invoice is in {_currency_name(currency)}.",
+                      currency=currency, usual=",".join(usual), history=len(past), bank_change=changed)  # fmt: skip
+    # Nothing new: the account already took this currency, or the supplier is paid in countries that
+    # use it and this account is in one of them (a supplier paid in Portugal and the UK, billing in euros).
+    profile = {c.strip().upper() for c in case.supplier.countries if c and c.strip()} if case.supplier else set()
+    profile |= {iban_country(k) for k in known}
+    profile_currencies = {IBAN_CURRENCY[c] for c in profile if c in IBAN_CURRENCY}
+    before = {(normalize_iban(d.iban), d.currency.strip().upper()) for d in case.history
+              if d.iban and is_valid_iban(d.iban) and (doc is None or d.id != doc.id)}
+    for b in beneficiaries:
+        country = iban_country(b.iban)
+        expected = IBAN_CURRENCY.get(country)
+        if expected is None or expected == currency or (b.iban, currency) in before:
+            continue
+        if country in profile and currency in profile_currencies:
+            continue
+        found.add(SignalKind.UNUSUAL_CURRENCY, severity,
+                  f"The bank account is in {_country(country)}, which uses {_currency_name(expected)}, "
+                  f"but the {what} is in {_currency_name(currency)}.",
+                  country=country, account_currency=expected, currency=currency, bank_change=changed)  # fmt: skip
+        return
 
 
 # --------------------------------------------------------------------------- recipient
