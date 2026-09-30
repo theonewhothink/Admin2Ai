@@ -52,6 +52,7 @@ class StepState(str, Enum):
     OFF = "switched_off"  # deliberately disabled (e.g. external AI)
     SKIPPED = "skipped"  # not needed
     FAILED = "failed"  # ran and failed (unreadable file, engine error)
+    NEEDS_PERSON = "needs_a_person"  # every engine tried and fields are still missing or disagree (§17 human stage)
 
 
 @dataclass(frozen=True)

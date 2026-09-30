@@ -42,6 +42,7 @@ of season and does fire in season; its typical amount is the in-season median.
 from __future__ import annotations
 
 import calendar
+import functools
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -245,13 +246,16 @@ def _month_shift(year: int, month: int, delta: int) -> tuple[int, int]:
     return index // 12, index % 12 + 1
 
 
+@functools.lru_cache(maxsize=65536)
 def _on_day(year: int, month: int, day: int) -> date:
-    """``day`` of the month, clipped to the month's length (31 -> 30 September)."""
+    """``day`` of the month, clipped to the month's length (31 -> 30 September). Pure, so cached: a month's
+    worth of payments is fitted against 31 anchors on every run (high volume, checklist X33)."""
     return date(year, month, min(day, calendar.monthrange(year, month)[1]))
 
 
+@functools.lru_cache(maxsize=262144)
 def _anchor_date(value: date, cadence: Cadence, anchor: int) -> date:
-    """The anchor date nearest to ``value`` (ties go to the earlier date)."""
+    """The anchor date nearest to ``value`` (ties go to the earlier date). Pure, so cached (see ``_on_day``)."""
     if cadence is Cadence.WEEKLY:
         return value + timedelta(days=((anchor - value.weekday() + 3) % 7) - 3)
     candidates = [
@@ -375,6 +379,20 @@ def _one_per_period(days: Sequence[date], cadence: Cadence, anchor: int) -> list
 def _fit_series(dates: Sequence[date]) -> tuple[_Fit, int, list[date]] | None:
     """Cadence, anchor and on-cycle days of distinct, ordered arrival days (shortest cadence first).
 
+    The same arrival days are fitted again on every run: the answer is cached by the days themselves
+    (pure function of them) and handed out as a fresh list each time.
+    """
+    fitted = _fit_series_cached(tuple(dates))
+    if fitted is None:
+        return None
+    fit, anchor, days = fitted
+    return fit, anchor, list(days)
+
+
+@functools.lru_cache(maxsize=8192)
+def _fit_series_cached(dates: tuple[date, ...]) -> tuple[_Fit, int, tuple[date, ...]] | None:
+    """:func:`_fit_series` itself.
+
     A day is on-cycle when it lies within the cadence tolerance of the anchor,
     and each anchor period keeps one on-cycle day. Everything else is an
     off-cycle extra: at most ``MAX_OFF_CYCLE_SHARE`` of the days. The on-cycle
@@ -396,9 +414,10 @@ def _fit_series(dates: Sequence[date]) -> tuple[_Fit, int, list[date]] | None:
                 # The months it skipped may be the same months every year: a season, not skips.
                 seasonal = _fit_seasonal(dates)
                 if seasonal is not None:
-                    return seasonal
-            return fit, anchor, on_cycle
-    return _fit_seasonal(dates)
+                    return seasonal[0], seasonal[1], tuple(seasonal[2])
+            return fit, anchor, tuple(on_cycle)
+    seasonal = _fit_seasonal(dates)
+    return (seasonal[0], seasonal[1], tuple(seasonal[2])) if seasonal is not None else None
 
 
 def _season_of(months: set[int]) -> tuple[int, ...] | None:

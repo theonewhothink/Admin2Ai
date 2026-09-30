@@ -57,6 +57,7 @@ from backoffice.learning import (
     day_month,
     display_name,
     format_money,
+    join_and,
     learn_from_transactions,
     suggest_rule_from_answer,
 )
@@ -81,7 +82,7 @@ _SLUG = re.compile(r"[^a-z0-9]+")
 # Needs-You questions shown as one plain choice with the engine's own prompt and options (§37).
 _PLAIN_QUESTIONS = ("company", "cash", "obligation", "refund", "obligation_company", "statement", "recharge",
                     "part", "deposit", "deposit_refund", "deposit_kept", "chargeback",
-                    "receipt", "expense_claim",
+                    "receipt", "expense_claim", "retake", "same_document",
                     "lease", "till", "member")  # leasing (X24), till reports (X5), receipts lists (X12)
 # Open payments proven without a document: their plan still shows in the month (I7, X9).
 _PLANNED_RULES = frozenset({"chargeback", "chargeback_won", "security_deposit"})
@@ -286,6 +287,7 @@ class BackOfficeService:
         self.orchestrator.log("accountant", "accountant_set", subject_id=company or "accountant",
                               values={"company": company} if company else None,
                               actor=f"owner:{self.repo.owner.email}")
+        self._authorize_delivery(company)
         self.orchestrator.run()
         out: dict[str, Any] = {"ok": True, "accountant": {"email": address, "name": person or None, "software": tool,
                                                           "firm": office, "companyId": company}}
@@ -1133,8 +1135,9 @@ class BackOfficeService:
     # ----------------------------------------------------------------- the send path (production: one event per email)
 
     def waiting_messages(self) -> list[str]:
-        """Emails written or confirmed but not yet accepted by a mailer, oldest first."""
-        ids = [m.id for m in self.orchestrator.waiting_messages()]
+        """Emails written or confirmed but not yet accepted by a mailer, oldest first. An email the back office
+        wrote on a permission the owner switched off since is held back (§25), so it is not among them."""
+        ids = [m.id for m in self.orchestrator.sendable_messages()]
         op = getattr(self, "_assistant", None)
         if op is not None:
             ids += [m.id for m in op.outbox.values() if m.status == "waiting"]
@@ -1376,7 +1379,18 @@ class BackOfficeService:
             out["disputed"] = {"status": repo.chargebacks[rec.id].status, "text": disputed}
             if not item.is_done:
                 out["nextStep"] = disputed
+        chain = self._import_chain("transaction", rec.id)
+        if chain is not None:  # one piece of an import purchase (X28): its order, customs and duties, by reference
+            out["importChain"] = chain
         return out
+
+    def _import_chain(self, kind: str, subject_id: str) -> dict[str, Any] | None:
+        """The import purchase a document, letter or payment is part of (backoffice.imports), as the details show
+        it: "Part of order PO-2026-114: deposit, invoice, freight, customs, duties"."""
+        from backoffice.imports import chain_for, chain_view
+
+        chain = chain_for(self.repo, kind, subject_id, text_of=self.orchestrator.evidence_text)
+        return chain_view(chain, today=self._today()) if chain is not None else None
 
     def _parts(self, **subject: str) -> list[dict[str, Any]]:
         """Deposit -> advance invoice -> invoice -> each payment -> the part held back (checklist X8)."""
@@ -1410,6 +1424,9 @@ class BackOfficeService:
             out["heldBack"] = {"amount": _num(held.amount), "until": _iso(held.until), "status": held.status,
                                "text": staged.held_sentence(held) if held.status == "held" else
                                f"The {format_money(held.amount, held.currency)} held back was paid."}
+        chain = self._import_chain("document", d.id)
+        if chain is not None:  # one piece of an import purchase (X28)
+            out["importChain"] = chain
         return out
 
     def _document_view(self, record: DocumentRecord, d: Any, item: Any, corrects: DocumentRecord | None
@@ -1643,13 +1660,22 @@ class BackOfficeService:
             recipients.append(entry)
         return {
             "recipients": recipients, "day": 3, "format": "zip", "includeDocuments": True,
-            "companies": list(self.repo.companies), "copyOwner": True,
+            "companies": list(self.repo.companies), "copyOwner": True, "whenOpen": "send",
         }
 
     def report_settings(self, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """GET/POST ``/api/settings/report``: when and to whom each month's package goes (§27, §28).
+
+        ``whenOpen``: a month with items still open on the day is sent with an honest note of what is open
+        (``"send"``, the default) or waits until it is closed (``"wait"``).
+        """
         cfg = self._report_settings()
         if body:
             cfg = dict(cfg)
+            when_open = body.get("whenOpen", cfg.get("whenOpen", "send"))
+            if when_open not in ("send", "wait"):
+                raise ServiceError(400, "Choose whether to send a month with open items or wait until it closes.")
+            cfg["whenOpen"] = when_open
             recipients = body.get("recipients", cfg["recipients"])
             if not isinstance(recipients, list) or len(recipients) > 20:
                 raise ServiceError(400, "Add up to 20 recipients.")
@@ -1674,11 +1700,128 @@ class BackOfficeService:
                        includeDocuments=bool(body.get("includeDocuments", cfg["includeDocuments"])),
                        copyOwner=bool(body.get("copyOwner", cfg["copyOwner"])))
             self._report_cfg = cfg
+            self.repo.package_settings = dict(cfg)  # what the monthly delivery follows (backoffice.package_delivery)
             self.orchestrator.log("closure", "report_settings_changed", values={"recipients": len(clean)})
         names = {c: e.name for c, e in self.repo.companies.items()}
         who = ", ".join(r["email"] for r in cfg["recipients"]) or "nobody yet"
         return {**cfg, "companyNames": names, "ownerEmail": self.repo.owner.email,
                 "summary": f"On working day {cfg['day']} of each month I send the closed month to {who}."}
+
+    # ----------------------------------------------------------------- What I may do on my own (§25)
+
+    # The owner's switches for what runs "automatically if authorized" (policy/actions.py): key, action, plain name,
+    # what it means. Everything else keeps its level: owner approval, or hard approval every time.
+    _AUTOMATION = (
+        ("supplierRequests", "supplier_invoice_request", "Ask suppliers for missing invoices",
+         "When a payment's invoice is missing, I write to the supplier and ask for it."),
+        ("accountantReplies", "routine_accountant_response", "Answer your accountant's routine questions",
+         "When your accountant asks about a payment and the documents answer it, I reply with the facts."),
+        ("monthlyPackage", "document_delivery", "Send each month to your accountant",
+         "After each month, I send your accountant the documents, the ledger and the originals."),
+    )
+
+    def automation_settings(self, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """GET/POST ``/api/settings/automation``: what I may do on my own (§25), in plain words.
+
+        POST ``{supplierRequests?, accountantReplies?, monthlyPackage?: bool, companyId?}`` switches each one on or
+        off, for every company or (``companyId``) one company. Only actions the policy lets an owner pre-grant can
+        be switched on here (policy/actions.py); moving money, tax filings, bank details, binding terms and
+        deleting originals always need a yes every time. Each change is recorded in the audit log.
+        """
+        from backoffice.policy import ActionKind, is_grantable
+
+        repo = self.repo
+        message = None
+        if body:
+            company = self._company(body.get("companyId"), required=False)
+            changes = [(key, ActionKind(action), body[key]) for key, action, _, _ in self._AUTOMATION if key in body]
+            if not changes:
+                raise ServiceError(400, "Choose what to switch on or off.")
+            if any(not isinstance(on, bool) for _, _, on in changes):
+                raise ServiceError(400, "Switch it on or off with true or false.")
+            for key, action, on in changes:
+                if not is_grantable(action):  # the table above only lists grantable actions; never widen it here
+                    raise ServiceError(400, "That always needs your yes, every time.")
+                if on:
+                    repo.policy = repo.policy.with_grant(action, granted_by=repo.owner.email, entity_id=company,
+                                                         at=self._now())
+                elif company is None:  # off for the business: off for every company too
+                    repo.policy = repo.policy.without_grant(action)
+                    for c in list(repo.companies):
+                        repo.policy = repo.policy.without_grant(action, entity_id=c)
+                else:
+                    if any(g.action is action and g.entity_id is None for g in repo.policy.grants):
+                        # On for the whole business, now off for one company: the others keep it.
+                        repo.policy = repo.policy.without_grant(action)
+                        for c in repo.companies:
+                            if c != company:
+                                repo.policy = repo.policy.with_grant(action, granted_by=repo.owner.email,
+                                                                     entity_id=c, at=self._now())
+                    repo.policy = repo.policy.without_grant(action, entity_id=company)
+                self._automation_choices()[f"{key}:{company or '*'}"] = on
+                self.orchestrator.log("policy", "automation_changed", subject_id=action.value,
+                                      values={"on": on, "company": company}, actor=f"owner:{repo.owner.email}")
+            self.orchestrator.run()  # switched on: what is waiting for it is written now, and sent by the send path
+            message = self._automation_message(changes, company)
+        items = []
+        for key, action, label, detail in self._AUTOMATION:
+            kind = ActionKind(action)
+            everywhere = repo.policy.allows(kind, None)
+            per_company = [{"companyId": c, "companyName": e.name, "on": repo.policy.allows(kind, c)}
+                           for c, e in repo.companies.items()]
+            if key == "monthlyPackage":
+                detail = (f"On working day {self._report_settings()['day']} after each month, I send your "
+                          "accountant the documents, the ledger and the originals.")
+            items.append({"id": key, "label": label, "detail": detail, "on": everywhere,
+                          "onFor": [p["companyId"] for p in per_company if p["on"]], "companies": per_company,
+                          "level": "automatic_if_authorized", "levelLabel": "Only when you allow it"})
+        on = [i["label"][0].lower() + i["label"][1:] for i in items if i["on"]]
+        summary = (f"I {join_and(on)} on my own. Everything else waits for you." if on else
+                   "I don't write to anyone on my own. Everything waits for you.")
+        out: dict[str, Any] = {
+            "items": items, "summary": summary,
+            "never": "Moving money, tax filings, bank detail changes, accepting terms and deleting originals always "
+                     "need your yes, every time.",
+        }
+        if message:
+            out["ok"], out["message"] = True, message
+        return out
+
+    def _authorize_delivery(self, company: str | None) -> None:
+        """Naming the accountant is the owner saying where each month goes ("I will send the closed months to
+        ..."): sending it is switched on (§25 document delivery, §27), unless the owner switched it off themselves."""
+        from backoffice.policy import ActionKind
+
+        repo = self.repo
+        choices = self._automation_choices()
+        if choices.get("monthlyPackage:*") is False or (company and choices.get(f"monthlyPackage:{company}") is False):
+            return
+        if repo.policy.allows(ActionKind.DOCUMENT_DELIVERY, company):
+            return
+        repo.policy = repo.policy.with_grant(ActionKind.DOCUMENT_DELIVERY, granted_by=repo.owner.email,
+                                             entity_id=company, at=self._now())
+        self.orchestrator.log("policy", "automation_changed", subject_id=ActionKind.DOCUMENT_DELIVERY.value,
+                              values={"on": True, "company": company, "because": "accountant_named"},
+                              actor=f"owner:{repo.owner.email}")
+
+    def _automation_choices(self) -> dict[str, bool]:
+        """What the owner switched on or off themselves ("<key>:<company or *>"): never overridden later."""
+        if getattr(self, "_automation", None) is None:
+            self._automation = {}
+        return self._automation
+
+    def _automation_message(self, changes: Sequence[tuple[str, Any, bool]], company: str | None) -> str:
+        where = f" for {self._company_name(company)}" if company else ""
+        parts = []
+        for key, _, on in changes:
+            phrase = {"supplierRequests": ("I will ask suppliers for missing invoices",
+                                           "I won't ask suppliers for invoices"),
+                      "accountantReplies": ("I will answer your accountant's routine questions",
+                                            "I won't answer your accountant on my own"),
+                      "monthlyPackage": ("I will send each month to your accountant",
+                                         "I won't send the months to your accountant on my own")}[key]
+            parts.append(phrase[0] if on else phrase[1])
+        return f"Done. {join_and(parts)}{where}."
 
     # ----------------------------------------------------------------- Accountant API keys (§28)
 
@@ -1869,6 +2012,11 @@ class BackOfficeService:
         notices = self._notices(company_id, month)
         if notices:
             result["notices"] = notices
+        # The month's package for the accountant (§27): "September sent to your accountant on 6 October." only once a
+        # transport accepted it; before that it says it is waiting (or held back).
+        delivery = self.orchestrator.packages.owner_view(company_id, month, self._today())
+        if delivery is not None:
+            result["delivery"] = delivery
         return result
 
     def _remaining(self, company_id: str, month: Month, status, txs: list[TxRecord]) -> list[dict[str, Any]]:  # type: ignore[no-untyped-def]
@@ -2072,6 +2220,9 @@ class BackOfficeService:
             merchant = _ISSUER_NAMES.get(finding.issuer.value, "A letter")
             amount, currency = finding.amount or Decimal("0"), finding.currency
             day = finding.due_on
+        elif n.subject_type == "evidence":  # a photo I can't read (backoffice.captures): nothing read from it
+            merchant, amount, currency = "Photo of a receipt", None, "EUR"
+            day = self.repo.evidence(n.subject_id).retrieved_at.astimezone(TZ).date()
         else:
             doc = self.repo.documents[n.subject_id]
             merchant, amount = display_name(doc.document.supplier_name), doc.document.gross_amount or Decimal("0")
@@ -2766,10 +2917,26 @@ class BackOfficeService:
         return f"Got it. I added the deadline from this letter: {ob.title}, by {due}. " + \
             self.orchestrator.obligations.next_step(ob)
 
+    def _upload_body(self, b: Mapping[str, Any]) -> dict[str, Any]:
+        """``POST /api/evidence/upload`` (and ``/api/receipts``): the phone's upload, with what it sends about the
+        capture (``capture_id``, ``page``, ``page_count``, ``hints``), JSON or multipart form fields."""
+        return self.upload_receipt(_field(b, "sha256"), _b64(b.get("dataBase64") or b.get("data_base64")),
+                                   filename=b.get("filename"),
+                                   content_type=b.get("contentType") or b.get("content_type"),
+                                   client_item_id=b.get("client_item_id") or b.get("clientItemId"),
+                                   source=b.get("source") or "mobile_scan",
+                                   captured_at=b.get("captured_at") or b.get("capturedAt"),
+                                   capture=capture_fields(b))
+
     def upload_receipt(self, sha256: str, data: bytes, *, filename: str | None = None,
                        content_type: str | None = None, client_item_id: str | None = None,
-                       source: str = "mobile_scan", captured_at: str | None = None) -> dict[str, Any]:
-        """Offline mobile upload (§43): the phone deletes its copy only when our hash equals its hash."""
+                       source: str = "mobile_scan", captured_at: str | None = None,
+                       capture: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Offline mobile upload (§43): the phone deletes its copy only when our hash equals its hash.
+
+        ``capture`` (:func:`capture_fields`): the pages of one multi-page scan (kept together as one document)
+        and the quality the phone noticed (a poor photo is read by the stronger engine, §11, §15).
+        """
         try:
             source_kind = SourceKind(source)
         except ValueError:
@@ -2783,7 +2950,7 @@ class BackOfficeService:
         request = UploadRequest(
             tenant_id=self.repo.tenant_id, client_upload_id=client_item_id or f"rcpt-{(sha256 or '')[:40]}",
             sha256=sha256 or "", data=data, content_type=content_type, filename=filename, captured_at=when,
-            source_kind=source_kind)
+            source_kind=source_kind, capture=dict(capture or {}))
         receipt, report = self.orchestrator.receive_upload(request)
         body = receipt.as_dict()
         body["duplicate"] = receipt.status.value == "duplicate"
@@ -2965,6 +3132,13 @@ class BackOfficeService:
                    "note": f"{month.name} is complete and ready to export to {software}."} if status.closed else
                   {"state": "partial", "ready": done, "total": total,
                    "note": f"{done} of {total} items are ready for {software}. The rest will follow when they close."})
+        delivered = self.orchestrator.packages.owner_view(company_id, month, self._today())
+        if delivered is not None and delivered.get("sentOn"):  # the package as the accountant sees it (§27 Day +1)
+            export["delivery"] = {
+                "state": delivered["state"], "sentOn": delivered["sentOn"], "confirmedOn": delivered.get("confirmedOn"),
+                "text": f"Sent to you on {day_month(date.fromisoformat(delivered['sentOn']), self._today())}." + (
+                    " You confirmed you have it." if delivered.get("confirmedOn") else
+                    " Reply to that email to confirm you have it.")}
         rules = [{"id": r.id, "label": r.label, "scope": "client" if r.entity_ids or r.tenant_id else "all"}
                  for r in self.orchestrator.accountant_rules(company_id)]
         # Leases (X24), the cash box and till reports (X4, X5), memberships and fees (X12): only when the
@@ -3181,7 +3355,36 @@ class BackOfficeService:
                                          f"{self.orchestrator.merchant_name(rec.tx)} invoice addressed to "
                                          f"{repo.company_name(named)}. Whether its VAT can be deducted is your call."},
                               rec.item_id))
+        flags += self._import_vat_flags(company_id, txs, records)
         return flags
+
+    def _import_vat_flags(self, company_id: str, txs: Sequence[TxRecord], records: Mapping[str, Any]
+                          ) -> list[tuple[dict[str, str], str]]:
+        """Import VAT paid at customs (X28): on the customs declaration, never on a supplier's invoice, so the
+        accountant is shown it with its import purchase. Accountant-facing only: the owner is never asked."""
+        from backoffice.imports import customs_vat, find_chains
+
+        repo = self.repo
+        text_of = self.orchestrator.evidence_text
+        tx_ids = {r.id for r in txs}
+        out: list[tuple[dict[str, str], str]] = []
+        for chain in find_chains(repo, company_id=company_id, text_of=text_of):
+            duties = [p for p in chain.pieces if p.role == "duties" and p.id in tx_ids]
+            declared = [p for p in chain.pieces if p.role == "customs" and p.kind == "document" and p.id in records]
+            if not duties and not declared:
+                continue  # not in this month
+            vat, customs = customs_vat(repo, chain, text_of)
+            item_id = repo.transactions[duties[0].id].item_id if duties else repo.documents[declared[0].id].item_id
+            mrn = f" (MRN {chain.mrn})" if chain.mrn else ""
+            charged = f"charged {format_money(vat)} of import VAT" if vat is not None else "charges import VAT"
+            paid = (f", paid to customs on {day_month(duties[0].on, self._today())}" if duties and duties[0].on
+                    else ", not paid yet")
+            out.append(({"id": f"t_import_vat_{chain.id}",
+                         "title": IMPORT_VAT_FLAG + (f" · {format_money(vat)}" if vat is not None else ""),
+                         "detail": f"Part of {chain.name}. The customs declaration{mrn} {charged}{paid}. It is not on "
+                                   "any supplier's invoice. Whether and how it is deducted is your call."},
+                        item_id))
+        return out
 
     def _tax_flags(self, company_id: str, txs: Sequence[TxRecord], month: Month | None = None
                    ) -> list[dict[str, str]]:
@@ -3542,20 +3745,8 @@ class BackOfficeService:
             ("POST", r("/api/evidence"),
              lambda b: self.upload_evidence(b.get("filename"), b.get("contentType") or b.get("content_type"),
                                             _b64(b.get("dataBase64") or b.get("data_base64")))),
-            ("POST", r("/api/evidence/upload"),
-             lambda b: self.upload_receipt(_field(b, "sha256"), _b64(b.get("dataBase64") or b.get("data_base64")),
-                                           filename=b.get("filename"),
-                                           content_type=b.get("contentType") or b.get("content_type"),
-                                           client_item_id=b.get("client_item_id") or b.get("clientItemId"),
-                                           source=b.get("source") or "mobile_scan",
-                                           captured_at=b.get("captured_at") or b.get("capturedAt"))),
-            ("POST", r("/api/receipts"),
-             lambda b: self.upload_receipt(_field(b, "sha256"), _b64(b.get("dataBase64") or b.get("data_base64")),
-                                           filename=b.get("filename"),
-                                           content_type=b.get("contentType") or b.get("content_type"),
-                                           client_item_id=b.get("client_item_id") or b.get("clientItemId"),
-                                           source=b.get("source") or "mobile_scan",
-                                           captured_at=b.get("captured_at") or b.get("capturedAt"))),
+            ("POST", r("/api/evidence/upload"), lambda b: self._upload_body(b)),
+            ("POST", r("/api/receipts"), lambda b: self._upload_body(b)),
             ("POST", r("/api/share"), lambda b: self.share(b)),
             ("GET", r("/api/sources"), lambda b: self.sources()),
             ("POST", r("/api/chat"), lambda b: self.chat(b or {})),
@@ -3582,6 +3773,8 @@ class BackOfficeService:
             ("POST", r(f"/api/expected-invoices/{seg}/not-coming"), lambda b, eid: self.expected_not_coming(eid)),
             ("GET", r("/api/settings/report"), lambda b: self.report_settings()),
             ("POST", r("/api/settings/report"), lambda b: self.report_settings(b or {})),
+            ("GET", r("/api/settings/automation"), lambda b: self.automation_settings()),
+            ("POST", r("/api/settings/automation"), lambda b: self.automation_settings(b or {"nothing": True})),
             ("GET", r("/api/accountant/api-keys"), lambda b: self.api_keys()),
             ("POST", r("/api/accountant/api-keys"), lambda b: self.api_key_create(b)),
             ("POST", r(f"/api/accountant/api-keys/{seg}/revoke"), lambda b, kid: self.api_key_revoke(kid)),
@@ -3641,6 +3834,7 @@ def _article(word: str) -> str:
 
 
 REVERSE_CHARGE_FLAG = "Possible reverse charge: VAT to be declared by you"
+IMPORT_VAT_FLAG = "Import VAT paid at customs"
 FOREIGN_VAT_FLAG = "Foreign VAT charged — may be reclaimable abroad, not deductible in Portugal"
 
 
@@ -3707,6 +3901,47 @@ def _terms_audit(terms: Mapping[str, Any]) -> dict[str, Any]:
     """A cost center's settings as the audit log records them (only those given)."""
     names = {"recharge": "recharge", "owner_name": "owner", "fee_percent": "fee_percent", "fee_monthly": "fee_monthly"}
     return {names[k]: v for k, v in terms.items() if k in names}
+
+
+_CAPTURE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_PHONE_QUALITY = ("blurry", "glare", "too_dark", "overexposed")
+MAX_CAPTURE_PAGES = 50
+
+
+def capture_fields(body: Mapping[str, Any]) -> dict[str, Any]:
+    """What the phone said about a capture (mobile/src/offline/uploader.ts), cleaned: ``{"id", "page",
+    "pageCount"}`` for one page of a multi-page scan, and ``{"quality": [...]}`` for the problems it noticed.
+
+    Multipart form fields arrive as text (``page=2``, ``hints='{"quality":["glare"]}'``). Anything unreadable
+    is dropped, never guessed: hints are advice for reading, never evidence (§3, §18).
+    """
+    out: dict[str, Any] = {}
+    cid = body.get("capture_id") or body.get("captureId")
+    page, count = _small_int(body.get("page")), _small_int(body.get("page_count") or body.get("pageCount"))
+    if isinstance(cid, str) and _CAPTURE_ID.match(cid.strip()) and page and count and page <= count <= \
+            MAX_CAPTURE_PAGES:
+        out.update(id=cid.strip(), page=page, pageCount=count)
+    hints = body.get("hints")
+    if isinstance(hints, str):
+        try:
+            hints = json.loads(hints)
+        except (json.JSONDecodeError, ValueError):
+            hints = None
+    if isinstance(hints, Mapping) and isinstance(hints.get("quality"), list):
+        quality = [q for q in dict.fromkeys(hints["quality"]) if isinstance(q, str) and q in _PHONE_QUALITY]
+        if quality:
+            out["quality"] = quality
+    return out
+
+
+def _small_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(str(value).strip()) if isinstance(value, (int, str)) else None
+    except ValueError:
+        return None
+    return number if number is not None and 0 < number <= 1000 else None
 
 
 def _field(body: Mapping[str, Any], *names: str) -> str:

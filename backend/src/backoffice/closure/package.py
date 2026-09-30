@@ -44,6 +44,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from backoffice.domain.lifecycle import TERMINAL, Stage, TrackedItem
 from backoffice.domain.models import (
+    SUPPORTING_DOCUMENT_TYPES,
     Document,
     DocumentType,
     Evidence,
@@ -140,7 +141,11 @@ PT_EXCEL = CsvFormat(delimiter=";", decimal_comma=True, bom=True)
 
 @dataclass(frozen=True, slots=True)
 class DocumentRef:
-    """The parts of a matched document an accountant books from."""
+    """The parts of a matched document an accountant books from.
+
+    ``supporting``: a pro-forma, quote, delivery note or order kept as supporting evidence. It is marked as such
+    in the ledger ("document_role") and the manifest and is never booked (§3).
+    """
 
     document_id: str
     doc_type: DocumentType
@@ -153,12 +158,17 @@ class DocumentRef:
     net_amount: Decimal | None = None
     vat_amount: Decimal | None = None
     gross_amount: Decimal | None = None
+    supporting: bool = False
 
     def __post_init__(self) -> None:
         for name in ("net_amount", "vat_amount", "gross_amount"):
             value = getattr(self, name)
             if value is not None:
                 require_money(value, name)
+
+    @property
+    def role(self) -> str:
+        return "supporting" if self.supporting else "booked"
 
     @classmethod
     def from_document(cls, doc: Document) -> DocumentRef:
@@ -174,6 +184,7 @@ class DocumentRef:
             net_amount=doc.net_amount,
             vat_amount=doc.vat_amount,
             gross_amount=doc.gross_amount,
+            supporting=doc.doc_type in SUPPORTING_DOCUMENT_TYPES,
         )
 
 
@@ -336,7 +347,7 @@ def _write_csv(header: Sequence[str], rows: Sequence[Sequence[str]], fmt: CsvFor
 _LEDGER_HEADER = (
     "date", "description", "amount", "currency", "status", "quality", "category",
     "supplier", "supplier_tax_id", "document_type", "document_number", "document_date",
-    "net", "vat", "gross", "document_currency", "why", "evidence_sha256", "item_id",
+    "net", "vat", "gross", "document_currency", "document_role", "why", "evidence_sha256", "item_id",
 )  # fmt: skip
 
 
@@ -369,7 +380,7 @@ def _booked(value: Decimal | None, doc_type: DocumentType) -> Decimal | None:
 
 def _document_cells(d: DocumentRef | None, fmt: CsvFormat) -> list[str]:
     if d is None:
-        return [""] * 9
+        return [""] * 10
     return [
         _text_cell(d.supplier_name),
         _text_cell(d.supplier_tax_id),
@@ -380,6 +391,7 @@ def _document_cells(d: DocumentRef | None, fmt: CsvFormat) -> list[str]:
         _money_cell(_booked(d.vat_amount, d.doc_type), fmt),
         _money_cell(_booked(d.gross_amount, d.doc_type), fmt),
         d.currency,
+        d.role,
     ]
 
 
@@ -515,6 +527,7 @@ def _entry_json(e: PackageEntry) -> dict[str, Any]:
                 "net": None if d.net_amount is None else cents(d.net_amount),
                 "vat": None if d.vat_amount is None else cents(d.vat_amount),
                 "gross": None if d.gross_amount is None else cents(d.gross_amount),
+                "role": d.role,
             }
             for d in e.documents
         ],
@@ -598,8 +611,13 @@ def build_package(
     questions: Sequence[OpenQuestion] = (),
     csv_format: CsvFormat = STANDARD_CSV,
     evidence_reader: EvidenceReader | None = None,
+    still_open: Sequence[str] = (),
 ) -> AccountantPackage:
-    """Build the month's package for the accountant, entirely in memory (§27 Day 0)."""
+    """Build the month's package for the accountant, entirely in memory (§27 Day 0).
+
+    ``still_open``: plain lines on what is not settled yet, kept in the manifest as the package's honest note
+    (a month sent before it closed, §3).
+    """
     generated_at = require_aware(generated_at, "generated_at")
     ids = [e.item_id for e in entries]
     if len(ids) != len(set(ids)):
@@ -635,6 +653,7 @@ def build_package(
             {"id": q.question_id, "text": q.text, "item_id": q.item_id, "asked_by": q.asked_by, "asked_at": q.asked_at}
             for q in open_questions
         ],
+        **({"still_open": list(still_open)} if still_open else {}),
         "evidence": [
             {
                 "id": ev.id,
