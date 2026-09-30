@@ -132,6 +132,11 @@ def _describe(svc: BackOfficeService, item: TrackedItem) -> dict[str, Any]:
         return {"kind": "document", "title": display_name(d.supplier_name or "") or "Document",
                 "detail": rec.label.split(" · ")[0], "amount": _money(d.gross_amount), "currency": d.currency or "EUR",
                 "date": issued.isoformat()}
+    expected = getattr(repo, "expected_invoices", {}).get(item.subject_id)
+    if expected is not None:  # a supplier's usual invoice that is overdue (§23)
+        return {"kind": "document", "title": expected.supplier_name,
+                "detail": f"Usual invoice for {expected.period.name}", "amount": _money(expected.series.typical_amount),
+                "currency": expected.series.currency or "EUR", "date": expected.due_on.isoformat()}
     return {"kind": item.subject_type, "title": item.subject_type.capitalize(), "detail": "", "amount": None,
             "currency": "EUR", "date": None}
 
@@ -225,7 +230,8 @@ def build_pipeline(svc: BackOfficeService) -> dict[str, Any]:
              else "neutral"}]},
         {"id": "deadlines", "label": "Deadlines", "items": [
             {"label": f"{o.title} · {svc._company_name(o.obligation.entity_id) or ''}".strip(" ·"),
-             "detail": ("Paid, with proof" if o.satisfied_by else f"Due {day_month(o.obligation.due_on, svc._today())}"),
+             "detail": (("Paid, with proof" if o.payable else "Done, with proof") if o.satisfied_by
+                        else f"Due {day_month(o.obligation.due_on, svc._today())}"),
              "tone": "good" if o.satisfied_by else "neutral"} for o in obligations]},
     ]
 

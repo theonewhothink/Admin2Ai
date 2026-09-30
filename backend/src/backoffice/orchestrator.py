@@ -24,8 +24,18 @@ Pipeline for one piece of evidence::
     Settlement     payouts from card terminals and payment / sales platforms: the provider's payout
                    report is read (CSV / JSON), must add up to the cent, and must equal the bank payout;
                    then gross sales, fees and refunds are known and the payout closes (§20, §21)
-    Obligation     tax letters become obligations; payments prove them (§24)
-    Missing        a plan for every payment still without its document; supplier chasing (§22)
+    Obligation     letters and messages become obligations (§24): tax and Social Security, bank and KYC
+                   requests, official requests, filings, insurance / contract / licence renewals, rent and
+                   debts, in Portuguese and English. Each is done only by its required proof: its payment
+                   (a payment to someone the bank line does not identify is one question), or for the rest a
+                   confirming letter or message that fits exactly one, or the owner's confirmation stored as
+                   evidence. A renewal that happens on its own is information only; a letter naming none of
+                   your companies is one question
+    Missing        a plan for every payment still without its document; supplier chasing (§22); money back
+                   without its credit note is asked for the same way; a supplier's usual invoice that is
+                   overdue past its learned rhythm is raised once, asked for, and closed when it arrives (§23)
+    Refunds        a refund closes on the credit note it matches, and that credit note's invoice is shown with
+                   it; another amount is one question; money back to a customer needs your own credit note
     Accountant     routine accountant questions answered from evidence (§28)
     Closure        lifecycle transitions and month status (§2, §27, §48); an invoice naming another of your
                    companies is a question (§51); a large first purchase needs the buyer's tax number and
@@ -68,9 +78,13 @@ from backoffice.closure import (
     OwnerInteraction,
     ProofKind,
     compute_month_status,
+    detect_confirmation,
     detect_obligation,
+    normalize_reference,
+    proof_for,
     satisfy,
 )
+from backoffice.closure.month import EXPECTED_INVOICE
 from backoffice.countries.pt import (
     PACK,
     PTQRCode,
@@ -105,6 +119,7 @@ from backoffice.domain.models import (
     FieldObservation,
     LegalEntity,
     Obligation,
+    ObligationKind,
     Quality,
     SourceKind,
     Supplier,
@@ -139,26 +154,35 @@ from backoffice.fraud import (
     SignalKind,
     VerificationChannel,
     assess,
+    email_domain,
+    find_ibans,
     mask_iban,
     normalize_iban,
+    registrable_domain,
     trust_iban,
 )
 from backoffice.learning import (
     Answer,
+    Basis,
     EntityAssignment,
+    Occurrence,
     OptionKind,
     OwnershipBook,
     Question,
+    RecurringSeries,
     RuleAuthor,
     RuleBook,
     RuleScope,
     assign_entity,
     build_history,
+    check_overdue,
     counterparty_key,
     day_month,
     detect_price_change,
     display_name,
     format_money,
+    learn_series,
+    next_expected,
     same_tax_id,
     suggest_rule_from_answer,
 )
@@ -178,11 +202,14 @@ from backoffice.mailer import is_simulated
 from backoffice.missing import (
     ChaseFacts,
     ChaseMessage,
+    RecurringChaseFacts,
     activity_line,
     choose_language,
     clean_invoice_number,
     compose_correction_request,
+    compose_recurring_request,
     compose_request,
+    recurring_activity_line,
     thread_token,
 )
 from backoffice.policy import ActionContext, ActionKind, Approval, Decision, TenantPolicy, authorize
@@ -231,6 +258,7 @@ __all__ = [
     "Clock",
     "ConnectorState",
     "DocumentRecord",
+    "ExpectedInvoiceRecord",
     "IngestReport",
     "MemoryObjectStore",
     "NeedsYouRecord",
@@ -518,6 +546,9 @@ class TxRecord:
     company_answer_ev: str | None = None  # the owner's answer on which company carries it (evidence id)
     # (paid by, carried by, company the invoice names) when the owner decided between two of their companies.
     company_note: tuple[str, str, str] | None = None
+    # A refund the owner said is part of a credit note for more (evidence id of that answer).
+    refund_answer_ev: str | None = None
+    not_for_document_ids: list[str] = field(default_factory=list)  # credit notes the owner said it is not for
 
     @property
     def id(self) -> str:
@@ -575,12 +606,105 @@ class ActivityEntry:
 
 @dataclass
 class ObligationRecord:
+    """One obligation from a letter or message (§24), with who wrote it and how it was done.
+
+    It is done only by its required proof (``proof``): a payment for what is to be paid; for the
+    rest a confirming letter or message, or the owner's explicit confirmation, stored as evidence.
+    A renewal the letter says happens on its own is ``informational``: shown, never blocking.
+    """
+
     obligation: Obligation
     evidence_id: str
     title: str
     reasons: tuple[str, ...]
     reference: str | None
     satisfied_by: tuple[str, ...] = ()
+    issuer: str = ""  # Issuer value: tax_authority, social_security, bank, landlord, insurer, other
+    received_on: date | None = None
+    sender: str = ""  # "Name <address>" when it came by email
+    payee_supplier_id: str | None = None  # a known supplier the letter names (tax number or email domain)
+    payee_ibans: tuple[str, ...] = ()  # bank accounts printed in the letter
+    payee_key: str | None = None  # the sender's name as a bank line shows it
+    informational: bool = False  # renews on its own: nothing to do unless the owner wants a change
+    confirmed_by: tuple[str, ...] = ()  # the owner's confirmation (and any file with it), as evidence
+    declined_tx_ids: list[str] = field(default_factory=list)  # payments the owner said do not pay it
+    how: str = ""  # plain words once done: "Paid on 2 November." / "Renewed on 20 October."
+
+    @property
+    def proof(self) -> ProofKind:
+        return proof_for(self.obligation.kind)
+
+    @property
+    def payable(self) -> bool:
+        return self.proof is ProofKind.PAYMENT
+
+    @property
+    def done(self) -> bool:
+        return bool(self.satisfied_by)
+
+    @property
+    def sender_domain(self) -> str | None:
+        host = email_domain(self.sender) if "@" in self.sender else None
+        return registrable_domain(host) if host else None
+
+
+@dataclass
+class PendingObligation:
+    """A letter with a deadline that names none of the owner's companies (§24, §51).
+
+    It becomes an obligation only when the owner says which company it is for; nothing is tracked
+    against a company on a guess. ``status``: "open" (asked), "recorded" or "declined" (not theirs).
+    """
+
+    id: str
+    finding: Any  # closure.ObligationFinding
+    evidence_id: str
+    received_on: date
+    sender: str
+    text: str
+    status: str = "open"
+
+
+@dataclass
+class ExpectedInvoiceRecord:
+    """A supplier's usual invoice that is overdue (§23).
+
+    Raised once per period, from a learned invoice rhythm; the supplier is asked for it
+    when the policy allows (§22, §25). It closes only when an invoice from that supplier
+    for that company arrives (the invoice is the evidence), or when the owner says it is
+    not coming (their answer is the evidence).
+    """
+
+    id: str
+    series_key: str
+    supplier_id: str | None
+    supplier_name: str
+    company_id: str
+    expected_on: date  # the period's usual date
+    due_on: date  # it normally arrives by this day
+    earliest: date  # an invoice from this day on covers the period
+    notice: str  # as said when raised: "Vodafone normally issues an invoice by the 26th. Today is the 29th. ..."
+    raised_at: datetime
+    item_id: str
+    series: RecurringSeries
+    arrivals: tuple[date, ...]  # the invoice dates the rhythm was learned from
+    learned_from: tuple[str, ...]  # their document ids
+    searched: tuple[str, ...] = ()  # where I looked, in plain words
+    status: str = "missing"  # "missing" | "received" | "not_coming"
+    document_id: str | None = None  # the invoice that arrived
+    message: ChaseMessage | None = None  # the request to the supplier, once written
+    line: str = ""  # the Activity line once it is sent
+    outbox_id: str = ""
+    written_at: datetime | None = None
+    sent_at: datetime | None = None
+
+    @property
+    def period(self) -> Month:
+        return Month.of(self.expected_on)
+
+    @property
+    def sent(self) -> bool:
+        return self.sent_at is not None
 
 
 @dataclass
@@ -687,6 +811,7 @@ class IngestReport:
     pending_links: list[str] = field(default_factory=list)
     stored_only: bool = False
     already_known: bool = False  # every document in it was already on file
+    confirmed_ids: list[str] = field(default_factory=list)  # obligations this letter proved done
 
 
 @dataclass
@@ -696,6 +821,7 @@ class RunReport:
     reopened: list[str] = field(default_factory=list)
     chased: list[str] = field(default_factory=list)  # payments whose supplier request was written in this run
     sent: list[str] = field(default_factory=list)  # outgoing messages a transport accepted in this run
+    expected: list[str] = field(default_factory=list)  # usual invoices found overdue in this run (§23)
     closed_months: list[tuple[str, str]] = field(default_factory=list)
 
 
@@ -757,6 +883,9 @@ class Repository:
         self.closure_log: list[ClosureActivity] = []
         self.interactions: list[OwnerInteraction] = []
         self.obligations: dict[str, ObligationRecord] = {}
+        self.pending_obligations: dict[str, PendingObligation] = {}  # letters waiting for "which company?"
+        # A supplier's usual invoice that is overdue (§23), keyed by its own id; tracked as an item too.
+        self.expected_invoices: dict[str, ExpectedInvoiceRecord] = {}
         self.settlements: dict[str, SettlementRecord] = {}  # payout reports, keyed by their document id
         self.chases: dict[str, ChaseRecord] = {}
         # Emails the back office wrote itself, in the order written; each is "sent" only once a transport took it.
@@ -867,12 +996,18 @@ class Repository:
                 return None
             day = doc.document.issue_date or doc.received_at.astimezone(TZ).date()
             return Month.of(day)
+        if item.subject_type == EXPECTED_INVOICE:
+            expected = self.expected_invoices.get(item.subject_id)
+            return expected.period if expected else None
         return None
 
     def item_company(self, item: TrackedItem) -> str | None:
         if item.subject_type == "transaction":
             rec = self.transactions.get(item.subject_id)
             return rec.company_id if rec else None
+        if item.subject_type == EXPECTED_INVOICE:
+            expected = self.expected_invoices.get(item.subject_id)
+            return expected.company_id if expected else None
         if item.subject_type == "document":
             doc = self.documents.get(item.subject_id)
             if doc is None:
@@ -1337,10 +1472,41 @@ class ReconciliationAgent(_Agent):
         engine = ExpectedEvidenceEngine(entities=self.repo.entities, suppliers=self.repo.resolver())
         for rec in records:
             decision = engine.classify(rec.tx)
+            decision = self._customer_refund(rec, decision) or decision
             rec.decision = decision
             self.log("expect", subject_id=rec.id, evidence_ids=[rec.evidence_id],
                      values={"expectation": decision.expectation.value, "rule": decision.rule},
                      response={"quality": decision.quality.value, "reason": decision.reason})
+
+    def customer_refunds(self) -> int:
+        """Money out already decided as needing a supplier's invoice, now known to go back to one of your
+        customers (their payment of your own invoice arrived since): it needs your own credit note (§20)."""
+        moved = 0
+        for rec in sorted(self.repo.transactions.values(), key=lambda r: r.id):
+            if rec.decision is None or rec.document_ids or self.repo.items[rec.item_id].is_done:
+                continue
+            found = self._customer_refund(rec, rec.decision)
+            if found is None:
+                continue
+            rec.decision = found
+            self.log("expect", subject_id=rec.id, evidence_ids=[rec.evidence_id],
+                     values={"expectation": found.expectation.value, "rule": found.rule},
+                     response={"quality": found.quality.value, "reason": found.reason})
+            moved += 1
+        return moved
+
+    def _customer_refund(self, rec: TxRecord, decision: ExpectationDecision) -> ExpectationDecision | None:
+        """Money out to someone who paid one of your own sales invoices: a refund to your customer, covered
+        by your own credit note, not by a supplier's invoice. Same bank account: GREEN; same name: AMBER."""
+        if rec.tx.amount >= 0 or decision.rule not in ("payment_out", "card_in_shop"):
+            return None
+        customer = self.o.customer_of(rec.tx)
+        if customer is None:
+            return None
+        name, by_account = customer
+        return ExpectationDecision(rec.tx.id, EvidenceExpectation.REFUND_OR_CREDIT_NOTE,
+                                   f"Money back to your customer {name}. Your own credit note covers it.",
+                                   Quality.GREEN if by_account else Quality.AMBER, "customer_refund")
 
     def match(self) -> list[Match]:
         """Payments matched to the documents that prove them (§20).
@@ -1427,11 +1593,15 @@ class ReconciliationAgent(_Agent):
                     f"Credit note{' ' + n.document.invoice_number if n.document.invoice_number else ''}: "
                     f"{format_money(abs(n.document.gross_amount or _ZERO), n.document.currency)} taken off"
                     for n in notes)
+                # A refund: the credit note it matches, and the invoice that credit note corrects (§20).
+                chain, chain_headline = self.o.refund_chain_lines(
+                    [repo.transactions[t] for t in m.transaction_ids], [repo.documents[d] for d in m.document_ids])
+                why += chain
                 for t in m.transaction_ids:
                     rec = repo.transactions[t]
                     rec.document_ids = [*m.document_ids, *(n.id for n in notes)]
                     rec.match_why = why
-                    rec.match_headline = m.headline
+                    rec.match_headline = chain_headline or m.headline
                     rec.likely_document_ids = []
                 for d in [*m.document_ids, *(n.id for n in notes)]:
                     repo.documents[d].matched_tx_ids = list(m.transaction_ids)
@@ -1912,64 +2082,369 @@ def _join_and(items: Sequence[str]) -> str:
     return ", ".join(items[:-1]) + " and " + items[-1]
 
 
+_TAX_ISSUERS = frozenset({Issuer.TAX_AUTHORITY.value, Issuer.SOCIAL_SECURITY.value})
+# How a letter about each kind of obligation reads in the Activity feed (§42, §69). The tax office's
+# payment letters keep "Read a letter about tax payment.".
+_OBLIGATION_ARRIVED: dict[ObligationKind, str] = {
+    ObligationKind.KYC_REQUEST: "Read a message from your bank asking for updated details.",
+    ObligationKind.BANK_REQUEST: "Read a request from your bank.",
+    ObligationKind.INSURANCE_RENEWAL: "Read a letter about an insurance renewal.",
+    ObligationKind.CONTRACT_RENEWAL: "Read a letter about a contract renewal.",
+    ObligationKind.LICENSE_RENEWAL: "Read a letter about a licence renewal.",
+    ObligationKind.RENT: "Read a letter about a rent payment.",
+    ObligationKind.DEBT_COLLECTION: "Read a debt collection letter.",
+    ObligationKind.PAYMENT_DEADLINE: "Read a letter about a payment due.",
+    ObligationKind.FILING: "Read a letter about a return to file.",
+}
+_RENEWED_THING = {ObligationKind.INSURANCE_RENEWAL: "policy", ObligationKind.LICENSE_RENEWAL: "licence",
+                  ObligationKind.CONTRACT_RENEWAL: "contract"}
+_PAYMENT_LETTER = {ObligationKind.RENT: "rent letter", ObligationKind.DEBT_COLLECTION: "debt collection letter",
+                   ObligationKind.PAYMENT_DEADLINE: "payment letter", ObligationKind.TAX_DEADLINE: "tax letter"}
+# Payments that never pay a letter: money moved between your own accounts, a card paid off.
+_NOT_A_LETTER_PAYMENT = frozenset({EvidenceExpectation.NONE_INTERNAL_TRANSFER, EvidenceExpectation.CARD_STATEMENT})
+
+
 class ObligationAgent(_Agent):
-    """Letters become obligations (§24); a GREEN payment with the right amount and reference proves one."""
+    """Letters and messages become obligations (§24); each is done only by its required proof (§3).
+
+    What is to be paid is proven by the payment: the tax office's letters by the tax payment (amount
+    and reference); rent, debts and other payments due by a payment of the right amount that carries
+    the letter's reference or goes to whoever wrote it. A payment of the right amount to someone the
+    bank line does not identify is one plain question, never a guess. Everything else (answering a
+    request, filing, renewing) is proven by a confirming letter or message that fits exactly one open
+    obligation, or by the owner's explicit confirmation, stored as evidence. A renewal the letter says
+    happens on its own is shown for information and never holds a month open.
+    """
 
     name = "obligation"
 
-    def detect(self, text: str, evidence_id: str, *, received_on: date, sender: str = "") -> ObligationRecord | None:
+    # ------------------------------------------------------------------ letters that ask for something
+
+    def detect(self, text: str, evidence_id: str, *, received_on: date,
+               sender: str = "") -> ObligationRecord | PendingObligation | None:
+        """The obligation a letter or message creates; a pending one when it names none of your companies."""
         finding = detect_obligation(
             text, tenant_id=self.repo.tenant_id, received_on=received_on, sender=sender,
             entities=self.repo.entities,
         )
-        if finding is None or finding.issuer not in (Issuer.TAX_AUTHORITY, Issuer.SOCIAL_SECURITY):
+        if finding is None:
             return None
+        tax = finding.issuer.value in _TAX_ISSUERS
+        if not tax and _reads_as_accounting_document(text):
+            return None  # an invoice or receipt with a due date: its payment proves it (§20), not a letter
+        oid = "obl_" + evidence_id[3:19]
+        if oid in self.repo.obligations:  # the same letter again
+            return self.repo.obligations[oid]
+        if oid in self.repo.pending_obligations:  # already asked about (or set aside by the owner)
+            return self.repo.pending_obligations[oid]
         if finding.obligation is None:
+            if finding.due_on is not None and finding.entity_id is None and self.repo.companies:
+                return self._ask_which_company(finding, evidence_id, received_on=received_on, sender=sender,
+                                               text=text)
             self.log("obligation_incomplete", evidence_ids=[evidence_id], values={"title": finding.title})
             return None
-        obligation = finding.obligation.model_copy(update={"id": "obl_" + evidence_id[3:19]})
-        record = ObligationRecord(obligation=obligation, evidence_id=evidence_id, title=finding.title,
-                                  reasons=tuple(finding.reasons), reference=finding.reference)
-        self.repo.obligations[obligation.id] = record
-        self.log("detect_obligation", subject_id=obligation.id, evidence_ids=[evidence_id],
-                 values={"kind": obligation.kind.value, "due_on": obligation.due_on, "amount": obligation.amount,
-                         "entity_id": obligation.entity_id},
+        return self.record(finding, evidence_id, received_on=received_on, sender=sender, text=text)
+
+    def record(self, finding: Any, evidence_id: str, *, received_on: date, sender: str, text: str,
+               entity_id: str | None = None) -> ObligationRecord:
+        """Keep one obligation (once: the same letter again, or the same deadline from another channel, is
+        the one already on file)."""
+        repo = self.repo
+        oid = "obl_" + evidence_id[3:19]
+        if oid in repo.obligations:
+            return repo.obligations[oid]
+        base = finding.obligation or Obligation(
+            tenant_id=repo.tenant_id, entity_id=entity_id, kind=finding.kind, title=finding.title,
+            due_on=finding.due_on, amount=finding.amount, responsible=finding.responsible,
+            consequence=finding.consequence, required_evidence=finding.required_evidence,
+            verification_condition=finding.condition.encode())
+        obligation = base.model_copy(update={"id": oid})
+        same = next((o for o in sorted(repo.obligations.values(), key=lambda o: o.obligation.id)
+                     if not o.done and o.obligation.entity_id == obligation.entity_id
+                     and o.obligation.kind is obligation.kind and o.obligation.due_on == obligation.due_on
+                     and o.obligation.amount == obligation.amount and o.reference == finding.reference), None)
+        if same is not None:
+            self.log("obligation_already_known", subject_id=same.obligation.id,
+                     evidence_ids=[evidence_id, same.evidence_id])
+            return same
+        payee_supplier, ibans, key = self._payee(text, sender)
+        record = ObligationRecord(
+            obligation=obligation, evidence_id=evidence_id, title=finding.title, reasons=tuple(finding.reasons),
+            reference=finding.reference, issuer=finding.issuer.value, received_on=received_on, sender=sender,
+            payee_supplier_id=payee_supplier, payee_ibans=ibans, payee_key=key,
+            informational=finding.renews_on_its_own)
+        repo.obligations[oid] = record
+        values: dict[str, Any] = {"kind": obligation.kind.value, "due_on": obligation.due_on,
+                                  "amount": obligation.amount, "entity_id": obligation.entity_id}
+        if finding.issuer.value not in _TAX_ISSUERS:
+            values.update(issuer=finding.issuer.value, responsible=obligation.responsible,
+                          proof=record.proof.value, informational=record.informational)
+        self.log("detect_obligation", subject_id=oid, evidence_ids=[evidence_id], values=values,
                  response={"quality": finding.quality.value})
         return record
 
+    def _payee(self, text: str, sender: str) -> tuple[str | None, tuple[str, ...], str | None]:
+        """Who the letter asks to be paid: a known supplier it names (by tax number or the sender's email
+        domain), the bank accounts it prints, and the sender's name as a bank line would show it."""
+        repo = self.repo
+        own = set(repo.own_tax_ids())
+        supplier = next((s for s in sorted(repo.suppliers.values(), key=lambda s: s.id)
+                         if s.tax_id and not any(same_tax_id(s.tax_id, t) for t in own)
+                         and _names_tax_id(text, s.tax_id)), None)
+        if supplier is None and "@" in sender:
+            supplier = repo.supplier_for_domain(email_domain(sender))
+        own_ibans = {normalize_iban(i) for e in repo.entities for i in e.own_ibans}
+        ibans = tuple(dict.fromkeys(i for i in (normalize_iban(x) for x in find_ibans(text)) if i not in own_ibans))
+        name = sender.split("<", 1)[0].strip().strip('"') if "<" in sender else ""
+        return (supplier.id if supplier else None), ibans, (counterparty_key(name) if name else None)
+
+    def _ask_which_company(self, finding: Any, evidence_id: str, *, received_on: date, sender: str,
+                           text: str) -> PendingObligation:
+        """A letter with a deadline that names none of your companies: one plain question (§37, §51)."""
+        repo = self.repo
+        pid = "obl_" + evidence_id[3:19]
+        pending = PendingObligation(pid, finding, evidence_id, received_on, sender, text)
+        repo.pending_obligations[pid] = pending
+        now = repo.clock.now()
+        options = [CheckOption(id=f"company:{e.id}", label=e.name, values={"company": e.id})
+                   for e in sorted(repo.entities, key=lambda e: e.name)]
+        options.append(CheckOption(id="none", label="None of them. It is personal or not for my companies."))
+        due = day_month(finding.due_on, repo.today())
+        why = [*(r for r in finding.reasons if not r.startswith("Due ")), f"Due {due}"]
+        why.append("It does not name one of your companies, so I won't guess which one.")
+        prompt = f"{finding.title}: which of your companies is this letter for?"
+        needs_id = _unique_id(repo.needs, f"nd_{_slug(finding.title.split()[0])}_letter")
+        repo.needs[needs_id] = NeedsYouRecord(
+            id=needs_id, kind="obligation_company", subject_type="obligation", subject_id=pid, item_id="",
+            company_id="", created_at=now, why=tuple(why), prompt=prompt, options=tuple(options))
+        self.log("ask_owner", subject_id=pid, evidence_ids=[evidence_id],
+                 values={"title": finding.title, "due_on": finding.due_on}, response={"needs_you": needs_id})
+        self.o.activity(now, "collected", f"Read a letter about “{finding.title}”. It does not say which of your "
+                        "companies it is for, so I asked you.", None, amount=finding.amount,
+                        evidence_ids=[evidence_id])
+        return pending
+
+    # ------------------------------------------------------------------ letters that say it was done
+
+    def confirm_from(self, text: str, evidence_id: str, *, received_on: date,
+                     sender: str = "") -> ObligationRecord | None:
+        """A letter or message saying something asked for was done ("Recebemos os seus documentos", "A sua
+        licença foi renovada até ..."). It closes an obligation only when it fits exactly one open one of
+        that kind, for that company, from the same sender, with the same reference (§3); else nothing."""
+        finding = detect_confirmation(text, received_on=received_on, sender=sender, entities=self.repo.entities)
+        if finding is None:
+            return None
+        domain = email_domain(sender) if "@" in sender else None
+        domain = registrable_domain(domain) if domain else None
+        reference = normalize_reference(finding.reference) if finding.reference else None
+        candidates = [
+            ob for ob in sorted(self.repo.obligations.values(), key=lambda o: o.obligation.id)
+            if not ob.done and not ob.payable and ob.obligation.kind in finding.kinds
+            and (finding.entity_id is None or ob.obligation.entity_id == finding.entity_id)
+            and not (domain and ob.sender_domain and domain != ob.sender_domain)
+            and not (finding.issuer is not Issuer.OTHER and ob.issuer not in ("", Issuer.OTHER.value)
+                     and ob.issuer != finding.issuer.value)
+            and not (reference and ob.reference and normalize_reference(ob.reference) != reference)
+        ]
+        self.log("read_confirmation", evidence_ids=[evidence_id],
+                 values={"proof": finding.proof.value, "candidates": [ob.obligation.id for ob in candidates]},
+                 validations=list(finding.reasons))
+        if len(candidates) != 1:
+            return None  # none on file, or more than one would fit: never closed on a guess
+        ob = candidates[0]
+        result = satisfy(ob.obligation, [finding.fact(evidence_id)])
+        self.log("satisfy", subject_id=ob.obligation.id, evidence_ids=[ob.evidence_id, evidence_id],
+                 response={"satisfied": result.satisfied, "quality": result.quality.value},
+                 validations=list(result.reasons))
+        if result.satisfied and result.quality is Quality.GREEN:
+            self._done(ob, result, how=_confirmed_how(finding.proof, received_on, finding.valid_until))
+        return ob
+
+    # ------------------------------------------------------------------ payments
+
     def prove(self) -> list[TxRecord]:
-        """Tax payments that satisfy an open obligation: the payment item can close with the letter as proof."""
+        """Payments that prove an open obligation (§24). Tax payments close with the tax letter as their proof."""
         proven: list[TxRecord] = []
         for ob in sorted(self.repo.obligations.values(), key=lambda o: o.obligation.id):
-            if ob.satisfied_by:
+            if ob.done or not ob.payable:
                 continue
-            facts = [
-                EvidenceFact(evidence_id=r.evidence_id, kind=ProofKind.PAYMENT, on=r.tx.booked_on,
-                             quality=Quality.GREEN, amount=abs(r.tx.amount), currency=r.tx.currency,
-                             reference=r.tx.reference)
-                for r in self.repo.transactions.values()
-                if r.company_id == ob.obligation.entity_id and r.tx.amount < 0 and r.decision is not None
-                and r.decision.expectation.value == "tax_notice_or_proof"
-            ]
-            if not facts:
-                continue
-            result = satisfy(ob.obligation, sorted(facts, key=lambda f: f.evidence_id))
+            if ob.obligation.kind is ObligationKind.TAX_DEADLINE:
+                proven += self._prove_tax(ob)
+            else:
+                self._prove_payment(ob)
+        return proven
+
+    @staticmethod
+    def _payment_fact(r: TxRecord) -> EvidenceFact:
+        return EvidenceFact(evidence_id=r.evidence_id, kind=ProofKind.PAYMENT, on=r.tx.booked_on,
+                            quality=Quality.GREEN, amount=abs(r.tx.amount), currency=r.tx.currency,
+                            reference=r.tx.reference)
+
+    def _prove_tax(self, ob: ObligationRecord) -> list[TxRecord]:
+        facts = [self._payment_fact(r) for r in self.repo.transactions.values()
+                 if r.company_id == ob.obligation.entity_id and r.tx.amount < 0 and r.decision is not None
+                 and r.decision.expectation.value == "tax_notice_or_proof"]
+        if not facts:
+            return []
+        result = satisfy(ob.obligation, sorted(facts, key=lambda f: f.evidence_id))
+        self.log("satisfy", subject_id=ob.obligation.id, evidence_ids=[ob.evidence_id, *result.evidence_ids],
+                 response={"satisfied": result.satisfied, "quality": result.quality.value},
+                 validations=list(result.reasons))
+        if not result.satisfied or result.quality is not Quality.GREEN:
+            return []
+        ob.obligation = result.obligation
+        ob.satisfied_by = tuple(result.evidence_ids)
+        ob.how = result.reasons[0]
+        proven = []
+        for rec in self.repo.transactions.values():
+            if rec.evidence_id in result.evidence_ids:
+                rec.proof_evidence_ids = [ob.evidence_id]
+                proven.append(rec)
+        return proven
+
+    def _candidates(self, ob: ObligationRecord) -> list[TxRecord]:
+        return sorted((r for r in self.repo.transactions.values()
+                       if r.company_id == ob.obligation.entity_id and r.tx.amount < 0 and not r.private
+                       and r.decision is not None and r.decision.expectation not in _NOT_A_LETTER_PAYMENT
+                       and r.id not in ob.declined_tx_ids),
+                      key=lambda r: (r.tx.booked_on, r.id))
+
+    def pays_issuer(self, ob: ObligationRecord, rec: TxRecord) -> bool:
+        """The bank line shows the payment went to whoever wrote the letter: the account the letter prints,
+        the supplier it names, or the sender's own name. A letter's reference is checked by :func:`satisfy`."""
+        tx = rec.tx
+        if ob.reference:
+            return True
+        if ob.payee_ibans and tx.counterparty_iban and normalize_iban(tx.counterparty_iban) in ob.payee_ibans:
+            return True
+        if ob.payee_supplier_id:
+            found = self.repo.resolver().resolve_transaction(tx).supplier
+            if found is not None and found.id == ob.payee_supplier_id:
+                return True
+        return bool(ob.payee_key and counterparty_key(tx.counterparty) == ob.payee_key)
+
+    def _prove_payment(self, ob: ObligationRecord) -> None:
+        """Rent, a debt or another payment due: proven by a payment of the right amount to whoever wrote
+        (or carrying the letter's reference). The right amount to someone else is one plain question."""
+        candidates = self._candidates(ob)
+        identified = [r for r in candidates if self.pays_issuer(ob, r)]
+        if identified:
+            result = satisfy(ob.obligation, [self._payment_fact(r) for r in identified])
             self.log("satisfy", subject_id=ob.obligation.id, evidence_ids=[ob.evidence_id, *result.evidence_ids],
                      response={"satisfied": result.satisfied, "quality": result.quality.value},
                      validations=list(result.reasons))
-            if not result.satisfied or result.quality is not Quality.GREEN:
+            if result.satisfied and result.quality is Quality.GREEN:
+                self._done(ob, result, how=" ".join(result.reasons))
+                return
+        if any(n.status == "open" and n.kind == "obligation" and n.options
+               and n.options[0].values.get("obligation") == ob.obligation.id for n in self.repo.needs.values()):
+            return
+        named = {r.id for r in identified}
+        for rec in candidates:
+            if rec.id in named or rec.tx.entity_id is None:
                 continue
-            ob.obligation = result.obligation
-            ob.satisfied_by = tuple(result.evidence_ids)
-            for rec in self.repo.transactions.values():
-                if rec.evidence_id in result.evidence_ids:
-                    rec.proof_evidence_ids = [ob.evidence_id]
-                    proven.append(rec)
-        return proven
+            if satisfy(ob.obligation, [self._payment_fact(rec)]).satisfied:
+                self.o.ask_about_obligation_payment(ob, rec)
+                return
+
+    def _done(self, ob: ObligationRecord, result: Any, *, how: str, extra: Sequence[str] = ()) -> None:
+        """Record the proof (never removed later, §3) and say so once in the Activity feed."""
+        merged = sorted({*result.obligation.satisfied_by_evidence_ids, *extra})
+        ob.obligation = result.obligation.model_copy(update={"satisfied_by_evidence_ids": merged})
+        ob.satisfied_by = tuple(dict.fromkeys([*result.evidence_ids, *extra]))
+        ob.how = how
+        self.log("obligation_done", subject_id=ob.obligation.id, evidence_ids=[ob.evidence_id, *ob.satisfied_by],
+                 values={"how": how})
+        self.o.activity(self.repo.clock.now(), "checked", f"{ob.title}: done. {how}", ob.obligation.entity_id,
+                        amount=ob.obligation.amount, evidence_ids=list(ob.satisfied_by))
+
+    # ------------------------------------------------------------------ plain words
+
+    def arrived_line(self, ob: ObligationRecord) -> str:
+        """The Activity line for a new letter (§42)."""
+        kind = ob.obligation.kind
+        if kind is ObligationKind.TAX_DEADLINE:
+            return f"Read a letter about {ob.title.lower()}."
+        if kind is ObligationKind.GOVERNMENT_REQUEST:
+            title = _lower_first(ob.title)
+            return f"Read {'an' if title[:1] in 'aeiou' else 'a'} {title}."
+        line = _OBLIGATION_ARRIVED.get(kind, "Read a letter with a deadline.")
+        if ob.informational:
+            line += " It renews on its own."
+        return line
+
+    def next_step(self, ob: ObligationRecord) -> str:
+        """What happens next, in plain words (Home "Due soon", the obligations list)."""
+        kind = ob.obligation.kind
+        if ob.done:
+            return ob.how or "Done, with proof."
+        if ob.informational:
+            return "It renews on its own. Nothing to do unless you want to change or end it."
+        if ob.payable:
+            return "I will check the payment when it goes out."
+        if ob.proof is ProofKind.SUBMISSION:
+            who = "Your accountant files this. " if ob.obligation.responsible == "accountant" else ""
+            return f"{who}I close it when the filing receipt arrives."
+        if ob.proof is ProofKind.RENEWAL:
+            return (f"I close it when the renewed {_RENEWED_THING.get(kind, 'contract')} arrives, or when you tell me "
+                    "you are not renewing.")
+        return "When you have sent what they ask for, forward me their confirmation or tell me it is done."
+
+    def payment_letter(self, ob: ObligationRecord) -> str:
+        return _PAYMENT_LETTER.get(ob.obligation.kind, "letter")
+
+
+def _confirmed_how(proof: ProofKind, on: date, valid_until: date | None = None, *, by_owner: bool = False) -> str:
+    """How an obligation that is not a payment was done, in plain words."""
+    day = day_month(on)
+    until = day_month(valid_until, on) if valid_until is not None else ""  # the year when it is not this one
+    if by_owner:
+        if proof is ProofKind.DECISION:
+            return f"You told me on {day} that you are not renewing it."
+        if proof is ProofKind.RENEWAL and valid_until is not None:
+            return f"You told me on {day} that it is renewed until {until}."
+        if proof is ProofKind.SUBMISSION:
+            return f"You told me on {day} that it was filed."
+        return f"You told me on {day} that it was sent."
+    if proof is ProofKind.DECISION:
+        return f"Confirmed on {day} that it will not be renewed."
+    if proof is ProofKind.RENEWAL and valid_until is not None:
+        return f"Renewed until {until}."
+    if proof is ProofKind.SUBMISSION:
+        return f"The filing receipt arrived on {day}."
+    return f"They confirmed on {day} that they received it."
+
+
+def _names_tax_id(text: str, tax_id: str) -> bool:
+    """'NIF: 234 567 899' / '234.567.899' / 'PT234567899' all name tax number 234567899."""
+    digits = re.sub(r"\D", "", tax_id or "")
+    if len(digits) < 5:
+        return False
+    return re.search(r"(?<![\d.])" + r"[ .]?".join(digits) + r"(?![\d]|[.]\d)", text or "") is not None
+
+
+def _reads_as_accounting_document(text: str) -> bool:
+    """A fiscal document rather than a letter: a Portuguese fiscal QR code, or a numbered invoice, receipt
+    or note title ("Fatura n.º FT 2026/183", "Invoice 2026/77"). Its payment proves it (§20)."""
+    if _QR_START.search(text or ""):
+        return True
+    from backoffice.learning import fold
+
+    for raw in (text or "").splitlines():
+        line = fold(raw)
+        if any(ch.isdigit() for ch in line) and any(pattern.match(line) for _, pattern in _KIND_TITLES):
+            return True
+    return False
 
 
 class MissingEvidenceAgent(_Agent):
-    """A plan for every payment still without its document; polite supplier requests when allowed (§22, §25)."""
+    """A plan for every payment still without its document; polite supplier requests when allowed (§22, §25).
+
+    Money back from a supplier without its credit note is chased the same way (the request asks for
+    the credit note). From learned invoice rhythms (§23), a supplier's usual invoice that is overdue
+    becomes one missing item, once per period: I look for it, ask the supplier when the policy
+    allows, and close it only when the invoice arrives.
+    """
 
     name = "missing_evidence"
 
@@ -1980,6 +2455,8 @@ class MissingEvidenceAgent(_Agent):
         when = day_month(rec.tx.booked_on, self.repo.today())
         if rec.decision is not None and rec.decision.expectation is EvidenceExpectation.PAYOUT_REPORT:
             return self.o.settlement.plan(rec, amount, when)
+        if rec.decision is not None and rec.decision.expectation is EvidenceExpectation.REFUND_OR_CREDIT_NOTE:
+            return self._refund_plan(rec, amount, who, when)
         chase = self.repo.chases.get(rec.id)
         if chase is not None and chase.sent:
             return (f"I asked {who} for the invoice for the {amount} payment on {when}. "
@@ -2000,18 +2477,44 @@ class MissingEvidenceAgent(_Agent):
             return f"The {amount} tax payment on {when} is waiting for the tax notice or payment proof."
         return f"I'm looking for the document for the {amount} payment to {who} on {when}."
 
+    def _refund_plan(self, rec: TxRecord, amount: str, who: str, when: str) -> str:
+        """Money back: from a supplier, it needs the supplier's credit note; to a customer, your own (§20)."""
+        if rec.decision is not None and rec.decision.rule == "customer_refund":
+            if rec.likely_document_ids:
+                return (f"I found your credit note that likely covers the {amount} refund to {who} on {when} and "
+                        "I'm confirming it.")
+            return (f"The {amount} refund to {who} on {when} needs your own credit note. Make it where you make your "
+                    "invoices and send it to me: I will match it.")
+        if any(n.subject_id == rec.id and n.status == "open" and n.kind == "refund" for n in self.repo.needs.values()):
+            return (f"{who} refunded {amount} on {when}, but its credit note is for a different amount. "
+                    "I asked you about it.")
+        chase = self.repo.chases.get(rec.id)
+        if chase is not None and chase.sent:
+            return (f"I asked {who} for the credit note for the {amount} refund on {when}. "
+                    "Suppliers usually reply within a few days.")
+        if chase is not None:
+            return (f"I wrote to {who} asking for the credit note for the {amount} refund on {when}. "
+                    "It is waiting to be sent.")
+        if rec.likely_document_ids:
+            return f"I found a likely credit note for the {amount} refund from {who} on {when} and I'm confirming it."
+        return f"I'm looking for the credit note for the {amount} refund from {who} on {when}."
+
     def chase_all(self, now: datetime) -> list[str]:
         """Write a request for every payment whose invoice is missing, when the policy allows it (§22, §25).
 
-        Requests go to the outbox; they count as asked only once a transport sends them
-        (:meth:`Orchestrator.deliver`). Returns the payments whose request was written now.
+        Money back from a supplier without its credit note is asked for the same way. Requests go to
+        the outbox; they count as asked only once a transport sends them (:meth:`Orchestrator.deliver`).
+        Returns the payments whose request was written now.
         """
         written: list[str] = []
         today = now.astimezone(TZ).date()
         for rec in sorted(self.repo.transactions.values(), key=lambda r: (r.tx.booked_on, r.id)):
             payout = rec.decision is not None and rec.decision.expectation is EvidenceExpectation.PAYOUT_REPORT
-            if rec.id in self.repo.chases or rec.document_ids or rec.private or (rec.tx.amount >= 0 and not payout):
-                continue  # money in is not chased; a payout still counts as missing its report (§22)
+            refund = (rec.decision is not None and rec.tx.amount > 0
+                      and rec.decision.expectation is EvidenceExpectation.REFUND_OR_CREDIT_NOTE)
+            if rec.id in self.repo.chases or rec.document_ids or rec.private or (
+                    rec.tx.amount >= 0 and not payout and not refund):
+                continue  # customers' money is not chased; a payout or a supplier refund still misses its document
             item = self.repo.items[rec.item_id]
             if item.is_done or item.stage in (Stage.NEEDS_OWNER, Stage.CONFLICT):
                 continue
@@ -2061,6 +2564,213 @@ class MissingEvidenceAgent(_Agent):
         self.log("request_invoice", subject_id=rec.id, evidence_ids=[rec.evidence_id],
                  values={"to": chase.message.to, "subject": chase.message.subject},
                  response={"message_id": chase.message.message_id})
+
+    # ------------------------------------------------------------------ usual invoices that have not arrived (§23)
+
+    def invoice_groups(self) -> dict[tuple[str, str], list[DocumentRecord]]:
+        """Each supplier's purchase invoices to each of your companies, oldest first: a rhythm is learned
+        per supplier and company. Sales documents, credit notes and supporting documents never count."""
+        groups: dict[tuple[str, str], list[DocumentRecord]] = {}
+        for d in self.repo.documents.values():
+            doc = d.document
+            if d.sales or d.supporting or doc.doc_type not in PURCHASE_INVOICE_TYPES or not doc.entity_id:
+                continue
+            digits = re.sub(r"\D", "", doc.supplier_tax_id or "")
+            key = d.supplier_id or (f"nif:{digits}" if digits else None)
+            if key is not None:
+                groups.setdefault((key, doc.entity_id), []).append(d)
+        for docs in groups.values():
+            docs.sort(key=lambda d: (_arrived_on(d), d.id))
+        return groups
+
+    def _covered(self, key: str, company_id: str, docs: Sequence[DocumentRecord]) -> tuple[date, ...]:
+        """Periods covered: the invoices that arrived, and the ones the owner said are not coming."""
+        told = [e.expected_on for e in self.repo.expected_invoices.values()
+                if e.series_key == key and e.company_id == company_id and e.status == "not_coming"]
+        return tuple(sorted({*(_arrived_on(d) for d in docs), *told}))
+
+    def check_recurring(self, now: datetime) -> list[str]:
+        """Every run (§23): an invoice that arrived closes what was waiting for it; then each learned invoice
+        rhythm is checked, and a supplier's usual invoice that is overdue past its grace is raised once as a
+        missing item. A supplier without a trusted rhythm never is (§57). Returns the items raised now."""
+        repo = self.repo
+        today = now.astimezone(TZ).date()
+        groups = self.invoice_groups()
+        self._receive_expected(groups, now)
+        raised: list[str] = []
+        for (key, company_id), docs in sorted(groups.items()):
+            if company_id not in repo.companies:
+                continue
+            supplier = repo.suppliers.get(key)
+            name = display_name(supplier.name if supplier else docs[-1].document.supplier_name, fallback="Supplier")
+            occurrences = [Occurrence(on=_arrived_on(d), amount=d.document.gross_amount, currency=d.document.currency,
+                                      label=d.document.supplier_name, ref=d.id) for d in docs]
+            series = learn_series(key, occurrences, basis=Basis.INVOICES, name=name)
+            if series is None or not series.trusted:
+                continue
+            covered = self._covered(key, company_id, docs)
+            notice = check_overdue(series, today, arrivals=covered)
+            if notice is None or notice.likely_ended:
+                continue  # on time, or it looks like it stopped: nothing to chase
+            window = next_expected(series, covered)
+            if not self._mail_read_past(company_id, window.due):
+                continue  # the mailbox has not been read that far: it may be sitting there unread (§47-48)
+            rid = "exp_" + hashlib.sha256(
+                f"{repo.tenant_id}|{key}|{company_id}|{window.expected.isoformat()}".encode()).hexdigest()[:16]
+            if rid in repo.expected_invoices:
+                continue  # raised once per period
+            self._raise_expected(rid, key=key, supplier=supplier, name=name, company_id=company_id, series=series,
+                                 window=window, message=notice.message, docs=docs, covered=covered, now=now)
+            raised.append(rid)
+        return raised
+
+    def _mail_read_past(self, company_id: str, day: date) -> bool:
+        """Every mailbox serving this company is healthy and has been read beyond ``day``: only then can an
+        invoice due by that day be called missing (a mailbox still importing or out of sync may hold it)."""
+        mailboxes = [c for c in self.repo.connectors.values() if c.kind == "email" and company_id in c.company_ids]
+        return all(c.healthy and c.covered_until is not None and c.covered_until.astimezone(TZ).date() > day
+                   for c in mailboxes)
+
+    def _raise_expected(self, rid: str, *, key: str, supplier: Supplier | None, name: str, company_id: str,
+                        series: RecurringSeries, window: Any, message: str, docs: Sequence[DocumentRecord],
+                        covered: tuple[date, ...], now: datetime) -> ExpectedInvoiceRecord:
+        repo = self.repo
+        evidence = [d.evidence_ids[0] for d in docs[-3:] if d.evidence_ids]  # the invoices the rhythm comes from
+        item = TrackedItem(id="item_" + rid, tenant_id=repo.tenant_id, subject_type=EXPECTED_INVOICE, subject_id=rid)
+        repo.items[item.id] = item
+        record = ExpectedInvoiceRecord(
+            id=rid, series_key=key, supplier_id=supplier.id if supplier else None, supplier_name=name,
+            company_id=company_id, expected_on=window.expected, due_on=window.due,
+            earliest=window.expected - timedelta(days=series.spec.tolerance_days), notice=message, raised_at=now,
+            item_id=item.id, series=series, arrivals=covered, learned_from=tuple(d.id for d in docs))
+        repo.expected_invoices[rid] = record
+        record.searched = self._search(record)
+        count = len(docs)
+        self.o.advance(item, Stage.ACQUIRED, evidence, agent=self.name,
+                       note=f"Learned from {count} earlier {name} invoice{'s' if count != 1 else ''}.")
+        self.o.advance(item, Stage.UNDERSTOOD, evidence, agent=self.name, note=message)
+        repo.closure_log.append(ClosureActivity(
+            kind=ClosureKind.MISSING_DOCUMENT_DETECTED, at=now, entity_id=company_id, subject_id=rid,
+            period=record.period))
+        self.o.activity(now, "checked", message, company_id, evidence_ids=evidence)
+        self.log("expected_invoice_missing", subject_id=rid, evidence_ids=evidence,
+                 values={"supplier": name, "expected_on": window.expected, "due_on": window.due,
+                         "cadence": series.cadence.value, "observations": series.observations},
+                 validations=list(record.searched))
+        return record
+
+    def _search(self, record: ExpectedInvoiceRecord) -> tuple[str, ...]:
+        """Where I looked before asking anyone, in plain words (§22: current email, documents on file, links)."""
+        from urllib.parse import urlparse
+
+        repo = self.repo
+        lines = ["I looked through your email and the documents you sent me: it is not there."]
+        loose = [d for d in repo.documents.values()
+                 if record.supplier_id and d.supplier_id == record.supplier_id and not d.document.entity_id
+                 and _arrived_on(d) >= record.earliest]
+        if loose:
+            lines.append(f"A {record.supplier_name} document arrived that does not show which of your companies it "
+                         "is for, so I did not count it.")
+        supplier = repo.suppliers.get(record.supplier_id or "")
+        domains = [d.lower() for d in (supplier.email_domains if supplier else [])]
+        waiting = [u for u in repo.pending_links
+                   if any((urlparse(u).hostname or "").lower().endswith(d) for d in domains)]
+        if waiting:
+            lines.append(f"An invoice link from {record.supplier_name} is waiting to be opened.")
+        return tuple(lines)
+
+    def _receive_expected(self, groups: Mapping[tuple[str, str], list[DocumentRecord]], now: datetime) -> None:
+        """An invoice from that supplier for that company, dated in the period or later, closes the item: the
+        invoice is its evidence (§3). Never a guess: another supplier or company does not count."""
+        repo = self.repo
+        for record in sorted(repo.expected_invoices.values(), key=lambda e: e.id):
+            if record.status != "missing":
+                continue
+            arrived = [d for d in groups.get((record.series_key, record.company_id), [])
+                       if _arrived_on(d) >= record.earliest]
+            if not arrived:
+                continue
+            doc = arrived[0]
+            record.status = "received"
+            record.document_id = doc.id
+            evidence = list(doc.evidence_ids)
+            self.o.closure._close(repo.items[record.item_id], evidence,
+                                  note=f"The {record.supplier_name} invoice arrived: {doc.label}.")
+            repo.closure_log.append(ClosureActivity(
+                kind=ClosureKind.MISSING_DOCUMENT_RETRIEVED, at=now, entity_id=record.company_id,
+                subject_id=record.id, period=record.period))
+            self.o.activity(now, "recovered", f"The {record.supplier_name} invoice for {record.period.name} arrived.",
+                            record.company_id, amount=doc.document.gross_amount, currency=doc.document.currency,
+                            evidence_ids=evidence)
+            self.log("expected_invoice_arrived", subject_id=record.id, evidence_ids=evidence,
+                     values={"document": doc.id})
+
+    def chase_expected(self, now: datetime) -> list[str]:
+        """Ask the supplier for its overdue usual invoice, once, when the policy allows it (§22, §25): the
+        same send path as every request (it counts as asked only once a transport accepted it)."""
+        repo = self.repo
+        today = now.astimezone(TZ).date()
+        written: list[str] = []
+        for record in sorted(repo.expected_invoices.values(), key=lambda e: e.id):
+            if record.status != "missing" or record.message is not None:
+                continue
+            supplier = repo.suppliers.get(record.supplier_id or "")
+            company = repo.companies.get(record.company_id)
+            if supplier is None or not supplier.contact_email or company is None:
+                continue
+            decision = authorize(ActionKind.SUPPLIER_INVOICE_REQUEST, repo.policy, ActionContext(
+                tenant_id=repo.tenant_id, entity_id=company.id, subject_id=record.id))
+            self.log("authorize_chase", subject_id=record.id,
+                     response={"allowed": decision.allowed_now, "reason": decision.reason_plain})
+            if not decision.allowed_now:
+                continue
+            facts = RecurringChaseFacts.build(supplier, company, period=record.expected_on, usually_by=record.due_on)
+            message = compose_recurring_request(facts, token=thread_token(repo.tenant_id, record.id), today=today,
+                                                message_id_domain=MESSAGE_ID_DOMAIN)
+            out = self.o.write_email("expected_invoice_request", record.id, company.id, message.to, message.subject,
+                                     message.body, now, headers=(("Message-ID", message.message_id),))
+            record.message, record.line, record.outbox_id, record.written_at = (
+                message, recurring_activity_line(facts), out.id, now)
+            self.log("write_request", subject_id=record.id,
+                     values={"to": message.to, "subject": message.subject, "outbox_id": out.id})
+            written.append(record.id)
+        return written
+
+    def sent_expected(self, record: ExpectedInvoiceRecord, at: datetime) -> None:
+        """A transport accepted the request for the usual invoice: now the supplier has been asked."""
+        record.sent_at = at
+        self.repo.closure_log.append(ClosureActivity(
+            kind=ClosureKind.SUPPLIER_CHASED, at=at, entity_id=record.company_id,
+            subject_id=record.supplier_id or record.id, period=record.period))
+        self.o.activity(at, "chased", record.line, record.company_id)
+        if record.message is not None:
+            self.log("request_invoice", subject_id=record.id,
+                     values={"to": record.message.to, "subject": record.message.subject},
+                     response={"message_id": record.message.message_id})
+
+    def current_notice(self, record: ExpectedInvoiceRecord) -> str:
+        """The notice as of today ("... Today is the 29th. Invoice missing.")."""
+        notice = check_overdue(record.series, self.repo.today(), arrivals=record.arrivals)
+        return notice.message if notice is not None else record.notice
+
+    def plan_expected(self, record: ExpectedInvoiceRecord) -> str:
+        """Plain-language next step for a usual invoice that has not arrived."""
+        name, month = record.supplier_name, record.period.name
+        if record.status == "received":
+            return f"The {name} invoice for {month} arrived."
+        if record.status == "not_coming":
+            return f"You told me the {name} invoice for {month} is not coming."
+        notice = self.current_notice(record)
+        if record.sent:
+            return f"{notice} I asked {name} for it."
+        if record.message is not None:
+            return f"{notice} I wrote to {name} asking for it. It is waiting to be sent."
+        return f"{notice} I will match it when it arrives."
+
+
+def _arrived_on(record: DocumentRecord) -> date:
+    """The day an invoice belongs to for its supplier's rhythm: its own date, else the day it reached us."""
+    return record.document.issue_date or record.received_at.astimezone(TZ).date()
 
 
 _KIND_WORDS = {TransactionKind.TRANSFER_OUT: "transfer", TransactionKind.DIRECT_DEBIT: "direct debit",
@@ -2247,8 +2957,21 @@ class ClosureAgent(_Agent):
             evidence = [rec.evidence_id, *[e for d in docs for e in d.evidence_ids]]
             if rec.company_answer_ev:
                 evidence.append(rec.company_answer_ev)
+            if rec.refund_answer_ev:  # the owner said this refund is part of a credit note for more
+                evidence.append(rec.refund_answer_ev)
             moved += self._close(item, evidence, note=rec.match_headline or "Matched to its document.")
             for d in docs:
+                if self.o.is_supplier_refund(rec, d):
+                    # A credit note closes once all its money is back, with every refund as evidence.
+                    if self.o.credit_left(d) != 0:
+                        continue
+                    refunds = self.o.refunds_of(d)
+                    moved += self._close(repo.items[d.item_id],
+                                         [*d.evidence_ids, *(r.evidence_id for r in refunds),
+                                          *(r.refund_answer_ev for r in refunds if r.refund_answer_ev)],
+                                         note=f"Refunded in full on {day_month(refunds[-1].tx.booked_on)}.")
+                    d.hold_reason = ""
+                    continue
                 moved += self._close(repo.items[d.item_id], evidence, note="Matched to its payment.")
         moved += self._settle_supporting()
         moved += self._close_cancelled_invoices()
@@ -2360,9 +3083,11 @@ class ClosureAgent(_Agent):
         # large purchase or a question): only the others count as "still looking for a document".
         decisions = [repo.transactions[t].decision for t in sorted(tx_ids)
                      if repo.transactions[t].decision and not repo.transactions[t].document_ids]
+        # A renewal the letter says happens on its own is information: it never holds a month open (§24).
+        obligations = [o.obligation for o in repo.obligations.values() if not o.informational]
         return compute_month_status(
             company_id, month, items, now=now or repo.clock.now(), connectors=repo.connectors_for(company_id),
-            decisions=decisions, obligations=[o.obligation for o in repo.obligations.values()],
+            decisions=decisions, obligations=obligations,
             activities=repo.closure_log, interactions=repo.interactions, tz=TZ,
         )
 
@@ -2407,6 +3132,11 @@ class AuditorAgent(_Agent):
 
     def _problem(self, item: TrackedItem) -> str | None:
         repo = self.repo
+        if item.subject_type == EXPECTED_INVOICE:
+            expected = repo.expected_invoices.get(item.subject_id)
+            if expected is None or expected.document_id not in repo.documents:
+                return "The invoice that arrived for it is no longer on file."
+            return None
         if item.subject_type == "document":
             doc = repo.documents[item.subject_id]
             if doc.on_hold:
@@ -2441,7 +3171,13 @@ class AuditorAgent(_Agent):
         present = [d for d in docs if d is not None]
         credits = [d for d in present if d.credit_for and d.credit_for in rec.document_ids]
         primary = [d for d in present if d not in credits]
-        if len(primary) == 1:
+        if len(primary) == 1 and not credits and self.o.is_supplier_refund(rec, primary[0]):
+            # A refund of a credit note, maybe in parts: never more than the credit note; less only when the
+            # owner said it is part of it, or the parts add up to it exactly.
+            total, back = abs(primary[0].document.gross_amount or _ZERO), self.o.refunded(primary[0])
+            if back > total or (back < total and not any(r.refund_answer_ev for r in self.o.refunds_of(primary[0]))):
+                return "The refunds and their credit note no longer agree."
+        elif len(primary) == 1:
             owed = (primary[0].document.gross_amount or _ZERO) - sum(
                 (abs(c.document.gross_amount or _ZERO) for c in credits), _ZERO)
             if owed != abs(rec.tx.amount):
@@ -2971,6 +3707,8 @@ class Orchestrator:
                  response={"simulated": is_simulated(transport)})
         if message.kind == "supplier_request" and message.subject_id in self.repo.chases:
             self.missing.sent(self.repo.chases[message.subject_id], at)
+        elif message.kind == "expected_invoice_request" and message.subject_id in self.repo.expected_invoices:
+            self.missing.sent_expected(self.repo.expected_invoices[message.subject_id], at)
         elif message.kind == "accountant_answer" and message.subject_id in self.repo.accountant_questions:
             self.accountant.sent(self.repo.accountant_questions[message.subject_id], at)
         elif message.kind == "correction_request" and message.subject_id in self.repo.documents:
@@ -2994,9 +3732,14 @@ class Orchestrator:
             if message.kind == "supplier_request" and (chase := self.repo.chases.get(message.subject_id)):
                 rec = self.repo.transactions[chase.tx_id]
                 who = self.merchant_name(rec.tx)
-                text = (f"Wrote to {who} asking for the invoice for the "
-                        f"{format_money(abs(rec.tx.amount), rec.tx.currency)} payment. It is waiting to be sent.")
+                what = ("the credit note for the {} refund" if rec.tx.amount > 0 else
+                        "the invoice for the {} payment").format(format_money(abs(rec.tx.amount), rec.tx.currency))
+                text = f"Wrote to {who} asking for {what}. It is waiting to be sent."
                 evidence = [rec.evidence_id]
+            elif message.kind == "expected_invoice_request" and (
+                    expected := self.repo.expected_invoices.get(message.subject_id)):
+                text = (f"Wrote to {expected.supplier_name} asking for its usual invoice for {expected.period.name}. "
+                        "It is waiting to be sent.")
             elif message.kind == "accountant_answer":
                 text = "Wrote an answer to your accountant. It is waiting to be sent."
                 q = self.repo.accountant_questions.get(message.subject_id)
@@ -3121,16 +3864,40 @@ class Orchestrator:
                                values={"format": evidence.format.value})
             return
         letter = _letter_text(parts)
-        if letter:
-            ob = self.obligations.detect(letter, evidence.id, received_on=at.astimezone(TZ).date())
-            if ob is not None and not _QR_START.search(letter):
-                report.obligation_ids.append(ob.obligation.id)
-                self.activity(at, "collected", f"Read a letter about {ob.title.lower()}.",
-                              ob.obligation.entity_id, amount=ob.obligation.amount, evidence_ids=[evidence.id])
-                return
+        if letter and self._read_letter(letter, evidence.id, at=at, report=report):
+            return
         record = self._document_from_parts(parts, at=at, origin=origin, retrieved=False, report=report)
         if record is None and any(p.kind == "read" for p in parts):
             report.message = "Got it. I stored it, but I couldn't find invoice details in it."
+
+    def _read_letter(self, text: str, evidence_id: str, *, at: datetime, report: IngestReport,
+                     sender: str = "") -> bool:
+        """A letter or message about an administrative obligation (§24): proof that one was done, a new one,
+        or one that names none of your companies (one question). True when the text was taken as such, so
+        it is not also read as an invoice; a fiscal document (QR code) always goes on to be read."""
+        received = at.astimezone(TZ).date()
+        fiscal = bool(_QR_START.search(text))
+        confirmed = self.obligations.confirm_from(text, evidence_id, received_on=received, sender=sender)
+        if confirmed is not None:
+            report.obligation_ids.append(confirmed.obligation.id)
+            if confirmed.done:
+                report.confirmed_ids.append(confirmed.obligation.id)
+            else:
+                self.activity(at, "collected", f"Read a letter about “{confirmed.title}”. It is not enough to close "
+                              "it yet.", confirmed.obligation.entity_id, evidence_ids=[evidence_id])
+            return not fiscal
+        found = self.obligations.detect(text, evidence_id, received_on=received, sender=sender)
+        if found is None or fiscal:
+            return False
+        if isinstance(found, PendingObligation):  # asked which company it is for (said once, in the Activity feed)
+            report.message = ("Got it. This letter does not say which of your companies it is for. "
+                              "I asked you in Needs you." if found.status == "open" else
+                              "Got it. You told me this letter is not for your companies.")
+            return True
+        report.obligation_ids.append(found.obligation.id)
+        self.activity(at, "collected", self.obligations.arrived_line(found), found.obligation.entity_id,
+                      amount=found.obligation.amount, evidence_ids=[evidence_id])
+        return True
 
     def _unread_message(self, evidence: Evidence) -> str:
         """Why a stored file was not read, in plain words (§36, §70)."""
@@ -3241,16 +4008,17 @@ class Orchestrator:
             self._document_from_parts(self._parts_for(ev), at=at, origin="link", retrieved=True,
                                       report=report, sender=sender, message_text=text, body=body_part,
                                       recipients=recipients)
+        writer = _sender_line(parsed.sender)
         for file_parts in groups:
             letter = _letter_text(file_parts)
-            if letter:
-                ob = self.obligations.detect(letter, file_parts[0].evidence_id, received_on=at.astimezone(TZ).date(),
-                                             sender=sender or "")
-                if ob is not None and not _QR_START.search(letter):
-                    report.obligation_ids.append(ob.obligation.id)
-                    continue
+            if letter and self._read_letter(letter, file_parts[0].evidence_id, at=at, report=report, sender=writer):
+                continue
             self._document_from_parts(file_parts, at=at, origin=origin, retrieved=False, report=report,
                                       sender=sender, message_text=text, body=body_part, recipients=recipients)
+        if not result.files and not parsed.invoice_links and not parsed.bulk and parsed.text_body.strip():
+            # A message with nothing attached: its own words may be the letter (a bank asking for
+            # documents, an insurer's renewal notice, a confirmation that something was done).
+            self._read_letter(text, message_id, at=at, report=report, sender=writer)
         for nested in result.attached_emails:
             self._process_email(nested, at=at, origin=origin, report=report)
 
@@ -3698,6 +4466,176 @@ class Orchestrator:
                     return rec.company_id
         return next(iter(self.repo.companies))
 
+    # ----------------------------------------------------------------- obligations (§24)
+
+    def ask_about_obligation_payment(self, ob: ObligationRecord, rec: TxRecord) -> None:
+        """A payment of the amount a letter asks for, to someone the bank line does not identify: one plain
+        question, never a guess (§3, §37). The payment's own evidence path is not touched."""
+        repo = self.repo
+        now = repo.clock.now()
+        amount = format_money(abs(rec.tx.amount), rec.tx.currency)
+        who = self.merchant_name(rec.tx)
+        when = day_month(rec.tx.booked_on, repo.today())
+        letter = self.obligations.payment_letter(ob)
+        received = day_month(ob.received_on, repo.today()) if ob.received_on else None
+        prompt = f"Does the {amount} payment to {who} on {when} pay the {letter}{f' of {received}' if received else ''}?"
+        due = format_money(ob.obligation.amount, rec.tx.currency) if ob.obligation.amount is not None else amount
+        why = (f"The letter asks for {due} by {day_month(ob.obligation.due_on, repo.today())}.",
+               f"This payment is {amount}, made after the letter arrived.",
+               "The bank line does not show that it went to whoever wrote the letter.",
+               "Until you answer, I won't count the letter as paid.")
+        options = (CheckOption(id="yes", label="Yes, it pays that letter", values={"obligation": ob.obligation.id}),
+                   CheckOption(id="no", label="No, it is for something else", values={"obligation": ob.obligation.id}))
+        needs_id = _unique_id(repo.needs, f"nd_{_slug(who.split()[0])}_letter")
+        repo.needs[needs_id] = NeedsYouRecord(
+            id=needs_id, kind="obligation", subject_type="transaction", subject_id=rec.id, item_id=rec.item_id,
+            company_id=rec.company_id, created_at=now, why=why, prompt=prompt, options=options)
+        self.obligations.log("ask_owner", subject_id=ob.obligation.id, evidence_ids=[ob.evidence_id, rec.evidence_id],
+                             values={"payment": rec.id}, response={"needs_you": needs_id})
+
+    def _answer_obligation(self, needs: NeedsYouRecord, option_id: str, answer_ev: str, now: datetime) -> AnswerOutcome:
+        """The owner said whether a payment pays a letter. "Yes": the payment and the answer are the proof."""
+        repo = self.repo
+        option = next((o for o in needs.options if o.id == option_id), None)
+        if option is None:
+            raise ValueError("not one of the options")
+        ob = repo.obligations[option.values["obligation"]]
+        rec = repo.transactions[needs.subject_id]
+        needs.status, needs.answer, needs.answered_at = "answered", option.id, now
+        amount = format_money(abs(rec.tx.amount), rec.tx.currency)
+        letter = self.obligations.payment_letter(ob)
+        if option.id == "no":
+            ob.declined_tx_ids.append(rec.id)
+            self.obligations.log("payment_not_for_letter", subject_id=ob.obligation.id,
+                                 evidence_ids=[rec.evidence_id, answer_ev], actor=OWNER_ACTOR)
+            self.activity(now, "answered", f"You said the {amount} payment does not pay the {letter}.",
+                          rec.company_id, evidence_ids=[answer_ev])
+            return AnswerOutcome(ok=True, message=f"Done. I'll keep watching for the payment that pays the {letter}.")
+        result = satisfy(ob.obligation, [ObligationAgent._payment_fact(rec)])
+        if not result.satisfied or result.quality is not Quality.GREEN:  # the letter changed meanwhile
+            raise ValueError("That payment no longer fits the letter.")
+        self.obligations._done(ob, result, how=f"Paid on {day_month(rec.tx.booked_on)}, as you confirmed.",
+                               extra=(answer_ev,))
+        ob.confirmed_by = (answer_ev,)
+        self.activity(now, "answered", f"You confirmed the {amount} payment pays the {letter}.", rec.company_id,
+                      amount=abs(rec.tx.amount), currency=rec.tx.currency, evidence_ids=[rec.evidence_id, answer_ev])
+        return AnswerOutcome(ok=True, message=f"Done. The {letter} is paid.")
+
+    def _answer_obligation_company(self, needs: NeedsYouRecord, option_id: str, answer_ev: str,
+                                   now: datetime) -> AnswerOutcome:
+        """The owner said which company a letter is for (or that it is not theirs). Their answer is evidence."""
+        repo = self.repo
+        option = next((o for o in needs.options if o.id == option_id), None)
+        if option is None:
+            raise ValueError("not one of the options")
+        pending = repo.pending_obligations[needs.subject_id]
+        needs.status, needs.answer, needs.answered_at = "answered", option.id, now
+        title = pending.finding.title
+        if option.id == "none":
+            pending.status = "declined"
+            self.obligations.log("letter_not_ours", subject_id=pending.id, evidence_ids=[pending.evidence_id, answer_ev],
+                                 actor=OWNER_ACTOR)
+            self.activity(now, "answered", f"You said the letter about “{title}” is not for your companies.", None,
+                          evidence_ids=[answer_ev])
+            return AnswerOutcome(ok=True, message="Done. I won't track it.")
+        company = option.values["company"]
+        pending.status = "recorded"
+        ob = self.obligations.record(pending.finding, pending.evidence_id, received_on=pending.received_on,
+                                     sender=pending.sender, text=pending.text, entity_id=company)
+        ob.reasons = (*ob.reasons, f"You said it is for {repo.company_name(company)}")
+        self.obligations.log("letter_company", subject_id=ob.obligation.id,
+                             evidence_ids=[pending.evidence_id, answer_ev], actor=OWNER_ACTOR,
+                             values={"entity_id": company})
+        name = repo.company_name(company) or "that company"
+        self.activity(now, "answered", f"You said the letter about “{title}” is for {name}.", company,
+                      amount=ob.obligation.amount, evidence_ids=[answer_ev])
+        return AnswerOutcome(ok=True, message=f"Done. I added it to {name}'s deadlines.")
+
+    def confirm_obligation(self, obligation_id: str, outcome: str, *, valid_until: date | None = None,
+                           data: bytes | None = None, filename: str | None = None,
+                           content_type: str | None = None) -> AnswerOutcome:
+        """The owner's explicit confirmation that an obligation was done, stored as evidence (§3, §24, §55).
+
+        ``outcome``: "sent" (a request was answered), "filed", "renewed" (with ``valid_until``) or
+        "not_renewing". A file (the reply, the receipt, the renewed policy) is stored with it. What is
+        to be paid is never closed this way: only its payment proves it.
+        """
+        repo = self.repo
+        ob = repo.obligations.get(obligation_id)
+        if ob is None:
+            raise KeyError(obligation_id)
+        if ob.done:
+            raise PermissionError("already done")
+        if ob.payable:
+            raise PermissionError("I close this one when I see the payment in your bank.")
+        wanted = {"sent": ProofKind.REPLY, "filed": ProofKind.SUBMISSION, "renewed": ProofKind.RENEWAL,
+                  "not_renewing": ProofKind.DECISION}.get(outcome)
+        allowed = {ProofKind.RENEWAL: (ProofKind.RENEWAL, ProofKind.DECISION)}.get(ob.proof, (ob.proof,))
+        if wanted is None or wanted not in allowed:
+            raise ValueError("That is not how this one gets done.")
+        now = repo.clock.now()
+        today = now.astimezone(TZ).date()
+        if wanted is ProofKind.RENEWAL and (valid_until is None or valid_until <= ob.obligation.due_on):
+            raise ValueError("Until when does the renewal run? It must run past "
+                             f"{day_month(ob.obligation.due_on, today)}.")
+        body = json.dumps({"obligation_id": ob.obligation.id, "outcome": outcome, "answered_by": repo.owner.email,
+                           "answered_at": now.isoformat(), "valid_until": valid_until.isoformat() if valid_until else None},
+                          sort_keys=True).encode()
+        reg = repo.registry.register(body, tenant_id=repo.tenant_id, source_kind=SourceKind.UPLOAD,
+                                     format=EvidenceFormat.JSON, mime_type="application/json", retrieved_at=now,
+                                     metadata={"kind": "owner_confirmation"})
+        evidence = [reg.evidence.id]
+        if data:  # the reply, the filing receipt or the renewed policy, kept as it came (§55)
+            filed = self.discovery.file(bytes(data), filename=filename, content_type=content_type,
+                                        source_kind=SourceKind.UPLOAD, at=now)
+            evidence += [r.evidence.id for r in filed.registrations if r.evidence.id not in evidence]
+        self.log("owner", "confirm_obligation", subject_id=ob.obligation.id, evidence_ids=evidence, actor=OWNER_ACTOR,
+                 values={"outcome": outcome})
+        repo.interactions.append(OwnerInteraction(at=now, active_seconds=ANSWER_SECONDS, kind=InteractionKind.ANSWER,
+                                                  entity_id=ob.obligation.entity_id))
+        fact = EvidenceFact(evidence_id=reg.evidence.id, kind=wanted, on=today, quality=Quality.GREEN,
+                            reference=ob.reference, valid_until=valid_until)
+        result = satisfy(ob.obligation, [fact])
+        self.obligations.log("satisfy", subject_id=ob.obligation.id, evidence_ids=[ob.evidence_id, *evidence],
+                             response={"satisfied": result.satisfied, "quality": result.quality.value},
+                             validations=list(result.reasons))
+        if not result.satisfied or result.quality is not Quality.GREEN:
+            raise ValueError(" ".join(result.reasons) or "That does not close it.")
+        self.obligations._done(ob, result, how=_confirmed_how(wanted, today, valid_until, by_owner=True),
+                               extra=evidence[1:])
+        ob.confirmed_by = tuple(evidence)
+        self.run(now)
+        return AnswerOutcome(ok=True, message=f"Done. {ob.title} is closed with your confirmation.")
+
+    def expected_invoice_not_coming(self, expected_id: str) -> AnswerOutcome:
+        """The owner says a usual invoice will not come (the service ended, nothing was billed that period).
+        Their statement is the evidence (§3, §55); the rhythm counts that period as covered."""
+        repo = self.repo
+        record = repo.expected_invoices.get(expected_id)
+        if record is None:
+            raise KeyError(expected_id)
+        if record.status != "missing":
+            raise PermissionError("already settled")
+        now = repo.clock.now()
+        body = json.dumps({"expected_invoice_id": record.id, "outcome": "not_coming", "answered_by": repo.owner.email,
+                           "answered_at": now.isoformat()}, sort_keys=True).encode()
+        reg = repo.registry.register(body, tenant_id=repo.tenant_id, source_kind=SourceKind.UPLOAD,
+                                     format=EvidenceFormat.JSON, mime_type="application/json", retrieved_at=now,
+                                     metadata={"kind": "owner_answer"})
+        self.log("owner", "expected_invoice_not_coming", subject_id=record.id, evidence_ids=[reg.evidence.id],
+                 actor=OWNER_ACTOR)
+        repo.interactions.append(OwnerInteraction(at=now, active_seconds=ANSWER_SECONDS, kind=InteractionKind.ANSWER,
+                                                  entity_id=record.company_id))
+        record.status = "not_coming"
+        self.advance(repo.items[record.item_id], Stage.NOT_REQUIRED, [reg.evidence.id], agent="missing_evidence",
+                     actor=f"{OWNER_ACTOR}:{repo.owner.email}", quality=Quality.GREEN,
+                     note="You said this invoice is not coming.")
+        month = record.period.name
+        self.activity(now, "answered", f"You said the {record.supplier_name} invoice for {month} is not coming.",
+                      record.company_id, evidence_ids=[reg.evidence.id])
+        self.run(now)
+        return AnswerOutcome(ok=True, message=f"Done. I won't wait for the {record.supplier_name} invoice for {month}.")
+
     # ----------------------------------------------------------------- the pipeline
 
     def run(self, at: datetime | None = None) -> RunReport:
@@ -3709,10 +4647,13 @@ class Orchestrator:
             moved = self._entities(now)
             moved += self._link_credit_notes(now)
             self.reconciliation.classify([r for r in self.repo.transactions.values() if r.decision is None])
+            moved += self.reconciliation.customer_refunds()  # money back to a customer: your own credit note
             moved += self.settlement.settle(now)  # payouts first: their reports and commission invoices
             matches = self.reconciliation.match()
             for m in matches:
                 self._reverify_with_bank(m)
+            moved += self._match_customer_refunds()
+            moved += self._settle_partial_refunds(now)
             proven = self.obligations.prove()
             moved += self.closure.progress()
             moved += len(matches) + len(proven)
@@ -3720,7 +4661,10 @@ class Orchestrator:
             if not moved:
                 break
         self.cost_centers.allocate(now)  # which job, property, vehicle ...: nothing at all without cost centers
+        self._ask_about_refund_amounts(now)  # a refund that does not match its credit note: one question
+        report.expected = self.missing.check_recurring(now)  # usual invoices that are overdue (§23)
         report.chased = self.missing.chase_all(now)
+        self.missing.chase_expected(now)
         self.accountant.answer_all(now)
         report.sent = self.deliver(now)
         self._announce_waiting(now)
@@ -3800,6 +4744,355 @@ class Orchestrator:
         """Credit notes linked to this invoice."""
         return sorted((d for d in self.repo.documents.values() if d.credit_for == document_id), key=lambda d: d.id)
 
+    # ----------------------------------------------------------------- refunds (§20): invoice -> credit note -> refund
+
+    @staticmethod
+    def is_supplier_refund(rec: TxRecord, doc: DocumentRecord) -> bool:
+        """Money back from a supplier against its credit note (not a credit note netted inside a payment)."""
+        return rec.tx.amount > 0 and doc.document.doc_type is DocumentType.CREDIT_NOTE and not doc.sales
+
+    def refunds_of(self, note: DocumentRecord) -> list[TxRecord]:
+        """The refunds matched to a supplier's credit note, oldest first."""
+        found = (self.repo.transactions[t] for t in note.matched_tx_ids if t in self.repo.transactions)
+        return sorted((r for r in found if r.tx.amount > 0), key=lambda r: (r.tx.booked_on, r.id))
+
+    def refunded(self, note: DocumentRecord) -> Decimal:
+        """What of a supplier's credit note came back. A refund matched to several credit notes at once (their
+        totals add up to it exactly) refunds each of them in full."""
+        total = abs(note.document.gross_amount or _ZERO)
+        back = _ZERO
+        for r in self.refunds_of(note):
+            together = any(d != note.id and d in self.repo.documents for d in r.document_ids)
+            back += total if together else abs(r.tx.amount)
+        return back
+
+    def credit_left(self, note: DocumentRecord) -> Decimal:
+        """What of a supplier's credit note has not come back to the bank yet."""
+        return abs(note.document.gross_amount or _ZERO) - self.refunded(note)
+
+    def customer_of(self, tx: Transaction) -> tuple[str, bool] | None:
+        """(name, same bank account) when this counterparty paid one of your own sales invoices (§20)."""
+        repo = self.repo
+        key = counterparty_key(tx.counterparty)
+        iban = normalize_iban(tx.counterparty_iban) if tx.counterparty_iban else None
+        by_name = None
+        for r in sorted(repo.transactions.values(), key=lambda r: (r.tx.booked_on, r.id)):
+            if r.id == tx.id or r.tx.amount <= 0 or not any(
+                    repo.documents[d].sales for d in r.document_ids if d in repo.documents):
+                continue
+            if iban and r.tx.counterparty_iban and normalize_iban(r.tx.counterparty_iban) == iban:
+                return display_name(r.tx.counterparty), True
+            if key and counterparty_key(r.tx.counterparty) == key and by_name is None:
+                by_name = (display_name(r.tx.counterparty), False)
+        return by_name
+
+    def refund_chain_lines(self, txs: Sequence[TxRecord], docs: Sequence[DocumentRecord]
+                           ) -> tuple[tuple[str, ...], str | None]:
+        """For a refund matched to a credit note: "Why?" lines naming the invoice it corrects and how that
+        invoice was paid, and a headline. Nothing for a credit note netted inside a payment."""
+        notes = [d for d in docs if d.document.doc_type is DocumentType.CREDIT_NOTE]
+        if len(txs) != 1 or not notes:
+            return (), None
+        rec = txs[0]
+        customer = rec.tx.amount < 0 and all(n.sales for n in notes)
+        if not (customer or all(self.is_supplier_refund(rec, n) for n in notes)):
+            return (), None
+        lines: list[str] = []
+        headline = None
+        for note in notes:
+            invoice = self.repo.documents.get(note.credit_for or "")
+            number = note.document.invoice_number or "on file"
+            if invoice is None:
+                continue
+            original = invoice.document.invoice_number or "on file"
+            lines.append(f"Credit note {number}: corrects invoice {original}")
+            paid = [self.repo.transactions[t] for t in invoice.matched_tx_ids if t in self.repo.transactions]
+            if paid:
+                p = paid[0]
+                verb = "paid" if p.tx.amount < 0 else "paid by the customer"
+                lines.append(f"Invoice {original}: {verb} {format_money(abs(p.tx.amount), p.tx.currency)} "
+                             f"on {day_month(p.tx.booked_on)}")
+            headline = headline or (
+                f"Refund to your customer for credit note {number}, which corrects invoice {original}." if customer
+                else f"Refund for credit note {number}, which corrects invoice {original}.")
+        return tuple(lines), headline
+
+    def refund_chain(self, *, tx_id: str | None = None, document_id: str | None = None) -> list[dict[str, Any]]:
+        """The steps invoice -> its payment -> credit note -> refund around one refund, credit note or invoice
+        (§20, §54), oldest first. Each: step, id, label, date, amount, currency, evidence ids. Empty without a
+        credit note."""
+        repo = self.repo
+        notes: list[DocumentRecord] = []
+        if tx_id is not None and tx_id in repo.transactions:
+            notes = [repo.documents[d] for d in repo.transactions[tx_id].document_ids
+                     if d in repo.documents and repo.documents[d].document.doc_type is DocumentType.CREDIT_NOTE]
+        elif document_id is not None and document_id in repo.documents:
+            doc = repo.documents[document_id]
+            notes = [doc] if doc.document.doc_type is DocumentType.CREDIT_NOTE else self.credits_for(doc.id)
+        steps: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def add(step: str, subject_id: str, label: str, day: date | None, amount: Decimal | None, currency: str,
+                evidence: Sequence[str]) -> None:
+            if subject_id not in seen:
+                seen.add(subject_id)
+                steps.append({"step": step, "id": subject_id, "label": label, "date": day, "amount": amount,
+                              "currency": currency, "evidenceIds": list(evidence)})
+
+        for note in notes:
+            invoice = repo.documents.get(note.credit_for or "")
+            if invoice is not None:
+                inv = invoice.document
+                add("invoice", invoice.id, invoice.label.split(" · ")[0], inv.issue_date,
+                    abs(inv.gross_amount) if inv.gross_amount is not None else None, inv.currency, invoice.evidence_ids)
+                for t in invoice.matched_tx_ids:
+                    p = repo.transactions.get(t)
+                    if p is None:
+                        continue
+                    money, day = format_money(abs(p.tx.amount), p.tx.currency), day_month(p.tx.booked_on)
+                    label = (f"Paid {money} to {self.merchant_name(p.tx)} on {day}" if p.tx.amount < 0
+                             else f"{display_name(p.tx.counterparty)} paid {money} on {day}")
+                    add("payment", p.id, label, p.tx.booked_on, abs(p.tx.amount), p.tx.currency, [p.evidence_id])
+            corrects = (f", which corrects invoice {invoice.document.invoice_number}"
+                        if invoice is not None and invoice.document.invoice_number else "")
+            nd = note.document
+            add("credit_note", note.id, f"{note.label.split(' · ')[0]}{corrects}", nd.issue_date,
+                abs(nd.gross_amount) if nd.gross_amount is not None else None, nd.currency, note.evidence_ids)
+            for t in note.matched_tx_ids:
+                r = repo.transactions.get(t)
+                if r is None or (r.tx.amount < 0 and not note.sales):
+                    continue  # a credit note netted inside a payment: that payment is the invoice's
+                money, day = format_money(abs(r.tx.amount), r.tx.currency), day_month(r.tx.booked_on)
+                label = (f"Refund of {money} received on {day}" if r.tx.amount > 0
+                         else f"Refund of {money} paid to {display_name(r.tx.counterparty)} on {day}")
+                add("refund", r.id, label, r.tx.booked_on, abs(r.tx.amount), r.tx.currency, [r.evidence_id])
+        return steps
+
+    def _match_customer_refunds(self) -> int:
+        """Money back to a customer, matched to your own credit note only on exact evidence: the same amount,
+        and the refund goes to the bank account the customer paid the corrected invoice from (§20)."""
+        repo = self.repo
+        refunds = [r for r in sorted(repo.transactions.values(), key=lambda r: r.id)
+                   if r.tx.amount < 0 and not r.document_ids and not r.private and r.tx.counterparty_iban
+                   and r.decision is not None and r.decision.rule == "customer_refund"
+                   and not repo.items[r.item_id].is_done
+                   and repo.items[r.item_id].stage not in (Stage.NEEDS_OWNER, Stage.CONFLICT)]
+        if not refunds:
+            return 0
+        notes = [d for d in sorted(repo.documents.values(), key=lambda d: d.id)
+                 if d.sales and d.document.doc_type is DocumentType.CREDIT_NOTE and not d.matched_tx_ids
+                 and not d.on_hold and d.document.quality is Quality.GREEN and d.credit_for in repo.documents
+                 and not repo.items[d.item_id].is_done]
+        fits: dict[str, list[DocumentRecord]] = {}
+        for rec in refunds:
+            iban = normalize_iban(rec.tx.counterparty_iban or "")
+            for note in notes:
+                doc = note.document
+                if doc.entity_id not in (None, rec.company_id) or doc.currency != rec.tx.currency \
+                        or abs(doc.gross_amount or _ZERO) != abs(rec.tx.amount):
+                    continue
+                payers = [repo.transactions[t] for t in repo.documents[note.credit_for or ""].matched_tx_ids
+                          if t in repo.transactions]
+                if any(p.tx.counterparty_iban and normalize_iban(p.tx.counterparty_iban) == iban for p in payers):
+                    fits.setdefault(rec.id, []).append(note)
+        moved = 0
+        for rec_id, found in sorted(fits.items()):
+            if len(found) != 1 or sum(1 for other in fits.values() if found[0] in other) != 1:
+                continue  # more than one way to pair them: never on a guess
+            note, rec = found[0], repo.transactions[rec_id]
+            invoice = repo.documents[note.credit_for or ""]
+            chain, headline = self.refund_chain_lines([rec], [note])
+            original = invoice.document.invoice_number or "on file"
+            rec.document_ids = [note.id]
+            rec.likely_document_ids = []
+            rec.match_why = (f"Credit note total: {format_money(abs(note.document.gross_amount or _ZERO))}",
+                             f"Money paid out: {format_money(abs(rec.tx.amount), rec.tx.currency)}",
+                             f"Bank account: the one the customer paid invoice {original} from", *chain)
+            rec.match_headline = headline or "Matched to your credit note."
+            note.matched_tx_ids = [rec.id]
+            self.reconciliation.log("match", subject_id=rec.id, evidence_ids=[rec.evidence_id, *note.evidence_ids],
+                                    values={"transactions": [rec.id], "documents": [note.id]},
+                                    validations=list(rec.match_why),
+                                    response={"quality": Quality.GREEN.value, "kind": "customer_refund"})
+            moved += 1
+        return moved
+
+    def _open_refunds(self) -> list[TxRecord]:
+        """Money back from a supplier with no credit note matched yet, nothing asked about it yet."""
+        repo = self.repo
+        return sorted((r for r in repo.transactions.values()
+                       if r.tx.amount > 0 and not r.document_ids and not r.private and r.tx.entity_id is not None
+                       and r.decision is not None and r.decision.expectation is EvidenceExpectation.REFUND_OR_CREDIT_NOTE
+                       and not repo.items[r.item_id].is_done
+                       and repo.items[r.item_id].stage not in (Stage.NEEDS_OWNER, Stage.CONFLICT)),
+                      key=lambda r: (r.tx.booked_on, r.id))
+
+    def _open_credit_notes(self, rec: TxRecord, supplier: Supplier) -> list[DocumentRecord]:
+        """That supplier's credit notes for that company with money still to come back."""
+        repo = self.repo
+        return sorted((d for d in repo.documents.values()
+                       if d.document.doc_type is DocumentType.CREDIT_NOTE and not d.sales and not d.on_hold
+                       and d.supplier_id == supplier.id and d.document.gross_amount is not None
+                       and d.document.currency == rec.tx.currency and d.document.entity_id in (None, rec.company_id)
+                       and d.id not in rec.not_for_document_ids and not repo.items[d.item_id].is_done
+                       and repo.items[d.item_id].stage not in (Stage.NEEDS_OWNER, Stage.CONFLICT)
+                       and not any(t in repo.transactions and repo.transactions[t].tx.amount < 0
+                                   for t in d.matched_tx_ids)
+                       and self.credit_left(d) > 0),
+                      key=lambda d: (d.document.issue_date or date.min, d.id))
+
+    def _settle_partial_refunds(self, now: datetime) -> int:
+        """The rest of a credit note refunded in parts: a refund equal to exactly what is still to come,
+        from the same supplier for the same company, is matched to it (and only when no other fits)."""
+        repo = self.repo
+        refunds = self._open_refunds()
+        if not refunds:
+            return 0
+        resolver = repo.resolver()
+        fits: dict[str, list[DocumentRecord]] = {}
+        for rec in refunds:
+            supplier = resolver.resolve_transaction(rec.tx).supplier
+            if supplier is None:
+                continue
+            found = [n for n in self._open_credit_notes(rec, supplier)
+                     if self.refunds_of(n) and self.credit_left(n) == rec.tx.amount]
+            if found:
+                fits[rec.id] = found
+        moved = 0
+        for rec_id, found in sorted(fits.items()):
+            if len(found) != 1 or sum(1 for other in fits.values() if found[0] in other) != 1:
+                continue  # more than one way to pair them: never on a guess
+            note, rec = found[0], repo.transactions[rec_id]
+            earlier = self.refunds_of(note)
+            note.matched_tx_ids.append(rec.id)
+            rec.document_ids = [note.id]
+            number = note.document.invoice_number or "on file"
+            chain, _ = self.refund_chain_lines([rec], [note])
+            before = ", ".join(f"{format_money(r.tx.amount, r.tx.currency)} on {day_month(r.tx.booked_on)}"
+                               for r in earlier)
+            rec.match_why = (f"Credit note total: {format_money(abs(note.document.gross_amount or _ZERO))}",
+                             f"Money received: {format_money(rec.tx.amount, rec.tx.currency)}",
+                             f"Earlier refunds: {before}", "Together: the credit note in full", *chain)
+            rec.match_headline = f"The rest of credit note {number}."
+            rec.likely_document_ids = []
+            self.reconciliation.log("match", subject_id=rec.id, evidence_ids=[rec.evidence_id, *note.evidence_ids],
+                                    values={"transactions": [rec.id], "documents": [note.id]},
+                                    validations=list(rec.match_why),
+                                    response={"quality": Quality.GREEN.value, "kind": "refund_in_parts"})
+            moved += 1
+        return moved
+
+    def _ask_about_refund_amounts(self, now: datetime) -> None:
+        """Money back that does not match the supplier's credit note: one plain question, never a close (§19)."""
+        repo = self.repo
+        resolver = repo.resolver()
+        for rec in self._open_refunds():
+            if any(n.subject_id == rec.id and n.status == "open" for n in repo.needs.values()):
+                continue
+            supplier = resolver.resolve_transaction(rec.tx).supplier
+            if supplier is None:
+                continue
+            notes = self._open_credit_notes(rec, supplier)
+            if any(n.id in rec.likely_document_ids and self.credit_left(n) == rec.tx.amount for n in notes):
+                continue  # the right amount, still being confirmed
+            notes = [n for n in notes if self.credit_left(n) != rec.tx.amount][:3]
+            if notes:
+                self._ask_refund(rec, notes, supplier, now)
+
+    def _ask_refund(self, rec: TxRecord, notes: Sequence[DocumentRecord], supplier: Supplier, now: datetime) -> None:
+        repo = self.repo
+        who = display_name(supplier.name)
+        amount = format_money(rec.tx.amount, rec.tx.currency)
+        when = day_month(rec.tx.booked_on, repo.today())
+
+        def number(n: DocumentRecord) -> str:
+            return n.document.invoice_number or "on file"
+
+        def left(n: DocumentRecord) -> str:
+            return format_money(self.credit_left(n), n.document.currency)
+
+        smaller = [n for n in notes if rec.tx.amount < self.credit_left(n)]
+        if len(notes) == 1:
+            ask = "Is this refund part of it?" if smaller else "What is this refund for?"
+            prompt = f"{who} refunded {amount} on {when}, but its credit note {number(notes[0])} is for {left(notes[0])}. {ask}"
+        else:
+            prompt = f"{who} refunded {amount} on {when}, but none of its credit notes is for that amount. What is it for?"
+        options = [CheckOption(id=f"part:{n.id}", label=f"Part of credit note {number(n)}. The rest is still to come.",
+                               values={"note": n.id}) for n in smaller]
+        chase = f" Ask {who} for its credit note." if supplier.contact_email else " I'll look for its own credit note."
+        options.append(CheckOption(id="other", label=f"Something else.{chase}",
+                                   values={"notes": ",".join(n.id for n in notes)}))
+        why = []
+        for n in notes:
+            back = self.refunded(n)
+            came = f", and {format_money(back, n.document.currency)} of it came back already" if back else ""
+            why.append(f"Credit note {number(n)} is for "
+                       f"{format_money(abs(n.document.gross_amount or _ZERO), n.document.currency)}{came}.")
+        account = repo.accounts.get(rec.tx.account_id)
+        company = repo.company_name(rec.company_id) or "your company"
+        why += [f"{amount} arrived in {company}'s account{f' ({account.label})' if account else ''} on {when}.",
+                "The amounts are not the same, so I won't match them on a guess.",
+                "Until you answer, I won't close this refund."]
+        needs_id = _unique_id(repo.needs, f"nd_{_slug(who.split()[0])}_refund")
+        repo.needs[needs_id] = NeedsYouRecord(
+            id=needs_id, kind="refund", subject_type="transaction", subject_id=rec.id, item_id=rec.item_id,
+            company_id=rec.company_id, created_at=now, why=tuple(why), prompt=prompt, options=tuple(options))
+        evidence = [rec.evidence_id, *(e for n in notes for e in n.evidence_ids)]
+        self.reconciliation.log("ask_owner", subject_id=rec.id, evidence_ids=evidence,
+                                values={"credit_notes": [n.id for n in notes], "refund": rec.tx.amount},
+                                response={"needs_you": needs_id})
+        self.activity(now, "checked", f"{who} refunded {amount}, but its credit note is for a different amount. "
+                      "I asked you about it.", rec.company_id, amount=rec.tx.amount, currency=rec.tx.currency,
+                      evidence_ids=evidence)
+        self.advance(repo.items[rec.item_id], Stage.NEEDS_OWNER, evidence, agent="reconciliation",
+                     note="A refund that does not match its credit note.")
+
+    def _answer_refund(self, needs: NeedsYouRecord, option_id: str, answer_ev: str, now: datetime) -> AnswerOutcome:
+        """The owner said whether a refund is part of a credit note for more, or for something else (§19, §37)."""
+        repo = self.repo
+        option = next((o for o in needs.options if o.id == option_id), None)
+        if option is None:
+            raise ValueError("not one of the options")
+        rec = repo.transactions[needs.subject_id]
+        item = repo.items[rec.item_id]
+        owner = f"{OWNER_ACTOR}:{repo.owner.email}"
+        who = self.merchant_name(rec.tx)
+        amount = format_money(rec.tx.amount, rec.tx.currency)
+        if option.id == "other":
+            needs.status, needs.answer, needs.answered_at = "answered", option.id, now
+            for note_id in str(option.values.get("notes", "")).split(","):
+                if note_id and note_id not in rec.not_for_document_ids:
+                    rec.not_for_document_ids.append(note_id)
+            self.advance(item, Stage.UNDERSTOOD, [rec.evidence_id, answer_ev], agent="reconciliation", actor=owner,
+                         note="Not for that credit note, as you said.")
+            self.activity(now, "answered", f"You said the {amount} refund from {who} is for something else.",
+                          rec.company_id, evidence_ids=[answer_ev])
+            return AnswerOutcome(ok=True, message="Done. I'm looking for its own credit note.")
+        note = repo.documents[option.values["note"]]
+        if rec.tx.amount >= self.credit_left(note):
+            raise ValueError("That credit note has no more than this left to refund.")
+        needs.status, needs.answer, needs.answered_at = "answered", option.id, now
+        rec.refund_answer_ev = answer_ev
+        note.matched_tx_ids.append(rec.id)
+        rec.document_ids = [note.id]
+        rec.likely_document_ids = []
+        number = note.document.invoice_number or "on file"
+        still = format_money(self.credit_left(note), note.document.currency)
+        chain, _ = self.refund_chain_lines([rec], [note])
+        rec.match_why = (f"Credit note total: {format_money(abs(note.document.gross_amount or _ZERO))}",
+                         f"Money received: {amount}", "You said: it is part of this credit note",
+                         f"Still to come: {still}", *chain)
+        rec.match_headline = f"Part of credit note {number}. {still} of it is still to come."
+        note.hold_reason = f"{still} of the {display_name(note.document.supplier_name)} credit note {number} is still to come."
+        self.reconciliation.log("match", subject_id=rec.id, evidence_ids=[rec.evidence_id, *note.evidence_ids, answer_ev],
+                                values={"transactions": [rec.id], "documents": [note.id]}, actor=OWNER_ACTOR,
+                                validations=list(rec.match_why), response={"kind": "refund_in_parts"})
+        self.advance(item, Stage.UNDERSTOOD, [rec.evidence_id, *note.evidence_ids, answer_ev], agent="reconciliation",
+                     actor=owner, note=f"Part of credit note {number}, as you said.")
+        self.activity(now, "answered", f"You said the {amount} refund from {who} is part of credit note {number}.",
+                      rec.company_id, amount=rec.tx.amount, currency=rec.tx.currency, evidence_ids=[answer_ev])
+        return AnswerOutcome(ok=True, message=f"Done. I counted it as part of credit note {number}. {still} is still to come.")
+
     def merchant_name(self, tx: Transaction) -> str:
         """Plain name of whoever was paid: the known supplier's name, else the cleaned bank descriptor."""
         supplier = self.repo.resolver().resolve_transaction(tx).supplier
@@ -3869,7 +5162,7 @@ class Orchestrator:
         answer_ev = self._record_answer(needs, option_id, now, split=split if needs.kind == "cost_center" else None)
         repo.interactions.append(OwnerInteraction(at=now, active_seconds=ANSWER_SECONDS,
                                                   kind=InteractionKind.APPROVAL if needs.kind == "approval"
-                                                  else InteractionKind.ANSWER, entity_id=needs.company_id))
+                                                  else InteractionKind.ANSWER, entity_id=needs.company_id or None))
         if needs.kind == "approval":
             outcome = self._answer_approval(needs, option_id, answer_ev, now)
         elif needs.kind == "check":
@@ -3878,6 +5171,12 @@ class Orchestrator:
             outcome = self._answer_company(needs, option_id, answer_ev, now)
         elif needs.kind == "cash":
             outcome = self._answer_cash(needs, option_id, answer_ev, now)
+        elif needs.kind == "obligation":
+            outcome = self._answer_obligation(needs, option_id, answer_ev, now)
+        elif needs.kind == "obligation_company":
+            outcome = self._answer_obligation_company(needs, option_id, answer_ev, now)
+        elif needs.kind == "refund":
+            outcome = self._answer_refund(needs, option_id, answer_ev, now)
         elif needs.kind == "cost_center":
             assert chosen is not None
             outcome = self._answer_cost_center(needs, option_id, chosen, remember, answer_ev, now)
@@ -4663,6 +5962,14 @@ def _join_words(words: Sequence[str]) -> str:
     if len(words) <= 1:
         return "".join(words)
     return ", ".join(words[:-1]) + f" and {words[-1]}"
+
+
+def _sender_line(sender: Any) -> str:
+    """'Millennium BCP <avisos@millenniumbcp.pt>' (the name helps recognise who wrote a letter)."""
+    if sender is None or not getattr(sender, "address", ""):
+        return ""
+    name = " ".join((getattr(sender, "name", "") or "").replace("<", " ").replace(">", " ").split())
+    return f"{name} <{sender.address}>" if name else sender.address
 
 
 def _letter_text(parts: Sequence[_Part]) -> str:

@@ -34,7 +34,8 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
-from backoffice.closure import Month
+from backoffice.closure import RENEWAL_KINDS, TAX_OBLIGATION_KINDS, Month
+from backoffice.domain.models import ObligationKind
 from backoffice.learning import counterparty_key, day_month, display_name, fold, format_money, learn_from_transactions
 from backoffice.learning.plain import count_phrase, join_and
 from backoffice.mailer import SIMULATED_NOTE, is_simulated
@@ -1407,6 +1408,8 @@ class RuleBrain:
                 parts.append(f"I found no {label} payment{' ' + p.phrase if p else ''}.")
             if s.category == "tax":
                 for ob in self.repo.obligations.values():
+                    if ob.obligation.kind is not ObligationKind.TAX_DEADLINE:
+                        continue  # a bank's request or a renewal is not an unpaid tax
                     if not ob.satisfied_by and (not s.company_ids or ob.obligation.entity_id in s.company_ids):
                         amount = f"{self._m(ob.obligation.amount)} " if ob.obligation.amount is not None else ""
                         parts.append(f"{self.repo.company_name(ob.obligation.entity_id)}’s {amount}is due on "
@@ -1452,9 +1455,19 @@ class RuleBrain:
             reports.insert(0, f"{len(payouts)} payouts are waiting for payout reports that add up.")
         report_chips = [{"label": self.ledger.payment_label(x), "id": x.evidence_id} for x, _ in payouts
                         if x.evidence_id]
+        # A supplier's usual invoice that is overdue (§23): missing although nothing was paid yet.
+        expected = [e for e in sorted(self.repo.expected_invoices.values(), key=lambda e: (e.due_on, e.id))
+                    if e.status == "missing" and (not s.company_ids or e.company_id in s.company_ids)
+                    and (p is None or p.start <= e.due_on <= p.end or p.start <= e.expected_on <= p.end)]
+        reports += [self.svc.orchestrator.missing.plan_expected(e) for e in expected[:3]]
+        report_chips += [{"label": f"{self.repo.company_name(e.company_id)} · {e.period.name}",
+                          "id": f"month:{e.company_id}:{e.period}"} for e in expected]
         if not items:
-            return _Answer(" ".join([f"Every payment that needs an invoice has one{when}.", *reports]),
-                           evidence=report_chips)
+            head = f"Every payment that needs an invoice has one{when}."
+            if expected:
+                head += (" One usual invoice has not arrived:" if len(expected) == 1 else
+                         f" {count_phrase(len(expected), 'usual invoice')} have not arrived:")
+            return _Answer(" ".join([head, *reports]), evidence=report_chips)
         head = "One payment still has no invoice" if len(items) == 1 else \
             f"{count_phrase(len(items), 'payment').capitalize()} still have no invoice"
         plans = [plan for _, plan in items[:4]]
@@ -1657,7 +1670,8 @@ class RuleBrain:
             items = [i for i in items if i["companyName"] in names]
         taxes = s.category == "tax" or re.search(r"\b(?:tax|taxes|vat|iva|impostos?)\b", u.text)
         if taxes:
-            items = [i for i in items if i["id"].startswith("due_obl_")]
+            items = [i for i in items if (ob := self.repo.obligations.get(i["id"][4:])) is not None
+                     and ob.obligation.kind in TAX_OBLIGATION_KINDS]
         parts = []
         if not items:
             parts.append(f"No {'tax ' if taxes else ''}payments are due in the next three weeks.")
@@ -1681,10 +1695,21 @@ class RuleBrain:
                         key=lambda r: (r.renews_on, r.name))
         named = [r for r in coming if _clean_name(r.name) and re.search(rf"\b{re.escape(_clean_name(r.name))}\b",
                                                                           u.text)]
-        if not coming:
+        # Renewals from letters (§24): insurance, contracts and licences, with what happens next.
+        letters = sorted((ob for ob in self.repo.obligations.values()
+                          if ob.obligation.kind in RENEWAL_KINDS and not ob.done and ob.obligation.due_on >= self.today
+                          and (not u.slots.company_ids or ob.obligation.entity_id in u.slots.company_ids)),
+                         key=lambda ob: (ob.obligation.due_on, ob.obligation.id))
+        lines = [f"{ob.title} ({self.repo.company_name(ob.obligation.entity_id)}) is due on "
+                 f"{self._day(ob.obligation.due_on)}. {self.svc.orchestrator.obligations.next_step(ob)}"
+                 for ob in letters]
+        if not coming and not lines:
             return _Answer("I don't know of any renewals coming up.")
-        return _Answer(" ".join(f"{r.name} ({self.repo.company_name(r.company_id)}) renews on {self._day(r.renews_on)}: "
-                                f"{r.detail[:1].lower()}{r.detail[1:]}." for r in (named or coming)))
+        evidence = [{"label": f"{ob.title} · {self.repo.company_name(ob.obligation.entity_id)} letter",
+                     "id": ob.evidence_id} for ob in letters]
+        return _Answer(" ".join([*(f"{r.name} ({self.repo.company_name(r.company_id)}) renews on "
+                                   f"{self._day(r.renews_on)}: {r.detail[:1].lower()}{r.detail[1:]}."
+                                   for r in (named or coming)), *lines]), evidence=evidence)
 
     def _i_subscriptions(self, u: Understanding) -> _Answer:
         prices = self.svc._price_answer()

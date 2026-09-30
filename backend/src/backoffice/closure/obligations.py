@@ -64,7 +64,10 @@ from ._text import (
 )
 
 __all__ = [
+    "AUTO_RENEWS",
     "DEFAULT_DUE_SOON_DAYS",
+    "RENEWAL_KINDS",
+    "ConfirmationFinding",
     "DueItem",
     "EvidenceFact",
     "Issuer",
@@ -72,13 +75,17 @@ __all__ = [
     "ProofKind",
     "Satisfaction",
     "VerificationCondition",
+    "detect_confirmation",
     "detect_obligation",
     "due_soon",
     "normalize_reference",
+    "proof_for",
     "satisfy",
 ]
 
 DEFAULT_DUE_SOON_DAYS = 14  # product default for Home "Due soon" (§35), not a legal figure
+# The consequence of a renewal that happens by itself: nothing is needed unless the owner wants a change.
+AUTO_RENEWS = "It renews on its own unless you act."
 
 
 # =========================================================================== vocabulary
@@ -207,6 +214,16 @@ _PROOF_FOR_KIND: dict[ObligationKind, ProofKind] = {
     ObligationKind.CONTRACT_RENEWAL: ProofKind.RENEWAL,
     ObligationKind.LICENSE_RENEWAL: ProofKind.RENEWAL,
 }
+
+RENEWAL_KINDS: frozenset[ObligationKind] = frozenset(
+    {ObligationKind.INSURANCE_RENEWAL, ObligationKind.CONTRACT_RENEWAL, ObligationKind.LICENSE_RENEWAL}
+)
+
+
+def proof_for(kind: ObligationKind) -> ProofKind:
+    """What proves an obligation of this kind done: a payment, a filing receipt, a reply or a renewal."""
+    return _PROOF_FOR_KIND[ObligationKind(kind)]
+
 
 # Default routing (§25, §28): the accountant usually files returns; the owner does the rest.
 _RESPONSIBLE: dict[ObligationKind, str] = {ObligationKind.FILING: "accountant"}
@@ -650,7 +667,7 @@ def _title(kind: ObligationKind, issuer: Issuer) -> str:
 
 def _consequence(folded: str, kind: ObligationKind) -> str:
     if _has("auto_renew", folded):
-        return "It renews on its own unless you act."
+        return AUTO_RENEWS
     named = [label for label, pattern in _CONSEQUENCE_PATTERNS if pattern.search(folded)]
     if named:
         return f"The letter mentions {join_and(named)}."
@@ -770,6 +787,11 @@ class ObligationFinding:
     @property
     def complete(self) -> bool:
         return self.obligation is not None
+
+    @property
+    def renews_on_its_own(self) -> bool:
+        """A renewal the letter says happens by itself: shown for information, nothing to do (§24, §42)."""
+        return self.kind in RENEWAL_KINDS and self.consequence == AUTO_RENEWS
 
     @property
     def question(self) -> str | None:
@@ -1014,6 +1036,156 @@ def _why_lines(
     if reference:
         lines.append(f"Reference {reference}")
     return lines
+
+
+# =========================================================================== confirmations (proof that it was done)
+
+# Folded phrases, Portuguese and English. Unverified conventions (verified_as_of: never); extend
+# as letters are seen. A confirmation is never proof on its own: the caller checks it against the
+# obligations on file (same company, kind, sender and reference) and closes one only when exactly
+# one fits (§3, §24).
+_STILL_ASKING = ("ainda precisamos", "ainda necessitamos", "continua em falta", "continuam em falta",
+                 "documentos em falta", "documentacao em falta", "falta enviar", "faltam", "queira enviar",
+                 "por favor envie", "solicitamos", "se nao pagar", "se nao efetuar", "se nao for paga",
+                 "se nao for pago", "caso nao pague", "caso nao efetue", "still need", "still missing",
+                 "still required", "missing documents", "please send", "please provide", "please upload",
+                 "unless", "if you do not", "if payment is not")  # fmt: skip
+_DECIDED = ("contrato cessado", "cessacao do contrato", "cessacao do seu contrato", "contrato terminado",
+            "contrato rescindido", "rescisao do contrato", "confirmamos a denuncia", "confirmamos a cessacao",
+            "confirmamos o cancelamento", "cancelamento confirmado", "apolice anulada", "apolice cancelada",
+            "nao sera renovado", "nao sera renovada", "has been cancelled", "has been canceled",
+            "has been terminated", "was terminated", "cancellation confirmed", "termination confirmed",
+            "will not be renewed")  # fmt: skip
+_RENEWED = ("foi renovado", "foi renovada", "foram renovados", "renovado ate", "renovada ate",
+            "renovacao efetuada", "renovacao efectuada", "renovacao concluida", "renovacao confirmada",
+            "confirmamos a renovacao", "renovado com sucesso", "renovada com sucesso", "has been renewed",
+            "was renewed", "renewed until", "renewal confirmed", "renewal is confirmed", "we have renewed",
+            "successfully renewed")  # fmt: skip
+_SUBMITTED = ("comprovativo de entrega", "declaracao submetida", "declaracao entregue", "declaracao foi submetida",
+              "declaracao foi entregue", "declaracao recebida", "entregue com sucesso", "submetida com sucesso",
+              "has been submitted", "was submitted", "submitted successfully", "successfully submitted",
+              "return received", "received your return", "successfully filed", "filing confirmation")  # fmt: skip
+_ANSWERED = ("recebemos os seus documentos", "recebemos a sua documentacao", "recebemos a documentacao",
+             "recebemos os documentos", "documentos recebidos", "documentacao recebida", "recebemos a sua resposta",
+             "resposta recebida", "confirmamos a rececao", "confirmamos a recepcao", "pedido concluido",
+             "processo concluido", "processo encerrado", "dados atualizados", "dados actualizados",
+             "atualizacao concluida", "actualizacao concluida", "verificacao concluida",
+             "we have received your documents", "we received your documents", "received your documents",
+             "documents received", "received your reply", "received your response", "confirm receipt",
+             "thank you for sending", "thank you for providing", "details have been updated",
+             "your details are up to date", "verification complete", "verification completed",
+             "identity has been verified", "request completed", "request has been completed",
+             "no further action")  # fmt: skip
+_CONTRACT = ("contrato", "contract", "subscricao", "subscription", "assinatura", "avenca", "service agreement")
+_VALIDITY = ("ate", "until", "valido ate", "valida ate", "valid until", "valid to", "validade", "nova validade",
+             "nova data de validade", "new expiry date", "expires on", "expira em", "expira a", "termina em",
+             "ends on", "renovado ate", "renovada ate", "renewed until")  # fmt: skip
+_C = {name: phrase_pattern(phrases) for name, phrases in {
+    "still_asking": _STILL_ASKING, "decided": _DECIDED, "renewed": _RENEWED, "submitted": _SUBMITTED,
+    "answered": _ANSWERED, "contract": _CONTRACT, "validity": _VALIDITY,
+}.items()}  # fmt: skip
+_CONFIRMED_LINE = {
+    ProofKind.REPLY: "They confirm they received what they asked for",
+    ProofKind.SUBMISSION: "Filing receipt",
+    ProofKind.RENEWAL: "Renewed",
+    ProofKind.DECISION: "Confirmed it will not be renewed",
+}
+_REPLY_KINDS = frozenset({ObligationKind.KYC_REQUEST, ObligationKind.BANK_REQUEST, ObligationKind.GOVERNMENT_REQUEST})
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmationFinding:
+    """A letter or message saying that something asked for was done (§24).
+
+    ``proof`` is what it shows: a reply received, a filing receipt, a renewal (and how long it
+    now runs, ``valid_until``) or an ending (a DECISION not to renew). ``kinds`` are the kinds of
+    obligation it can confirm. It proves nothing by itself: the caller closes an obligation with
+    it only when exactly one open obligation fits (§3).
+    """
+
+    proof: ProofKind
+    kinds: frozenset[ObligationKind]
+    issuer: Issuer
+    entity_id: str | None
+    reference: str | None
+    valid_until: date | None
+    on: date
+    reasons: tuple[str, ...]
+
+    def fact(self, evidence_id: str, quality: Quality = Quality.GREEN) -> EvidenceFact:
+        """The confirmation as proof for :func:`satisfy`."""
+        return EvidenceFact(evidence_id=evidence_id, kind=self.proof, on=self.on, quality=quality,
+                            reference=self.reference, valid_until=self.valid_until)
+
+
+def _validity(body: str, received_on: date) -> date | None:
+    """The date a renewal now runs until: the one date after a validity word, else the one future date."""
+    hits = _date_hits(body, received_on)
+    anchored = _anchored(body, _C["validity"], hits, 40)
+    pool = anchored or hits
+    values = sorted({h.value for h in pool if h.value > received_on})  # type: ignore[operator]
+    return values[0] if len(values) == 1 else None  # type: ignore[return-value]
+
+
+def _confirmed_kinds(proof: ProofKind, body: str, issuer: Issuer) -> frozenset[ObligationKind]:
+    if proof in (ProofKind.RENEWAL, ProofKind.DECISION):
+        if _has("license", body):
+            return frozenset({ObligationKind.LICENSE_RENEWAL})
+        if issuer is Issuer.INSURER or _has("insurance", body):
+            return frozenset({ObligationKind.INSURANCE_RENEWAL})
+        if _C["contract"].search(body):
+            return frozenset({ObligationKind.CONTRACT_RENEWAL})
+        return RENEWAL_KINDS
+    if proof is ProofKind.SUBMISSION:
+        return frozenset({ObligationKind.FILING})
+    if _has("kyc", body):
+        return frozenset({ObligationKind.KYC_REQUEST})
+    if issuer is Issuer.BANK:
+        return frozenset({ObligationKind.KYC_REQUEST, ObligationKind.BANK_REQUEST})
+    if issuer in (Issuer.TAX_AUTHORITY, Issuer.SOCIAL_SECURITY):
+        return frozenset({ObligationKind.GOVERNMENT_REQUEST})
+    return _REPLY_KINDS
+
+
+def detect_confirmation(
+    text: str,
+    *,
+    received_on: date,
+    sender: str = "",
+    source_kind: SourceKind | None = None,
+    entities: Sequence[LegalEntity] = (),
+    default_entity_id: str | None = None,
+) -> ConfirmationFinding | None:
+    """Read one letter or message that says an obligation was done, or None (§24).
+
+    "Recebemos os seus documentos", "A sua licença foi renovada até 30/11/2027", "Comprovativo de
+    entrega", "Your contract has been terminated". A message that is still asking for something
+    ("we still need", "please send", "unless") is never a confirmation. Like detection, this reads
+    wording only: the caller decides whether it matches exactly one obligation on file.
+    """
+    body = fold(text)
+    everything = fold(f"{sender} {text}")
+    if not body or _C["still_asking"].search(body):
+        return None
+    proof = next((p for name, p in (("decided", ProofKind.DECISION), ("renewed", ProofKind.RENEWAL),
+                                    ("submitted", ProofKind.SUBMISSION), ("answered", ProofKind.REPLY))
+                  if _C[name].search(body)), None)
+    if proof is None:
+        return None
+    issuer = _issuer(everything, source_kind)
+    valid_until = _validity(body, received_on) if proof is ProofKind.RENEWAL else None
+    reference = _reference(body)
+    entity_id, _ = _entity(everything, entities, default_entity_id)
+    lines = [_ISSUER_LINE[issuer]] if issuer in _ISSUER_LINE else []
+    lines.append(_CONFIRMED_LINE[proof])
+    if valid_until is not None:
+        lines.append(f"Valid until {day_month(valid_until, received_on)}")
+    if reference:
+        lines.append(f"Reference {reference}")
+    return ConfirmationFinding(
+        proof=proof, kinds=_confirmed_kinds(proof, body, issuer), issuer=issuer, entity_id=entity_id,
+        reference=reference, valid_until=valid_until, on=received_on, reasons=tuple(lines),
+    )
 
 
 # =========================================================================== satisfaction

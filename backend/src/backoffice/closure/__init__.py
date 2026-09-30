@@ -138,7 +138,10 @@ from .month import (
     render_closed_summary,
 )
 from .obligations import (
+    AUTO_RENEWS,
     DEFAULT_DUE_SOON_DAYS,
+    RENEWAL_KINDS,
+    ConfirmationFinding,
     DueItem,
     EvidenceFact,
     Issuer,
@@ -146,9 +149,11 @@ from .obligations import (
     ProofKind,
     Satisfaction,
     VerificationCondition,
+    detect_confirmation,
     detect_obligation,
     due_soon,
     normalize_reference,
+    proof_for,
     satisfy,
 )
 from .package import (
@@ -175,7 +180,9 @@ from .period import Month
 
 __all__ = [
     "AUDIT_DAYS",
+    "AUTO_RENEWS",
     "DEFAULT_DUE_SOON_DAYS",
+    "RENEWAL_KINDS",
     "MANIFEST_SCHEMA",
     "PT_EXCEL",
     "STANDARD_CSV",
@@ -202,6 +209,7 @@ __all__ = [
     "CloseSummary",
     "ClosedSummaryText",
     "CompanyLine",
+    "ConfirmationFinding",
     "ConnectorCoverage",
     "CsvFormat",
     "CustomerSuccessReport",
@@ -257,6 +265,7 @@ __all__ = [
     "closed_summary",
     "compute_month_status",
     "customer_success",
+    "detect_confirmation",
     "detect_obligation",
     "due_soon",
     "evaluate_activation",
@@ -268,6 +277,7 @@ __all__ = [
     "normalize_reference",
     "owner_touched",
     "plan_month_end",
+    "proof_for",
     "render_business_audit",
     "render_closed_summary",
     "satisfy",

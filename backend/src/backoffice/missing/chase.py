@@ -46,6 +46,7 @@ __all__ = [
     "InboundEmail",
     "Language",
     "MatchMethod",
+    "RecurringChaseFacts",
     "ReminderDecision",
     "ReminderPolicy",
     "ReminderStep",
@@ -55,12 +56,14 @@ __all__ = [
     "choose_language",
     "clean_invoice_number",
     "compose_correction_request",
+    "compose_recurring_request",
     "compose_reminder",
     "compose_request",
     "day_month_pt",
     "format_money_pt",
     "match_reply",
     "next_reminder",
+    "recurring_activity_line",
     "thread_token",
     "valid_mail_domain",
 ]
@@ -176,6 +179,8 @@ class ChaseFacts:
     company_country: str = "PT"
     invoice_number: str | None = None
     language: Language = Language.EN
+    # Money back from the supplier: what is asked for is its credit note, for the refund received.
+    refund: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.amount, float) or not isinstance(self.amount, (Decimal, int)):
@@ -210,6 +215,7 @@ class ChaseFacts:
             company_country=company.country,
             invoice_number=clean_invoice_number(invoice_number),
             language=language or choose_language(supplier, supplier.contact_email),
+            refund=transaction.amount > 0,
         )
 
 
@@ -240,7 +246,7 @@ def _guard(*texts: str) -> None:
             raise ValueError("a supplier message may not contain internal identifiers")
 
 
-def _our_details(facts: ChaseFacts) -> str:
+def _our_details(facts: ChaseFacts | RecurringChaseFacts) -> str:
     is_pt = facts.company_country.strip().upper() == "PT"
     tax_id = (normalize_tax_id(facts.company_tax_id) if is_pt else None) or facts.company_tax_id.strip()
     label = "NIF" if is_pt else ("NIF/VAT" if facts.language is Language.PT else "VAT number")
@@ -258,7 +264,28 @@ def _money_and_date(facts: ChaseFacts, today: date) -> tuple[str, str]:
     return format_money(facts.amount, facts.currency), day_month(facts.paid_on, today)
 
 
+def _refund_request_text(facts: ChaseFacts, today: date) -> tuple[str, str]:
+    """Money came back without its credit note: ask for the credit note (§20 refunds, §22)."""
+    money, when = _money_and_date(facts, today)
+    if facts.language is Language.PT:
+        subject = f"Nota de crédito do reembolso de {money} de {when}"
+        body = (
+            f"Olá,\n\nRecebemos um reembolso de {money} a {when}. Poderiam, por favor, enviar-nos a nota de "
+            f"crédito correspondente? Agradecemos desde já.\n\n{_our_details(facts)}\n\n"
+            f"Com os melhores cumprimentos,\n{facts.company_name}"
+        )
+        return subject, body
+    subject = f"Credit note for the {money} refund of {when}"
+    body = (
+        f"Hello,\n\nWe received a refund of {money} on {when}. Could you please send us the credit note for it? "
+        f"Thank you.\n\n{_our_details(facts)}\n\nKind regards,\n{facts.company_name}"
+    )
+    return subject, body
+
+
 def _request_text(facts: ChaseFacts, today: date) -> tuple[str, str]:
+    if facts.refund:
+        return _refund_request_text(facts, today)
     money, when = _money_and_date(facts, today)
     number = facts.invoice_number
     if facts.language is Language.PT:
@@ -286,6 +313,18 @@ def _request_text(facts: ChaseFacts, today: date) -> tuple[str, str]:
 def _reminder_text(facts: ChaseFacts, today: date) -> str:
     money, when = _money_and_date(facts, today)
     number = facts.invoice_number
+    if facts.refund:
+        if facts.language is Language.PT:
+            return (
+                f"Olá,\n\nRelembramos o nosso pedido: a nota de crédito do reembolso de {money} de {when}. "
+                f"Poderiam enviá-la assim que possível? Agradecemos desde já.\n\n{_our_details(facts)}\n\n"
+                f"Com os melhores cumprimentos,\n{facts.company_name}"
+            )
+        return (
+            f"Hello,\n\nA quick reminder about the credit note for the {money} refund of {when}. "
+            f"Could you please send it when you can? Thank you.\n\n{_our_details(facts)}\n\n"
+            f"Kind regards,\n{facts.company_name}"
+        )
     if facts.language is Language.PT:
         what = f"a fatura {number}" if number else "a fatura"
         return (
@@ -536,4 +575,79 @@ def match_reply(threads: Iterable[ChaseThread], inbound: InboundEmail) -> ReplyM
 
 def activity_line(facts: ChaseFacts) -> str:
     """Quiet Activity entry (§42): 'Asked Vodafone for the invoice for the €117.20 payment.'"""
+    if facts.refund:
+        return (f"Asked {facts.supplier_name} for the credit note for the "
+                f"{format_money(facts.amount, facts.currency)} refund.")
     return f"Asked {facts.supplier_name} for the invoice for the {format_money(facts.amount, facts.currency)} payment."
+
+
+# --------------------------------------------------------------------------- a usual invoice that has not arrived (§23)
+
+_EN_MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+              "November", "December")
+
+
+@dataclass(frozen=True)
+class RecurringChaseFacts:
+    """A supplier's usual invoice that has not arrived yet (§23). There is no payment to quote:
+    only the period and the day it normally arrives by. Nothing else reaches the supplier."""
+
+    supplier_name: str
+    supplier_email: str
+    period_year: int
+    period_month: int  # 1..12: the period the missing invoice is for
+    usually_by: date  # it normally arrives by this day
+    company_name: str
+    company_tax_id: str
+    company_country: str = "PT"
+    language: Language = Language.EN
+
+    def __post_init__(self) -> None:
+        if not _PLAIN_ADDRESS.fullmatch(self.supplier_email):
+            raise ValueError("supplier email must be one plain address")
+        if not 1 <= self.period_month <= 12:
+            raise ValueError("period month must be 1..12")
+
+    @classmethod
+    def build(cls, supplier: Supplier, company: LegalEntity, *, period: date, usually_by: date,
+              language: Language | None = None) -> RecurringChaseFacts:
+        if not supplier.contact_email:
+            raise ValueError("the supplier has no contact email")
+        return cls(
+            supplier_name=display_name(supplier.name), supplier_email=supplier.contact_email,
+            period_year=period.year, period_month=period.month, usually_by=usually_by,
+            company_name=company.name.strip(), company_tax_id=company.tax_id, company_country=company.country,
+            language=language or choose_language(supplier, supplier.contact_email),
+        )
+
+
+def compose_recurring_request(facts: RecurringChaseFacts, *, token: str, today: date,
+                              message_id_domain: str) -> ChaseMessage:
+    """Ask for a usual invoice that is overdue (§23): 'Your invoice for October 2026 usually reaches us by
+    26 October, and we have not received it yet. Could you please send it?'"""
+    ours = _our_details(facts)
+    if facts.language is Language.PT:
+        period = f"{PT_MONTHS[facts.period_month - 1]} de {facts.period_year}"
+        subject = f"Fatura de {period}"
+        body = (
+            f"Olá,\n\nA vossa fatura de {period} costuma chegar-nos até {day_month_pt(facts.usually_by, today)} e "
+            f"ainda não a recebemos. Poderiam, por favor, enviá-la? Agradecemos desde já.\n\n{ours}\n\n"
+            f"Com os melhores cumprimentos,\n{facts.company_name}"
+        )
+    else:
+        period = f"{_EN_MONTHS[facts.period_month - 1]} {facts.period_year}"
+        subject = f"Invoice for {period}"
+        body = (
+            f"Hello,\n\nYour invoice for {period} usually reaches us by {day_month(facts.usually_by, today)}, and we "
+            f"have not received it yet. Could you please send it? Thank you.\n\n{ours}\n\n"
+            f"Kind regards,\n{facts.company_name}"
+        )
+    subject = f"{subject} (Ref. {token})"
+    _guard(subject, body)
+    return ChaseMessage(to=facts.supplier_email, subject=subject, body=body, language=facts.language, token=token,
+                        message_id=_message_id(token, 0, today, message_id_domain))
+
+
+def recurring_activity_line(facts: RecurringChaseFacts) -> str:
+    """'Asked Vodafone for its usual invoice for October.'"""
+    return f"Asked {facts.supplier_name} for its usual invoice for {_EN_MONTHS[facts.period_month - 1]}."

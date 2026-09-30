@@ -348,10 +348,11 @@ def _fixes(t: _Tenant, rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]
             add("amber", f"conn:{c['id']}", f"{c['name']} is not syncing ({c['account']})",
                 c.get("message") or "The month cannot close until it syncs again.",
                 companies[0] if len(companies) == 1 else None, "/sources")
-    open_obligations = [o.obligation for o in repo.obligations.values() if not o.satisfied_by]
+    open_obligations = [o.obligation for o in repo.obligations.values() if not o.satisfied_by and not o.informational]
     for due in due_soon(open_obligations, svc._today(), within_days=DEADLINE_DAYS):
         amount = format_money(due.amount, due.currency) if due.amount is not None else None
-        detail = " · ".join(p for p in (amount, f"Due {due.due_on.isoformat()}", "No payment seen yet") if p)
+        seen = "No payment seen yet" if repo.obligations[due.obligation_id].payable else "No proof seen yet"
+        detail = " · ".join(p for p in (amount, f"Due {due.due_on.isoformat()}", seen) if p)
         add("red" if due.overdue else "amber", f"due:{due.obligation_id}", f"{due.title} {due.when}", f"{detail}.",
             due.entity_id, None)
     for n in repo.open_needs():
@@ -361,7 +362,8 @@ def _fixes(t: _Tenant, rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]
             prompt = n.question.prompt if n.question is not None else "The owner needs to answer one question."
             add("blue", n.id, f"{who} {format_money(abs(rec.tx.amount), rec.tx.currency)}: waiting for the owner",
                 prompt, n.company_id, f"/needs-you#{n.id}")
-        elif n.kind in ("company", "cash"):  # which company carries it; a cash receipt to confirm
+        elif n.kind in ("company", "cash", "obligation", "refund", "obligation_company"):
+            # which company carries it; a cash receipt to confirm; a letter's payment; a refund; a letter's company
             shown = svc._question(n)
             amount = format_money(Decimal(str(shown["amount"] or 0)), shown["currency"])
             add("blue", n.id, f"{shown['merchant']} {amount}: waiting for the owner", n.prompt, n.company_id,

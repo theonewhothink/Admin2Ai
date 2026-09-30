@@ -153,7 +153,8 @@ def build_business(h: Harness, token: str) -> dict[str, Any]:
     seen["cost_centers"] = [outlet["costCenter"]["id"]]
     glance()
     csv = BANK_CSV.replace(b"{acct}", bank["id"].encode()).replace(b"{card}", card["id"].encode())
-    ok(c.post("/api/evidence", files={"file": ("extrato.csv", csv, "text/csv")}, headers=H))
+    rows = ok(c.post("/api/evidence", files={"file": ("extrato.csv", csv, "text/csv")}, headers=H))
+    seen["transactions"] = list(rows["transactions"])
     doc = ok(c.post("/api/evidence", files={"file": ("edp.txt", E.EDP_INVOICE, "text/plain")}, headers=H))
     seen["documents"] = [d["id"] for d in doc["documents"]]
     ok(c.post("/api/evidence", json={"filename": "letter.txt", "contentType": "text/plain",

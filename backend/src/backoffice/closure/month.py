@@ -54,6 +54,7 @@ from .activity import (
 from .period import Month
 
 __all__ = [
+    "EXPECTED_INVOICE",
     "TAX_OBLIGATION_KINDS",
     "Blocker",
     "BlockerKind",
@@ -77,6 +78,8 @@ __all__ = [
 TAX_OBLIGATION_KINDS: frozenset[ObligationKind] = frozenset(
     {ObligationKind.TAX_DEADLINE, ObligationKind.FILING}
 )
+# Tracked subject: a recurring supplier invoice that is overdue (§23). Missing until it arrives.
+EXPECTED_INVOICE = "expected_invoice"
 
 
 # --------------------------------------------------------------------------- inputs
@@ -314,6 +317,7 @@ _NOUNS = {
     "transaction": ("payment", "payments"),
     "document": ("document", "documents"),
     "obligation": ("deadline", "deadlines"),
+    "expected_invoice": ("invoice", "invoices"),
 }
 
 
@@ -421,6 +425,11 @@ def _bucket_items(items: Sequence[TrackedItem], decisions: Sequence[EvidenceDeci
             raise ValueError(f"duplicate tracked item {item.id}")
         state = classify_item(item)
         buckets.states[item.id] = state
+        if item.subject_type == EXPECTED_INVOICE:
+            # A supplier's usual invoice that has not arrived (§23): a missing document until it does.
+            if state is not ItemState.DONE and _before_match(item):
+                buckets.missing.append(item)
+            continue
         if item.subject_type != "transaction":
             continue
         tracked_tx.add(item.subject_id)

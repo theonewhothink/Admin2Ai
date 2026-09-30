@@ -63,6 +63,14 @@ __all__ = ["BackOfficeService", "ServiceError"]
 BANK_CONSENT_DAYS = 180  # PSD2 access consent (RTS Art. 10, as amended 2022): renew at most every 180 days
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _SLUG = re.compile(r"[^a-z0-9]+")
+# Needs-You questions shown as one plain choice with the engine's own prompt and options (§37).
+_PLAIN_QUESTIONS = ("company", "cash", "obligation", "refund", "obligation_company")
+_ISSUER_NAMES = {"tax_authority": "Tax office", "social_security": "Social Security", "bank": "Your bank",
+                 "landlord": "Your landlord", "insurer": "Your insurer"}
+_STAGE_WORDS = {Stage.DISCOVERED: "Found", Stage.ACQUIRED: "Received", Stage.UNDERSTOOD: "Read",
+                Stage.VERIFIED: "Checked", Stage.MATCHED: "Matched", Stage.ACTED: "Done", Stage.CONFIRMED: "Confirmed",
+                Stage.CLOSED: "Closed", Stage.NEEDS_OWNER: "Waiting for you", Stage.CONFLICT: "Details disagree",
+                Stage.NOT_REQUIRED: "Nothing needed"}
 
 
 def _default_vault() -> Any:
@@ -285,14 +293,21 @@ class BackOfficeService:
         open_obligations = [o.obligation for o in self.repo.obligations.values() if not o.satisfied_by]
         for due in due_soon(open_obligations, today, within_days=21):
             record = self.repo.obligations[due.obligation_id]
+            if record.informational and due.overdue:
+                continue  # it renewed on its own: nothing was ever due from the owner
             amount = f"{format_money(due.amount, due.currency)} · " if due.amount is not None else ""
             reference = f"reference {record.reference}. " if record.reference else ""
             tone = "risk" if due.overdue else ("attention" if due.days_left <= 5 else "neutral")
+            if record.payable:
+                note = f"{amount}{reference}I will check the payment when it goes out.".replace(" · reference",
+                                                                                         ", reference")
+            else:
+                note = self.orchestrator.obligations.next_step(record)
+                tone = "neutral" if record.informational else tone
             items.append({
                 "id": f"due_{due.obligation_id}", "title": due.title,
                 "companyName": self._company_name(due.entity_id) or "", "due": _iso(due.due_on),
-                "note": f"{amount}{reference}I will check the payment when it goes out.".replace(" · reference", ", reference"),
-                "tone": tone,
+                "note": note, "tone": tone,
             })
         return sorted(items, key=lambda i: (i["due"], i["id"]))
 
@@ -965,6 +980,131 @@ class BackOfficeService:
         return {"filename": name, "contentType": "application/zip", "count": count,
                 "data": base64.b64encode(data).decode()}
 
+    # ----------------------------------------------------------------- one payment or document, with its "Why?" (§54)
+
+    @staticmethod
+    def _history(item) -> list[dict[str, Any]]:  # type: ignore[no-untyped-def]
+        return [{"at": t.at.isoformat(), "stage": t.to_stage.value, "label": _STAGE_WORDS.get(t.to_stage, ""),
+                 "note": t.note} for t in item.history]
+
+    def _chain(self, **subject: str) -> list[dict[str, Any]]:
+        """Invoice -> its payment -> credit note -> refund, when a credit note is involved (§20)."""
+        return [{**step, "amount": _num(step["amount"]), "date": _iso(step["date"])}
+                for step in self.orchestrator.refund_chain(**subject)]
+
+    def transaction(self, tx_id: str) -> dict[str, Any] | None:
+        """One payment: what it needs, its documents, why they match, its history and any refund chain."""
+        repo = self.repo
+        rec = repo.transactions.get(tx_id)
+        if rec is None:
+            return None
+        item = repo.items[rec.item_id]
+        needs_document = rec.decision is not None and rec.decision.requires_document
+        out: dict[str, Any] = {
+            "id": rec.id, "date": rec.tx.booked_on.isoformat(), "amount": _num(abs(rec.tx.amount)),
+            "currency": rec.tx.currency, "direction": "in" if rec.tx.amount > 0 else "out",
+            "counterparty": self.orchestrator.merchant_name(rec.tx), "companyId": rec.company_id,
+            "companyName": self._company_name(rec.company_id) or "", "status": item.stage.value,
+            "statusLabel": _STAGE_WORDS.get(item.stage, ""), "expects": rec.decision.reason if rec.decision else "",
+            "documents": [{"id": d.id, "label": d.label, "evidenceIds": list(d.evidence_ids)}
+                          for d in (repo.documents[i] for i in rec.document_ids if i in repo.documents)],
+            "headline": rec.match_headline, "why": [r.replace(": ", " ", 1) for r in rec.match_why],
+            "history": self._history(item), "chain": self._chain(tx_id=rec.id), "evidenceIds": [rec.evidence_id],
+        }
+        if not item.is_done and needs_document and not rec.document_ids:
+            out["nextStep"] = self.orchestrator.missing.plan(rec)
+        return out
+
+    def document(self, document_id: str) -> dict[str, Any] | None:
+        """One document: its details, the payments it proves, the credit notes that correct it, its history."""
+        repo = self.repo
+        record = repo.documents.get(document_id)
+        if record is None:
+            return None
+        d = record.document
+        item = repo.items[record.item_id]
+        corrects = repo.documents.get(record.credit_for or "")
+        return {
+            "id": d.id, "label": record.label, "supplier": display_name(d.supplier_name), "number": d.invoice_number or "",
+            "type": d.doc_type.value.replace("_", " "), "date": _iso(d.issue_date or record.received_at.date()),
+            "amount": _num(abs(d.gross_amount) if d.gross_amount is not None else None), "currency": d.currency,
+            "companyId": d.entity_id or "", "companyName": self._company_name(d.entity_id) or "",
+            "status": item.stage.value, "statusLabel": _STAGE_WORDS.get(item.stage, ""),
+            "waiting": record.hold_reason,
+            "corrects": ({"id": corrects.id, "label": corrects.label.split(" · ")[0]} if corrects else None),
+            "creditNotes": [{"id": n.id, "label": n.label} for n in self.orchestrator.credits_for(d.id)],
+            "payments": [self._tx_evidence(repo.transactions[t]) | {"transactionId": t}
+                         for t in record.matched_tx_ids if t in repo.transactions],
+            "history": self._history(item), "chain": self._chain(document_id=d.id),
+            "evidenceIds": list(record.evidence_ids),
+        }
+
+    # ----------------------------------------------------------------- deadlines from letters (§24)
+
+    _CONFIRMATIONS = {
+        "reply": [{"id": "sent", "label": "I sent what they asked for"}],
+        "submission": [{"id": "filed", "label": "It is filed"}],
+        "renewal": [{"id": "renewed", "label": "It is renewed", "needsDate": True},
+                    {"id": "not_renewing", "label": "I'm not renewing it"}],
+    }
+
+    def obligations(self) -> dict[str, Any]:
+        """Every deadline from a letter or message, with who does it, what proves it done and how it stands."""
+        from backoffice.closure import VerificationCondition
+
+        today = self._today()
+        items = []
+        for ob in sorted(self.repo.obligations.values(), key=lambda o: (o.obligation.due_on, o.obligation.id)):
+            o = ob.obligation
+            try:
+                condition = VerificationCondition.parse(o.verification_condition).describe(today)
+            except (ValueError, ArithmeticError):
+                condition = o.required_evidence
+            open_ = not ob.done and not ob.informational
+            late = open_ and o.due_on < today
+            items.append({
+                "id": o.id, "title": ob.title, "kind": o.kind.value, "companyId": o.entity_id,
+                "companyName": self._company_name(o.entity_id) or "", "due": o.due_on.isoformat(),
+                "amount": _num(o.amount), "currency": "EUR", "reference": ob.reference or "",
+                "responsible": "Your accountant" if o.responsible == "accountant" else "You",
+                "consequence": o.consequence, "requiredProof": o.required_evidence, "condition": condition,
+                "status": "done" if ob.done else ("information" if ob.informational else "open"),
+                "tone": "good" if ob.done else ("risk" if late else "neutral" if ob.informational else "attention"),
+                "nextStep": self.orchestrator.obligations.next_step(ob), "why": list(ob.reasons),
+                "evidenceIds": [ob.evidence_id, *ob.satisfied_by],
+                "confirmOptions": [] if ob.done or ob.payable else self._CONFIRMATIONS.get(ob.proof.value, []),
+            })
+        return {"today": today.isoformat(), "items": items}
+
+    def obligation_done(self, obligation_id: str, body: Mapping[str, Any] | None) -> dict[str, Any]:
+        """The owner says a deadline is done (sent, filed, renewed, not renewing), optionally with the file."""
+        b = body or {}
+        raw = b.get("dataBase64") or b.get("data_base64")
+        try:
+            result = self.orchestrator.confirm_obligation(
+                obligation_id, str(b.get("outcome") or ""),
+                valid_until=self._date_arg(b, "validUntil") or self._date_arg(b, "valid_until"),
+                data=_b64(raw) if raw else None, filename=b.get("filename"),
+                content_type=b.get("contentType") or b.get("content_type"))
+        except KeyError:
+            raise ServiceError(404, "I can't find that deadline.") from None
+        except PermissionError as exc:
+            raise ServiceError(409, "That one is already done." if str(exc) == "already done" else str(exc)) from None
+        except ValueError as exc:
+            raise ServiceError(400, str(exc)) from None
+        item = next(i for i in self.obligations()["items"] if i["id"] == obligation_id)
+        return {"ok": True, "message": result.message, "obligation": item}
+
+    def expected_not_coming(self, expected_id: str) -> dict[str, Any]:
+        """The owner says a supplier's usual invoice will not come this time (§23)."""
+        try:
+            result = self.orchestrator.expected_invoice_not_coming(expected_id)
+        except KeyError:
+            raise ServiceError(404, "I can't find that invoice.") from None
+        except PermissionError:
+            raise ServiceError(409, "That one is already settled.") from None
+        return {"ok": True, "message": result.message}
+
     # ----------------------------------------------------------------- Monthly report delivery
 
     def _report_settings(self) -> dict[str, Any]:
@@ -1209,7 +1349,8 @@ class BackOfficeService:
                           "text": f"I still need one thing from you: which company the {who} payment of "
                                   f"{format_money(abs(rec.tx.amount), rec.tx.currency)} belongs to."})
         for n in self._open_needs(company_id):
-            if n.kind not in ("company", "cash") or repo.item_month(repo.items[n.item_id]) != month:
+            if n.kind not in ("company", "cash", "obligation", "refund") or \
+                    repo.item_month(repo.items[n.item_id]) != month:
                 continue
             lines.append({"id": f"r_{n.id}", "tone": "attention", "href": f"/needs-you#{n.id}", "linkLabel": "Answer",
                           "text": f"I still need one thing from you. {n.prompt}"})
@@ -1223,6 +1364,11 @@ class BackOfficeService:
                 continue
             if rec.decision is not None and rec.decision.requires_document:
                 lines.append({"id": f"r_{rec.id}", "text": self.orchestrator.missing.plan(rec), "tone": "neutral"})
+        for expected in sorted(repo.expected_invoices.values(), key=lambda e: (e.due_on, e.id)):
+            # A supplier's usual invoice that has not arrived (§23): missing until it does.
+            if expected.status == "missing" and expected.company_id == company_id and expected.period == month:
+                lines.append({"id": f"r_{expected.id}", "text": self.orchestrator.missing.plan_expected(expected),
+                              "tone": "neutral"})
         for item in repo.items_for(company_id, month):
             if item.subject_type != "document" or item.is_done or item.stage in (Stage.NEEDS_OWNER, Stage.CONFLICT):
                 continue
@@ -1306,7 +1452,7 @@ class BackOfficeService:
         for n in self._open_needs():
             if n.kind == "check":
                 items.append(self._check(n))
-            elif n.kind in ("company", "cash"):
+            elif n.kind in _PLAIN_QUESTIONS:
                 items.append(self._question(n))
             elif n.kind == "cost_center":
                 items.append(self._cost_center_item(n))
@@ -1315,11 +1461,17 @@ class BackOfficeService:
         return {"items": items}
 
     def _question(self, n: NeedsYouRecord) -> dict[str, Any]:
-        """Which company carries a payment, or a cash receipt to confirm: one plain choice (§37, §51)."""
+        """Which company carries a payment, a cash receipt to confirm, whether a payment pays a letter, a
+        refund that differs from its credit note, which company a letter is for: one plain choice (§37, §51)."""
         if n.subject_type == "transaction":
             rec = self.repo.transactions[n.subject_id]
             merchant, amount = self.orchestrator.merchant_name(rec.tx), abs(rec.tx.amount)
             currency, day = rec.tx.currency, rec.tx.booked_on
+        elif n.subject_type == "obligation":
+            finding = self.repo.pending_obligations[n.subject_id].finding
+            merchant = _ISSUER_NAMES.get(finding.issuer.value, "A letter")
+            amount, currency = finding.amount or Decimal("0"), finding.currency
+            day = finding.due_on
         else:
             doc = self.repo.documents[n.subject_id]
             merchant, amount = display_name(doc.document.supplier_name), doc.document.gross_amount or Decimal("0")
@@ -1780,10 +1932,12 @@ class BackOfficeService:
                 who = display_name(self.repo.documents[n.subject_id].document.supplier_name)
                 parts.append(n.prompt)
                 evidence.append({"label": f"{who} · invoice to check", "id": f"needs:{n.id}"})
-            elif n.kind in ("company", "cash"):
+            elif n.kind in _PLAIN_QUESTIONS:
                 item = self._question(n)
                 parts.append(n.prompt)
-                what = "which company" if n.kind == "company" else "cash receipt to confirm"
+                what = {"company": "which company", "cash": "cash receipt to confirm",
+                        "obligation": "payment to confirm", "refund": "refund to confirm",
+                        "obligation_company": "which company"}[n.kind]
                 evidence.append({"label": f"{item['merchant']} · {what}", "id": f"needs:{n.id}"})
             elif n.kind == "cost_center":
                 rec = self.repo.transactions[n.subject_id]
@@ -1819,9 +1973,18 @@ class BackOfficeService:
             evidence.insert(0, self._doc_evidence(doc))
             checks = [f"the {r.split(':')[0].lower()}" for r in rec.match_why[:3]]
             agreed = ", ".join(checks[:-1]) + f" and {checks[-1]}" if len(checks) > 1 else "".join(checks)
-            answer = (f"The {format_money(amount)} payment on {when} went to {who}. Its {_doc_phrase(doc)} "
-                      f"arrived on {day_month(doc.received_at.astimezone(TZ).date(), self._today())}. "
-                      f"{agreed[:1].upper()}{agreed[1:]} all agree.")
+            chain = self.orchestrator.refund_chain(tx_id=rec.id)
+            if rec.tx.amount > 0 and chain:  # money back: the credit note, and the invoice it corrects (§20)
+                answer = (f"The {format_money(amount)} refund on {when} came from {who}. {rec.match_headline} "
+                          f"{agreed[:1].upper()}{agreed[1:]} all agree.")
+            else:
+                answer = (f"The {format_money(amount)} payment on {when} went to {who}. Its {_doc_phrase(doc)} "
+                          f"arrived on {day_month(doc.received_at.astimezone(TZ).date(), self._today())}. "
+                          f"{agreed[:1].upper()}{agreed[1:]} all agree.")
+                if chain and rec.match_headline:
+                    answer += f" {rec.match_headline}"
+            evidence += [{"label": step["label"], "id": step["evidenceIds"][0]} for step in chain
+                         if step["evidenceIds"] and step["id"] != rec.id and step["id"] not in rec.document_ids]
         elif rec.proof_evidence_ids:
             ob = next((o for o in self.repo.obligations.values() if rec.evidence_id in o.satisfied_by), None)
             reference = f", reference {ob.reference}" if ob is not None and ob.reference else ""
@@ -1863,7 +2026,7 @@ class BackOfficeService:
                 message = (f"Got it. It matches the {format_money(abs(rec.tx.amount), rec.tx.currency)} payment to "
                            f"{self.orchestrator.merchant_name(rec.tx)} on {day_month(rec.tx.booked_on, self._today())}.")
         if report.obligation_ids:
-            message = "Got it. I added the deadline from this letter and will check the payment."
+            message = self._letter_message(report)
         if report.transaction_ids:
             n = len(report.transaction_ids)
             message = f"Got it. I added {n} bank {'transaction' if n == 1 else 'transactions'}."
@@ -1872,6 +2035,23 @@ class BackOfficeService:
         return {"ok": True, "message": message, "evidenceIds": list(dict.fromkeys(report.evidence_ids)),
                 "documents": docs, "transactions": list(report.transaction_ids),
                 "pendingLinks": list(report.pending_links), "storedOnly": bool(report.stored_only and not docs)}
+
+    def _letter_message(self, report) -> str:  # type: ignore[no-untyped-def]
+        """What the owner reads after sending a letter: the deadline it adds, or what it proved done (§24, §69)."""
+        ob = self.repo.obligations.get(report.obligation_ids[-1])
+        if ob is None:
+            return "Got it."
+        due = day_month(ob.obligation.due_on, self._today())
+        if ob.obligation.id in report.confirmed_ids:
+            return f"Got it. This closes “{ob.title}”. {ob.how}"
+        if ob.done:
+            return f"Got it. “{ob.title}” is already done. {ob.how}"
+        if ob.payable:
+            return "Got it. I added the deadline from this letter and will check the payment."
+        if ob.informational:
+            return f"Got it. {ob.title}: it renews on its own on {due}. Nothing to do unless you want to change it."
+        return f"Got it. I added the deadline from this letter: {ob.title}, by {due}. " + \
+            self.orchestrator.obligations.next_step(ob)
 
     def upload_receipt(self, sha256: str, data: bytes, *, filename: str | None = None,
                        content_type: str | None = None, client_item_id: str | None = None,
@@ -2195,6 +2375,11 @@ class BackOfficeService:
             ("GET", r("/api/documents"), lambda b: self.documents_list(b)),
             ("POST", r("/api/documents/export"), lambda b: self.documents_export(b)),
             ("GET", r(f"/api/documents/{seg}/file"), lambda b, did: self.document_download(did)),
+            ("GET", r(f"/api/documents/{seg}"), lambda b, did: self.document(did)),
+            ("GET", r(f"/api/transactions/{seg}"), lambda b, tid: self.transaction(tid)),
+            ("GET", r("/api/obligations"), lambda b: self.obligations()),
+            ("POST", r(f"/api/obligations/{seg}/done"), lambda b, oid: self.obligation_done(oid, b)),
+            ("POST", r(f"/api/expected-invoices/{seg}/not-coming"), lambda b, eid: self.expected_not_coming(eid)),
             ("GET", r("/api/settings/report"), lambda b: self.report_settings()),
             ("POST", r("/api/settings/report"), lambda b: self.report_settings(b or {})),
             ("GET", r("/api/accountant/api-keys"), lambda b: self.api_keys()),
