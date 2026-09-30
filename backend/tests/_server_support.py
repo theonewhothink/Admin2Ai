@@ -147,6 +147,10 @@ def build_business(h: Harness, token: str) -> dict[str, Any]:
                                     "host": "imap.padaria.pt", "password": "app-password-123"}, headers=H))
     ok(c.post("/api/sources", json={"kind": "insurance", "name": "Fidelidade", "companyId": "padaria-lda",
                                     "renewsOn": "2027-01-15"}, headers=H))
+    # A cost center (here an outlet) with the card it pays with: its costs are put on it as they arrive.
+    outlet = ok(c.post("/api/companies/padaria-lda/cost-centers", json={
+        "name": "Loja Baixa", "kind": "Outlet", "identifiers": {"cards": ["2291"]}}, headers=H))
+    seen["cost_centers"] = [outlet["costCenter"]["id"]]
     glance()
     csv = BANK_CSV.replace(b"{acct}", bank["id"].encode()).replace(b"{card}", card["id"].encode())
     ok(c.post("/api/evidence", files={"file": ("extrato.csv", csv, "text/csv")}, headers=H))
@@ -179,6 +183,8 @@ def build_business(h: Harness, token: str) -> dict[str, Any]:
         if n["kind"] == "choice":
             ok(c.post(f"/api/needs-you/{n['id']}/answer", json={"optionId": n["options"][0]["id"],
                                                                  "remember": True}, headers=H))
+    ok(c.post(f"/api/cost-centers/{seen['cost_centers'][0]}", json={"name": "Loja da Baixa"}, headers=H))
+    ok(c.post("/api/cost-centers/allocate", json={"subjectId": seen["documents"][0], "general": True}, headers=H))
     ok(c.post("/api/documents/export", json={"from": "2026-09-01", "to": "2026-09-30"}, headers=H))
     glance()
     return seen

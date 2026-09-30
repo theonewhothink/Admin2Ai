@@ -351,7 +351,7 @@ def _fixes(t: _Tenant, rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]
         add("red" if due.overdue else "amber", f"due:{due.obligation_id}", f"{due.title} {due.when}", f"{detail}.",
             due.entity_id, None)
     for n in repo.open_needs():
-        if n.kind == "choice":
+        if n.kind in ("choice", "cost_center"):
             rec = repo.transactions[n.subject_id]
             who = svc.orchestrator.merchant_name(rec.tx)
             prompt = n.question.prompt if n.question is not None else "The owner needs to answer one question."

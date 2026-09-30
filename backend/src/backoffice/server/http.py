@@ -71,7 +71,7 @@ _ROUTE_WORDS = frozenset(
     "tool tasks done outbox send reports file documents export settings report accountant api-keys revoke remove "
     "connections stale reconnect clients rules audit pipeline auth signup login logout me account delete "
     "onboarding company oauth start callback bank devices v1 healthz readyz internal overview operations "
-    "readiness".split())
+    "readiness cost-centers allocate".split())
 
 UNAVAILABLE = "I can't reach your data right now. Please try again in a minute."
 DIVERGED = "Your data is safe, but I can't open it right now. The team has been alerted."

@@ -19,7 +19,7 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # Set only while an event-sourced tenant applies one event (backoffice.server):
 # ids and "now" then come from the event itself, so replaying the event log
@@ -202,6 +202,131 @@ class Evidence(BaseModel):
         return hashlib.sha256(data).hexdigest()
 
 
+_CENT = Decimal("0.01")
+
+
+def _money_in_cents(value: Decimal, name: str) -> Decimal:
+    if isinstance(value, float) or not isinstance(value, Decimal):
+        raise TypeError(f"{name} must be Decimal, never float")
+    if not value.is_finite() or value != value.quantize(_CENT):
+        raise ValueError(f"{name} must be a whole number of cents")
+    return value
+
+
+class DocumentLine(BaseModel):
+    """One line of an invoice: what was bought, at which VAT rate, and for whom when the line says so."""
+
+    model_config = {"frozen": True}
+
+    id: str  # the line number as printed ("1", "2", ...)
+    description: str = ""
+    net_amount: Decimal | None = None
+    vat_rate: Decimal | None = None  # percent, e.g. Decimal("23")
+    quantity: Decimal | None = None
+    reference: str | None = None  # project code, order line or cost reference printed on the line
+    customer_tax_id: str | None = None  # the end customer named on a reseller line
+
+    @property
+    def text(self) -> str:
+        return " ".join(p for p in (self.description, self.reference or "", self.customer_tax_id or "") if p)
+
+
+class VatPart(BaseModel):
+    """One VAT rate's share of an amount: net plus VAT. ``rate`` is None when the rate is not known."""
+
+    model_config = {"frozen": True}
+
+    rate: Decimal | None = None
+    net: Decimal
+    vat: Decimal = Decimal("0.00")
+
+    @property
+    def gross(self) -> Decimal:
+        return self.net + self.vat
+
+
+class AllocationMethod(str, Enum):
+    """Why an amount sits on a cost center (strongest first). Every allocation also keeps its reasons."""
+
+    OWNER = "owner"  # the owner said so (Needs You or a direct choice)
+    RULE = "rule"  # a rule the owner taught ("always put ... on Job Rua das Flores")
+    LEARNED_SPLIT = "learned_split"  # a split the owner taught ("always split EDP 40/30/30")
+    IDENTIFIER = "identifier"  # a project code, address, plate, tax number ... found on the evidence
+    LINES = "lines"  # the invoice lines name different cost centers
+    INVOICE = "invoice"  # carried over between a payment and its matched invoice
+    CARD = "card"  # paid with a card or account that belongs to one cost center
+    HISTORY = "history"  # this supplier always went to the same cost center before (likely, not proven)
+
+
+class AllocationShare(BaseModel):
+    """The part of one amount that belongs to one cost center."""
+
+    model_config = {"frozen": True}
+
+    cost_center_id: str
+    amount: Decimal  # positive, in cents
+    parts: tuple[VatPart, ...] = ()  # the amount by VAT rate, when the rates are known
+    percent: Decimal | None = None  # when the split was given in percent
+    line_ids: tuple[str, ...] = ()  # invoice lines behind this share
+
+    @model_validator(mode="after")
+    def _exact(self) -> AllocationShare:
+        _money_in_cents(self.amount, "amount")
+        if self.amount <= 0:
+            raise ValueError("a share must be more than zero")
+        if self.parts and sum((p.gross for p in self.parts), Decimal(0)) != self.amount:
+            raise ValueError("a share's VAT parts must add up to its amount")
+        return self
+
+
+class CostAllocation(BaseModel):
+    """Which cost center(s) an amount belongs to: one, a split adding up exactly, or general costs.
+
+    ``total`` is the absolute amount of the payment or document. The shares
+    always add up to it to the cent; an allocation that does not is refused
+    when it is built, never stored.
+    """
+
+    model_config = {"frozen": True}
+
+    total: Decimal
+    currency: str = "EUR"
+    shares: tuple[AllocationShare, ...] = ()
+    general: bool = False  # the company's general costs, not one cost center
+    method: AllocationMethod
+    quality: Quality = Quality.GREEN
+    why: tuple[str, ...] = ()
+    rule_id: str | None = None
+    evidence_ids: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _adds_up(self) -> CostAllocation:
+        _money_in_cents(self.total, "total")
+        if self.total < 0:
+            raise ValueError("the total is an absolute amount")
+        if self.general and self.shares:
+            raise ValueError("general costs have no cost center shares")
+        if not self.general and not self.shares:
+            raise ValueError("an allocation needs at least one share, or general costs")
+        ids = [s.cost_center_id for s in self.shares]
+        if len(set(ids)) != len(ids):
+            raise ValueError("one share per cost center")
+        if self.shares and sum((s.amount for s in self.shares), Decimal(0)) != self.total:
+            raise ValueError("the shares must add up exactly to the total")
+        return self
+
+    @property
+    def cost_center_ids(self) -> tuple[str, ...]:
+        return tuple(s.cost_center_id for s in self.shares)
+
+    @property
+    def is_split(self) -> bool:
+        return len(self.shares) > 1
+
+    def amount_for(self, cost_center_id: str) -> Decimal:
+        return next((s.amount for s in self.shares if s.cost_center_id == cost_center_id), Decimal(0))
+
+
 class DocumentType(str, Enum):
     INVOICE = "invoice"
     INVOICE_RECEIPT = "invoice_receipt"
@@ -237,6 +362,8 @@ class Document(BaseModel):
     entity_id: str | None = None
     fields: dict[str, VerifiedField] = Field(default_factory=dict)
     quality: Quality = Quality.AMBER
+    lines: tuple[DocumentLine, ...] = ()
+    cost_allocation: CostAllocation | None = None  # which job, property, vehicle ... (cost centers)
 
     @property
     def signed_gross(self) -> Decimal | None:
@@ -270,6 +397,7 @@ class Transaction(BaseModel):
     counterparty_iban: str | None = None
     reference: str | None = None
     entity_id: str | None = None
+    cost_allocation: CostAllocation | None = None  # which job, property, vehicle ... (cost centers)
 
 
 class LegalEntity(BaseModel):

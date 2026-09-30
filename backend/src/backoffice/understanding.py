@@ -422,6 +422,8 @@ class Vocabulary:
     categories: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     category_labels: Mapping[str, str] = field(default_factory=dict)
     accountant: tuple[str, ...] = ()
+    # Jobs, properties, vehicles ... (cost centers): "Job Rua das Flores", "Rua das Flores", "OBR-2026-014".
+    cost_centers: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     @classmethod
     def from_repo(cls, repo: Any, categories: Iterable[Any] = ()) -> Vocabulary:
@@ -464,13 +466,21 @@ class Vocabulary:
         if repo.accountant is not None:
             person = _clean(repo.accountant.person or "")
             accountant |= {person, person.split(" ")[0] if person else "", _clean(repo.accountant.firm or "")}
+        taken = {v for vs in companies.values() for v in vs}
+        centers: dict[str, tuple[str, ...]] = {}
+        for c in sorted(getattr(repo, "cost_centers", {}).values(), key=lambda c: c.id):
+            if not c.active:
+                continue
+            variants = {_clean(c.label), _clean(c.name)}
+            variants |= {_clean(r) for r in c.identifiers.references if len(_clean(r)) >= 4}
+            centers[c.id] = _variants(variants - taken)
         return cls(companies, names, suppliers, supplier_names, cats, labels,
-                   tuple(sorted(w for w in accountant if len(w) >= 3)))
+                   tuple(sorted(w for w in accountant if len(w) >= 3)), cost_centers=centers)
 
     def words(self) -> set[str]:
         """Every single word in these names (typos are corrected towards them)."""
         out: set[str] = set()
-        for table in (self.companies, self.suppliers, self.categories):
+        for table in (self.companies, self.suppliers, self.categories, self.cost_centers):
             for variants in table.values():
                 for v in variants:
                     out |= {w for w in v.split() if len(w) >= 4}
@@ -721,6 +731,7 @@ class Slots:
 
     periods: list[Period] = field(default_factory=list)
     company_ids: list[str] = field(default_factory=list)
+    cost_center_ids: list[str] = field(default_factory=list)  # jobs, properties, vehicles ... named
     all_companies: bool = False
     supplier_ids: list[str] = field(default_factory=list)
     category: str | None = None
@@ -740,12 +751,15 @@ class Slots:
         return self.periods[0] if self.periods else None
 
     def empty(self) -> bool:
-        return not (self.periods or self.company_ids or self.supplier_ids or self.category or self.amount is not None)
+        return not (self.periods or self.company_ids or self.supplier_ids or self.category or self.amount is not None
+                    or self.cost_center_ids)
 
     def merged_from(self, older: Slots) -> Slots:
         """These slots, completed with what an earlier question named (for follow-ups)."""
         return replace(self, periods=self.periods or older.periods,
                        company_ids=self.company_ids or ([] if self.all_companies else older.company_ids),
+                       cost_center_ids=self.cost_center_ids or ([] if self.company_ids or self.all_companies
+                                                                else older.cost_center_ids),
                        supplier_ids=self.supplier_ids or older.supplier_ids,
                        category=self.category or older.category, amount=self.amount
                        if self.amount is not None else older.amount, group_by=self.group_by or older.group_by)
@@ -793,7 +807,8 @@ def unrelated_words(text: str, vocab: Vocabulary) -> set[str]:
     "what is the weather in Porto?" has "weather", so it is a new question,
     never the previous one again.
     """
-    names = {w for vs in (*vocab.companies.values(), *vocab.suppliers.values(), *vocab.categories.values())
+    names = {w for vs in (*vocab.companies.values(), *vocab.suppliers.values(), *vocab.categories.values(),
+                          *vocab.cost_centers.values())
              for v in vs for w in v.split()}
     words = re.findall(r"[a-z]+", text)
     known = _FOLLOW_FILLER | names | set(_EN) | set(_PT) | {m[:3] for m in _EN} | _KEYWORDS
@@ -830,6 +845,9 @@ def understand(message: str, vocab: Vocabulary, today: date) -> Understanding:
     blocked = list(spans)
     company_hits = _find(t, vocab.companies, blocked)
     blocked += [(a, b) for a, b, _ in company_hits]
+    center_hits = _find(t, vocab.cost_centers, blocked)
+    blocked += [(a, b) for a, b, _ in center_hits]
+    slots.cost_center_ids = list(dict.fromkeys(k for _, _, k in center_hits))
     supplier_hits = _find(t, vocab.suppliers, blocked)
     blocked += [(a, b) for a, b, _ in supplier_hits]
     slots.company_ids = list(dict.fromkeys(k for _, _, k in company_hits))
@@ -914,9 +932,9 @@ def _score(t: str, s: Slots, vocab: Vocabulary) -> dict[str, float]:
         if base <= 0.5:  # only "payments" or "how much … on"
             if s.amount is not None or doc_noun:
                 base = 0.3  # "the €418 payment" is a lookup; "invoices" is about documents
-            elif s.periods or s.category:
-                base = 0.9  # "payments in September", "how much on software"
-        if base >= 0.9 and (s.periods or s.category or s.company_ids or s.supplier_ids):
+            elif s.periods or s.category or s.cost_center_ids:
+                base = 0.9  # "payments in September", "how much on software", "how much on Job Rua das Flores"
+        if base >= 0.9 and (s.periods or s.category or s.company_ids or s.supplier_ids or s.cost_center_ids):
             base += 0.1
         scores["spending"] = base
     if s.category and not scores:
