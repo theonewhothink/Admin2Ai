@@ -525,6 +525,12 @@ class FetchResult:
     via_browser: bool = False
     snapshot_png: bytes | None = field(default=None, repr=False)
     supplier: str | None = None  # display name used in owner copy
+    portal: str | None = None  # a supplier portal adapter (§10) handed the document over, not a web page
+
+    @property
+    def expired(self) -> bool:
+        """The link can no longer give the document (gone, 404/410, refused for good): never retried."""
+        return self.outcome is LinkOutcome.UNAVAILABLE and not self.retryable
 
 
 @dataclass(frozen=True)
