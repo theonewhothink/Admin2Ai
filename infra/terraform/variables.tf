@@ -336,3 +336,86 @@ variable "log_level" {
   type    = string
   default = "INFO"
 }
+
+# --------------------------------------------------------------------------- production API and sync worker
+
+variable "api_public_url" {
+  description = "Public HTTPS origin of the API (BACKOFFICE_API_URL); OAuth and bank redirects come back here."
+  type        = string
+
+  validation {
+    condition     = can(regex("^https://[^/]+$", var.api_public_url))
+    error_message = "api_public_url must be an https:// origin without a path or trailing slash."
+  }
+}
+
+variable "web_public_url" {
+  description = "Public HTTPS origin of the web app (BACKOFFICE_WEB_URL); always an allowed CORS origin."
+  type        = string
+
+  validation {
+    condition     = can(regex("^https://[^/]+$", var.web_public_url))
+    error_message = "web_public_url must be an https:// origin without a path or trailing slash."
+  }
+}
+
+variable "extra_allowed_origins" {
+  description = "Further exact origins allowed to call the API with its session cookie."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for o in var.extra_allowed_origins : can(regex("^https://[^/]+$", o))])
+    error_message = "extra_allowed_origins lists https:// origins without paths."
+  }
+}
+
+variable "admin_emails" {
+  description = "Emails that get the admin role (the team's internal dashboard) when their account is created."
+  type        = list(string)
+  default     = []
+}
+
+variable "sync_interval_seconds" {
+  description = "How often the sync worker reads each mailbox (banks: at most every 6 hours)."
+  type        = number
+  default     = 900
+
+  validation {
+    condition     = var.sync_interval_seconds >= 30 && var.sync_interval_seconds <= 86400
+    error_message = "sync_interval_seconds must be 30-86400."
+  }
+}
+
+variable "history_days" {
+  description = "How far back the first sync of a mailbox or bank reads (§6: 90, or up to 365)."
+  type        = number
+  default     = 90
+
+  validation {
+    condition     = var.history_days >= 30 && var.history_days <= 365
+    error_message = "history_days must be 30-365."
+  }
+}
+
+variable "sync_cpu" {
+  type    = number
+  default = 1024
+}
+
+variable "sync_memory" {
+  type    = number
+  default = 2048
+}
+
+variable "smtp_port" {
+  description = "SMTP submission port of the mail relay (credentials are in Secrets Manager)."
+  type        = number
+  default     = 587
+}
+
+variable "external_ai_reading" {
+  description = "Allow the Claude vision fallback for documents local OCR cannot read (§53). Off: no file leaves."
+  type        = bool
+  default     = false
+}

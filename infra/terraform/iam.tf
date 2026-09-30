@@ -1,6 +1,8 @@
 # Least privilege (§52): each workload gets only what its code calls.
-#   api     read/write originals (never delete), enqueue ingest, publish events
-#   worker  the same, plus consume queues; may assume the deletion role
+#   api     read/write originals (never delete), enqueue ingest, publish events,
+#           seal and open owners' sign-ins (vault key)
+#   sync    read/write originals, the vault key (mailbox and bank sync)
+#   worker  the same as api minus the vault, plus consume queues; may assume the deletion role
 #   ocr     no AWS permissions at all (receives bytes over HTTP from the worker)
 #   evidence-deletion  delete object versions and bypass GOVERNANCE retention,
 #           assumable only by the worker, used only after hard approval (§25)
@@ -94,6 +96,42 @@ resource "aws_iam_role_policy" "worker_common" {
   name   = "app-common"
   role   = aws_iam_role.worker.id
   policy = data.aws_iam_policy_document.app_common.json
+}
+
+# The sync worker (python -m backoffice.server.worker): reads connected
+# mailboxes and banks into each business. Same evidence access as the api.
+resource "aws_iam_role" "sync" {
+  name               = "${local.name}-sync-task"
+  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_trust.json
+}
+
+resource "aws_iam_role_policy" "sync_common" {
+  name   = "app-common"
+  role   = aws_iam_role.sync.id
+  policy = data.aws_iam_policy_document.app_common.json
+}
+
+# Owners' sign-ins are sealed with envelope keys from the vault key; KMS
+# checks the encryption context (tenant, connection, provider) on every use.
+data "aws_iam_policy_document" "vault_key" {
+  statement {
+    sid       = "ConnectionVault"
+    actions   = ["kms:GenerateDataKey", "kms:Decrypt"]
+    resources = [aws_kms_key.vault.arn]
+
+    condition {
+      test     = "ForAllValues:StringEquals"
+      variable = "kms:EncryptionContextKeys"
+      values   = ["tenant", "connection", "provider"]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "vault_key" {
+  for_each = { api = aws_iam_role.api.id, sync = aws_iam_role.sync.id }
+  name     = "connection-vault"
+  role     = each.value
+  policy   = data.aws_iam_policy_document.vault_key.json
 }
 
 data "aws_iam_policy_document" "api_queues" {

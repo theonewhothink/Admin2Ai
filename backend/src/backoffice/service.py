@@ -19,7 +19,7 @@ import base64
 import binascii
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal
 from typing import Any
@@ -105,6 +105,12 @@ class BackOfficeService:
         self.vault = vault if vault is not None else _default_vault()
         self.authorizer = authorizer
         self.sign_in: dict[str, dict[str, Any]] = {}
+        # A real business (production): a connection covers a period only once it has actually been
+        # synced (§47, "never green without it"). The demo's connections are simulated and cover
+        # their 90 days at once.
+        self.real_sources = False
+        # What each synced connection remembers between runs (connectors.base.ConnectorState as JSON).
+        self.sync_states: dict[str, dict[str, Any]] = {}
 
     @classmethod
     def demo(cls) -> BackOfficeService:
@@ -131,7 +137,9 @@ class BackOfficeService:
             raise ServiceError(400, "That doesn't look like an email address.")
         owner = OwnerProfile(first_name=full_name.split()[0], full_name=full_name, email=email)
         repo = Repository(tenant_id=tenant_id, owner=owner, now=now)
-        return cls(Orchestrator(repo), vault=vault, authorizer=authorizer)
+        svc = cls(Orchestrator(repo), vault=vault, authorizer=authorizer)
+        svc.real_sources = True
+        return svc
 
     def add_company(self, name: Any, tax_id: Any, legal_name: Any = None) -> dict[str, Any]:
         """Add one of the owner's companies. A Portuguese NIF is checked with the country pack."""
@@ -334,7 +342,9 @@ class BackOfficeService:
         if c is None:
             raise ServiceError(404, "I can't find that connection.")
         c.healthy = True
-        c.covered_until = c.last_synced_at = self._now()
+        if not self.real_sources:  # a real connection covers new days only once they are synced
+            c.covered_until = c.last_synced_at = self._now()
+        self._clear_reconnect(c.id)
         self.orchestrator.log("closure", "connector_reconnected", subject_id=c.id)
         self.orchestrator.run()
         return {"ok": True, "connection": next(x for x in self.connections()["connections"] if x["id"] == c.id)}
@@ -511,13 +521,17 @@ class BackOfficeService:
             except Exception:
                 authorize_url = None
         pending = authorize_url is not None
+        simulated = not pending and not self.real_sources
         self.repo.add_connector(ConnectorState(
             id=cid, name=name, kind="email", account=address, company_ids=company_ids, healthy=not pending,
-            covered_from=None if pending else now - timedelta(days=90),
-            covered_until=None if pending else now, last_synced_at=None if pending else now))
+            covered_from=now - timedelta(days=90) if simulated else None,
+            covered_until=now if simulated else None, last_synced_at=now if simulated else None))
         self.sign_in[cid] = {"provider": provider, "stored": secret_stored, "pending": pending}
-        if not pending:
+        if simulated:
             self.orchestrator.activity(now, "checked", f"Connected {address} and read the last 90 days.",
+                                       company if company else None)
+        elif not pending:
+            self.orchestrator.activity(now, "checked", f"Connected {address}. I'm reading the last 90 days now.",
                                        company if company else None)
         out: dict[str, Any] = {"id": cid, "message": "Almost done. Finish signing in." if pending else
                                f"Done. I now read {address}."}
@@ -525,7 +539,8 @@ class BackOfficeService:
             out["authorizeUrl"] = authorize_url
         return out
 
-    def _add_bank(self, body: Mapping[str, Any]) -> dict[str, Any]:
+    def _add_bank(self, body: Mapping[str, Any], *, consent_until: date | None = None) -> dict[str, Any]:
+        """A bank account. ``consent_until``: the owner authorised access at the bank (PSD2 consent)."""
         bank = self._text(body, "bank", "Which bank?")
         company = self._company(body.get("companyId"))
         iban_raw = self._text(body, "iban", "", required=False, limit=42)
@@ -547,14 +562,130 @@ class BackOfficeService:
             cid = existing.id
         else:
             cid = self._slug("bank", bank)
+            simulated = not self.real_sources
             self.repo.add_connector(ConnectorState(
                 id=cid, name=bank, kind="bank", account=entity.name, company_ids=(company,), healthy=True,
-                covered_from=now - timedelta(days=90), covered_until=now, last_synced_at=now))
-        until = (now + timedelta(days=BANK_CONSENT_DAYS)).date()
-        self.sign_in[aid] = self.sign_in[cid] = {"provider": "open_banking", "consent_until": until}
-        self.orchestrator.activity(now, "checked", f"Connected {bank} for {entity.name} and imported 90 days.",
-                                   company)
+                covered_from=now - timedelta(days=90) if simulated else None,
+                covered_until=now if simulated else None, last_synced_at=now if simulated else None))
+        if not self.real_sources:
+            until = (now + timedelta(days=BANK_CONSENT_DAYS)).date()
+            self.sign_in[aid] = self.sign_in[cid] = {"provider": "open_banking", "consent_until": until}
+            self.orchestrator.activity(now, "checked", f"Connected {bank} for {entity.name} and imported 90 days.",
+                                       company)
+            return {"id": aid, "message": f"Done. {bank} is connected for {entity.name}."}
+        if consent_until is None:  # added by hand: payments arrive once the bank is linked (or by export)
+            self.sign_in[aid] = {"provider": "open_banking", "pending": True}
+            self.sign_in.setdefault(cid, {"provider": "open_banking", "pending": True})
+            return {"id": aid, "message": f"Done. I added {bank} for {entity.name}. Link it to your bank so I can "
+                                          "import its payments, or send me a bank export."}
+        self.sign_in[aid] = self.sign_in[cid] = {"provider": "open_banking", "consent_until": consent_until}
+        self._clear_reconnect(cid)
+        self.orchestrator.activity(now, "checked", f"Connected {bank} for {entity.name}. I'm importing the last "
+                                   "90 days now.", company)
         return {"id": aid, "message": f"Done. {bank} is connected for {entity.name}."}
+
+    def link_bank(self, bank: str, company_id: str, ibans: Sequence[str], consent_until: date) -> dict[str, Any]:
+        """The owner authorised access at the bank (GoCardless, PSD2): its accounts join the company."""
+        ids: list[str] = []
+        for iban in list(ibans) or [""]:
+            try:
+                out = self._add_bank({"bank": bank, "companyId": company_id, "iban": iban},
+                                     consent_until=consent_until)
+            except ServiceError as exc:
+                if exc.status != 409:  # an account already connected is fine
+                    raise
+                existing = next((a for a in self.repo.accounts.values() if iban and a.iban == normalize_iban(iban)),
+                                None)
+                if existing is None:
+                    continue
+                out = {"id": existing.id}
+                self.sign_in[existing.id] = {"provider": "open_banking", "consent_until": consent_until}
+            ids.append(out["id"])
+        cid = next((c.id for c in self.repo.connectors.values() if c.kind == "bank" and c.name == bank), None)
+        if cid is not None:
+            self.sign_in[cid] = {"provider": "open_banking", "consent_until": consent_until}
+        self.orchestrator.log("discovery", "bank_linked", subject_id=cid, values={"accounts": len(ids)})
+        self.orchestrator.run()
+        return {"ok": True, "ids": ids, "connectionId": cid}
+
+    # ----------------------------------------------------------------- synced imports (production worker)
+
+    def _clear_reconnect(self, connection_id: str) -> None:
+        state = self.sync_states.get(connection_id)
+        if state and state.get("reconnect_required"):
+            self.sync_states[connection_id] = {**state, "reconnect_required": False, "consecutive_failures": 0}
+
+    def _synced(self, c: ConnectorState, state: Mapping[str, Any]) -> int | None:
+        """Coverage from a real sync (connectors.base.ConnectorState as JSON).
+
+        Returns how many days the first sync read (None for later syncs).
+        """
+        first = not (self.sync_states.get(c.id) or {}).get("last_successful_sync")
+        self.sync_states[c.id] = dict(state)
+
+        def when(key: str) -> datetime | None:
+            value = state.get(key)
+            return datetime.fromisoformat(value) if isinstance(value, str) and value else None
+
+        start, end, last = when("coverage_start"), when("coverage_end"), when("last_successful_sync")
+        gaps = [datetime.fromisoformat(g["end"]) for g in state.get("known_gaps") or [] if isinstance(g, Mapping)]
+        if gaps and start is not None:  # a known hole: only what follows it is covered (never assumed complete)
+            start = max([start, *gaps])
+        c.healthy = not state.get("reconnect_required")
+        c.covered_from, c.covered_until = start, end
+        c.last_synced_at = last or c.last_synced_at
+        expires = when("auth_expires_at")
+        if c.kind == "bank" and expires is not None:
+            self.sign_in[c.id] = {**self.sign_in.get(c.id, {}), "provider": "open_banking",
+                                  "consent_until": expires.astimezone(TZ).date(), "pending": False}
+        if not first:
+            return None
+        return max(1, round((end - start).total_seconds() / 86400)) if start and end else 90
+
+    def sync_mail(self, connection_id: str, messages: Sequence[bytes], state: Mapping[str, Any] | None
+                  ) -> dict[str, Any]:
+        """Messages read from a connected mailbox, then (last batch) what the mailbox sync remembers."""
+        c = self.repo.connectors.get(connection_id)
+        if c is None or c.kind != "email":
+            raise ServiceError(404, "I can't find that mailbox.")
+        for raw in messages:
+            self.orchestrator.ingest_file(raw, filename="message.eml", content_type="message/rfc822",
+                                          source_kind=SourceKind.EMAIL, origin="email")
+        if state is not None:
+            days = self._synced(c, state)
+            if days is not None:
+                self.orchestrator.activity(self._now(), "checked", f"Read {c.account}: the last {days} days are in.")
+            self.orchestrator.log("discovery", "connector_synced", subject_id=c.id,
+                                  values={"messages": len(messages)})
+            self.orchestrator.run()
+        return {"ok": True, "messages": len(messages)}
+
+    def sync_bank(self, connection_id: str, rows: Sequence[Any], state: Mapping[str, Any] | None) -> dict[str, Any]:
+        """Booked transactions from a linked bank (open banking), then what the bank sync remembers."""
+        c = self.repo.connectors.get(connection_id)
+        if c is None or c.kind != "bank":
+            raise ServiceError(404, "I can't find that bank connection.")
+        known = [r for r in rows if r.account_id in self.repo.accounts]
+        if known:
+            self.orchestrator.ingest_bank(known)
+        if state is not None:
+            days = self._synced(c, state)
+            if days is not None:
+                self.orchestrator.activity(self._now(), "checked", f"Imported the last {days} days from {c.name}.")
+            self.orchestrator.log("discovery", "connector_synced", subject_id=c.id, values={"rows": len(known)})
+            self.orchestrator.run()
+        return {"ok": True, "rows": len(known)}
+
+    def sync_failed(self, connection_id: str, state: Mapping[str, Any], *, reconnect: bool) -> dict[str, Any]:
+        """A sync failed. Only the owner can fix a refused sign-in: the connection needs reconnecting (§47–48)."""
+        c = self.repo.connectors.get(connection_id)
+        if c is None:
+            raise ServiceError(404, "I can't find that connection.")
+        self.sync_states[c.id] = dict(state)
+        if reconnect and c.healthy:
+            return self.mark_connection_stale(c.id, since=c.last_synced_at or self._now())
+        self.orchestrator.log("discovery", "connector_failed", subject_id=c.id, values={"reconnect": reconnect})
+        return {"ok": True}
 
     def _add_card(self, body: Mapping[str, Any]) -> dict[str, Any]:
         last4 = self._text(body, "last4", "The last 4 digits of the card.", limit=4)
@@ -849,7 +980,11 @@ class BackOfficeService:
         if c is None:
             return
         now = self._now()
-        c.healthy, c.covered_from, c.covered_until, c.last_synced_at = True, now - timedelta(days=90), now, now
+        if self.real_sources:  # covered once the first sync has read it (the sync worker)
+            c.healthy = True
+            self._clear_reconnect(connection_id)
+        else:
+            c.healthy, c.covered_from, c.covered_until, c.last_synced_at = True, now - timedelta(days=90), now, now
         self.sign_in[connection_id] = {**self.sign_in.get(connection_id, {}), "pending": False, "stored": True}
         self.orchestrator.activity(now, "checked", f"Connected {c.account}.")
         self.orchestrator.run()

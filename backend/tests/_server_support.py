@@ -68,6 +68,7 @@ def harness(tmp_path: Path, *, store: Any = None, cfg: ServerConfig | None = Non
     clock = services.pop("now", None) or FakeClock()
     store = store if store is not None else MemoryStore()
     objects = services.pop("objects", None) or LocalObjectStore(tmp_path / "objects")
+    services.setdefault("strict_reads", True)  # a read that changes a tenant fails the test
     app = build_production_app(cfg or config(), store=store, objects=objects, now=clock, **services)
     n = next(_ADDRESSES)
     client = TestClient(app, base_url="https://api.backoffice.test", client=(f"10.{n // 65536 % 256}.{n // 256 % 256}.{n % 256}", 50000))

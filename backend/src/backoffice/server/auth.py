@@ -113,7 +113,14 @@ OWNER_ONLY_READS = frozenset({"/api/account/export"})
 
 
 def permitted(principal: Principal, method: str, path: str) -> bool:
-    """May ``principal`` call ``method path``? Owners and admins may do everything in their business."""
+    """May ``principal`` call ``method path``? Owners and admins may do everything in their business.
+
+    The team's internal dashboard (``/api/internal/*``) is for admins only (``internal.admin_only``).
+    """
+    from backoffice.internal import admin_only
+
+    if admin_only(path):
+        return principal.is_admin
     if principal.is_owner:
         return True
     if method in ("GET", "HEAD"):

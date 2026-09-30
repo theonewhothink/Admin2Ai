@@ -81,6 +81,9 @@ class ServerConfig:
     max_json_bytes: int = 1024 * 1024
     tenant_cache_size: int = 200
     log_level: str = "INFO"
+    strict_reads: bool = False  # a read that changes a tenant raises (tests); otherwise logged and rebuilt
+    sync_interval_s: int = 900  # the sync worker: how often each connection is read
+    history_days: int = 90  # the first sync of a mailbox or bank reads this far back (§6: 90, or 365)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> ServerConfig:
@@ -121,6 +124,9 @@ class ServerConfig:
             max_json_bytes=_int(e, "BACKOFFICE_MAX_JSON_BYTES", 1024 * 1024, low=16 * 1024, high=16 * 1024 * 1024),
             tenant_cache_size=_int(e, "BACKOFFICE_TENANT_CACHE_SIZE", 200, low=1, high=100_000),
             log_level=(e.get("LOG_LEVEL") or "INFO").strip().upper(),
+            strict_reads=_flag(e, "BACKOFFICE_STRICT_READS"),
+            sync_interval_s=_int(e, "BACKOFFICE_SYNC_INTERVAL", 900, low=30, high=86_400),
+            history_days=_int(e, "BACKOFFICE_HISTORY_DAYS", 90, low=30, high=365),
         )
 
     def require_production(self) -> None:

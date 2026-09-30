@@ -67,6 +67,7 @@ locals {
   running_services = {
     api    = module.api.service_name
     worker = module.worker.service_name
+    sync   = module.sync.service_name
     ocr    = module.ocr.service_name
   }
 }

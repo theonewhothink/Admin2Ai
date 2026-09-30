@@ -49,7 +49,7 @@ from .base import (
     record_success,
     record_webhook,
 )
-from .http import AuthorizedHttp, json_object, object_list, required_str
+from .http import AuthorizedHttp, json_object, object_list, required_str, retry_after_seconds
 from .oauth import TokenProvider
 
 __all__ = ["GMAIL_API", "GMAIL_READONLY_SCOPE", "GmailConfig", "GmailConnector", "GmailPush"]
@@ -94,7 +94,7 @@ def _classify(response: httpx.Response) -> ConnectorError | None:
     if status in (403, 429):
         reasons = _reasons(response)
         if reasons & _TRANSIENT_REASONS or status == 429:
-            return TransientError(f"gmail_rate_limited_{status}")
+            return TransientError(f"gmail_rate_limited_{status}", retry_after=retry_after_seconds(response))
         if reasons & _PERMISSION_REASONS or status == 403:
             return ReconnectRequired("gmail_insufficient_permissions")
     if status == 400 and "failedPrecondition" in _reasons(response):

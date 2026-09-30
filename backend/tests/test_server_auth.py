@@ -268,6 +268,48 @@ def test_accountant_reads_and_teaches_rules_only(tmp_path: Path) -> None:
     assert h.client.get("/api/account/export", headers=A).status_code == 403
 
 
+INTERNAL = ("/api/internal/overview", "/api/internal/operations?limit=5", "/api/internal/readiness")
+
+
+def test_the_team_dashboard_is_for_admins_only(tmp_path: Path) -> None:
+    from backoffice.internal import admin_only
+    from backoffice.server.auth import Principal, permitted
+    from backoffice.server.store import Tenant, User
+
+    h = harness(tmp_path)
+    owner = signup(h.client)
+    other = signup(h.client, "rui@oficina.pt", company="Oficina Rui", tax_id=NIF_B, name="Rui")
+    accountant = signup(h.client, "marc@vidal.pt", company="Contabilidade Vidal", tax_id=None)
+    h.store.add_membership(owner["tenant"]["id"], accountant["user"]["id"], "accountant")
+    h.store._d.memberships.discard((accountant["tenant"]["id"], accountant["user"]["id"], "owner"))
+    A = bearer(h.client.post("/api/auth/login", json={"email": "marc@vidal.pt", "password": PASSWORD}).json()["token"])
+    admin = signup(h.client, "admin@backoffice.test", company="Admin2Ai Lda", tax_id=None, name="Team")
+    assert admin["user"] and h.client.get("/api/auth/me", headers=bearer(admin["token"])).json()["role"] == "admin"
+    for who in (bearer(owner["token"]), A):
+        for path in INTERNAL:
+            res = h.client.get(path, headers=who)
+            assert (res.status_code, res.json()) == (403, {"error": "forbidden",
+                                                           "message": "This page is for the Admin2Ai team only."}), path
+    assert h.client.get("/api/internal/overview").status_code == 401
+
+    X = bearer(admin["token"])
+    overview = h.client.get("/api/internal/overview", headers=X)
+    assert overview.status_code == 200
+    tenants = {t["id"] for t in overview.json()["tenants"]}
+    assert tenants == {owner["tenant"]["id"], other["tenant"]["id"], accountant["tenant"]["id"],
+                       admin["tenant"]["id"]}  # every business the service runs, read-only
+    ops = h.client.get("/api/internal/operations?limit=5", headers=X).json()
+    assert ops["audit"]["shown"] == min(5, ops["audit"]["records"]) and len(ops["audit"]["chains"]) == 4
+    assert h.client.get("/api/internal/readiness", headers=X).status_code == 200
+    assert h.client.get("/api/internal/nothing", headers=X).status_code == 404
+    assert h.client.post("/api/internal/overview", json={}, headers=X).status_code == 405
+
+    # The one rule, also where roles are checked: an owner may do everything in their business except this.
+    principal = Principal(User("u", "ana@example.pt", "Ana"), Tenant("t", "Padaria"), frozenset({"owner"}), "", "bearer")
+    assert admin_only("/api/internal/overview?x=1") and not permitted(principal, "GET", "/api/internal/overview")
+    assert permitted(principal, "GET", "/api/home")
+
+
 def test_origins_and_credentials(tmp_path: Path) -> None:
     h = harness(tmp_path)
     res = h.client.options("/api/auth/login", headers={"Origin": ORIGIN, "Access-Control-Request-Method": "POST",

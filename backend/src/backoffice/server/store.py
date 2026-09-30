@@ -153,6 +153,9 @@ class Store(Protocol):
     def erase_account(self, tenant_id: str, user_id: str, at: datetime) -> int: ...
     def mark_objects_purged(self, tenant_id: str, at: datetime) -> None: ...
 
+    # every tenant (the sync worker's fan-out and the team's internal dashboard)
+    def tenant_ids(self) -> list[str]: ...
+
 
 # --------------------------------------------------------------------------- in memory
 
@@ -420,6 +423,11 @@ class MemoryStore:
                 self._d.sessions = {h: s for h, s in self._d.sessions.items() if s.user_id != user_id}
             return events
 
+    def tenant_ids(self) -> list[str]:
+        self._up()
+        with self._lock:
+            return sorted(self._d.tenants)
+
     def mark_objects_purged(self, tenant_id: str, at: datetime) -> None:
         with self._lock:
             if tenant_id in self._d.erasures:
@@ -429,9 +437,6 @@ class MemoryStore:
         return self._d.erasures.get(tenant_id)
 
     # ----------------------------------------------------------------- introspection for tests
-
-    def tenant_ids(self) -> list[str]:
-        return sorted(self._d.tenants)
 
     def user_ids(self) -> list[str]:
         return sorted(self._d.users)

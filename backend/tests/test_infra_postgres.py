@@ -275,6 +275,30 @@ def test_ensure_login_creates_a_member_that_rls_applies_to(
     assert count(db.with_settings(role=user), "SELECT count(*) AS n FROM evidence") == 0
 
 
+def test_the_scheduler_membership_lists_tenants_only_after_set_role(
+    server: Server, db: PsqlExecutor, tenant: dict[str, str]
+) -> None:
+    user = f"svc_{uuid.uuid4().hex[:8]}"
+    env = {
+        "MIGRATION_DATABASE_URL": server.url(db.params.settings["dbname"]),
+        "APP_DB_PASSWORD": "a-very-long-password-1234",
+        "PATH": os.environ.get("PATH", ""),
+    }
+    assert cli(["ensure-login", user, "--member-of", "backoffice_app", "--member-of", "backoffice_scheduler"],
+               env=env) == 0
+    grants = db.query(
+        "SELECT g.rolname AS grp, m.inherit_option AS inherit, m.set_option AS can_set FROM pg_auth_members m "
+        f"JOIN pg_roles g ON g.oid = m.roleid JOIN pg_roles u ON u.oid = m.member WHERE u.rolname = '{user}' "
+        "ORDER BY g.rolname")
+    assert grants == [{"grp": "backoffice_app", "inherit": "t", "can_set": "t"},
+                      {"grp": "backoffice_scheduler", "inherit": "f", "can_set": "t"}]
+    # As the login, without a tenant scope: no tenant is visible ...
+    assert count(db.with_settings(role=user), "SELECT count(*) AS n FROM tenants") == 0
+    # ... until it takes the scheduler role, which may list them (and read nothing else).
+    assert count(db.with_settings(role="backoffice_scheduler"), "SELECT count(*) AS n FROM tenants") >= 1
+    fails(db.with_settings(role="backoffice_scheduler"), "SELECT count(*) AS n FROM evidence", "42501")
+
+
 # --------------------------------------------------------------------------- tenant isolation (§52)
 
 

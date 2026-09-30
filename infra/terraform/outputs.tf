@@ -64,7 +64,16 @@ output "kms_keys" {
     messaging = aws_kms_key.messaging.arn
     logs      = aws_kms_key.logs.arn
     dr        = aws_kms_key.dr.arn
+    vault     = aws_kms_key.vault.arn
   }
+}
+
+output "operator_secrets" {
+  description = "Secrets an operator fills in (empty fields = that feature is off): OAuth apps, GoCardless, SMTP, Expo, Anthropic."
+  value = merge(
+    { for k, s in aws_secretsmanager_secret.connector : "connectors/${k}" => s.name },
+    { for k, s in aws_secretsmanager_secret.integration : "integrations/${k}" => s.name },
+  )
 }
 
 output "alarm_topic_arn" {

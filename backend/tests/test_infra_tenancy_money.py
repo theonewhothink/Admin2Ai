@@ -135,6 +135,10 @@ def test_login_script_creates_a_plain_member_and_quotes_the_password() -> None:
     assert "PASSWORD 'it''s-a-long-pass$$word\\x';" in sql
     assert "NOSUPERUSER NOBYPASSRLS" in sql and "GRANT backoffice_app TO backoffice_api;" in sql
     assert sql.index("DO $$") < sql.index("END $$;") < sql.index("PASSWORD")  # secret stays outside $$
+    both = ensure_login_sql("backoffice_api", "x" * 20, ["backoffice_app", "backoffice_scheduler"])
+    assert "GRANT backoffice_app TO backoffice_api;" in both
+    # listing tenants only after SET ROLE: the scheduler's policy never applies to ordinary queries
+    assert "GRANT backoffice_scheduler TO backoffice_api WITH INHERIT FALSE, SET TRUE;" in both
 
 
 @pytest.mark.parametrize(

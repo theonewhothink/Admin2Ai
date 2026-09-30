@@ -51,6 +51,21 @@ resource "aws_kms_alias" "secrets" {
   target_key_id = aws_kms_key.secrets.key_id
 }
 
+# The connection vault (connectors/vault.py): envelope keys for owners' sign-ins
+# (mailbox refresh tokens, IMAP app passwords, bank consents), each bound by
+# encryption context to its tenant and connection.
+resource "aws_kms_key" "vault" {
+  description             = "${local.name} connection vault (owners' sign-ins)"
+  enable_key_rotation     = true
+  deletion_window_in_days = 30
+  policy                  = data.aws_iam_policy_document.key_admin.json
+}
+
+resource "aws_kms_alias" "vault" {
+  name          = "alias/${local.name}-vault"
+  target_key_id = aws_kms_key.vault.key_id
+}
+
 # SQS queues and the EventBridge bus. EventBridge must be able to encrypt
 # events on the bus and deliver them to encrypted queues.
 data "aws_iam_policy_document" "messaging_key" {

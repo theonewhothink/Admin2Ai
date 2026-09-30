@@ -35,13 +35,16 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from backoffice.internal import admin_only
+
 from .account import erase_account, export_account
 from .auth import COOKIE_NAME, CSRF_HEADER, CSRF_VALUE, SESSION_DAYS, AuthError, AuthService, Principal, permitted
 from .config import ServerConfig
 from .runtime import READ_ONLY_POSTS, ReplayDiverged, TenantManager, TenantNotFound
-from .store import Device, Store, StoreUnavailable
+from .store import Device, Store, StoreError, StoreUnavailable
 
-__all__ = ["JsonLogFormatter", "StoreNonces", "build_production_app", "configure_logging"]
+__all__ = ["JsonLogFormatter", "StoreNonces", "build_manager", "build_production_app", "configure_logging",
+           "production_services"]
 
 log = logging.getLogger("backoffice.http")
 
@@ -66,11 +69,14 @@ _ROUTE_WORDS = frozenset(
     "api home needs-you answer activity companies months ask evidence upload receipts share sources chat tools "
     "tool tasks done outbox send reports file documents export settings report accountant api-keys revoke remove "
     "connections stale reconnect clients rules audit pipeline auth signup login logout me account delete "
-    "onboarding company oauth start callback bank devices v1 healthz readyz".split())
+    "onboarding company oauth start callback bank devices v1 healthz readyz internal overview operations "
+    "readiness".split())
 
 UNAVAILABLE = "I can't reach your data right now. Please try again in a minute."
 DIVERGED = "Your data is safe, but I can't open it right now. The team has been alerted."
 FORBIDDEN = "You don't have access to that."
+ADMIN_ONLY = "This page is for the Admin2Ai team only."
+INTERNAL_VIEWS = frozenset({"overview", "operations", "readiness"})
 CSRF_BLOCKED = "This request was blocked for your safety. Please reload the page and try again."
 
 
@@ -84,7 +90,8 @@ def _error(status: int, error: str, message: str, headers: Mapping[str, str] | N
 class JsonLogFormatter(logging.Formatter):
     """One JSON object per line. Only fields this module chooses; never request bodies or addresses."""
 
-    FIELDS = ("request_id", "method", "route", "status", "ms", "tenant", "role", "seq", "reason", "exc_type")
+    FIELDS = ("request_id", "method", "route", "status", "ms", "tenant", "role", "seq", "reason", "exc_type",
+              "tenants", "connections", "messages", "rows")
 
     def format(self, record: logging.LogRecord) -> str:
         out: dict[str, Any] = {
@@ -234,6 +241,7 @@ def _default_services(config: ServerConfig) -> dict[str, Any]:
     from backoffice.connectors.vault import AwsKmsKeyProvider, LocalKeyProvider, TokenVault
     from backoffice.evidence.store import LocalObjectStore, S3ObjectStore
     from backoffice.mailer import mailer_from_env
+    from backoffice.reading import reader_from_env
 
     from .notify import ExpoPushClient, PushNotifier
     from .postgres import PostgresCredentialStore, PostgresStore
@@ -286,19 +294,32 @@ def _default_services(config: ServerConfig) -> dict[str, Any]:
                                              base_url=config.gocardless_api_url or GOCARDLESS_API)
     return {"store": store, "objects": objects, "vault": vault, "authorizer": authorizer,
             "mailer": mailer_from_env(), "brain_factory": brain_factory, "notifier": notifier,
-            "aggregator": aggregator, "now": now}
+            "aggregator": aggregator, "reader": reader_from_env(), "now": now}
+
+
+def production_services(config: ServerConfig, overrides: Mapping[str, Any]) -> dict[str, Any]:
+    """The configured services, or (tests) exactly the ones given when a ``store`` is among them."""
+    return dict(overrides) if "store" in overrides else {**_default_services(config), **overrides}
+
+
+def build_manager(config: ServerConfig, services: Mapping[str, Any]) -> TenantManager:
+    """The tenant manager the API and the sync worker share (same store, vault, reader, mailer, push)."""
+    now: Callable[[], datetime] = services.get("now") or (lambda: datetime.now(timezone.utc))
+    return TenantManager(
+        services["store"], services["objects"], now=now, vault=services.get("vault"),
+        authorizer=services.get("authorizer"), mailer=services.get("mailer"),
+        brain_factory=services.get("brain_factory"), notifier=services.get("notifier"),
+        reader=services.get("reader"), cache_size=config.tenant_cache_size,
+        strict_reads=bool(services.get("strict_reads", config.strict_reads)))
 
 
 def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
     """The production app. Tests pass ``store``, ``objects``, ``now``, fakes for OAuth, GoCardless, push."""
     configure_logging(config.log_level)
-    services = overrides if "store" in overrides else {**_default_services(config), **overrides}
+    services = production_services(config, overrides)
     store: Store = services["store"]
     now: Callable[[], datetime] = services.get("now") or (lambda: datetime.now(timezone.utc))
-    manager = TenantManager(
-        store, services["objects"], now=now, vault=services.get("vault"), authorizer=services.get("authorizer"),
-        mailer=services.get("mailer"), brain_factory=services.get("brain_factory"),
-        notifier=services.get("notifier"), cache_size=config.tenant_cache_size)
+    manager = build_manager(config, services)
     auth = AuthService(store, manager, rate_key=config.state_key, admin_emails=config.admin_emails, now=now)
     aggregator_factory = services.get("aggregator")
 
@@ -369,6 +390,8 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
         if via == "cookie" and request.method not in ("GET", "HEAD", "OPTIONS") and \
                 request.headers.get(CSRF_HEADER, "") != CSRF_VALUE:
             raise AuthError(403, "forbidden", CSRF_BLOCKED)
+        if admin_only(request.url.path) and not principal.is_admin:
+            raise AuthError(403, "forbidden", ADMIN_ONLY)
         if not permitted(principal, request.method, request.url.path) or (owner and not principal.is_owner):
             raise AuthError(403, "forbidden", FORBIDDEN)
         request.state.log_tenant = principal.tenant.id  # read by the request log line (_Guard)
@@ -618,10 +641,15 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
             consent = aggregator.consent(secret["requisition_id"])
             if consent.status is not ConsentStatus.ACTIVE:
                 return False
-            ibans = [info.iban for info in (aggregator.account(a) for a in consent.account_ids) if info.iban]
+            infos = [aggregator.account(a) for a in consent.account_ids]
+            ibans = [info.iban for info in infos if info.iban]
+            # Which bank account is which: the sync worker files each payment under the right account.
+            secret = {**secret, "accounts": {info.account_id: info.iban for info in infos if info.iban}}
             institution = str(payload["i"])
             bank = institution.split("_")[0].title()
-            status, out = manager.bank_linked(tenant_id, bank=bank, company_id=str(payload["c"]), ibans=ibans)
+            until = consent.expires_at.date() if consent.expires_at is not None else None
+            status, out = manager.bank_linked(tenant_id, bank=bank, company_id=str(payload["c"]), ibans=ibans,
+                                              consent_until=until)
             if status != 200:
                 return False
             connector = manager.read(tenant_id, lambda svc: next(
@@ -752,6 +780,27 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
     async def upload_receipt(request: Request) -> Response:
         return await _upload(request, "/api/evidence/upload")
 
+    # ----------------------------------------------------------------- the team's dashboard (admins only)
+
+    def _internal(principal: Principal, target: str, query: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """``/api/internal/<view>`` over every tenant (read-only), for an admin."""
+        from backoffice import internal
+
+        view = target.rstrip("/").rsplit("/", 1)[-1]
+        if view not in INTERNAL_VIEWS:
+            return 404, {"error": "not_found", "message": "I can't find that."}
+        try:
+            tenant_ids = store.tenant_ids()
+        except StoreUnavailable:
+            raise
+        except StoreError:  # the login may not list tenants (not in backoffice_scheduler): own business only
+            log.warning("tenant_list_unavailable")
+            tenant_ids = []
+        if principal.tenant.id not in tenant_ids:
+            tenant_ids = [*tenant_ids, principal.tenant.id]
+        return 200, manager.read_many(tenant_ids, lambda services: internal.handle(view, services, query),
+                                      what=f"GET {route_template(target)}")
+
     # ----------------------------------------------------------------- everything else the demo serves
 
     @app.api_route("/api/{path:path}", methods=["GET", "POST"])
@@ -762,7 +811,11 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
             return _error(404, "not_found", "I can't find that.")
         principal, refresh = await _signed_in(request)
         tenant, actor = principal.tenant.id, principal.user.id
-        if request.method == "GET":
+        if admin_only(target):
+            if request.method != "GET":
+                return _error(405, "method_not_allowed", "That is not something I can do here.")
+            status, out = await run_in_threadpool(_internal, principal, target, dict(request.query_params))
+        elif request.method == "GET":
             query = ("?" + request.url.query) if request.url.query else ""
             status, out = await run_in_threadpool(manager.view, tenant, "GET", target + query, None)
         else:

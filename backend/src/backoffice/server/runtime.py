@@ -22,6 +22,14 @@ in-process cache, one lock per tenant:
 
 Side effects (email, push notifications, stored secrets) happen only live:
 a replay has a vault that stores nothing and a mailer that sends nothing.
+Nothing external runs while an event applies: PDFs and photos are read (OCR,
+Claude vision) before the event is recorded and the event keeps the full
+reading (server/reads.py); the chat model's tool calls are events of their
+own; OAuth and bank calls happen in the HTTP handlers and the sync worker.
+
+Reads are checked: a read that changes a tenant's state digest is logged and
+the tenant is dropped from the cache (rebuilt from its log on the next
+request); with ``strict_reads`` (tests) it raises :class:`ReadChangedState`.
 """
 
 from __future__ import annotations
@@ -33,28 +41,45 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from backoffice.domain.models import deterministic
 from backoffice.orchestrator import TZ
 from backoffice.service import BackOfficeService, ServiceError
 
-from .events import SECRET_FIELDS, Event, EventError, genesis_hash, restore_files, sanitize_body, state_digest
+from .events import (
+    FILE_FIELDS,
+    OBJECT,
+    SECRET_FIELDS,
+    Event,
+    EventError,
+    genesis_hash,
+    restore_files,
+    sanitize_body,
+    state_digest,
+)
+from .reads import RecordedReader, pre_read
 from .store import IndexOp, SeqConflict, Store, StoreUnavailable
 
 __all__ = [
     "Env",
+    "HISTORY_CHARS",
+    "HISTORY_TURNS",
     "READ_ONLY_POSTS",
+    "ReadChangedState",
     "ReplayDiverged",
     "TenantManager",
     "TenantNotFound",
     "TenantRuntime",
+    "bank_row",
+    "clean_history",
 ]
 
 log = logging.getLogger("backoffice.server")
 
-# POST routes that only read (a body carries their filters).
+# POST routes that only read (a body carries their filters). /api/ask is not one: every answer
+# writes an audit record (the ask agent's answer_question), so it is recorded as an event.
 READ_ONLY_POSTS = frozenset({"/api/documents/export"})
 _API_KEYS = "/api/accountant/api-keys"
 _REVOKE = re.compile(r"^/api/accountant/api-keys/([^/]+)/revoke$")
@@ -73,6 +98,10 @@ class ReplayDiverged(RuntimeError):
         self.tenant_id = tenant_id
         self.seq = seq
         self.reason = reason
+
+
+class ReadChangedState(AssertionError):
+    """A read changed a tenant's state (strict mode, tests): reads must never change anything."""
 
 
 class _Reload(Exception):
@@ -165,6 +194,52 @@ class TenantRuntime:
         return state_digest(self.svc) if self.svc is not None else None
 
 
+HISTORY_TURNS = 10  # the chat history a brain is given and an event records
+HISTORY_CHARS = 4000  # per turn
+
+
+def clean_history(history: Any) -> list[dict[str, str]]:
+    """The last text turns of a chat, as the brain uses them and the event records them."""
+    if not isinstance(history, list):
+        return []
+    turns = [{"role": h["role"], "content": h["content"][:HISTORY_CHARS]} for h in history
+             if isinstance(h, Mapping) and h.get("role") in ("user", "assistant") and isinstance(h.get("content"), str)]
+    return turns[-HISTORY_TURNS:]
+
+
+def _uploads(body: Mapping[str, Any], env: Env) -> list[tuple[bytes, str | None, str | None]]:
+    """The files a request body carries (bytes just stored, file name, declared type), for reading first."""
+    out = []
+    for name in FILE_FIELDS:
+        ref = body.get(name)
+        if isinstance(ref, Mapping) and isinstance(ref.get(OBJECT), Mapping):
+            data = env.files.get(str(ref[OBJECT].get("sha256", "")))
+            if data is not None:
+                mime = body.get("contentType") or body.get("content_type") or body.get("mimeType") or \
+                    body.get("mime_type")
+                out.append((data, _text_or_none(body.get("filename")), _text_or_none(mime)))
+    return out
+
+
+def _text_or_none(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def bank_row(data: Mapping[str, Any]) -> Any:
+    """A recorded bank row (BankRow.to_json) back as the engine's BankRow."""
+    from decimal import Decimal
+
+    from backoffice.domain.models import TransactionKind
+    from backoffice.orchestrator import BankRow
+
+    return BankRow(bank_id=str(data["bank_id"]), account_id=str(data["account_id"]),
+                   booked_on=date.fromisoformat(str(data["booked_on"])), amount=Decimal(str(data["amount"])),
+                   counterparty=str(data.get("counterparty") or ""), description=str(data.get("description") or ""),
+                   kind=TransactionKind(str(data.get("kind") or "card")), card_last4=data.get("card_last4"),
+                   counterparty_iban=data.get("counterparty_iban"), reference=data.get("reference"),
+                   currency=str(data.get("currency") or "EUR"))
+
+
 def _error(exc: ServiceError) -> tuple[int, dict[str, Any]]:
     return exc.status, {"error": _SERVICE_CODES.get(exc.status, "error"), "message": exc.message}
 
@@ -186,7 +261,9 @@ class TenantManager:
         mailer: Any = None,
         brain_factory: Callable[[BackOfficeService], Any] | None = None,
         notifier: Any = None,
+        reader: Any = None,
         cache_size: int = 200,
+        strict_reads: bool = False,
     ) -> None:
         self.store = store
         self.objects = objects
@@ -196,7 +273,13 @@ class TenantManager:
         self.mailer = mailer
         self.brain_factory = brain_factory
         self.notifier = notifier
+        # The live document reader (backoffice.reading.reader_from_env). It only ever runs before an
+        # event is recorded (server/reads.py); applies read through the recorded outcomes.
+        self.reader = reader
         self.cache_size = cache_size
+        # Reads must never change a tenant. In tests a read that does raises; in production it is
+        # logged and the tenant is rebuilt from its log on the next request.
+        self.strict_reads = strict_reads
         self._cache: OrderedDict[str, TenantRuntime] = OrderedDict()
         self._locks: dict[str, threading.RLock] = {}
         self._guard = threading.Lock()
@@ -413,6 +496,10 @@ class TenantManager:
             return handler(self, rt, event, env)
         svc = rt.service
         svc.vault, svc.authorizer, svc.mailer = env.vault, env.authorizer, env.mailer
+        # Files are never read while an event applies: live and on replay, the engine reads through
+        # the outcomes recorded in the event (server/reads.py).
+        facts = event.data.get("env") if isinstance(event.data.get("env"), Mapping) else {}
+        svc.repo.reader = RecordedReader.from_event(event.data.get("reads")) if facts.get("reader") else None
         clock = svc.repo.clock
         with deterministic(f"{rt.tenant_id}:{event.seq}", clock.now):
             clock.advance_to(event.at)
@@ -468,22 +555,64 @@ class TenantManager:
         """A read: the state as of now, unchanged."""
         with self.open(tenant_id) as rt:
             self.tick_if_due(rt)
-            svc = rt.service
-            with svc.repo.clock.peek(self.now()):
-                return svc.dispatch(method, path, body)
+            return self._guarded_read(rt, f"{method} {path.split('?', 1)[0]}",
+                                      lambda svc: svc.dispatch(method, path, body))
 
-    def read(self, tenant_id: str, reader: Callable[[BackOfficeService], Any]) -> Any:
+    def read(self, tenant_id: str, reader: Callable[[BackOfficeService], Any], *, what: str = "read") -> Any:
         """Run ``reader`` on the tenant's service (no change allowed) as of now."""
         with self.open(tenant_id) as rt:
-            svc = rt.service
-            with svc.repo.clock.peek(self.now()):
-                return reader(svc)
+            return self._guarded_read(rt, what, reader)
+
+    def read_many(self, tenant_ids: Sequence[str], reader: Callable[[list[BackOfficeService]], Any], *,
+                  what: str = "read") -> Any:
+        """Run ``reader`` over several tenants at once (the internal dashboard), each locked and as of now.
+
+        Locks are taken in tenant-id order; every other path holds one tenant lock at a time, so
+        this cannot deadlock. A tenant that cannot be opened is left out.
+        """
+        from contextlib import ExitStack
+
+        now = self.now()
+        with ExitStack() as stack:
+            opened: list[TenantRuntime] = []
+            for tenant_id in sorted(set(tenant_ids)):
+                try:
+                    opened.append(stack.enter_context(self.open(tenant_id)))
+                except (TenantNotFound, ReplayDiverged):
+                    continue
+            services = [rt.service for rt in opened]
+            before = [state_digest(svc) for svc in services]
+            for svc in services:
+                stack.enter_context(svc.repo.clock.peek(now))
+            result = reader(services)
+        for rt, digest in zip(opened, before, strict=True):
+            self._check_unchanged(rt, digest, what)
+        return result
+
+    def _guarded_read(self, rt: TenantRuntime, what: str, reader: Callable[[BackOfficeService], Any]) -> Any:
+        svc = rt.service
+        before = state_digest(svc)
+        with svc.repo.clock.peek(self.now()):
+            result = reader(svc)
+        self._check_unchanged(rt, before, what)
+        return result
+
+    def _check_unchanged(self, rt: TenantRuntime, before: str, what: str) -> None:
+        """A read changed the tenant: that change is in no event, so drop it (rebuild from the log)."""
+        if rt.svc is None or state_digest(rt.svc) == before:
+            return
+        log.error("read_changed_state", extra={"tenant": rt.tenant_id, "route": what})
+        with self._guard:
+            self._cache.pop(rt.tenant_id, None)
+        if self.strict_reads:
+            raise ReadChangedState(f"{what} changed tenant {rt.tenant_id}")
 
     def live_env(self, **kwargs: Any) -> Env:
         return Env(live=True, vault=self.vault, mailer=self.mailer, **kwargs)
 
     def _facts(self, **extra: Any) -> dict[str, Any]:
-        return {"vault": self.vault is not None, "mailer": self.mailer is not None, **extra}
+        return {"vault": self.vault is not None, "mailer": self.mailer is not None,
+                "reader": self.reader is not None, **extra}
 
     def command(self, tenant_id: str, actor: str, method: str, path: str,
                 body: Mapping[str, Any] | None) -> tuple[int, dict[str, Any]]:
@@ -505,8 +634,11 @@ class TenantManager:
             revoke = _REVOKE.match(path)
             if method == "POST" and revoke:
                 index.append(IndexOp("remove_api_key", revoke.group(1)))
-            data = {"method": method, "path": path, "body": clean,
-                    "env": self._facts(authorize=authorize is not None)}
+            data: dict[str, Any] = {"method": method, "path": path, "body": clean,
+                                    "env": self._facts(authorize=authorize is not None)}
+            reads = pre_read(rt.service, self.reader, _uploads(clean, env))
+            if reads:
+                data["reads"] = reads
             return self.record(rt, "request", data, actor, env, index=index)
 
     def _authorize_url(self, rt: TenantRuntime, path: str, body: Mapping[str, Any]) -> str | None:
@@ -570,11 +702,42 @@ class TenantManager:
                     log.exception("vault_move_failed", extra={"tenant": tenant_id})
             return status, body
 
-    def bank_linked(self, tenant_id: str, *, bank: str, company_id: str, ibans: Sequence[str]
-                    ) -> tuple[int, dict[str, Any]]:
+    def bank_linked(self, tenant_id: str, *, bank: str, company_id: str, ibans: Sequence[str],
+                    consent_until: date | None = None) -> tuple[int, dict[str, Any]]:
+        until = consent_until or (self.now() + timedelta(days=180)).date()
         with self.open(tenant_id) as rt:
-            return self.record(rt, "bank.linked", {"bank": bank, "companyId": company_id, "ibans": list(ibans)},
+            return self.record(rt, "bank.linked", {"bank": bank, "companyId": company_id, "ibans": list(ibans),
+                                                   "consentUntil": until.isoformat()},
                                "system", self.live_env())
+
+    # ----------------------------------------------------------------- synced imports (server/sync.py)
+
+    def record_mail(self, tenant_id: str, connection_id: str, messages: Sequence[bytes],
+                    state: Mapping[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        """Messages a mailbox sync fetched (and, on the last batch, the sync's new state) as one event."""
+        with self.open(tenant_id) as rt:
+            env = self.live_env()
+            refs = [self.put_file(tenant_id, raw, env) for raw in messages]
+            data: dict[str, Any] = {"connectionId": connection_id, "messages": [{OBJECT: ref} for ref in refs],
+                                    "state": dict(state) if state is not None else None, "env": self._facts()}
+            reads = pre_read(rt.service, self.reader, [(raw, "message.eml", "message/rfc822") for raw in messages])
+            if reads:
+                data["reads"] = reads
+            return self.record(rt, "sync.mail", data, "system:sync", env)
+
+    def record_bank(self, tenant_id: str, connection_id: str, rows: Sequence[Mapping[str, Any]],
+                    state: Mapping[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        """Booked transactions a bank sync fetched (BankRow JSON) and the sync's new state, as one event."""
+        with self.open(tenant_id) as rt:
+            data = {"connectionId": connection_id, "rows": [dict(r) for r in rows],
+                    "state": dict(state) if state is not None else None}
+            return self.record(rt, "sync.bank", data, "system:sync", self.live_env())
+
+    def record_sync_failure(self, tenant_id: str, connection_id: str, state: Mapping[str, Any], *,
+                            reconnect: bool) -> tuple[int, dict[str, Any]]:
+        with self.open(tenant_id) as rt:
+            return self.record(rt, "sync.failed", {"connectionId": connection_id, "state": dict(state),
+                                                   "reconnect": bool(reconnect)}, "system:sync", self.live_env())
 
     def chat(self, tenant_id: str, actor: str, body: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
         message = body.get("message")
@@ -582,7 +745,7 @@ class TenantManager:
             return 400, {"error": "bad_request", "message": "Write what you need."}
         if len(message) > 4000:
             return 400, {"error": "bad_request", "message": "That is too long. Try a shorter request."}
-        history = body.get("history") if isinstance(body.get("history"), list) else []
+        history = clean_history(body.get("history"))
         with self.open(tenant_id) as rt:
             self.tick_if_due(rt)
             if self.brain_factory is not None:
@@ -596,14 +759,15 @@ class TenantManager:
                     raise
                 except Exception:  # the model is unavailable: the rules answer instead
                     log.warning("chat_model_unavailable", extra={"tenant": tenant_id})
-            return self.record(rt, "chat.rule", {"message": message}, actor, self.live_env())
+            return self.record(rt, "chat.rule", {"message": message, "history": history}, actor, self.live_env())
 
     def _chat_tool(self, rt: TenantRuntime, actor: str, name: str, args: dict[str, Any],
                    cards: list[dict[str, Any]]) -> Any:
         from backoffice.assistant import CHANGING_TOOLS, run_tool
 
         if name not in CHANGING_TOOLS:
-            return run_tool(rt.service.assistant, name, args, cards)
+            return self._guarded_read(rt, f"chat tool {name}",
+                                      lambda svc: run_tool(svc.assistant, name, args, cards))
         _, body = self.record(rt, "chat.tool", {"name": name, "input": dict(args)}, actor,
                               self.live_env(cards=cards))
         if body.get("isError"):
@@ -670,7 +834,8 @@ def _chat_rule(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> t
     from backoffice.assistant import RuleBrain
 
     try:
-        return 200, RuleBrain(rt.service.assistant).handle(str(event.data.get("message", "")))
+        return 200, RuleBrain(rt.service.assistant).handle(str(event.data.get("message", "")),
+                                                          clean_history(event.data.get("history")))
     except ValueError as exc:
         return 400, {"error": "bad_request", "message": str(exc)}
 
@@ -705,18 +870,29 @@ def _email_connected(m: TenantManager, rt: TenantRuntime, event: Event, env: Env
 
 
 def _bank_linked(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
-    svc = rt.service
-    ids: list[str] = []
-    ibans = [str(i) for i in event.data.get("ibans") or []] or [""]
-    for iban in ibans:
-        try:
-            out = svc.add_source({"kind": "bank", "bank": event.data.get("bank"),
-                                  "companyId": event.data.get("companyId"), "iban": iban})
-            ids.append(out["id"])
-        except ServiceError as exc:
-            if exc.status != 409:  # an account already connected is fine
-                raise
-    return 200, {"ok": True, "ids": ids}
+    d = event.data
+    until = date.fromisoformat(str(d["consentUntil"])) if d.get("consentUntil") else \
+        (event.at + timedelta(days=180)).date()
+    return 200, rt.service.link_bank(str(d.get("bank") or ""), str(d.get("companyId") or ""),
+                                     [str(i) for i in d.get("ibans") or []], until)
+
+
+def _sync_mail(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
+    d = event.data
+    raws = [m.get_file(rt.tenant_id, ref[OBJECT], env) for ref in d.get("messages") or []]
+    return 200, rt.service.sync_mail(str(d.get("connectionId")), raws, d.get("state"))
+
+
+def _sync_bank(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
+    d = event.data
+    rows = [bank_row(r) for r in d.get("rows") or []]
+    return 200, rt.service.sync_bank(str(d.get("connectionId")), rows, d.get("state"))
+
+
+def _sync_failed(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
+    d = event.data
+    return 200, rt.service.sync_failed(str(d.get("connectionId")), d.get("state") or {},
+                                       reconnect=bool(d.get("reconnect")))
 
 
 def _tick(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
@@ -739,6 +915,9 @@ _HANDLERS: dict[str, Handler] = {
     "sign_in.finished": _sign_in_finished,
     "email.connected": _email_connected,
     "bank.linked": _bank_linked,
+    "sync.mail": _sync_mail,
+    "sync.bank": _sync_bank,
+    "sync.failed": _sync_failed,
     "tick": _tick,
     "void": _void,
 }

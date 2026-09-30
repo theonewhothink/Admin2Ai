@@ -7,6 +7,9 @@ region      = "eu-south-2" # Spain, closest EU region to Portugal
 dr_region   = "eu-west-3"  # Paris
 
 api_certificate_arn       = "<acm certificate arn in eu-south-2>"
+api_public_url            = "https://<api host>" # BACKOFFICE_API_URL: OAuth and bank redirects
+web_public_url            = "https://<web app host>"
+admin_emails              = []                                       # the team's internal dashboard
 temporal_address          = "<namespace>.<account>.tmprl.cloud:7233" # an EU-region Temporal namespace
 temporal_namespace        = "<namespace>.<account>"
 workflow_services_factory = "<package.module:factory>"

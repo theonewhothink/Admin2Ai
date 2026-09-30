@@ -76,6 +76,17 @@ def test_compose_has_the_whole_stack() -> None:
     assert services["migrate"]["command"] == ["python", "-m", "backoffice_db", "migrate"]
 
 
+def test_compose_runs_the_sync_worker_like_the_api() -> None:
+    services = _compose()["services"]
+    sync, api = services["sync-worker"], services["api"]
+    assert sync["command"] == ["python", "-m", "backoffice.server.worker"]
+    assert sync["depends_on"]["migrate"]["condition"] == "service_completed_successfully"
+    assert "ports" not in sync  # outbound only
+    shared = {k: v for k, v in api["environment"].items() if k not in ("WEB_CONCURRENCY", "FORWARDED_ALLOW_IPS")}
+    assert sync["environment"] == shared  # same database, vault, OAuth apps, bank keys, reading
+    assert sync["volumes"] == api["volumes"]  # the same evidence files
+
+
 def test_compose_publishes_ports_on_localhost_only() -> None:
     for name, service in _compose()["services"].items():
         for port in service.get("ports", []):

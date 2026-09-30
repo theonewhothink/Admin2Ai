@@ -1,6 +1,8 @@
 # Compute on ECS Fargate (§44): api (behind the load balancer), worker
-# (Temporal activities and workflows), ocr (self-hosted OCR, §13-17) and an
-# on-demand migration task. Images are immutable, scanned on push, KMS-encrypted.
+# (Temporal activities and workflows), sync (reads connected mailboxes and
+# banks into every business and runs each business's day, §6, §47), ocr
+# (self-hosted OCR, §13-17) and an on-demand migration task. Images are
+# immutable, scanned on push, KMS-encrypted.
 #
 # GPU note for OCR: Fargate has no GPUs. PP-OCRv6 and PaddleOCR-VL run on x64
 # CPU (slower, fine for the MVP volume). For GPU inference, run the ocr
@@ -93,6 +95,8 @@ locals {
   backend_image = "${aws_ecr_repository.repo["backend"].repository_url}:${var.backend_image_tag}"
   ocr_image     = "${aws_ecr_repository.repo["ocr"].repository_url}:${var.ocr_image_tag}"
   log_prefix    = "/${var.project}/${var.environment}"
+  # Cloud Map registers the ocr service under its service name.
+  ocr_url = "http://${local.name}-ocr.${aws_service_discovery_private_dns_namespace.internal.name}:8080"
 
   app_environment = {
     AWS_REGION                = var.region
@@ -104,7 +108,7 @@ locals {
     INGEST_QUEUE_URL          = aws_sqs_queue.main["ingest"].url
     OCR_QUEUE_URL             = aws_sqs_queue.main["ocr"].url
     NOTIFICATIONS_QUEUE_URL   = aws_sqs_queue.main["notifications"].url
-    OCR_SERVICE_URL           = "http://ocr.${aws_service_discovery_private_dns_namespace.internal.name}:8080"
+    OCR_SERVICE_URL           = local.ocr_url
     TEMPORAL_ADDRESS          = var.temporal_address
     TEMPORAL_NAMESPACE        = var.temporal_namespace
     TEMPORAL_TASK_QUEUE       = var.temporal_task_queue
@@ -119,6 +123,48 @@ locals {
       AUDIT_HMAC_KEY = aws_secretsmanager_secret.audit_hmac.arn
     },
     var.temporal_api_key_secret_arn == null ? {} : { TEMPORAL_API_KEY = var.temporal_api_key_secret_arn },
+  )
+
+  # The production back office (backend/src/backoffice/server): real businesses,
+  # sign-in, event-sourced data in PostgreSQL, files in the evidence bucket. The
+  # api and the sync worker share these settings; secrets come from Secrets
+  # Manager, never from plain variables.
+  production_environment = {
+    BACKOFFICE_MODE             = "production"
+    S3_BUCKET                   = aws_s3_bucket.evidence.bucket
+    BACKOFFICE_VAULT_KMS_KEY_ID = aws_kms_key.vault.arn
+    BACKOFFICE_API_URL          = var.api_public_url
+    BACKOFFICE_WEB_URL          = var.web_public_url
+    BACKOFFICE_ALLOWED_ORIGINS  = join(",", distinct(concat([var.web_public_url], var.extra_allowed_origins)))
+    BACKOFFICE_ADMIN_EMAILS     = join(",", [for e in var.admin_emails : lower(e)])
+    BACKOFFICE_OCR_URL          = local.ocr_url
+    BACKOFFICE_EXTERNAL_AI      = var.external_ai_reading ? "on" : "off"
+    BACKOFFICE_SMTP_PORT        = tostring(var.smtp_port)
+    BACKOFFICE_SYNC_INTERVAL    = tostring(var.sync_interval_seconds)
+    BACKOFFICE_HISTORY_DAYS     = tostring(var.history_days)
+  }
+
+  production_secrets = {
+    BACKOFFICE_STATE_KEY               = aws_secretsmanager_secret.state_key.arn
+    BACKOFFICE_GOOGLE_CLIENT_ID        = "${aws_secretsmanager_secret.connector["google-oauth-client"].arn}:client_id::"
+    BACKOFFICE_GOOGLE_CLIENT_SECRET    = "${aws_secretsmanager_secret.connector["google-oauth-client"].arn}:client_secret::"
+    BACKOFFICE_MICROSOFT_CLIENT_ID     = "${aws_secretsmanager_secret.connector["microsoft-oauth-client"].arn}:client_id::"
+    BACKOFFICE_MICROSOFT_CLIENT_SECRET = "${aws_secretsmanager_secret.connector["microsoft-oauth-client"].arn}:client_secret::"
+    GOCARDLESS_SECRET_ID               = "${aws_secretsmanager_secret.connector["open-banking"].arn}:secret_id::"
+    GOCARDLESS_SECRET_KEY              = "${aws_secretsmanager_secret.connector["open-banking"].arn}:secret_key::"
+    BACKOFFICE_SMTP_HOST               = "${aws_secretsmanager_secret.integration["smtp"].arn}:host::"
+    BACKOFFICE_SMTP_USER               = "${aws_secretsmanager_secret.integration["smtp"].arn}:user::"
+    BACKOFFICE_SMTP_PASSWORD           = "${aws_secretsmanager_secret.integration["smtp"].arn}:password::"
+    BACKOFFICE_SMTP_FROM               = "${aws_secretsmanager_secret.integration["smtp"].arn}:from::"
+    EXPO_ACCESS_TOKEN                  = "${aws_secretsmanager_secret.integration["expo"].arn}:access_token::"
+    ANTHROPIC_API_KEY                  = "${aws_secretsmanager_secret.integration["anthropic"].arn}:api_key::"
+  }
+
+  # Known length at plan time (it drives a count in the module).
+  production_secret_arns = concat(
+    [aws_secretsmanager_secret.state_key.arn],
+    [for k in sort(keys(local.connector_secret_fields)) : aws_secretsmanager_secret.connector[k].arn],
+    [for k in sort(keys(local.integration_secret_fields)) : aws_secretsmanager_secret.integration[k].arn],
   )
 
   # Built so its length is known at plan time (it drives a count in the module).
@@ -168,9 +214,9 @@ module "api" {
   port    = 8000
 
   # Tasks are reachable only from the load balancer's security group.
-  environment   = merge(local.app_environment, { FORWARDED_ALLOW_IPS = "*" })
-  secrets       = local.app_secrets
-  secret_arns   = local.app_secret_arns
+  environment   = merge(local.app_environment, local.production_environment, { FORWARDED_ALLOW_IPS = "*" })
+  secrets       = merge(local.app_secrets, local.production_secrets)
+  secret_arns   = concat(local.app_secret_arns, local.production_secret_arns)
   task_role_arn = aws_iam_role.api.arn
 
   subnet_ids             = aws_subnet.app[*].id
@@ -221,6 +267,38 @@ module "worker" {
   capacity_provider_strategy = local.worker_capacity
 }
 
+# One task: it reads every connected mailbox and bank on schedule (cursors and
+# backoff live in each business's event log and in memory), and runs each
+# business's day even when nobody signs in. A second copy would only repeat
+# the same reads (events are deduplicated), so it runs singly, on demand capacity.
+module "sync" {
+  source = "./modules/ecs_service"
+
+  name                = "${local.name}-sync"
+  cluster_arn         = local.module_common.cluster_arn
+  region              = local.module_common.region
+  logs_kms_key_arn    = local.module_common.logs_kms_key_arn
+  log_retention_days  = local.module_common.log_retention_days
+  log_group_prefix    = local.module_common.log_group_prefix
+  secrets_kms_key_arn = local.module_common.secrets_kms_key_arn
+
+  image   = local.backend_image
+  command = ["python", "-m", "backoffice.server.worker"]
+  cpu     = var.sync_cpu
+  memory  = var.sync_memory
+
+  environment   = merge(local.app_environment, local.production_environment)
+  secrets       = merge(local.app_secrets, local.production_secrets)
+  secret_arns   = concat(local.app_secret_arns, local.production_secret_arns)
+  task_role_arn = aws_iam_role.sync.arn
+
+  subnet_ids             = aws_subnet.app[*].id
+  security_group_ids     = [aws_security_group.sync.id]
+  desired_count          = 1
+  enable_execute_command = var.enable_execute_command
+  stop_timeout           = 120 # finishes the business it is syncing
+}
+
 module "ocr" {
   source = "./modules/ecs_service"
 
@@ -267,7 +345,8 @@ module "migrate" {
   image          = local.backend_image
   command = [
     "sh", "-c",
-    "python -m backoffice_db migrate && python -m backoffice_db check && python -m backoffice_db ensure-login backoffice_api --member-of backoffice_app",
+    # backoffice_scheduler: the sync worker and the team dashboard list tenant ids (nothing else).
+    "python -m backoffice_db migrate && python -m backoffice_db check && python -m backoffice_db ensure-login backoffice_api --member-of backoffice_app --member-of backoffice_scheduler",
   ]
   cpu    = 512
   memory = 1024

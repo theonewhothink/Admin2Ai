@@ -174,6 +174,12 @@ resource "aws_security_group" "worker" {
   vpc_id      = aws_vpc.main.id
 }
 
+resource "aws_security_group" "sync" {
+  name        = "${local.name}-sync"
+  description = "Sync worker tasks (mailboxes and banks)"
+  vpc_id      = aws_vpc.main.id
+}
+
 resource "aws_security_group" "ocr" {
   name        = "${local.name}-ocr"
   description = "Self-hosted OCR tasks"
@@ -237,15 +243,26 @@ resource "aws_vpc_security_group_ingress_rule" "api_from_alb" {
 }
 
 # App tiers reach external mail, bank and portal APIs over HTTPS, and the
-# managed Temporal endpoint (7233) when Temporal Cloud is used.
+# managed Temporal endpoint (7233) when Temporal Cloud is used. The sync worker
+# needs HTTPS, IMAPS, PostgreSQL and OCR only.
 resource "aws_vpc_security_group_egress_rule" "https_out" {
-  for_each          = { api = aws_security_group.api.id, worker = aws_security_group.worker.id }
+  for_each          = { api = aws_security_group.api.id, worker = aws_security_group.worker.id, sync = aws_security_group.sync.id }
   security_group_id = each.value
   description       = "HTTPS to AWS APIs and external providers"
   cidr_ipv4         = "0.0.0.0/0"
   ip_protocol       = "tcp"
   from_port         = 443
   to_port           = 443
+}
+
+# Mailboxes connected with an app password are read over IMAPS (connectors/imap.py).
+resource "aws_vpc_security_group_egress_rule" "sync_imaps" {
+  security_group_id = aws_security_group.sync.id
+  description       = "IMAP over TLS to owners' mail servers"
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "tcp"
+  from_port         = 993
+  to_port           = 993
 }
 
 resource "aws_vpc_security_group_egress_rule" "temporal_out" {
@@ -259,7 +276,7 @@ resource "aws_vpc_security_group_egress_rule" "temporal_out" {
 }
 
 resource "aws_vpc_security_group_egress_rule" "to_db" {
-  for_each                     = { api = aws_security_group.api.id, worker = aws_security_group.worker.id }
+  for_each                     = { api = aws_security_group.api.id, worker = aws_security_group.worker.id, sync = aws_security_group.sync.id }
   security_group_id            = each.value
   description                  = "PostgreSQL"
   referenced_security_group_id = aws_security_group.db.id
@@ -279,7 +296,7 @@ resource "aws_vpc_security_group_egress_rule" "to_redis" {
 }
 
 resource "aws_vpc_security_group_egress_rule" "to_ocr" {
-  for_each                     = { api = aws_security_group.api.id, worker = aws_security_group.worker.id }
+  for_each                     = { api = aws_security_group.api.id, worker = aws_security_group.worker.id, sync = aws_security_group.sync.id }
   security_group_id            = each.value
   description                  = "Self-hosted OCR"
   referenced_security_group_id = aws_security_group.ocr.id
@@ -289,7 +306,7 @@ resource "aws_vpc_security_group_egress_rule" "to_ocr" {
 }
 
 resource "aws_vpc_security_group_ingress_rule" "ocr_from_app" {
-  for_each                     = { api = aws_security_group.api.id, worker = aws_security_group.worker.id }
+  for_each                     = { api = aws_security_group.api.id, worker = aws_security_group.worker.id, sync = aws_security_group.sync.id }
   security_group_id            = aws_security_group.ocr.id
   description                  = "OCR requests from ${each.key}"
   referenced_security_group_id = each.value
@@ -321,7 +338,7 @@ resource "aws_vpc_security_group_egress_rule" "ocr_s3_gateway" {
 }
 
 resource "aws_vpc_security_group_ingress_rule" "db_from_app" {
-  for_each                     = { api = aws_security_group.api.id, worker = aws_security_group.worker.id }
+  for_each                     = { api = aws_security_group.api.id, worker = aws_security_group.worker.id, sync = aws_security_group.sync.id }
   security_group_id            = aws_security_group.db.id
   description                  = "PostgreSQL from ${each.key}"
   referenced_security_group_id = each.value

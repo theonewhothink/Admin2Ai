@@ -2,7 +2,8 @@
 # Local development only (docker-entrypoint-initdb.d of the postgres service).
 #
 # Creates the login user the api and worker connect with: a member of
-# backoffice_app, never a superuser, never the table owner, never BYPASSRLS,
+# backoffice_app (and backoffice_scheduler, which may only list tenant ids),
+# never a superuser, never the table owner, never BYPASSRLS,
 # so row-level security applies to every query it makes (§52). The group roles
 # are created here too, idempotently, so the grant works before the first
 # migration; migration 0001 accepts roles that already exist.
@@ -33,4 +34,8 @@ SELECT format(
 )
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'backoffice_api')
 \gexec
+
+-- The sync worker and the team dashboard list tenant ids (and nothing else) as the
+-- scheduler, only after SET ROLE: its policy never applies to ordinary queries.
+GRANT backoffice_scheduler TO backoffice_api WITH INHERIT FALSE, SET TRUE;
 SQL

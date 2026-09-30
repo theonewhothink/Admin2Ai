@@ -197,7 +197,7 @@ jobs:
       - name: Service login can be created
         env:
           APP_DB_PASSWORD: ci-only-app-password
-        run: python -m backoffice_db ensure-login backoffice_api --member-of backoffice_app
+        run: python -m backoffice_db ensure-login backoffice_api --member-of backoffice_app --member-of backoffice_scheduler
 
       - name: Database behaviour tests (isolation, immutability, golden rule, pgvector, production store)
         working-directory: backend

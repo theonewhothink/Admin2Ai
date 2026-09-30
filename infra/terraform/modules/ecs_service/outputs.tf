@@ -13,3 +13,17 @@ output "execution_role_arn" {
 output "log_group_name" {
   value = aws_cloudwatch_log_group.this.name
 }
+
+output "command" {
+  value = var.command
+}
+
+output "environment" {
+  description = "Plain environment variables of the container (never secrets)."
+  value       = var.environment
+}
+
+output "secret_names" {
+  description = "Variables injected from Secrets Manager (names only)."
+  value       = sort(keys(var.secrets))
+}

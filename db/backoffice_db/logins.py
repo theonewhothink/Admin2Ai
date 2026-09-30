@@ -16,7 +16,7 @@ import re
 from collections.abc import Sequence
 
 from .executor import SqlExecutor
-from .tenancy import GROUP_ROLES
+from .tenancy import GROUP_ROLES, SCHEDULER_ROLE
 
 __all__ = ["MIN_PASSWORD_LENGTH", "ensure_login", "ensure_login_sql"]
 
@@ -34,6 +34,12 @@ def ensure_login_sql(user: str, password: str, member_of: Sequence[str]) -> str:
     if len(password) < MIN_PASSWORD_LENGTH or "\x00" in password:
         raise ValueError(f"password must be at least {MIN_PASSWORD_LENGTH} characters")
     literal = "'" + password.replace("'", "''") + "'"
+    plain = [g for g in groups if g != SCHEDULER_ROLE]
+    grants = f"GRANT {', '.join(plain)} TO {user};\n" if plain else ""
+    if SCHEDULER_ROLE in groups:
+        # Only after SET ROLE (listing tenant ids): its policy, which sees every tenant, must never
+        # apply to the login's ordinary, tenant-scoped queries (PostgreSQL 16 grant options).
+        grants += f"GRANT {SCHEDULER_ROLE} TO {user} WITH INHERIT FALSE, SET TRUE;\n"
     return (
         "SET LOCAL standard_conforming_strings = on;\n"
         "DO $$ BEGIN\n"
@@ -43,7 +49,7 @@ def ensure_login_sql(user: str, password: str, member_of: Sequence[str]) -> str:
         "END $$;\n"
         f"ALTER ROLE {user} WITH LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE "
         f"NOREPLICATION PASSWORD {literal};\n"
-        f"GRANT {', '.join(groups)} TO {user};\n"
+        + grants
     )
 
 

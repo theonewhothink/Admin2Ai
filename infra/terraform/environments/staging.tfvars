@@ -8,6 +8,8 @@ region      = "eu-south-2"
 dr_region   = "eu-west-3"
 
 api_certificate_arn       = "<acm certificate arn in eu-south-2>"
+api_public_url            = "https://<staging api host>"
+web_public_url            = "https://<staging web app host>"
 temporal_address          = "<namespace>.<account>.tmprl.cloud:7233"
 temporal_namespace        = "<namespace>.<account>"
 workflow_services_factory = "<package.module:factory>"
@@ -31,5 +33,7 @@ worker_desired_count = 1
 ocr_desired_count    = 1
 ocr_cpu              = 2048
 ocr_memory           = 8192
+sync_cpu             = 512
+sync_memory          = 1024
 log_retention_days   = 30
 # alarm_email = "<on-call address>" # receives CloudWatch alarms

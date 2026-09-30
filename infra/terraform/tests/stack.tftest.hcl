@@ -89,6 +89,9 @@ variables {
   ocr_image_tag             = "2026.09.28-1"
   temporal_address          = "backoffice.example.tmprl.cloud:7233"
   workflow_services_factory = "backoffice.wiring:build_services"
+  api_public_url            = "https://api.backoffice.example"
+  web_public_url            = "https://app.backoffice.example"
+  admin_emails              = ["Team@Backoffice.example"]
 }
 
 run "production_defaults" {
@@ -190,8 +193,57 @@ run "production_defaults" {
   }
 
   assert {
-    condition     = length(aws_cloudwatch_metric_alarm.service_no_tasks) == 3 && length(aws_cloudwatch_metric_alarm.redis_memory) == 2
-    error_message = "api, worker and ocr, and each cache node, must be watched"
+    condition     = length(aws_cloudwatch_metric_alarm.service_no_tasks) == 4 && length(aws_cloudwatch_metric_alarm.redis_memory) == 2
+    error_message = "api, worker, sync and ocr, and each cache node, must be watched"
+  }
+
+  assert {
+    condition = alltrue([for m in [module.api, module.sync] : alltrue([
+      m.environment["BACKOFFICE_MODE"] == "production",
+      m.environment["S3_BUCKET"] == aws_s3_bucket.evidence.bucket,
+      m.environment["BACKOFFICE_VAULT_KMS_KEY_ID"] == aws_kms_key.vault.arn,
+      m.environment["BACKOFFICE_ALLOWED_ORIGINS"] == "https://app.backoffice.example",
+      m.environment["BACKOFFICE_ADMIN_EMAILS"] == "team@backoffice.example",
+      m.environment["BACKOFFICE_EXTERNAL_AI"] == "off",
+    ])])
+    error_message = "the api and the sync worker run the production back office"
+  }
+
+  assert {
+    condition = alltrue([for m in [module.api, module.sync] : length(setsubtract([
+      "DATABASE_URL", "BACKOFFICE_STATE_KEY", "BACKOFFICE_GOOGLE_CLIENT_ID", "BACKOFFICE_GOOGLE_CLIENT_SECRET",
+      "BACKOFFICE_MICROSOFT_CLIENT_ID", "BACKOFFICE_MICROSOFT_CLIENT_SECRET", "GOCARDLESS_SECRET_ID",
+      "GOCARDLESS_SECRET_KEY", "BACKOFFICE_SMTP_HOST", "BACKOFFICE_SMTP_USER", "BACKOFFICE_SMTP_PASSWORD",
+      "BACKOFFICE_SMTP_FROM", "EXPO_ACCESS_TOKEN", "ANTHROPIC_API_KEY",
+    ], m.secret_names)) == 0])
+    error_message = "every credential of the api and the sync worker comes from Secrets Manager"
+  }
+
+  assert {
+    condition = alltrue([for m in [module.api, module.sync, module.worker] : length([
+      for k in keys(m.environment) : k if can(regex("PASSWORD|SECRET|TOKEN|STATE_KEY|API_KEY|DATABASE_URL", k))
+    ]) == 0])
+    error_message = "no secret is ever a plain environment variable"
+  }
+
+  assert {
+    condition     = join(" ", module.sync.command) == "python -m backoffice.server.worker" && module.sync.service_name != null
+    error_message = "the sync worker runs as its own service"
+  }
+
+  assert {
+    condition     = strcontains(join(" ", module.migrate.command), "--member-of backoffice_app --member-of backoffice_scheduler")
+    error_message = "the api login may list tenant ids (scheduler) for the sync worker and the team dashboard"
+  }
+
+  assert {
+    condition     = aws_kms_key.vault.enable_key_rotation && length(aws_iam_role_policy.vault_key) == 2
+    error_message = "owners' sign-ins are sealed with a rotating KMS key only the api and sync worker may use"
+  }
+
+  assert {
+    condition     = length(aws_secretsmanager_secret_version.connector) == 3 && length(aws_secretsmanager_secret_version.integration) == 3
+    error_message = "every operator secret exists with empty fields, so tasks start before it is filled in"
   }
 
   assert {

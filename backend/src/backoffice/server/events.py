@@ -240,5 +240,14 @@ def state_digest(svc: Any) -> str:
         "outbox": sorted([m.id, m.status] for m in op.outbox.values()) if op else [],
         "reports": sorted(op.reports) if op else [],
         "seq": getattr(op, "_seq", 0),
+        # Files read so far (by evidence id) and what each reading found, so a read that reads is caught.
+        "reads": sorted([k, bool(v.found_anything), len(v.text), len(v.steps)] for k, v in repo.reads.items()),
+        "real_sources": bool(getattr(svc, "real_sources", False)),
+        "sync": getattr(svc, "sync_states", None) or {},
+        "logs": [len(repo.closure_log), len(repo.interactions), len(repo.history_pairs),
+                 len(repo.history_transactions)],
+        "recovered": sorted(repo.recovered_tx_ids),
+        "portal": sorted(repo.portal),
+        "phones": sorted(repo.supplier_phones.items()),
     }
     return hashlib.sha256(canonical(summary).encode()).hexdigest()

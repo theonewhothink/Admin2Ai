@@ -8,7 +8,10 @@ tenant into a multi-tenant service:
 * :mod:`.store`     the storage contract, plus an in-memory store for tests;
 * :mod:`.postgres`  the PostgreSQL store (psycopg 3, row-level security per request);
 * :mod:`.events`    the append-only, hash-chained tenant event log and state digests;
-* :mod:`.runtime`   event-sourced tenants: record, apply, replay, cache, locks;
+* :mod:`.runtime`   event-sourced tenants: record, apply, replay, cache, locks, read guard;
+* :mod:`.reads`     documents read before an event is recorded; replays use the recorded reading;
+* :mod:`.sync`      the sync worker: mailboxes and banks into events, each tenant's day;
+* :mod:`.worker`    ``python -m backoffice.server.worker``;
 * :mod:`.auth`      sign-up, sign-in, sessions, CSRF guard, roles, rate limits;
 * :mod:`.notify`    Expo push notifications, for the few things that need the owner;
 * :mod:`.account`   GDPR export and erasure;

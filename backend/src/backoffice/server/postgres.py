@@ -414,6 +414,22 @@ class PostgresStore:
                 cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
             return events
 
+    def tenant_ids(self) -> list[str]:
+        """Every tenant id, as the scheduler role (the only one that may list tenants, 0001).
+
+        The API/worker login must be a member of ``backoffice_scheduler``
+        (``ensure-login ... --member-of backoffice_app --member-of backoffice_scheduler``).
+        Everything else is still read per tenant under row-level security.
+        """
+        psycopg = _psycopg()
+        try:
+            with self._tx() as cur:
+                cur.execute(f"SET LOCAL ROLE {self._db.SCHEDULER_ROLE}")
+                cur.execute("SELECT id FROM tenants ORDER BY id")
+                return [str(r[0]) for r in cur.fetchall()]
+        except psycopg.errors.InsufficientPrivilege:
+            raise StoreError(f"the database login is not a member of {self._db.SCHEDULER_ROLE}") from None
+
     def mark_objects_purged(self, tenant_id: str, at: datetime) -> None:
         with self._tx(tenant=tenant_id) as cur:
             cur.execute("UPDATE tenant_erasures SET objects_purged_at = %s WHERE tenant_id = %s", (at, tenant_id))

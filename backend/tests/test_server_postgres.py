@@ -95,7 +95,11 @@ def database(server: Server) -> dict[str, object]:
     migrate_all(db)
     login = f"bo_api_{uuid.uuid4().hex[:8]}"
     db.execute(f"CREATE ROLE {login} LOGIN PASSWORD '{APP_PASSWORD}' NOSUPERUSER NOBYPASSRLS IN ROLE backoffice_app")
-    return {"db": db, "url": server.url(name, login, APP_PASSWORD), "name": name}
+    db.execute(f"GRANT backoffice_scheduler TO {login} WITH INHERIT FALSE, SET TRUE")  # as ensure-login does
+    plain = f"bo_plain_{uuid.uuid4().hex[:8]}"  # a login that may not list tenants
+    db.execute(f"CREATE ROLE {plain} LOGIN PASSWORD '{APP_PASSWORD}' NOSUPERUSER NOBYPASSRLS IN ROLE backoffice_app")
+    return {"db": db, "url": server.url(name, login, APP_PASSWORD), "name": name,
+            "plain_url": server.url(name, plain, APP_PASSWORD)}
 
 
 @pytest.fixture(scope="module")
@@ -304,3 +308,30 @@ def test_account_erasure_removes_the_business_and_leaves_a_record(tmp_path: Path
                       f"FROM tenant_erasures WHERE tenant_id = '{tenant}'")
     assert record == [{"events_erased": "4", "done": "t", "files": "t"}]  # created, company, task, key
     assert h.client.post("/api/auth/login", json={"email": email, "password": PASSWORD}).status_code == 401
+
+
+def test_listing_tenants_needs_the_scheduler_role(tmp_path: Path, database: dict, store: PostgresStore) -> None:
+    from backoffice.server.store import StoreError
+    from backoffice.server.sync import SyncWorker
+
+    h = harness(tmp_path, store=store)
+    account = signup(h.client, f"list-{uuid.uuid4().hex[:6]}@example.pt")
+    tenant = account["tenant"]["id"]
+    assert tenant in store.tenant_ids()
+    assert len(store.tenant_ids()) > 1
+    with store._tx(tenant=tenant) as cur:  # the membership never widens ordinary, tenant-scoped reads
+        cur.execute("SELECT id FROM tenants")
+        assert [r[0] for r in cur.fetchall()] == [tenant]
+    with store._tx() as cur:
+        cur.execute("SELECT count(*) FROM tenants")
+        assert cur.fetchone()[0] == 0
+    plain = PostgresStore(str(database["plain_url"]), pool_size=1)
+    try:
+        with pytest.raises(StoreError):
+            plain.tenant_ids()
+    finally:
+        plain.close()
+    # The sync worker fans out over PostgreSQL: the day turns for a tenant nobody opened.
+    h.clock.advance(days=1)
+    report = SyncWorker(h.manager).run_once()
+    assert report.ticks >= 1 and [e.kind for e in store.events(tenant)][-1] == "tick"
