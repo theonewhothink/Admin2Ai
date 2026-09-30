@@ -265,13 +265,16 @@ def extract_text_fields(
     *,
     method: ExtractionMethod = ExtractionMethod.OCR,
     known_customer_tax_ids: Collection[str] = (),
+    known_supplier_tax_ids: Collection[str] = (),
 ) -> TextFieldsResult:
     """Extract candidate observations from Portuguese document text.
 
     ``source`` is the evidence id (or engine name) recorded on every
     observation. Use ``method=EMBEDDED_TEXT`` for a PDF's own text layer.
     ``known_customer_tax_ids`` are NIFs known to be the recipient (e.g. the
-    business's own NIFs when reading purchase invoices).
+    business's own NIFs when reading purchase invoices);
+    ``known_supplier_tax_ids`` are NIFs known to be the issuer (e.g. the
+    business's own NIF when it reads its own sales invoice).
     """
     original = clean(text or "")
     lines = original.split("\n")
@@ -289,7 +292,7 @@ def extract_text_fields(
 
     atcud = _find_atcud(lines, folded)
     doc_numbers = _document_numbers(lines, folded, out, atcud)
-    unassigned, final_consumer = _tax_ids(folded, out, known_customer_tax_ids)
+    unassigned, final_consumer = _tax_ids(folded, out, known_customer_tax_ids, known_supplier_tax_ids)
     ibans = _ibans(original, out)
     multibanco = _multibanco(folded, out)
 
@@ -458,9 +461,10 @@ _CUSTOMER, _SUPPLIER = "customer", "supplier"
 
 
 def _tax_ids(
-    folded: list[str], out: _Builder, known_customers: Collection[str]
+    folded: list[str], out: _Builder, known_customers: Collection[str], known_suppliers: Collection[str] = ()
 ) -> tuple[tuple[str, ...], bool]:
-    known = {n for n in (normalize_nif(k) for k in known_customers) if n}
+    issuers = {n for n in (normalize_nif(k) for k in known_suppliers) if n}
+    known = {n for n in (normalize_nif(k) for k in known_customers) if n} - issuers
     roles: dict[str, set[str | None]] = {}
     first_line: dict[str, int] = {}
     final_consumer = False
@@ -478,7 +482,7 @@ def _tax_ids(
                 continue
             first_line.setdefault(nif, index + 1)
             roles.setdefault(nif, set()).add(_role_for(folded, index, context))
-    return _assign_roles(roles, first_line, known, out), final_consumer
+    return _assign_roles(roles, first_line, known, out, issuers), final_consumer
 
 
 def _nif_matches(folded_line: str) -> list[re.Match[str]]:
@@ -514,6 +518,7 @@ def _assign_roles(
     first_line: dict[str, int],
     known: set[str],
     out: _Builder,
+    issuers: Collection[str] = frozenset(),
 ) -> tuple[str, ...]:
     customers: list[str] = []
     suppliers: list[str] = []
@@ -521,11 +526,12 @@ def _assign_roles(
     contradictory: list[str] = []
     for nif, seen_roles in roles.items():
         labelled = {r for r in seen_roles if r is not None}
-        if (nif in known and labelled - {_CUSTOMER}) or len(labelled) > 1:
+        if (nif in known and labelled - {_CUSTOMER}) or (nif in issuers and labelled - {_SUPPLIER}) \
+                or len(labelled) > 1:
             contradictory.append(nif)  # e.g. a known customer id labelled as supplier
         elif nif in known or labelled == {_CUSTOMER}:
             customers.append(nif)
-        elif labelled == {_SUPPLIER}:
+        elif nif in issuers or labelled == {_SUPPLIER}:
             suppliers.append(nif)
         else:
             unlabelled.append(nif)
@@ -536,13 +542,20 @@ def _assign_roles(
         out.add(CriticalField.SUPPLIER_TAX_ID, unlabelled[0], _NIF_DEDUCED_CONFIDENCE,
                 first_line[unlabelled[0]])
         unlabelled = []
+    elif len(suppliers) == 1 and suppliers[0] in issuers and not customers and not contradictory \
+            and len(unlabelled) == 1:
+        # The issuer is known (the business's own sales invoice): the only other
+        # valid NIF on it is the customer's.
+        out.add(CriticalField.CUSTOMER_TAX_ID, unlabelled[0], _NIF_DEDUCED_CONFIDENCE,
+                first_line[unlabelled[0]])
+        unlabelled = []
     _emit_role(CriticalField.CUSTOMER_TAX_ID, customers, known, first_line, out)
-    _emit_role(CriticalField.SUPPLIER_TAX_ID, suppliers, set(), first_line, out)
+    _emit_role(CriticalField.SUPPLIER_TAX_ID, suppliers, issuers, first_line, out)
     return tuple(nif for nif in roles if nif in unlabelled or nif in contradictory)
 
 
 def _emit_role(
-    field_: CriticalField, nifs: list[str], known: set[str], first_line: dict[str, int], out: _Builder
+    field_: CriticalField, nifs: list[str], known: Collection[str], first_line: dict[str, int], out: _Builder
 ) -> None:
     if len(nifs) == 1:
         confidence = _NIF_KNOWN_CONFIDENCE if nifs[0] in known else _NIF_CONFIDENCE

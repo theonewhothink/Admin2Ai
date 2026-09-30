@@ -61,8 +61,8 @@ _TYPES: tuple[NativeDocumentType, ...] = (
     _t("RC", "Recibo (IVA de caixa)", "Receipt (cash-accounting VAT)", _T.RECEIPT, _P, paid=True),
     _t("RG", "Recibo", "Receipt", _T.RECEIPT, _P, paid=True),
     # Movement of goods (SAF-T MovementType): not invoices.
-    _t("GR", "Guia de remessa", "Delivery note", _T.OTHER, _M),
-    _t("GT", "Guia de transporte", "Transport document", _T.OTHER, _M),
+    _t("GR", "Guia de remessa", "Delivery note", _T.DELIVERY_NOTE, _M),
+    _t("GT", "Guia de transporte", "Transport document", _T.DELIVERY_NOTE, _M),
     _t("GA", "Guia de movimentação de ativos próprios", "Own-asset transfer note", _T.OTHER, _M),
     _t("GC", "Guia de consignação", "Consignment note", _T.OTHER, _M),
     _t("GD", "Guia ou nota de devolução", "Return note", _T.OTHER, _M),
@@ -71,10 +71,10 @@ _TYPES: tuple[NativeDocumentType, ...] = (
     _t("CC", "Crédito de consignação", "Consignment credit", _T.OTHER, _W),
     _t("FC", "Fatura de consignação", "Consignment invoice", _T.OTHER, _W),
     _t("FO", "Folha de obra", "Work sheet", _T.OTHER, _W),
-    _t("NE", "Nota de encomenda", "Purchase order", _T.OTHER, _W),
+    _t("NE", "Nota de encomenda", "Purchase order", _T.ORDER_CONFIRMATION, _W),
     _t("OU", "Outros", "Other", _T.OTHER, _W),
-    _t("OR", "Orçamento", "Quote", _T.OTHER, _W),
-    _t("PF", "Pró-forma", "Pro-forma invoice", _T.OTHER, _W),
+    _t("OR", "Orçamento", "Quote", _T.QUOTE, _W),
+    _t("PF", "Pró-forma", "Pro-forma invoice", _T.PRO_FORMA, _W),
     _t("DC", "Documento de conferência", "Conference document", _T.OTHER, _W, legacy=True),
 )
 

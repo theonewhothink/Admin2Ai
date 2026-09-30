@@ -144,13 +144,25 @@ class Operator:
             if q and not all(t in hay for t in q.split()):
                 continue
             ev = self.repo.registry.get(self.repo.tenant_id, rec.evidence_ids[0]) if rec.evidence_ids else None
+            if rec.on_hold and not rec.hold_released:
+                status = "on hold"
+            elif rec.supporting:
+                status = "supporting evidence, not an invoice"
+            elif rec.matched_tx_ids:
+                status = "matched"
+            elif rec.paid_in_cash:
+                status = "paid in cash"
+            else:
+                status = "waiting for payment"
             out.append({
                 "id": d.id, "supplier": name or "Unknown", "number": d.invoice_number or "",
                 "type": d.doc_type.value.replace("_", " "), "date": issued.isoformat(),
                 "amount": float(d.gross_amount) if d.gross_amount is not None else None,
                 "currency": d.currency, "companyId": d.entity_id or "", "company": self._company(d.entity_id),
-                "status": "on hold" if rec.on_hold and not rec.hold_released else
-                          ("matched" if rec.matched_tx_ids else "waiting for payment"),
+                "status": status,
+                # For the accountant (§28): a pro-forma, quote, delivery note, order or account statement
+                # is supporting evidence only and is never booked.
+                "booking": "supporting" if rec.supporting else "booked",
                 "quality": d.quality.name.lower(), "origin": rec.origin,
                 "filename": (ev.filename if ev and ev.filename else f"{d.id}.bin"),
                 "evidenceIds": list(rec.evidence_ids),
@@ -168,14 +180,20 @@ class Operator:
 
     def export_zip(self, *, company_id: str = "", date_from: date | None = None,
                    date_to: date | None = None) -> tuple[str, bytes, int]:
-        """All documents in a period as a ZIP: originals, ledger.csv and manifest.json."""
+        """All documents in a period as a ZIP: originals, ledger.csv and manifest.json.
+
+        Supporting evidence (a pro-forma, quote, delivery note, order or account statement) is
+        marked ``supporting`` in the ``booking`` column and filed under ``documents/supporting/``:
+        it is kept for the accountant to see, never to book (§3, §28).
+        """
         import zipfile
 
         docs = self.documents(company_id=company_id, date_from=date_from, date_to=date_to)
         buf = io.BytesIO()
         ledger = io.StringIO()
         w = csv.writer(ledger, delimiter=";")
-        w.writerow(["date", "company", "supplier", "number", "type", "gross", "currency", "status", "file", "sha256"])
+        w.writerow(["date", "company", "supplier", "number", "type", "gross", "currency", "status", "booking", "file",
+                    "sha256"])
         manifest = []
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
             for d in docs:
@@ -184,11 +202,13 @@ class Operator:
                 sha = ""
                 if f:
                     safe = re.sub(r"[^\w.-]+", "_", f[0])[:80]
-                    path = f"documents/{d['date']}_{d['id']}_{safe}"
+                    folder = "documents/supporting" if d["booking"] == "supporting" else "documents"
+                    path = f"{folder}/{d['date']}_{d['id']}_{safe}"
                     z.writestr(path, f[2])
                     sha = self.repo.registry.get(self.repo.tenant_id, d["evidenceIds"][0]).sha256
                 w.writerow([d["date"], d["company"], d["supplier"], d["number"], d["type"],
-                            "" if d["amount"] is None else f"{d['amount']:.2f}", d["currency"], d["status"], path, sha])
+                            "" if d["amount"] is None else f"{d['amount']:.2f}", d["currency"], d["status"],
+                            d["booking"], path, sha])
                 manifest.append({**d, "file": path, "sha256": sha})
             z.writestr("ledger.csv", "﻿" + ledger.getvalue())
             z.writestr("manifest.json", json.dumps({"documents": manifest}, indent=2, ensure_ascii=False))
@@ -1125,6 +1145,8 @@ class RuleBrain:
                         return _Answer(found["answer"], evidence=found["evidence"])
                 where = "came from" if x.direction == "in" else "went to"
                 text = f"The {self._m(x.amount)} payment on {self._day(x.on)} {where} {x.merchant}."
+                if x.paid_in_cash:
+                    text += " It was paid in cash, as the receipt shows."
                 if x.history:
                     text += " It comes from the bank history imported when you connected, so I haven't checked its invoice."
                 return _Answer(text, evidence=[{"label": self.ledger.payment_label(x), "id": x.evidence_id}]

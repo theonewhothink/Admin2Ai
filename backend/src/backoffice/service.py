@@ -53,6 +53,7 @@ from backoffice.orchestrator import (
     TxRecord,
 )
 from backoffice.domain.models import Supplier
+from backoffice.purchases import CAPITAL_ASSET_FLAG, possible_capital_asset
 
 __all__ = ["BackOfficeService", "ServiceError"]
 
@@ -1108,9 +1109,18 @@ class BackOfficeService:
             lines.append({"id": f"r_{n.id}", "tone": "attention", "href": f"/needs-you#{n.id}", "linkLabel": "Answer",
                           "text": f"I still need one thing from you: which company the {who} payment of "
                                   f"{format_money(abs(rec.tx.amount), rec.tx.currency)} belongs to."})
+        for n in self._open_needs(company_id):
+            if n.kind not in ("company", "cash") or repo.item_month(repo.items[n.item_id]) != month:
+                continue
+            lines.append({"id": f"r_{n.id}", "tone": "attention", "href": f"/needs-you#{n.id}", "linkLabel": "Answer",
+                          "text": f"I still need one thing from you. {n.prompt}"})
         for rec in sorted(txs, key=lambda r: (r.tx.booked_on, r.id)):
             item = repo.items[rec.item_id]
-            if item.is_done or item.stage in (Stage.NEEDS_OWNER, Stage.CONFLICT) or rec.document_ids:
+            if item.is_done or item.stage in (Stage.NEEDS_OWNER, Stage.CONFLICT):
+                continue
+            if rec.document_ids:
+                if rec.hold_reason:  # matched, but a large first purchase needs more before it closes
+                    lines.append({"id": f"r_{rec.id}", "text": rec.hold_reason, "tone": "attention"})
                 continue
             if rec.decision is not None and rec.decision.requires_document:
                 lines.append({"id": f"r_{rec.id}", "text": self.orchestrator.missing.plan(rec), "tone": "neutral"})
@@ -1118,6 +1128,9 @@ class BackOfficeService:
             if item.subject_type != "document" or item.is_done or item.stage in (Stage.NEEDS_OWNER, Stage.CONFLICT):
                 continue
             doc = repo.documents[item.subject_id]
+            if doc.hold_reason:
+                lines.append({"id": f"r_{doc.id}", "text": doc.hold_reason, "tone": "attention"})
+                continue
             if doc.matched_tx_ids:
                 continue
             lines.append({"id": f"r_{doc.id}", "tone": "neutral",
@@ -1187,9 +1200,30 @@ class BackOfficeService:
         for n in self._open_needs():
             if n.kind == "check":
                 items.append(self._check(n))
+            elif n.kind in ("company", "cash"):
+                items.append(self._question(n))
             else:
                 items.append(self._choice(n) if n.kind == "choice" else self._approval(n))
         return {"items": items}
+
+    def _question(self, n: NeedsYouRecord) -> dict[str, Any]:
+        """Which company carries a payment, or a cash receipt to confirm: one plain choice (§37, §51)."""
+        if n.subject_type == "transaction":
+            rec = self.repo.transactions[n.subject_id]
+            merchant, amount = self.orchestrator.merchant_name(rec.tx), abs(rec.tx.amount)
+            currency, day = rec.tx.currency, rec.tx.booked_on
+        else:
+            doc = self.repo.documents[n.subject_id]
+            merchant, amount = display_name(doc.document.supplier_name), doc.document.gross_amount or Decimal("0")
+            currency = doc.document.currency
+            day = doc.document.issue_date or doc.received_at.astimezone(TZ).date()
+        return {
+            "id": n.id, "kind": "choice", "tone": "attention", "eyebrow": "We need one answer",
+            "merchant": merchant, "amount": _num(amount), "currency": currency, "date": _iso(day),
+            "companyId": n.company_id, "question": n.prompt, "options": [{"id": o.id, "label": o.label}
+                                                                        for o in n.options],
+            "why": list(n.why),
+        }
 
     def _check(self, n: NeedsYouRecord) -> dict[str, Any]:
         """A document whose sources disagree (§19), asked as a plain choice (§37)."""
@@ -1434,6 +1468,11 @@ class BackOfficeService:
                 who = display_name(self.repo.documents[n.subject_id].document.supplier_name)
                 parts.append(n.prompt)
                 evidence.append({"label": f"{who} · invoice to check", "id": f"needs:{n.id}"})
+            elif n.kind in ("company", "cash"):
+                item = self._question(n)
+                parts.append(n.prompt)
+                what = "which company" if n.kind == "company" else "cash receipt to confirm"
+                evidence.append({"label": f"{item['merchant']} · {what}", "id": f"needs:{n.id}"})
             else:
                 doc = self.repo.documents[n.subject_id]
                 who = display_name(doc.document.supplier_name)
@@ -1616,19 +1655,56 @@ class BackOfficeService:
                              {"label": "Matched with a document", "value": str(matched)},
                              {"label": "Documents collected", "value": str(len(docs))},
                              {"label": "Still missing", "value": str(status.missing_documents)}],
-                "anomalies": anomalies, "taxFlags": self._tax_flags(company_id, txs), "questions": questions,
+                "anomalies": anomalies, "taxFlags": self._tax_flags(company_id, txs, month), "questions": questions,
                 "exportState": export}
 
-    def _tax_flags(self, company_id: str, txs: list[TxRecord]) -> list[dict[str, str]]:
+    def _tax_flags(self, company_id: str, txs: list[TxRecord], month: Month | None = None) -> list[dict[str, str]]:
+        """What the accountant should look at (§28). Accountant-facing only: the owner is never asked."""
+        repo = self.repo
         flags = []
+        records: dict[str, DocumentRecord] = {}
         for rec in txs:
             for doc_id in rec.document_ids:
-                doc = self.repo.documents[doc_id].document
-                if doc.doc_type is DocumentType.INVOICE_RECEIPT and doc.vat_amount == 0 and \
-                        doc.supplier_tax_id and doc.supplier_tax_id[:1] in "123":
-                    flags.append({"id": f"t_{doc_id}",
-                                  "title": f"Rent paid to a private landlord · {format_money(doc.gross_amount or 0)}",
-                                  "detail": "No withholding shown on the receipt. Whether it applies is your call."})
+                records.setdefault(doc_id, repo.documents[doc_id])
+        if month is not None:  # and the month's own documents: paid in cash, still waiting, or held
+            for item in repo.items_for(company_id, month):
+                record = repo.documents.get(item.subject_id) if item.subject_type == "document" else None
+                if record is not None and not record.supporting:
+                    records.setdefault(record.id, record)
+        for doc_id, record in records.items():
+            doc = record.document
+            if doc.doc_type is DocumentType.INVOICE_RECEIPT and doc.vat_amount == 0 and \
+                    doc.supplier_tax_id and doc.supplier_tax_id[:1] in "123":
+                flags.append({"id": f"t_{doc_id}",
+                              "title": f"Rent paid to a private landlord · {format_money(doc.gross_amount or 0)}",
+                              "detail": "No withholding shown on the receipt. Whether it applies is your call."})
+            if not record.sales and possible_capital_asset(doc, record.text):
+                net = doc.net_amount if doc.net_amount is not None else doc.gross_amount
+                paid = " Paid in cash." if record.paid_in_cash else ""
+                flags.append({"id": f"t_asset_{doc_id}",
+                              "title": f"{CAPITAL_ASSET_FLAG} · {format_money(net or 0, doc.currency)} before VAT",
+                              "detail": f"{display_name(doc.supplier_name)} invoice"
+                                        f"{' ' + doc.invoice_number if doc.invoice_number else ''}. It may be "
+                                        f"equipment to depreciate rather than a cost of the month.{paid}"})
+        for rec in sorted(repo.transactions.values(), key=lambda r: (r.tx.booked_on, r.id)):
+            note = rec.company_note
+            if note is None or company_id not in note or (month is not None and Month.of(rec.tx.booked_on) != month):
+                continue
+            paid_by, carried_by, named = note
+            amount = format_money(abs(rec.tx.amount), rec.tx.currency)
+            if paid_by != carried_by:
+                flags.append({"id": f"t_interco_{rec.id}",
+                              "title": f"Inter-company payment · {amount}",
+                              "detail": f"{repo.company_name(paid_by)} paid {repo.company_name(carried_by)}'s "
+                                        f"{self.orchestrator.merchant_name(rec.tx)} invoice from its own account. "
+                                        f"The owner confirmed {repo.company_name(carried_by)} carries it, so it owes "
+                                        f"{repo.company_name(paid_by)} {amount}."})
+            elif carried_by != named:
+                flags.append({"id": f"t_interco_{rec.id}",
+                              "title": f"Invoice addressed to another company · {amount}",
+                              "detail": f"The owner chose {repo.company_name(carried_by)} for a "
+                                        f"{self.orchestrator.merchant_name(rec.tx)} invoice addressed to "
+                                        f"{repo.company_name(named)}. Whether its VAT can be deducted is your call."})
         return flags
 
     def accountant_rule(self, text: str, scope: str = "client") -> dict[str, Any]:

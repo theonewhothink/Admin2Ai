@@ -181,6 +181,7 @@ class Line:
     needs_document: bool
     has_document: bool
     description: str = ""
+    paid_in_cash: bool = False  # a receipt that says it was paid in cash: no bank line (§11)
 
     @property
     def category_label(self) -> str:
@@ -252,8 +253,39 @@ class Ledger:
         for rec in repo.transactions.values():
             decision = rec.decision or engine.classify(rec.tx)
             out.append(self._line(rec.tx, rec, decision, resolver, pending, accountant_ids))
+        for record in repo.documents.values():
+            cash = self._cash_line(record)
+            if cash is not None:
+                out.append(cash)
         out.sort(key=lambda x: (x.on, x.id))
         return out
+
+    def _cash_line(self, record: Any) -> Line | None:
+        """A purchase paid in cash: its receipt is its only evidence (§11). Counted once the receipt
+        closed as a company's cost; waiting for the owner's answer it is pending, like any payment."""
+        repo = self.repo
+        if not record.paid_in_cash or record.matched_tx_ids or record.document.gross_amount is None:
+            return None
+        from backoffice.domain.lifecycle import Stage
+
+        stage = repo.items[record.item_id].stage
+        doc = record.document
+        if stage is Stage.CLOSED and doc.entity_id:
+            company, waiting = doc.entity_id, False
+        elif stage is Stage.NEEDS_OWNER:
+            company, waiting = None, True
+        else:
+            return None  # set aside by the owner, or still being read
+        text = self._document_text(record)
+        category = next((cat for phrase, cat in _EVIDENCE_PHRASES if _has_phrase(text, phrase)), OTHER.id)
+        return Line(
+            id=record.id, on=doc.issue_date or record.received_at.date(), amount=abs(doc.gross_amount),
+            direction="out", currency=doc.currency, merchant=display_name(doc.supplier_name),
+            supplier_id=record.supplier_id, company_id=company, pending=waiting, private=False, kind="cost",
+            category=category, evidence_id=record.evidence_ids[0] if record.evidence_ids else None,
+            document_ids=(record.id,), history=False, needs_document=True, has_document=True,
+            description="Paid in cash", paid_in_cash=True,
+        )
 
     def _line(self, tx: Transaction, rec: Any, decision: Any, resolver: Any, pending: set[str],
               accountant_ids: list[str]) -> Line:
@@ -526,7 +558,8 @@ class Ledger:
     # -- presentation ---------------------------------------------------------
 
     def payment_label(self, x: Line) -> str:
-        return f"{x.merchant} · {day_month(x.on, self.today)} · {format_money(x.amount, x.currency)}"
+        cash = " · paid in cash" if x.paid_in_cash else ""
+        return f"{x.merchant} · {day_month(x.on, self.today)} · {format_money(x.amount, x.currency)}{cash}"
 
     def payment_dict(self, x: Line) -> dict[str, Any]:
         if x.history:
@@ -537,9 +570,12 @@ class Ledger:
             invoice = "proof" if x.has_document else "missing"  # the tax letter or payment proof, not an invoice
         else:
             invoice = "matched" if x.has_document else "missing"
-        return {"id": x.evidence_id or "", "date": x.on.isoformat(), "label": x.merchant,
-                "company": self.repo.company_name(x.company_id) or ("Not decided yet" if x.pending else ""),
-                "amount": _num(x.amount), "invoice": invoice, "category": x.category_label}
+        out = {"id": x.evidence_id or "", "date": x.on.isoformat(), "label": x.merchant,
+               "company": self.repo.company_name(x.company_id) or ("Not decided yet" if x.pending else ""),
+               "amount": _num(x.amount), "invoice": invoice, "category": x.category_label}
+        if x.paid_in_cash:
+            out["paidWith"] = "cash"
+        return out
 
 
 def _num(value: Decimal) -> float:

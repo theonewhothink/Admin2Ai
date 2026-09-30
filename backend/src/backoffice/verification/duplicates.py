@@ -53,6 +53,7 @@ __all__ = [
     "DuplicateVerdict",
     "MergeSuggestion",
     "find_duplicates",
+    "same_document_kind",
     "supplier_name_key",
 ]
 
@@ -209,8 +210,17 @@ def _same_supplier(a: DocumentFingerprint, b: DocumentFingerprint) -> bool:
     return bool(a.supplier_name and a.supplier_name == b.supplier_name)
 
 
+def same_document_kind(a: DocumentType, b: DocumentType) -> bool:
+    """Two documents can only be copies of each other when they are the same kind.
+
+    An invoice and its credit note, or an invoice and a pro-forma with the same
+    number, are two documents. ``OTHER`` (kind not known) is compatible with any kind.
+    """
+    return a == b or DocumentType.OTHER in (a, b)
+
+
 def _same_kind(a: DocumentFingerprint, b: DocumentFingerprint) -> bool:
-    return a.doc_type == b.doc_type or DocumentType.OTHER in (a.doc_type, b.doc_type)
+    return same_document_kind(a.doc_type, b.doc_type)
 
 
 def _differs(x: object, y: object) -> bool:

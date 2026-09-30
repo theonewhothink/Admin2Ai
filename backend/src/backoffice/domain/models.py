@@ -214,7 +214,25 @@ class DocumentType(str, Enum):
     PAYROLL = "payroll"
     LOAN_STATEMENT = "loan_statement"
     CONTRACT = "contract"
+    # Documents that are not accounting documents (§3, §50): they never prove a purchase
+    # or a payment. Kept as supporting evidence only.
+    PRO_FORMA = "pro_forma"
+    QUOTE = "quote"
+    DELIVERY_NOTE = "delivery_note"  # guia de remessa / guia de transporte
+    ORDER_CONFIRMATION = "order_confirmation"
+    SUPPLIER_STATEMENT = "supplier_statement"  # extrato de conta corrente
     OTHER = "other"
+
+
+# Supporting evidence only: attached to the supplier and the payment, never the invoice,
+# never booked, never enough to close a payment (§3).
+SUPPORTING_DOCUMENT_TYPES: frozenset[DocumentType] = frozenset({
+    DocumentType.PRO_FORMA,
+    DocumentType.QUOTE,
+    DocumentType.DELIVERY_NOTE,
+    DocumentType.ORDER_CONFIRMATION,
+    DocumentType.SUPPLIER_STATEMENT,
+})
 
 
 class Document(BaseModel):

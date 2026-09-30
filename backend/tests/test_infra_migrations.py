@@ -58,11 +58,14 @@ def test_only_the_embeddings_migration_needs_pgvector() -> None:
 
 
 def _domain_values(name: str) -> set[str]:
-    match = re.search(
-        rf"CREATE DOMAIN {name} AS text CHECK \(VALUE IN \((?P<body>.*?)\)\);", ALL_SQL, re.S
-    )
-    assert match, f"domain {name} not found"
-    return set(re.findall(r"'([a-z_]+)'", match.group("body")))
+    """The values a domain allows after every migration: its CREATE DOMAIN check, or the last
+    ALTER DOMAIN ... ADD CONSTRAINT ... CHECK that replaced it (e.g. 0007, 0009)."""
+    definitions = list(re.finditer(
+        rf"(?:CREATE DOMAIN {name} AS text|ALTER DOMAIN {name} ADD CONSTRAINT \w+)\s+CHECK\s*"
+        rf"\(\s*VALUE IN \((?P<body>.*?)\)\s*\);", ALL_SQL, re.S
+    ))
+    assert definitions, f"domain {name} not found"
+    return set(re.findall(r"'([a-z_]+)'", definitions[-1].group("body")))
 
 
 @pytest.mark.parametrize(

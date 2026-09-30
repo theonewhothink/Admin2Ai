@@ -17,11 +17,16 @@ Pipeline for one piece of evidence::
                    question for the owner, whose answer is stored as evidence (§19, §37)
     Fraud          hard stops: changed IBAN, recipient mismatch, ... (§26)
     Entity         which company (§51), taught rules (§38)
-    Reconciliation expected evidence (§21), then transaction <-> document matching (§20)
+    Reconciliation expected evidence (§21), then transaction <-> document matching (§20): only accounting
+                   documents of the kind the payment needs prove it; a pro-forma, quote, delivery note,
+                   order or supplier statement is kept as supporting evidence only; a credit note linked
+                   to its invoice is netted against it
     Obligation     tax letters become obligations; payments prove them (§24)
     Missing        a plan for every payment still without its document; supplier chasing (§22)
     Accountant     routine accountant questions answered from evidence (§28)
-    Closure        lifecycle transitions and month status (§2, §27, §48)
+    Closure        lifecycle transitions and month status (§2, §27, §48); an invoice naming another of your
+                   companies is a question (§51); a large first purchase needs the buyer's tax number and
+                   totals that add up (§26); a receipt paid in cash closes on its own evidence (§11)
     Auditor        re-checks closed items and reopens any that no longer hold (§55, §57)
 
 The orchestrator is pure Python: no network, no threads started, no
@@ -73,6 +78,7 @@ from backoffice.countries.pt import (
 from backoffice.domain.lifecycle import IllegalTransition, Stage, TrackedItem
 from backoffice.domain.models import (
     METHOD_RANK,
+    SUPPORTING_DOCUMENT_TYPES,
     CriticalField,
     Document,
     DocumentType,
@@ -141,6 +147,7 @@ from backoffice.learning import Rule, RuleField, RuleMatch, RuleOutcome, RuleSub
 from backoffice.missing import ChaseFacts, ChaseMessage, activity_line, compose_request, thread_token
 from backoffice.policy import ActionContext, ActionKind, Approval, Decision, TenantPolicy, authorize
 from backoffice.policy.actions import Requirement
+from backoffice.purchases import PURCHASE_INVOICE_TYPES, is_high_value
 from backoffice.reconciliation import (
     ExpectationDecision,
     ExpectedEvidenceEngine,
@@ -148,8 +155,10 @@ from backoffice.reconciliation import (
     SupplierResolver,
     reconcile,
 )
-from backoffice.verification import DocumentAssessment, assess_document, currency_mark, lineage
+from backoffice.reconciliation.scoring import document_flow
+from backoffice.verification import DocumentAssessment, assess_document, check_sum, currency_mark, lineage
 from backoffice.verification._display import field_label, join, method_label, show_many
+from backoffice.verification.duplicates import same_document_kind
 
 __all__ = [
     "SYSTEM",
@@ -397,10 +406,23 @@ class DocumentRecord:
     checks: dict[str, VerifiedField] = field(default_factory=dict)
     # Values the owner confirmed when the sources disagreed (§19): method HUMAN, source = the answer.
     owner_values: dict[str, FieldObservation] = field(default_factory=dict)
+    sales: bool = False  # issued by one of the business's own companies: money in, not a purchase
+    paid_in_cash: bool = False  # the document itself says it was paid in cash: no bank line to wait for
+    referenced_number: str | None = None  # a credit note: the invoice number it says it corrects
+    credit_for: str | None = None  # a credit note linked to that invoice (document id)
+    supports_tx_ids: list[str] = field(default_factory=list)  # supporting evidence for these payments, never proof
+    text: str = ""  # the document's readable text (for wording checks such as equipment)
+    owner_confirmed: str | None = None  # evidence id of the owner's answer confirming a cash receipt
+    hold_reason: str = ""  # plain reason it waits although nothing is missing (e.g. a large first purchase)
 
     @property
     def id(self) -> str:
         return self.document.id
+
+    @property
+    def supporting(self) -> bool:
+        """Not an accounting document (a pro-forma, quote, delivery note...): never closes anything (§3)."""
+        return self.document.doc_type in SUPPORTING_DOCUMENT_TYPES
 
     @property
     def label(self) -> str:
@@ -426,6 +448,12 @@ class TxRecord:
     private: bool = False  # the owner said: personal / not one of my companies
     proof_evidence_ids: list[str] = field(default_factory=list)  # e.g. the tax letter a payment proves
     missing_since: date | None = None
+    # Documents kept with the payment that do not prove it (a pro-forma, a receipt where an invoice is needed).
+    supporting_document_ids: list[str] = field(default_factory=list)
+    hold_reason: str = ""  # plain reason a matched payment is not closed yet
+    company_answer_ev: str | None = None  # the owner's answer on which company carries it (evidence id)
+    # (paid by, carried by, company the invoice names) when the owner decided between two of their companies.
+    company_note: tuple[str, str, str] | None = None
 
     @property
     def id(self) -> str:
@@ -556,7 +584,14 @@ _DOC_LABELS = {
     DocumentType.TAX_NOTICE: "Tax notice",
     DocumentType.STATEMENT: "Statement",
     DocumentType.CONTRACT: "Contract",
+    DocumentType.PRO_FORMA: "Pro-forma",
+    DocumentType.QUOTE: "Quote",
+    DocumentType.DELIVERY_NOTE: "Delivery note",
+    DocumentType.ORDER_CONFIRMATION: "Order confirmation",
+    DocumentType.SUPPLIER_STATEMENT: "Account statement",
 }
+# Documents a purchase paid in cash can be evidenced by (§11: the owner photographs the receipt).
+_CASH_DOCUMENTS = frozenset({DocumentType.RECEIPT, *PURCHASE_INVOICE_TYPES})
 
 
 # --------------------------------------------------------------------------- repository
@@ -674,6 +709,12 @@ class Repository:
     def own_tax_ids(self) -> list[str]:
         return [e.tax_id for e in self.entities]
 
+    def company_for_tax_id(self, tax_id: str | None) -> str | None:
+        """Which of the business's own companies has this tax number, if any."""
+        if not tax_id:
+            return None
+        return next((e.id for e in self.entities if same_tax_id(e.tax_id, tax_id)), None)
+
     def document_for_evidence(self, evidence_id: str) -> DocumentRecord | None:
         return next((d for d in self.documents.values() if evidence_id in d.evidence_ids), None)
 
@@ -782,6 +823,10 @@ class _Extracted:
     buyer_is_final_consumer: bool = False
     parsers: list[str] = field(default_factory=list)
     invoice_number: str | None = None
+    issuer_tax_id: str | None = None  # one of the business's own tax numbers, when it issued the document
+    referenced_number: str | None = None  # the invoice a credit note says it corrects
+    paid_in_cash: bool = False
+    text: str = ""
 
 
 class DiscoveryAgent(_Agent):
@@ -874,18 +919,27 @@ class DocumentAgent(_Agent):
 
     name = "document"
 
-    def stage0_fields(self, text: str, source: str, method: ExtractionMethod) -> dict[str, list[FieldObservation]]:
-        """Fields this agent reads from a file's own text and QR payloads (Stage 0 for the OCR router)."""
+    def stage0_fields(self, text: str, source: str, method: ExtractionMethod,
+                      hint: dict[str, str] | None = None) -> dict[str, list[FieldObservation]]:
+        """Fields this agent reads from a file's own text and QR payloads (Stage 0 for the OCR router).
+
+        ``hint`` remembers, for the OCR engines that read the same file next, whether one of
+        the business's own companies issued it (its own sales invoice).
+        """
         extracted = self.read([_Part(source, "text", text=text, method=method)])
+        if hint is not None and extracted is not None and extracted.issuer_tax_id:
+            hint["issuer"] = extracted.issuer_tax_id
         return {} if extracted is None else {k: list(v) for k, v in extracted.observations.items()}
 
-    def text_extractor(self) -> Any:
+    def text_extractor(self, hint: Mapping[str, str] | None = None) -> Any:
         """Reads Portuguese fields from an OCR engine's text (the router labels them with the engine)."""
-        known = self.repo.own_tax_ids()
 
         def extract(text: str, source: str, method: ExtractionMethod) -> dict[CriticalField, list[FieldObservation]]:
+            issuer = (hint or {}).get("issuer") or self.own_issuer([_Part(source, "text", text=text, method=method)])
+            customers, suppliers = self._roles(issuer)
             found: dict[CriticalField, list[FieldObservation]] = {}
-            for obs in extract_text_fields(text, source, method=method, known_customer_tax_ids=known).observations:
+            for obs in extract_text_fields(text, source, method=method, known_customer_tax_ids=customers,
+                                           known_supplier_tax_ids=suppliers).observations:
                 found.setdefault(obs.field, []).append(obs)
             currency = _text_currency(text, source, method)
             if currency is not None:
@@ -894,14 +948,64 @@ class DocumentAgent(_Agent):
 
         return extract
 
+    def _roles(self, issuer: str | None) -> tuple[list[str], list[str]]:
+        """(known buyers, known issuers) for the text reader: the business's own tax numbers are
+        the buyer's, except the one that issued the document (its own sales invoice)."""
+        own = self.repo.own_tax_ids()
+        if issuer is None:
+            return own, []
+        return [t for t in own if not same_tax_id(t, issuer)], [issuer]
+
+    def own_issuer(self, parts: Sequence[_Part]) -> str | None:
+        """The business's own tax number when one of its companies issued the document, else None.
+
+        Structured sources decide when there are any (the fiscal QR code's issuer, the
+        e-invoice's supplier); otherwise the text, but only where it names the roles (a
+        labelled supplier, or a labelled customer and exactly one other tax number).
+        """
+        own = self.repo.own_tax_ids()
+        if not own:
+            return None
+        structured: list[str] = []
+        worded: list[str] = []
+        for part in parts:
+            if part.kind == "ubl":
+                try:
+                    result = parse_einvoice(part.data, source=part.evidence_id)
+                except (StructuredFormatError, XMLSyntaxError):
+                    continue
+                structured += [str(o.value) for o in result.fields.get(CriticalField.SUPPLIER_TAX_ID, ())]
+                continue
+            if part.kind == "read":
+                structured += [str(o.value) for o in part.observations.get(CriticalField.SUPPLIER_TAX_ID.value, ())
+                               if o.method in (ExtractionMethod.QR, ExtractionMethod.STRUCTURED_XML)]
+            payloads, rest = _split_qr(part.text)
+            for payload in payloads:
+                try:
+                    structured.append(parse_qr(payload).issuer_nif)
+                except QRCodeError:
+                    continue
+            neutral = extract_text_fields(rest, part.evidence_id, method=part.method)
+            worded += [str(o.value) for o in neutral.observations if o.field is CriticalField.SUPPLIER_TAX_ID]
+        for value in structured or worded:
+            mine = next((t for t in own if same_tax_id(t, value)), None)
+            if mine is not None:
+                return mine
+        return None
+
     def read(self, parts: Sequence[_Part]) -> _Extracted | None:
         observations: dict[str, list[FieldObservation]] = {}
-        doc_type: DocumentType | None = None
+        # The document's kind by where it was read, most trusted first when choosing (§13: structured first).
+        kinds: dict[str, DocumentType] = {}
+        receipt_fallback = False  # text with fields but no word naming its kind: read as a receipt
         supplier_name: str | None = None
         qr: PTQRCode | None = None
         final_consumer = False
         parsers: list[str] = []
-        known = self.repo.own_tax_ids()
+        issuer = self.own_issuer(parts)
+        customers, suppliers = self._roles(issuer)
+        texts: list[str] = []
+        reference: str | None = None
 
         def add(field_: CriticalField | str, obs: FieldObservation) -> None:
             key = field_.value if isinstance(field_, CriticalField) else str(field_)
@@ -917,8 +1021,10 @@ class DocumentAgent(_Agent):
                 for f, found in result.fields.items():
                     for obs in found:
                         add(f, obs)
-                doc_type = doc_type or result.doc_type
+                if result.doc_type is not None:
+                    kinds.setdefault("ubl", result.doc_type)
                 supplier_name = supplier_name or result.extras.get("supplier_name")
+                reference = reference or result.extras.get("invoice_reference")
                 continue
             if part.kind == "read":
                 for name, found in sorted(part.observations.items()):
@@ -927,7 +1033,8 @@ class DocumentAgent(_Agent):
                 if part.observations:
                     parsers.append(f"ocr:{part.parser}" if part.parser else "ocr")
                 supplier_name = supplier_name or part.supplier_name
-                doc_type = doc_type or part.doc_type
+                if part.doc_type is not None:
+                    kinds.setdefault("reading", part.doc_type)
             text = part.text
             qr_payloads, rest = _split_qr(text)
             for payload in qr_payloads:
@@ -943,9 +1050,10 @@ class DocumentAgent(_Agent):
                 add(CriticalField.CURRENCY, FieldObservation(
                     value=code.currency, source=part.evidence_id, method=ExtractionMethod.QR, confidence=0.95,
                     location="qr:amounts are in euro"))
-                doc_type = doc_type or code.doc_type
+                kinds.setdefault("qr", code.doc_type)
             method = part.method
-            fields = extract_text_fields(rest, part.evidence_id, method=method, known_customer_tax_ids=known)
+            fields = extract_text_fields(rest, part.evidence_id, method=method, known_customer_tax_ids=customers,
+                                         known_supplier_tax_ids=suppliers)
             if fields.observations:
                 parsers.append({"text": "pt_text_fields", "read": "pt_text_fields:pdf_text"}.get(
                     part.kind, "pt_text_fields:email_body"))
@@ -962,19 +1070,36 @@ class DocumentAgent(_Agent):
             if currency is not None:
                 add(CriticalField.CURRENCY, currency)
             supplier_name = supplier_name or _first_line(rest)
-            if doc_type is None and fields.observations:
-                doc_type = _text_doc_type(rest)
+            if fields.observations:
+                named = _text_doc_type(rest)
+                if named is not None:
+                    kinds.setdefault("text", named)
+                receipt_fallback = True
+            if rest.strip():
+                texts.append(rest)
+                reference = reference or _referenced_invoice(rest)
             if part.kind == "read" and part.observations:
                 supplier_name = supplier_name or _first_line(part.reading_text)
-                doc_type = doc_type or _text_doc_type(part.reading_text)
+                named = _text_doc_type(part.reading_text)
+                if named is not None:
+                    kinds.setdefault("reading_text", named)
+                receipt_fallback = True
+                if part.reading_text.strip():
+                    texts.append(part.reading_text)
+                    reference = reference or _referenced_invoice(part.reading_text)
         if not observations:
             return None
         number = _first_value(observations, CriticalField.INVOICE_NUMBER)
+        doc_type = next((kinds[k] for k in ("qr", "ubl", "text", "reading", "reading_text") if k in kinds),
+                        DocumentType.RECEIPT if receipt_fallback else DocumentType.INVOICE)
+        joined = "\n".join(texts)
         return _Extracted(
-            observations=observations, doc_type=doc_type or DocumentType.INVOICE, supplier_name=supplier_name,
+            observations=observations, doc_type=doc_type, supplier_name=supplier_name,
             evidence_ids=list(dict.fromkeys(p.evidence_id for p in parts)), qr=qr,
             buyer_is_final_consumer=final_consumer, parsers=parsers,
             invoice_number=str(number) if number is not None else None,
+            issuer_tax_id=issuer, referenced_number=reference, paid_in_cash=_says_paid_in_cash(joined),
+            text=joined[:_TEXT_KEPT],
         )
 
 
@@ -1079,6 +1204,16 @@ class ReconciliationAgent(_Agent):
                      response={"quality": decision.quality.value, "reason": decision.reason})
 
     def match(self) -> list[Match]:
+        """Payments matched to the documents that prove them (§20).
+
+        Only accounting documents take part: a pro-forma, quote, delivery note, order or
+        supplier statement never proves a payment (§3), nor does a receipt paid in cash (no bank
+        line) or a document already kept as supporting evidence. A match only counts when the
+        document is a kind the payment needs (ACCEPTED_DOCUMENT_TYPES, §21, when that need is
+        certain); otherwise the document stays with the payment as supporting evidence and
+        the payment stays open. An invoice with a linked credit note is matched net of it,
+        then, for a payment of the full amount, as it stands.
+        """
         repo = self.repo
         txs = [r for r in repo.transactions.values()
                if r.decision is not None and not r.document_ids and not r.private
@@ -1086,14 +1221,53 @@ class ReconciliationAgent(_Agent):
                and (r.decision.requires_document or r.decision.quality is not Quality.GREEN)]
         docs = [d for d in repo.documents.values()
                 if not d.on_hold and not d.matched_tx_ids and d.document.quality is not Quality.RED
-                and not repo.items[d.item_id].is_done]
-        if not txs or not docs:
-            return []
+                and not repo.items[d.item_id].is_done
+                and not d.supporting and not d.paid_in_cash and not d.supports_tx_ids]
+        accepted: list[Match] = []
+        if txs and docs:
+            netted = self._netting(docs)
+            accepted = self._reconcile(txs, docs, netted)
+            if netted:  # an invoice paid in full although a credit note was issued for it: the credit waits
+                left_tx = [r for r in txs if not r.document_ids]
+                left_docs = [d for d in docs if not d.matched_tx_ids and not d.supports_tx_ids]
+                if left_tx and any(d.id in netted for d in left_docs):
+                    accepted += self._reconcile(left_tx, left_docs, {})
+        self._attach_supporting()
+        return accepted
+
+    def _netting(self, docs: Sequence[DocumentRecord]) -> dict[str, list[DocumentRecord]]:
+        """Open invoices with open linked credit notes smaller than them: invoice id -> credit notes."""
+        by_id = {d.id: d for d in docs}
+        credits: dict[str, list[DocumentRecord]] = {}
+        for d in sorted(docs, key=lambda d: d.id):
+            if d.document.doc_type is DocumentType.CREDIT_NOTE and d.credit_for in by_id:
+                credits.setdefault(d.credit_for, []).append(d)
+        netted = {}
+        for invoice_id, notes in credits.items():
+            invoice = by_id[invoice_id].document
+            if invoice.gross_amount is None or any(
+                    n.document.gross_amount is None or n.document.currency != invoice.currency for n in notes):
+                continue
+            credit = sum((abs(n.document.gross_amount or _ZERO) for n in notes), _ZERO)
+            if credit < abs(invoice.gross_amount):
+                netted[invoice_id] = notes
+        return netted
+
+    def _reconcile(self, txs: Sequence[TxRecord], docs: Sequence[DocumentRecord],
+                   netted: Mapping[str, list[DocumentRecord]]) -> list[Match]:
+        repo = self.repo
+        own = repo.own_tax_ids()
+        absorbed = {n.id for notes in netted.values() for n in notes}
+        pool = [d for d in docs if d.id not in absorbed]
+        balances: dict[str, Decimal] = {}
+        for invoice_id, notes in netted.items():
+            flow = document_flow(repo.documents[invoice_id].document, own) or _ZERO
+            balances[invoice_id] = flow + sum((document_flow(n.document, own) or _ZERO for n in notes), _ZERO)
         decisions = {r.id: r.decision for r in txs if r.decision is not None}
         result = reconcile(
             [r.tx for r in sorted(txs, key=lambda r: r.id)],
-            [d.document for d in sorted(docs, key=lambda d: d.id)],
-            suppliers=repo.resolver(), own_tax_ids=repo.own_tax_ids(), expectations=decisions,
+            [d.document for d in sorted(pool, key=lambda d: d.id)],
+            suppliers=repo.resolver(), own_tax_ids=own, expectations=decisions, document_balances=balances,
         )
         accepted = []
         for m in result.matches:
@@ -1103,20 +1277,77 @@ class ReconciliationAgent(_Agent):
             self.log("match", subject_id=m.id, evidence_ids=evidence,
                      values={"transactions": list(m.transaction_ids), "documents": list(m.document_ids)},
                      validations=list(m.why), response={"quality": m.quality.value, "kind": m.kind.value})
-            if m.quality is Quality.GREEN and not m.is_ambiguous:
+            refused = self._wrong_kind(m) if m.quality is Quality.GREEN and not m.is_ambiguous else None
+            if m.quality is Quality.GREEN and not m.is_ambiguous and refused is None:
                 accepted.append(m)
+                notes = [n for d in m.document_ids for n in netted.get(d, [])]
+                why = tuple(m.why) + tuple(
+                    f"Credit note{' ' + n.document.invoice_number if n.document.invoice_number else ''}: "
+                    f"{format_money(abs(n.document.gross_amount or _ZERO), n.document.currency)} taken off"
+                    for n in notes)
                 for t in m.transaction_ids:
                     rec = repo.transactions[t]
-                    rec.document_ids = list(m.document_ids)
-                    rec.match_why = tuple(m.why)
+                    rec.document_ids = [*m.document_ids, *(n.id for n in notes)]
+                    rec.match_why = why
                     rec.match_headline = m.headline
                     rec.likely_document_ids = []
-                for d in m.document_ids:
+                for d in [*m.document_ids, *(n.id for n in notes)]:
                     repo.documents[d].matched_tx_ids = list(m.transaction_ids)
+            elif refused is not None:
+                # The right amount, but not the document this payment needs: kept with it as supporting
+                # evidence; the payment stays open and its invoice is still looked for (§22).
+                self.log("not_proof", subject_id=m.id, evidence_ids=evidence, response={"reason": refused})
+                for t in m.transaction_ids:
+                    self.o.support(repo.transactions[t], [repo.documents[d] for d in m.document_ids])
             else:
                 for t in m.transaction_ids:
                     repo.transactions[t].likely_document_ids = list(m.document_ids)
         return accepted
+
+    def _wrong_kind(self, m: Match) -> str | None:
+        """Why the matched documents cannot prove these payments, or None when they can (§21).
+
+        Applied where the need is certain (a GREEN decision, e.g. a known supplier's invoice);
+        a credit note netted inside the payment is not what is judged.
+        """
+        records = [self.repo.documents[d] for d in m.document_ids]
+        docs = [r.document for r in records]
+        kinds = {d.doc_type for d in docs if d.doc_type is not DocumentType.CREDIT_NOTE} or {d.doc_type for d in docs}
+        for t in m.transaction_ids:
+            rec = self.repo.transactions[t]
+            decision = rec.decision
+            if decision is None or not decision.requires_document or decision.quality is not Quality.GREEN:
+                continue
+            if rec.tx.amount > 0 and all(r.sales for r in records):
+                continue  # your own invoice, paid by a customer who also happens to be a supplier
+            if not kinds <= decision.accepted_document_types:
+                return (f"{', '.join(sorted(k.value for k in kinds))} cannot stand for the "
+                        f"{decision.expectation.value} this payment needs")
+        return None
+
+    def _attach_supporting(self) -> None:
+        """Pro-formas, quotes, delivery notes... kept with the payment they relate to (never as its proof)."""
+        repo = self.repo
+        docs = [d for d in repo.documents.values()
+                if d.supporting and not d.supports_tx_ids and not d.on_hold and d.document.gross_amount is not None]
+        txs = [r for r in repo.transactions.values()
+               if r.decision is not None and r.decision.requires_document and not r.private and r.tx.amount != 0]
+        if not docs or not txs:
+            return
+        result = reconcile(
+            [r.tx for r in sorted(txs, key=lambda r: r.id)],
+            [d.document for d in sorted(docs, key=lambda d: d.id)],
+            suppliers=repo.resolver(), own_tax_ids=repo.own_tax_ids(),
+        )
+        for m in result.matches:
+            if m.is_ambiguous or m.quality is Quality.RED:
+                continue
+            self.log("keep_supporting", subject_id=m.id,
+                     evidence_ids=[*(repo.transactions[t].evidence_id for t in m.transaction_ids),
+                                   *(e for d in m.document_ids for e in repo.documents[d].evidence_ids)],
+                     values={"transactions": list(m.transaction_ids), "documents": list(m.document_ids)})
+            for t in m.transaction_ids:
+                self.o.support(repo.transactions[t], [repo.documents[d] for d in m.document_ids])
 
 
 class ObligationAgent(_Agent):
@@ -1191,6 +1422,11 @@ class MissingEvidenceAgent(_Agent):
                     "Suppliers usually reply within a few days.")
         if rec.likely_document_ids:
             return f"I found a likely document for the {amount} payment to {who} on {when} and I'm confirming it."
+        if rec.supporting_document_ids:
+            doc = self.repo.documents.get(rec.supporting_document_ids[0])
+            kind = _DOC_LABELS.get(doc.document.doc_type, "document").lower() if doc else "document"
+            return (f"I have the {kind} for the {amount} payment to {who} on {when}. It is not an invoice, "
+                    "so I'm still looking for the invoice.")
         if rec.decision is not None and rec.decision.provider.value == "owner":
             return f"The {amount} payment to {who} on {when} is waiting for its receipt. I will match it when it arrives."
         if rec.decision is not None and rec.decision.provider.value == "government":
@@ -1361,10 +1597,108 @@ class ClosureAgent(_Agent):
             docs = [repo.documents[d] for d in rec.document_ids]
             if any(d.on_hold for d in docs) or any(d.document.quality is not Quality.GREEN for d in docs):
                 continue
+            # The invoice names one of your other companies: never closed on a guess (§51).
+            named = self.o.company_mismatch(rec, docs)
+            if named is not None:
+                moved += self.o.ask_which_company(rec, docs, named)
+                continue
+            # A large first purchase from someone new needs more than a matching amount (§26, §57).
+            hold = self.o.large_purchase_hold(docs, rec.company_id)
+            if hold is not None:
+                self.o.note_hold(rec, hold, rec.company_id, [rec.evidence_id, *[e for d in docs for e in d.evidence_ids]])
+                continue
+            rec.hold_reason = ""
             evidence = [rec.evidence_id, *[e for d in docs for e in d.evidence_ids]]
+            if rec.company_answer_ev:
+                evidence.append(rec.company_answer_ev)
             moved += self._close(item, evidence, note=rec.match_headline or "Matched to its document.")
             for d in docs:
                 moved += self._close(repo.items[d.item_id], evidence, note="Matched to its payment.")
+        moved += self._settle_supporting()
+        moved += self._close_cancelled_invoices()
+        moved += self._close_cash_purchases()
+        return moved
+
+    def _settle_supporting(self) -> int:
+        """Supporting evidence never needs closing: a pro-forma, quote or delivery note right away, other
+        documents kept with a payment once that payment is closed on its real document (§3)."""
+        repo = self.repo
+        moved = 0
+        for record in sorted(repo.documents.values(), key=lambda d: d.id):
+            item = repo.items[record.item_id]
+            if item.is_done or record.on_hold or item.stage in (Stage.NEEDS_OWNER, Stage.CONFLICT) \
+                    or record.matched_tx_ids:
+                continue
+            if record.supporting:
+                kind = _DOC_LABELS.get(record.document.doc_type, "document")
+                moved += self.o.advance(item, Stage.NOT_REQUIRED, record.evidence_ids, agent=self.name,
+                                        quality=Quality.GREEN,
+                                        note=f"{kind} kept as supporting evidence. It is not an invoice.")
+                continue
+            closed = [repo.transactions[t] for t in record.supports_tx_ids
+                      if t in repo.transactions and repo.items[repo.transactions[t].item_id].stage is Stage.CLOSED]
+            if closed:
+                evidence = [*record.evidence_ids, *(r.evidence_id for r in closed)]
+                moved += self.o.advance(item, Stage.NOT_REQUIRED, evidence, agent=self.name, quality=Quality.GREEN,
+                                        note="Kept with the payment as supporting evidence.")
+        return moved
+
+    def _close_cancelled_invoices(self) -> int:
+        """An invoice fully cancelled by its linked credit notes: both close together, no payment due."""
+        repo = self.repo
+        moved = 0
+        for record in sorted(repo.documents.values(), key=lambda d: d.id):
+            item = repo.items[record.item_id]
+            notes = self.o.credits_for(record.id)
+            if not notes or item.is_done or record.matched_tx_ids or record.on_hold:
+                continue
+            docs = [record, *notes]
+            if any(d.on_hold or d.matched_tx_ids or d.document.quality is not Quality.GREEN for d in docs):
+                continue
+            if any(repo.items[d.item_id].stage in (Stage.NEEDS_OWNER, Stage.CONFLICT) for d in docs):
+                continue
+            credit = sum((abs(n.document.gross_amount or _ZERO) for n in notes), _ZERO)
+            if record.document.gross_amount is None or credit != abs(record.document.gross_amount) or any(
+                    n.document.currency != record.document.currency for n in notes):
+                continue
+            evidence = [e for d in docs for e in d.evidence_ids]
+            for d in docs:
+                moved += self._close(repo.items[d.item_id], evidence,
+                                     note="The credit note cancels this invoice in full. Nothing is due.")
+        return moved
+
+    def _close_cash_purchases(self) -> int:
+        """A receipt that says it was paid in cash closes on its own evidence (§3, §11): no bank line will come.
+
+        Verified and addressed to one of your companies: closed as that company's cash cost in its
+        month. Otherwise one plain question (which company, and is the reading right), never a
+        permanent blocker.
+        """
+        repo = self.repo
+        moved = 0
+        for record in sorted(repo.documents.values(), key=lambda d: d.id):
+            item = repo.items[record.item_id]
+            if not record.paid_in_cash or record.matched_tx_ids or record.on_hold or item.is_done:
+                continue
+            if item.stage in (Stage.NEEDS_OWNER, Stage.CONFLICT):
+                continue
+            company = record.document.entity_id
+            verified = record.document.quality is Quality.GREEN or record.owner_confirmed is not None
+            if company is None or not verified:
+                moved += self.o.ask_about_cash(record)
+                continue
+            hold = self.o.large_purchase_hold([record], company)
+            if hold is not None:
+                self.o.note_hold(record, hold, company, record.evidence_ids)
+                continue
+            record.hold_reason = ""
+            evidence = [*record.evidence_ids, *([record.owner_confirmed] if record.owner_confirmed else [])]
+            moved += self._close(item, evidence, note="Paid in cash, as the receipt shows.")
+            who = display_name(record.document.supplier_name)
+            amount = format_money(record.document.gross_amount or _ZERO, record.document.currency)
+            self.o.activity(repo.clock.now(), "checked", f"Recorded the {amount} cash purchase at {who} for "
+                            f"{repo.company_name(company)}.", company, amount=record.document.gross_amount,
+                            currency=record.document.currency, evidence_ids=evidence)
         return moved
 
     def _open_question(self, rec: TxRecord) -> NeedsYouRecord | None:
@@ -1386,7 +1720,10 @@ class ClosureAgent(_Agent):
         repo = self.repo
         items = repo.items_for(company_id, month)
         tx_ids = {i.subject_id for i in items if i.subject_type == "transaction"}
-        decisions = [repo.transactions[t].decision for t in sorted(tx_ids) if repo.transactions[t].decision]
+        # A payment already matched to its documents is not missing one (it may still wait, e.g. a held
+        # large purchase or a question): only the others count as "still looking for a document".
+        decisions = [repo.transactions[t].decision for t in sorted(tx_ids)
+                     if repo.transactions[t].decision and not repo.transactions[t].document_ids]
         return compute_month_status(
             company_id, month, items, now=now or repo.clock.now(), connectors=repo.connectors_for(company_id),
             decisions=decisions, obligations=[o.obligation for o in repo.obligations.values()],
@@ -1438,6 +1775,10 @@ class AuditorAgent(_Agent):
             doc = repo.documents[item.subject_id]
             if doc.on_hold:
                 return "This document is on hold."
+            if doc.supporting:
+                return "A document that is not an invoice cannot close anything."
+            if doc.owner_confirmed is not None and doc.paid_in_cash and doc.document.quality is not Quality.RED:
+                return None  # a cash receipt the owner confirmed: their answer is the evidence (§19, §55)
             if doc.document.quality is not Quality.GREEN:
                 return "The document's details no longer agree."
             return None
@@ -1449,11 +1790,21 @@ class AuditorAgent(_Agent):
         docs = [repo.documents.get(d) for d in rec.document_ids]
         if any(d is None or d.on_hold or d.document.quality is not Quality.GREEN for d in docs):
             return "The document for this payment no longer checks out."
-        total = sum((d.document.gross_amount or _ZERO) for d in docs if d is not None)
-        if len(docs) == 1 and total != abs(rec.tx.amount):
-            return "The amounts of the payment and its document no longer agree."
+        if any(d is not None and d.supporting for d in docs):
+            return "A document that is not an invoice cannot close a payment."
+        # One document, or one invoice with the credit notes netted against it.
+        present = [d for d in docs if d is not None]
+        credits = [d for d in present if d.credit_for and d.credit_for in rec.document_ids]
+        primary = [d for d in present if d not in credits]
+        if len(primary) == 1:
+            owed = (primary[0].document.gross_amount or _ZERO) - sum(
+                (abs(c.document.gross_amount or _ZERO) for c in credits), _ZERO)
+            if owed != abs(rec.tx.amount):
+                return "The amounts of the payment and its document no longer agree."
         if rec.tx.entity_id is None:
             return "It is no longer clear which company this belongs to."
+        if self.o.company_mismatch(rec, present) is not None:
+            return "The invoice names another of your companies."
         return None
 
 
@@ -1655,10 +2006,11 @@ class Orchestrator:
             from backoffice.reading import ReadRequest  # server only: the browser demo has no reader
 
             data = repo.registry.open(repo.tenant_id, evidence.id)
+            hint: dict[str, str] = {}  # Stage 0 tells the OCR reading whether this is your own sales invoice
             request = ReadRequest(
                 tenant_id=repo.tenant_id, evidence_id=evidence.id, data=data, mime_type=evidence.mime_type,
-                stage0_fields=lambda text, method: self.documents.stage0_fields(text, evidence.id, method),
-                extractor=self.documents.text_extractor(),
+                stage0_fields=lambda text, method: self.documents.stage0_fields(text, evidence.id, method, hint),
+                extractor=self.documents.text_extractor(hint),
             )
             try:
                 outcome = repo.reader.read(request)
@@ -1756,18 +2108,26 @@ class Orchestrator:
         assessment = self.verification.assess(extracted.observations, extracted.doc_type,
                                               evidence_ids=extracted.evidence_ids)
         values, quality, reasons = _settled_values(assessment), assessment.quality, assessment.reasons
-        supplier = self.repo.supplier_for_tax_id(values.get("supplier_tax_id"))
-        existing = self._duplicate_of(values, supplier)
+        # The business's own sales invoice (§20 "money in"): issued by one of its companies.
+        issuer = extracted.issuer_tax_id or next(
+            (t for t in self.repo.own_tax_ids() if same_tax_id(t, _text(values.get("supplier_tax_id")))), None)
+        sales = issuer is not None
+        supplier = None if sales else self.repo.supplier_for_tax_id(values.get("supplier_tax_id"))
+        existing = self._duplicate_of(values, extracted.doc_type)
         if existing is not None:
             return self._merge_duplicate(existing, extracted, report)
         doc_id = "doc_" + extracted.evidence_ids[0][3:19]
         customer = values.get("customer_tax_id")
         if extracted.buyer_is_final_consumer and customer and str(customer) == "999999990":
             customer = None  # sold to a final consumer: addressed to nobody in particular
+        issuer_company = self.repo.company_for_tax_id(issuer)
+        if sales and issuer_company is not None:
+            name = self.repo.legal_names.get(issuer_company) or self.repo.company_name(issuer_company) or "Company"
+        else:
+            name = supplier.name if supplier else display_name(extracted.supplier_name, fallback="Supplier")
         document = Document(
             id=doc_id, tenant_id=self.repo.tenant_id, evidence_ids=extracted.evidence_ids,
-            doc_type=extracted.doc_type,
-            supplier_name=supplier.name if supplier else display_name(extracted.supplier_name, fallback="Supplier"),
+            doc_type=extracted.doc_type, supplier_name=name,
             supplier_tax_id=_text(values.get("supplier_tax_id")), customer_tax_id=_text(customer),
             invoice_number=_text(values.get("invoice_number")), issue_date=_date(values.get("issue_date")),
             due_date=_date(values.get("due_date")), currency=_text(values.get("currency")) or "EUR",
@@ -1782,48 +2142,75 @@ class Orchestrator:
             document=document, evidence_ids=extracted.evidence_ids, origin=origin, received_at=at, item_id=item.id,
             observations=extracted.observations, reasons=reasons, sender=sender, message_text=message_text,
             supplier_id=supplier.id if supplier else None, retrieved=retrieved, checks=assessment.verified_fields,
+            sales=sales, text=extracted.text,
+            paid_in_cash=extracted.paid_in_cash and not sales and document.doc_type in _CASH_DOCUMENTS,
+            referenced_number=extracted.referenced_number if document.doc_type is DocumentType.CREDIT_NOTE else None,
         )
         self.repo.documents[doc_id] = record
         evidence = extracted.evidence_ids
         self.advance(item, Stage.ACQUIRED, evidence, agent="discovery", note="Document received.")
         self.advance(item, Stage.UNDERSTOOD, evidence, agent="document", note="Details read.")
-        if quality is Quality.RED:
+        if quality is Quality.RED and not record.supporting:
+            # A pro-forma or delivery note never closes anything, so its readings are never asked about.
             self.advance(item, Stage.CONFLICT, evidence, agent="verification", note=" ".join(reasons))
-        # Fraud runs on every supplier document, before anything can be matched or paid (§26).
-        record.fraud = self.fraud.check(record)
-        entity_id = self.entity.assign_document(record)
+        if sales:
+            # Our own invoice to a customer: nothing is paid out on it, so the supplier checks do not apply.
+            record.fraud = None
+            entity_id = issuer_company
+        else:
+            # Fraud runs on every supplier document, before anything can be matched or paid (§26).
+            record.fraud = self.fraud.check(record)
+            entity_id = self.entity.assign_document(record)
         if entity_id:
             record.document = record.document.model_copy(update={"entity_id": entity_id})
-        if record.fraud.hard_stop:
+        if record.fraud is not None and record.fraud.hard_stop:
             self._hold(record, at)
         company = self.repo.item_company(item)
         who = display_name(document.supplier_name)
-        if retrieved:
+        kind = _DOC_LABELS.get(document.doc_type, "document").lower()
+        source = {"email": "your email", "scan": "your phone", "share": "something you shared"}.get(
+            origin, "your upload")
+        number = f" {document.invoice_number}" if document.invoice_number else ""
+        if record.supporting:
+            self.activity(at, "collected", f"Collected the {who} {kind} from {source}. It is not an invoice, so I keep "
+                          "it only as supporting evidence.", company, amount=document.gross_amount,
+                          currency=document.currency, evidence_ids=evidence)
+        elif sales:
+            self.activity(at, "collected", f"Collected {self.repo.company_name(issuer_company) or who}'s sales "
+                          f"{kind}{number} from {source}.", company, amount=document.gross_amount,
+                          currency=document.currency, evidence_ids=evidence)
+        elif retrieved:
             self.activity(at, "recovered", f"Recovered the {who} invoice from a link in your email.", company,
                           amount=document.gross_amount, currency=document.currency, evidence_ids=evidence)
         else:
-            source = {"email": "your email", "scan": "your phone", "share": "something you shared"}.get(
-                origin, "your upload")
-            self.activity(at, "collected", f"Collected the {who} {_DOC_LABELS.get(document.doc_type, 'document').lower()}"
-                          f" from {source}.", company, amount=document.gross_amount, currency=document.currency,
-                          evidence_ids=evidence)
+            self.activity(at, "collected", f"Collected the {who} {kind} from {source}.", company,
+                          amount=document.gross_amount, currency=document.currency, evidence_ids=evidence)
         report.document_ids.append(doc_id)
-        if record.on_hold:
+        if record.on_hold and record.fraud is not None:
             report.message = f"Got it. I put the {who} payment on hold: {record.fraud.owner_message}"
+        elif record.supporting:
+            report.message = (f"Got it. This is a {kind}, not an invoice. I keep it with the payment as supporting "
+                              "evidence and still wait for the invoice.")
         elif quality is Quality.RED:
             needs = self._ask_about_conflict(record, at)
             if needs is not None:
                 report.message = f"Got it. I need one answer from you: {needs.prompt}"
         return record
 
-    def _duplicate_of(self, values: Mapping[str, Any], supplier: Supplier | None) -> DocumentRecord | None:
+    def _duplicate_of(self, values: Mapping[str, Any], doc_type: DocumentType) -> DocumentRecord | None:
+        """The same document again: same supplier, same number and the same kind of document.
+
+        A different kind is never a copy (verification.duplicates): a credit note that carries
+        its invoice's number, or a pro-forma numbered like the invoice, is a document of its own.
+        """
         number = _text(values.get("invoice_number"))
         tax_id = _text(values.get("supplier_tax_id"))
         if not number or not tax_id:
             return None
         for rec in self.repo.documents.values():
             doc = rec.document
-            if doc.invoice_number and _same_number(doc.invoice_number, number) and same_tax_id(doc.supplier_tax_id, tax_id):
+            if doc.invoice_number and _same_number(doc.invoice_number, number) and \
+                    same_tax_id(doc.supplier_tax_id, tax_id) and same_document_kind(doc.doc_type, doc_type):
                 return rec
         return None
 
@@ -1948,6 +2335,189 @@ class Orchestrator:
         record.reasons = assessment.reasons
         record.checks = assessment.verified_fields
 
+    # ----------------------------------------------------------------- which company, large purchases, cash
+
+    def support(self, rec: TxRecord, docs: Sequence[DocumentRecord]) -> None:
+        """Keep documents with a payment as supporting evidence: never its proof, never booked."""
+        for d in docs:
+            if d.id not in rec.supporting_document_ids:
+                rec.supporting_document_ids.append(d.id)
+            if rec.id not in d.supports_tx_ids:
+                d.supports_tx_ids.append(rec.id)
+
+    def document_company(self, record: DocumentRecord) -> str | None:
+        """The company a document itself names: the issuer of your own sales invoice, the buyer of a purchase."""
+        if record.document.doc_type is DocumentType.CREDIT_NOTE and record.credit_for:
+            return None  # judged through the invoice it corrects
+        tax = record.document.supplier_tax_id if record.sales else record.document.customer_tax_id
+        return self.repo.company_for_tax_id(tax)
+
+    def company_mismatch(self, rec: TxRecord, docs: Sequence[DocumentRecord]) -> str | None:
+        """The company the matched documents name, when it is one of yours but not the one whose account
+        paid (or received) the money, and the owner has not decided yet; else None (§51)."""
+        if rec.company_answer_ev or rec.tx.entity_id is None:
+            return None
+        named = sorted({c for d in docs if (c := self.document_company(d)) is not None and c != rec.company_id})
+        return named[0] if named else None
+
+    def ask_which_company(self, rec: TxRecord, docs: Sequence[DocumentRecord], named: str) -> int:
+        """One plain question: which of two of your companies carries this payment and its invoice (§37)."""
+        repo = self.repo
+        if any(n.subject_id == rec.id and n.status == "open" and n.kind == "company" for n in repo.needs.values()):
+            return 0
+        now = repo.clock.now()
+        payer, payer_name = rec.company_id, repo.company_name(rec.company_id) or "One of your companies"
+        named_name = repo.company_name(named) or "another of your companies"
+        sales = any(d.sales for d in docs)
+        who = self.merchant_name(rec.tx)
+        amount = format_money(abs(rec.tx.amount), rec.tx.currency)
+        account = repo.accounts.get(rec.tx.account_id)
+        if sales:
+            prompt = f"{payer_name} received a payment for an invoice {named_name} issued. Which company should carry it?"
+            why = [f"{named_name} issued the invoice.",
+                   f"The {amount} arrived in {payer_name}'s account{f' ({account.label})' if account else ''}."]
+            first = f"{named_name} (received by {payer_name})"
+        else:
+            prompt = f"{payer_name} paid an invoice addressed to {named_name}. Which company should carry it?"
+            why = [f"The {who} invoice shows {named_name}'s tax number as the buyer.",
+                   f"The {amount} left {payer_name}'s account{f' ({account.label})' if account else ''}."]
+            first = f"{named_name} (paid by {payer_name})"
+        why.append("Until you answer, I won't close this payment.")
+        options = (
+            CheckOption(id=f"company:{named}", label=first, values={"company": named, "named": named, "payer": payer}),
+            CheckOption(id=f"company:{payer}", label=payer_name,
+                        values={"company": payer, "named": named, "payer": payer}),
+        )
+        needs_id = _unique_id(repo.needs, f"nd_{_slug(who.split()[0])}_company")
+        item = repo.items[rec.item_id]
+        repo.needs[needs_id] = NeedsYouRecord(
+            id=needs_id, kind="company", subject_type="transaction", subject_id=rec.id, item_id=rec.item_id,
+            company_id=payer, created_at=now, why=tuple(why), prompt=prompt, options=options)
+        self.entity.log("ask_owner", subject_id=rec.id,
+                        evidence_ids=[rec.evidence_id, *(e for d in docs for e in d.evidence_ids)],
+                        values={"paid_by": payer, "invoice_names": named}, response={"needs_you": needs_id})
+        self.activity(now, "checked", f"The {who} invoice is addressed to {named_name}, but {payer_name} "
+                      f"{'received' if sales else 'paid'} the money. I asked you which company carries it.", payer,
+                      evidence_ids=[rec.evidence_id])
+        return self.advance(item, Stage.NEEDS_OWNER, [rec.evidence_id, *(e for d in docs for e in d.evidence_ids)],
+                            agent="entity", note="Which of your companies carries this.")
+
+    def large_purchase_hold(self, docs: Sequence[DocumentRecord], company_id: str | None) -> str | None:
+        """Why a large first purchase from a new supplier cannot close yet, in plain words; None when it can.
+
+        At or above the high-value threshold (backoffice.purchases), from a supplier with no earlier
+        documents or payments, closing needs the buyer's tax number to be the company's and the
+        totals to add up (amount before VAT + VAT = total).
+        """
+        repo = self.repo
+        company = repo.companies.get(company_id or "")
+        for record in docs:
+            doc = record.document
+            if record.sales or not is_high_value(doc) or self._supplier_has_history(record):
+                continue
+            buyer_ok = company is not None and same_tax_id(doc.customer_tax_id, company.tax_id)
+            parts_known = None not in (doc.net_amount, doc.vat_amount, doc.gross_amount)
+            sums_ok = parts_known and check_sum(doc.net_amount, doc.vat_amount, doc.gross_amount).ok  # type: ignore[arg-type]
+            if buyer_ok and sums_ok:
+                continue
+            problems = []
+            if not buyer_ok:
+                name = company.name if company is not None else "your company"
+                problems.append(f"it does not show {name}'s tax number as the buyer")
+            if not parts_known:
+                problems.append("I can't see its amount before VAT and its VAT")
+            elif not sums_ok:
+                problems.append("its amount before VAT and its VAT do not add up to the total")
+            who = display_name(doc.supplier_name)
+            amount = format_money(abs(doc.gross_amount or _ZERO), doc.currency)
+            return (f"I'm holding the {amount} {who} invoice: it is the first from this supplier and a large amount, "
+                    f"and {join(problems)}.")
+        return None
+
+    def _supplier_has_history(self, record: DocumentRecord) -> bool:
+        """Earlier documents from the same supplier (same tax number), or earlier payments to it.
+
+        A pro-forma or quote for the same purchase is not history: it is the same new supplier.
+        """
+        repo = self.repo
+        doc = record.document
+
+        def earlier(other: DocumentRecord) -> bool:
+            if other.document.issue_date and doc.issue_date:
+                return other.document.issue_date < doc.issue_date
+            return other.received_at < record.received_at
+
+        if doc.supplier_tax_id and any(
+                d.id != record.id and not d.supporting and d.credit_for != record.id and earlier(d)
+                and same_tax_id(d.document.supplier_tax_id, doc.supplier_tax_id) for d in repo.documents.values()):
+            return True
+        if record.supplier_id is None:
+            return False
+        resolver = repo.resolver()
+        paid = [*repo.history_transactions, *(r.tx for r in repo.transactions.values()
+                                              if r.id not in record.matched_tx_ids)]
+        since = doc.issue_date or record.received_at.astimezone(TZ).date()
+        for tx in paid:
+            found = resolver.resolve_transaction(tx).supplier
+            if found is not None and found.id == record.supplier_id and tx.booked_on < since:
+                return True
+        return False
+
+    def note_hold(self, subject: TxRecord | DocumentRecord, reason: str, company_id: str | None,
+                  evidence: Sequence[str]) -> None:
+        """Keep the plain reason something waits; said once in the activity feed."""
+        if subject.hold_reason == reason:
+            return
+        subject.hold_reason = reason
+        self.log("closure", "hold_large_purchase", subject_id=subject.id, evidence_ids=evidence,
+                 response={"reason": reason})
+        self.activity(self.repo.clock.now(), "checked", reason, company_id, evidence_ids=evidence)
+
+    def ask_about_cash(self, record: DocumentRecord) -> int:
+        """One plain question for a cash receipt that cannot close on its own: which company, and is it right."""
+        repo = self.repo
+        if any(n.subject_id == record.id and n.status == "open" for n in repo.needs.values()):
+            return 0
+        now = repo.clock.now()
+        doc = record.document
+        who = display_name(doc.supplier_name)
+        amount = format_money(doc.gross_amount, doc.currency) if doc.gross_amount is not None else "a"
+        when = f" on {day_month(doc.issue_date, repo.today())}" if doc.issue_date else ""
+        verified = doc.quality is Quality.GREEN
+        shown: dict[str, Any] = {}
+        if not verified:  # what the owner sees, and so confirms, by answering yes
+            for name in ("gross_amount", "issue_date", "currency"):
+                value = getattr(doc, name)
+                if value is not None:
+                    shown[name] = value
+        yes = "" if verified else "Yes, "
+        companies = sorted(repo.companies.values(), key=lambda e: (e.id != doc.entity_id, e.name))
+        options = [CheckOption(id=f"company:{e.id}", label=f"{yes}{e.name}" if yes else e.name,
+                               values={"company": e.id, **shown}) for e in companies]
+        options.append(CheckOption(id="personal", label="It's personal, not a company cost" if verified
+                                   else "Yes, but it's personal, not a company cost"))
+        if not verified:
+            options.append(CheckOption(id="wrong", label="No, the details are wrong. I'll send a clearer photo."))
+        if verified:
+            prompt = f"Which company paid the {amount} cash purchase at {who}{when}?"
+        else:
+            prompt = f"I read a {amount} cash payment at {who}{when}. Is that right, and which company paid it?"
+        why = ["The receipt says it was paid in cash, so there is no bank payment to match."]
+        if doc.entity_id is None:
+            why.append("It does not show which of your companies bought it.")
+        if not verified:
+            why.append("I could only read it from one source, so I need you to confirm it.")
+        why.append("Until you answer, I won't count it.")
+        company = doc.entity_id or next(iter(repo.companies), "")
+        needs_id = _unique_id(repo.needs, f"nd_{_slug(who.split()[0])}_cash")
+        repo.needs[needs_id] = NeedsYouRecord(
+            id=needs_id, kind="cash", subject_type="document", subject_id=record.id, item_id=record.item_id,
+            company_id=company, created_at=now, why=tuple(why), prompt=prompt, options=tuple(options))
+        self.verification.log("ask_owner", subject_id=record.id, evidence_ids=record.evidence_ids,
+                              values={"options": [o.label for o in options]}, response={"needs_you": needs_id})
+        return self.advance(repo.items[record.item_id], Stage.NEEDS_OWNER, record.evidence_ids, agent="closure",
+                            note="A cash receipt to confirm.")
+
     def _iban_changed(self, record: DocumentRecord) -> bool:
         return bool(record.fraud and record.fraud.of_kind(SignalKind.CHANGED_IBAN))
 
@@ -1968,6 +2538,7 @@ class Orchestrator:
         for _ in range(self.MAX_PASSES):
             report.passes += 1
             moved = self._entities(now)
+            moved += self._link_credit_notes(now)
             self.reconciliation.classify([r for r in self.repo.transactions.values() if r.decision is None])
             matches = self.reconciliation.match()
             for m in matches:
@@ -2020,6 +2591,42 @@ class Orchestrator:
                                 response={"needs_you": needs_id})
         return moved
 
+    def _link_credit_notes(self, now: datetime) -> int:
+        """A credit note that names the invoice it corrects is linked to that invoice (§20 credit notes).
+
+        The invoice must be on file, from the same supplier (same tax number), with that number.
+        The link is what lets the payment be matched to the invoice net of the credit.
+        """
+        repo = self.repo
+        linked = 0
+        invoices = sorted((d for d in repo.documents.values() if d.document.doc_type in PURCHASE_INVOICE_TYPES
+                           and d.document.invoice_number), key=lambda d: d.id)
+        for note in sorted(repo.documents.values(), key=lambda d: d.id):
+            if note.document.doc_type is not DocumentType.CREDIT_NOTE or note.credit_for or not note.referenced_number:
+                continue
+            original = next((d for d in invoices if d.document.supplier_tax_id
+                             and same_tax_id(d.document.supplier_tax_id, note.document.supplier_tax_id)
+                             and _same_number(d.document.invoice_number or "", note.referenced_number)), None)
+            if original is None:
+                continue
+            note.credit_for = original.id
+            who = display_name(note.document.supplier_name)
+            number = f" {note.document.invoice_number}" if note.document.invoice_number else ""
+            self.documents.log("link_credit_note", subject_id=note.id, evidence_ids=[*note.evidence_ids,
+                                                                                      *original.evidence_ids],
+                               values={"credit_note": note.id, "invoice": original.id,
+                                       "referenced_number": note.referenced_number})
+            self.activity(now, "checked", f"Linked the {who} credit note{number} to invoice "
+                          f"{original.document.invoice_number}.", self.repo.item_company(repo.items[note.item_id]),
+                          amount=note.document.gross_amount, currency=note.document.currency,
+                          evidence_ids=note.evidence_ids)
+            linked += 1
+        return linked
+
+    def credits_for(self, document_id: str) -> list[DocumentRecord]:
+        """Credit notes linked to this invoice."""
+        return sorted((d for d in self.repo.documents.values() if d.credit_for == document_id), key=lambda d: d.id)
+
     def merchant_name(self, tx: Transaction) -> str:
         """Plain name of whoever was paid: the known supplier's name, else the cleaned bank descriptor."""
         supplier = self.repo.resolver().resolve_transaction(tx).supplier
@@ -2048,8 +2655,11 @@ class Orchestrator:
             return
         rec = self.repo.transactions[match.transaction_ids[0]]
         doc = self.repo.documents[match.document_ids[0]]
+        # Paid net of a linked credit note: the payment plus the credit is what the invoice's total must show.
+        credit = sum((abs(c.document.gross_amount or _ZERO) for c in self.credits_for(doc.id)
+                      if c.id in rec.document_ids), _ZERO)
         assessment = self.verification.assess(
-            doc.observations, doc.document.doc_type, bank_amount=abs(rec.tx.amount), subject_id=doc.id,
+            doc.observations, doc.document.doc_type, bank_amount=abs(rec.tx.amount) + credit, subject_id=doc.id,
             evidence_ids=[*doc.evidence_ids, rec.evidence_id], owner=doc.owner_values)
         doc.document = doc.document.model_copy(update={"quality": assessment.quality})
         doc.reasons = assessment.reasons
@@ -2086,6 +2696,10 @@ class Orchestrator:
             outcome = self._answer_approval(needs, option_id, answer_ev, now)
         elif needs.kind == "check":
             outcome = self._answer_check(needs, option_id, answer_ev, now)
+        elif needs.kind == "company":
+            outcome = self._answer_company(needs, option_id, answer_ev, now)
+        elif needs.kind == "cash":
+            outcome = self._answer_cash(needs, option_id, answer_ev, now)
         else:
             outcome = self._answer_choice(needs, option_id, remember, answer_ev, now)
         self.run(now)
@@ -2241,6 +2855,89 @@ class Orchestrator:
         return AnswerOutcome(ok=True, message=f"Done. I will use {option.label.split(', as ')[0]} for the {who} "
                                               "invoice.")
 
+    def _answer_company(self, needs: NeedsYouRecord, option_id: str, answer_ev: str, now: datetime) -> AnswerOutcome:
+        """The owner said which of their companies carries a payment whose invoice names another (§51).
+
+        The answer is evidence. When the company that carries it is not the one whose account paid,
+        it is recorded as an inter-company payment for the accountant.
+        """
+        repo = self.repo
+        option = next((o for o in needs.options if o.id == option_id), None)
+        if option is None:
+            raise ValueError("not one of the options")
+        rec = repo.transactions[needs.subject_id]
+        item = repo.items[rec.item_id]
+        chosen, named, payer = option.values["company"], option.values["named"], option.values["payer"]
+        needs.status = "answered"
+        needs.answer = option.id
+        needs.answered_at = now
+        rec.tx = rec.tx.model_copy(update={"entity_id": chosen})
+        rec.company_answer_ev = answer_ev
+        rec.company_note = (payer, chosen, named)
+        for d in rec.document_ids:
+            doc = repo.documents[d]
+            doc.document = doc.document.model_copy(update={"entity_id": chosen})
+        who = self.merchant_name(rec.tx)
+        chosen_name = repo.company_name(chosen) or "that company"
+        payer_name = repo.company_name(payer) or "the other company"
+        if chosen != payer:
+            detail = f" {payer_name} paid it on {chosen_name}'s behalf."
+        elif chosen != named:
+            detail = f" It stays with {chosen_name} although the invoice names {repo.company_name(named)}."
+        else:
+            detail = ""
+        self.log("entity", "company_answer", subject_id=rec.id, evidence_ids=[rec.evidence_id, answer_ev],
+                 actor=OWNER_ACTOR, values={"carried_by": chosen, "paid_by": payer, "invoice_names": named})
+        self.advance(item, Stage.UNDERSTOOD, [rec.evidence_id, answer_ev], agent="entity",
+                     actor=f"{OWNER_ACTOR}:{repo.owner.email}", note=f"{chosen_name} carries it.{detail}")
+        self.activity(now, "answered", f"You said {chosen_name} carries the {who} invoice.{detail}", chosen,
+                      amount=abs(rec.tx.amount), currency=rec.tx.currency, evidence_ids=[answer_ev])
+        return AnswerOutcome(ok=True, message=f"Done. {chosen_name} carries it.{detail}")
+
+    def _answer_cash(self, needs: NeedsYouRecord, option_id: str, answer_ev: str, now: datetime) -> AnswerOutcome:
+        """The owner confirmed a cash receipt (which company; the reading is right) or set it aside (§11, §37)."""
+        repo = self.repo
+        option = next((o for o in needs.options if o.id == option_id), None)
+        if option is None:
+            raise ValueError("not one of the options")
+        record = repo.documents[needs.subject_id]
+        item = repo.items[record.item_id]
+        owner = f"{OWNER_ACTOR}:{repo.owner.email}"
+        who = display_name(record.document.supplier_name)
+        needs.status = "answered"
+        needs.answer = option.id
+        needs.answered_at = now
+        if option.id in ("personal", "wrong"):
+            personal = option.id == "personal"
+            note = "Personal, as you said." if personal else "Set aside: you said the details are wrong."
+            self.advance(item, Stage.NOT_REQUIRED, [*record.evidence_ids, answer_ev], agent="closure", actor=owner,
+                         quality=Quality.GREEN, note=note)
+            self.activity(now, "answered", f"You set the {who} cash receipt aside." if not personal else
+                          f"You said the {who} cash purchase is personal.", None, evidence_ids=[answer_ev])
+            message = ("Done. It is set aside as personal." if personal else
+                       "Done. I set it aside. Send a clearer photo and I will read it again.")
+            return AnswerOutcome(ok=True, message=message)
+        company = option.values["company"]
+        for name, value in option.values.items():
+            if name == "company":
+                continue
+            record.owner_values[name] = FieldObservation(
+                value=value, source=answer_ev, method=ExtractionMethod.HUMAN, confidence=1.0,
+                location="owner answer: " + option.label)
+        if record.owner_values:
+            assessment = self.verification.assess(record.observations, record.document.doc_type, subject_id=record.id,
+                                                  evidence_ids=[*record.evidence_ids, answer_ev],
+                                                  owner=record.owner_values)
+            self._apply_assessment(record, assessment)
+        record.document = record.document.model_copy(update={"entity_id": company})
+        record.owner_confirmed = answer_ev
+        name = repo.company_name(company) or "that company"
+        self.advance(item, Stage.UNDERSTOOD, [*record.evidence_ids, answer_ev], agent="closure", actor=owner,
+                     note=f"A cash purchase for {name}, as you said.")
+        self.activity(now, "answered", f"You said the {who} cash purchase is for {name}.", company,
+                      amount=record.document.gross_amount, currency=record.document.currency, evidence_ids=[answer_ev])
+        return AnswerOutcome(ok=True, message=f"Done. I counted it as a cash purchase for {name}.")
+
     def payment_fingerprint(self, record: DocumentRecord) -> str:
         doc = record.document
         facts = f"{doc.id}|{normalize_iban(doc.iban or '')}|{doc.gross_amount}|{doc.currency}"
@@ -2368,17 +3065,101 @@ def _text_currency(text: str, source: str, method: ExtractionMethod) -> FieldObs
     return FieldObservation(value=codes.pop(), source=source, method=method, confidence=0.6, location=where)
 
 
-def _text_doc_type(text: str) -> DocumentType:
-    folded = text.casefold()
-    if "nota de crédito" in folded or "nota de credito" in folded:
-        return DocumentType.CREDIT_NOTE
-    if "fatura-recibo" in folded or "fatura recibo" in folded:
-        return DocumentType.INVOICE_RECEIPT
-    if "fatura simplificada" in folded:
-        return DocumentType.SIMPLIFIED_INVOICE
-    if "fatura" in folded or "invoice" in folded:
-        return DocumentType.INVOICE
-    return DocumentType.RECEIPT
+# What a document calls itself, on folded (lower-case, accent-free) text; the most specific name first,
+# so "Fatura pró-forma" is a pro-forma and "Fatura-recibo" an invoice-receipt, not an invoice (§50).
+_FATURA = r"(?:fatura|factura)"
+_KIND_NAMES: tuple[tuple[DocumentType, str], ...] = (
+    (DocumentType.PRO_FORMA, rf"{_FATURA}\s*[-:]?\s*pro[\s-]*forma|pro[\s-]*forma(?:\s+invoice)?"),
+    (DocumentType.QUOTE, r"orcamento|quotation|quote"),
+    (DocumentType.DELIVERY_NOTE, r"guia\s+de\s+(?:remessa|transporte)|delivery\s+note|transport\s+document"),
+    (DocumentType.ORDER_CONFIRMATION,
+     r"confirmacao\s+(?:de|da)\s+encomenda|nota\s+de\s+encomenda|order\s+confirmation|purchase\s+order"),
+    (DocumentType.SUPPLIER_STATEMENT,
+     r"extrato\s+(?:de\s+)?conta[\s-]+corrente|statement\s+of\s+account|supplier\s+statement"),
+    (DocumentType.CREDIT_NOTE, r"nota\s+de\s+credito|credit\s+note"),
+    (DocumentType.DEBIT_NOTE, r"nota\s+de\s+debito|debit\s+note"),
+    (DocumentType.INVOICE_RECEIPT, rf"{_FATURA}[\s-]+recibo|invoice[\s-]+receipt"),
+    (DocumentType.SIMPLIFIED_INVOICE, rf"{_FATURA}\s+simplificada|simplified\s+invoice"),
+    (DocumentType.INVOICE, rf"{_FATURA}|(?:tax\s+)?invoice"),
+    (DocumentType.RECEIPT, r"recibo|receipt|talao(?:\s+de\s+venda)?"),
+)
+_KIND_TITLES = tuple((kind, re.compile(rf"(?:{words})(?![a-z])")) for kind, words in _KIND_NAMES)
+# Without a title line, only names that invoices do not use when they merely refer to another document
+# ("conforme orçamento", "V/ guia de remessa", "purchase order: PO-12" are common on real invoices).
+_KIND_ANYWHERE = tuple(
+    (kind, re.compile(rf"(?<![a-z])(?:{words})(?![a-z])")) for kind, words in (
+        (DocumentType.PRO_FORMA, rf"{_FATURA}\s*[-:]?\s*pro[\s-]*forma|pro[\s-]*forma\s+invoice|proforma\s+invoice"),
+        (DocumentType.SUPPLIER_STATEMENT, r"extrato\s+(?:de\s+)?conta[\s-]+corrente|statement\s+of\s+account"),
+        (DocumentType.CREDIT_NOTE, r"nota\s+de\s+credito|credit\s+note"),
+        (DocumentType.DEBIT_NOTE, r"nota\s+de\s+debito|debit\s+note"),
+        (DocumentType.INVOICE_RECEIPT, rf"{_FATURA}[\s-]+recibo"),
+        (DocumentType.SIMPLIFIED_INVOICE, rf"{_FATURA}\s+simplificada"),
+        (DocumentType.INVOICE, rf"{_FATURA}|invoice"),
+    )
+)
+
+
+def _text_doc_type(text: str) -> DocumentType | None:
+    """The kind a document's own title gives it, or None when its text never names one.
+
+    The title is the first line that starts with a document name ("Fatura n.º FT 2026/183",
+    "Guia de remessa GR 2026/33", "Orçamento"). Without one, only names that are not
+    mere references to other documents count.
+    """
+    from backoffice.learning import fold
+
+    for raw in (text or "").splitlines():
+        line = fold(raw)
+        for kind, pattern in _KIND_TITLES:
+            if pattern.match(line):
+                return kind
+    folded = fold(text or "")
+    for kind, pattern in _KIND_ANYWHERE:
+        if pattern.search(folded):
+            return kind
+    return None
+
+
+# The invoice a credit note corrects: "referente à fatura FT 2026/183", "Ref. FT A/123",
+# "Documento de origem: FT 2026/183", "Invoice reference: FT 2026/183".
+_INVOICE_REFERENCE = re.compile(
+    r"(?<![a-z])(?:referente|relativ[ao]|respeitante|correspondente|retifica|rectifica|anula|corrige)"
+    r"\s+(?:(?:[àa]o?|da|do|de)\s+)?"
+    r"(?:(?:fatura|factura|invoice)(?:[\s-]+recibo|\s+simplificada)?\s+)?(?:(?:n\.?\s*[ºo°]\.?|nr\.?|no\.)\s*)?"
+    r"(?P<a>(?:[a-z]{1,4}\s+)?[^\s/,;:()]{1,40}/\d{1,12})(?![\d/])"
+    r"|(?<![a-z])(?:ref(?:er[êe]ncia|\.)?|documento\s+de\s+origem|doc\.?\s+(?:de\s+)?origem|invoice\s+reference"
+    r"|original\s+invoice)\s*[:.]?\s*(?:(?:fatura|factura|invoice)\s+)?(?:(?:n\.?\s*[ºo°]\.?|nr\.?|no\.)\s*)?"
+    r"(?P<b>(?:FT|FR|FS|ND|VD)\s+[^\s/,;:()]{1,40}/\d{1,12})(?![\d/])",
+    re.IGNORECASE,
+)
+
+
+def _referenced_invoice(text: str) -> str | None:
+    """The invoice number a credit note says it corrects, as printed; None when it names none."""
+    for m in _INVOICE_REFERENCE.finditer(text or ""):
+        found = m.group("a") or m.group("b")
+        if found and any(ch.isdigit() for ch in found):
+            return " ".join(found.split())
+    return None
+
+
+# "Pago em numerário", "Dinheiro 20,00", "Paid in cash" — unless the same document also names
+# a card or bank payment (then it does not say cash alone, §19). "Cash & Carry" is a shop name.
+_CASH_WORDS = re.compile(
+    r"(?<![a-z])(?:numerario|(?:pago|pagamento|paga)\s+em\s+dinheiro|dinheiro|paid\s+(?:in\s+)?cash"
+    r"|cash\s+payment|payment\s*(?:method)?\s*:?\s*cash|cash)(?![a-z])")
+_NOT_CASH_WORDS = re.compile(
+    r"(?<![a-z])(?:cartao|card|multibanco|visa|mastercard|maestro|amex|american\s+express|mb\s*way|transferencia"
+    r"|bank\s+transfer|debito\s+direto|direct\s+debit|paypal|apple\s+pay|google\s+pay|tpa)(?![a-z])")
+_CASH_AND_CARRY = re.compile(r"cash\s*(?:&|and|e|n)\s*carry|cash\s*back|petty\s+cash")
+_TEXT_KEPT = 20_000  # characters of a document's text kept for wording checks
+
+
+def _says_paid_in_cash(text: str) -> bool:
+    from backoffice.learning import fold
+
+    folded = _CASH_AND_CARRY.sub(" ", fold(text or ""))
+    return bool(_CASH_WORDS.search(folded)) and not _NOT_CASH_WORDS.search(folded)
 
 
 def _first_line(text: str) -> str | None:

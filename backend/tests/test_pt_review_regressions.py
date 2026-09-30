@@ -167,14 +167,15 @@ def test_oversized_qr_payload_is_rejected_up_front():
 
 
 @pytest.mark.parametrize(
-    ("doc", "number", "atcud"),
-    [("PF", "PF 2026/7", "CSDF7T5H-7"), ("OR", "OR 2026/7", "CSDF7T5H-7"),
-     ("GT", "GT 2026/7", "CSDF7T5H-7")],
+    ("doc", "number", "atcud", "kind"),
+    [("PF", "PF 2026/7", "CSDF7T5H-7", DocumentType.PRO_FORMA), ("OR", "OR 2026/7", "CSDF7T5H-7", DocumentType.QUOTE),
+     ("GT", "GT 2026/7", "CSDF7T5H-7", DocumentType.DELIVERY_NOTE)],
 )
-def test_non_fiscal_documents_are_not_usable_as_payment_evidence(doc, number, atcud):
-    """A pro-forma, quote or transport document QR cannot support a payment."""
+def test_non_fiscal_documents_are_not_usable_as_payment_evidence(doc, number, atcud, kind):
+    """A pro-forma, quote or transport document QR cannot support a payment: each is its own
+    supporting-only kind."""
     result = get_pack("PT").parse_fiscal_qr(qr(D=doc, G=number, H=atcud), "ev")
-    assert result is not None and result.doc_type == DocumentType.OTHER
+    assert result is not None and result.doc_type == kind
     assert result.usable is False
 
 

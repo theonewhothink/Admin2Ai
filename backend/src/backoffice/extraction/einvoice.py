@@ -224,6 +224,8 @@ class _UBLReader(_Reader):
         self._totals(currency)
         self._tax_totals(currency)
         self._payment_means()
+        # The invoice a credit note corrects (EN 16931 BT-25, "preceding invoice reference").
+        c.extra("invoice_reference", _text(self.find("cac:BillingReference/cac:InvoiceDocumentReference/cbc:ID")))
         type_code = _text(self.find("cbc:CreditNoteTypeCode" if self.credit else "cbc:InvoiceTypeCode"))
         default = DocumentType.CREDIT_NOTE if self.credit else DocumentType.INVOICE
         return c.result(self.doc_type(type_code, default))

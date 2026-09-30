@@ -149,7 +149,8 @@ def _journey(item: TrackedItem) -> list[dict[str, Any]]:
 def _current(item: TrackedItem, note: str, need: Any, chase: Any) -> str:
     """What is happening with this item right now, in one sentence."""
     if item.stage is Stage.NEEDS_OWNER and need is not None:
-        ask = need.question.prompt if need.question is not None else (need.why[0] if need.why else "")
+        ask = need.question.prompt if need.question is not None else (
+            getattr(need, "prompt", "") or (need.why[0] if need.why else ""))
         return f"Waiting for you: {ask}".strip()
     if chase is not None and item.stage not in (Stage.CLOSED, Stage.NOT_REQUIRED):
         return f"{chase.line} Waiting for their reply."
