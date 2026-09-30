@@ -50,6 +50,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from backoffice.accountant_questions import PaymentFacts, amounts_in, answer_question, description_lines
 from backoffice.audit import AuditEntry, AuditLog, InMemoryAuditStore
 from backoffice.closure import Activity as ClosureActivity
 from backoffice.closure import ActivityKind as ClosureKind
@@ -144,7 +145,17 @@ from backoffice.learning import (
     suggest_rule_from_answer,
 )
 from backoffice.learning import Rule, RuleField, RuleMatch, RuleOutcome, RuleSubject
-from backoffice.missing import ChaseFacts, ChaseMessage, activity_line, compose_request, thread_token
+from backoffice.mailer import is_simulated
+from backoffice.missing import (
+    ChaseFacts,
+    ChaseMessage,
+    activity_line,
+    choose_language,
+    clean_invoice_number,
+    compose_correction_request,
+    compose_request,
+    thread_token,
+)
 from backoffice.policy import ActionContext, ActionKind, Approval, Decision, TenantPolicy, authorize
 from backoffice.policy.actions import Requirement
 from backoffice.purchases import PURCHASE_INVOICE_TYPES, is_high_value
@@ -179,6 +190,7 @@ __all__ = [
     "NeedsYouRecord",
     "ObligationRecord",
     "Orchestrator",
+    "OutgoingMessage",
     "OwnerProfile",
     "PortalDocument",
     "Repository",
@@ -193,6 +205,7 @@ SYSTEM = "system"
 OWNER_ACTOR = "owner"
 CHASE_AFTER_DAYS = 3  # a payment this old without its invoice is worth a polite request (§22, §23)
 ANSWER_SECONDS = 40  # owner time recorded for one tap on a Needs-You item (§59)
+MESSAGE_ID_DOMAIN = "backoffice.example"  # right-hand side of the Message-IDs of the emails we write
 
 _ZERO = Decimal("0")
 
@@ -519,14 +532,52 @@ class ObligationRecord:
     satisfied_by: tuple[str, ...] = ()
 
 
-@dataclass(frozen=True)
+@dataclass
 class ChaseRecord:
+    """A request to a supplier for a missing invoice (§22).
+
+    Written when the policy allows it; it counts as asked only once a transport
+    accepted it (``sent_at``). Until then every screen says it is waiting to be sent.
+    """
+
     tx_id: str
     supplier_id: str
     company_id: str
     message: ChaseMessage
-    sent_at: datetime
-    line: str
+    written_at: datetime
+    line: str  # the Activity line once it is sent
+    outbox_id: str = ""
+    sent_at: datetime | None = None
+
+    @property
+    def sent(self) -> bool:
+        return self.sent_at is not None
+
+
+@dataclass
+class OutgoingMessage:
+    """An email the back office writes itself: a supplier request or an answer to the accountant.
+
+    ``status`` is "waiting" until a transport (backoffice.mailer) accepted it, then "sent".
+    """
+
+    id: str
+    kind: str  # "supplier_request" | "correction_request" | "accountant_answer"
+    subject_id: str  # the payment, the held document or the accountant's question
+    company_id: str | None
+    to: str
+    subject: str
+    body: str
+    written_at: datetime
+    headers: tuple[tuple[str, str], ...] = ()
+    status: str = "waiting"  # "waiting" -> "sent"
+    sent_at: datetime | None = None
+    announced: bool = False  # the owner was told it is waiting to be sent
+    failures: int = 0
+
+    @property
+    def sent(self) -> bool:
+        return self.status == "sent"
 
 
 @dataclass
@@ -536,9 +587,15 @@ class AccountantQuestion:
     text: str
     evidence_id: str
     asked_at: datetime
-    status: str = "waiting"  # "waiting" | "answered"
+    # "waiting": open (for the owner unless I can answer it from evidence); "written": my answer is
+    # written and waiting to be sent; "answered": the answer reached the accountant's mailbox.
+    status: str = "waiting"
     answer: str | None = None
     answer_evidence_ids: tuple[str, ...] = ()
+    subject: str = ""  # of the accountant's email, to reply in the same thread
+    message_id: str | None = None
+    period: Month | None = None  # the month of the payment the answer is about
+    outbox_id: str = ""
 
 
 @dataclass
@@ -562,7 +619,8 @@ class RunReport:
     transitions: int = 0
     passes: int = 0
     reopened: list[str] = field(default_factory=list)
-    chased: list[str] = field(default_factory=list)
+    chased: list[str] = field(default_factory=list)  # payments whose supplier request was written in this run
+    sent: list[str] = field(default_factory=list)  # outgoing messages a transport accepted in this run
     closed_months: list[tuple[str, str]] = field(default_factory=list)
 
 
@@ -624,6 +682,8 @@ class Repository:
         self.interactions: list[OwnerInteraction] = []
         self.obligations: dict[str, ObligationRecord] = {}
         self.chases: dict[str, ChaseRecord] = {}
+        # Emails the back office wrote itself, in the order written; each is "sent" only once a transport took it.
+        self.outbox: dict[str, OutgoingMessage] = {}
         self.accountant_questions: dict[str, AccountantQuestion] = {}
         self.rulebook = RuleBook()
         self.policy = TenantPolicy(tenant_id=tenant_id)
@@ -1417,9 +1477,12 @@ class MissingEvidenceAgent(_Agent):
         who = self.o.merchant_name(rec.tx)
         when = day_month(rec.tx.booked_on, self.repo.today())
         chase = self.repo.chases.get(rec.id)
-        if chase is not None:
+        if chase is not None and chase.sent:
             return (f"I asked {who} for the invoice for the {amount} payment on {when}. "
                     "Suppliers usually reply within a few days.")
+        if chase is not None:
+            return (f"I wrote to {who} asking for the invoice for the {amount} payment on {when}. "
+                    "It is waiting to be sent.")
         if rec.likely_document_ids:
             return f"I found a likely document for the {amount} payment to {who} on {when} and I'm confirming it."
         if rec.supporting_document_ids:
@@ -1434,7 +1497,12 @@ class MissingEvidenceAgent(_Agent):
         return f"I'm looking for the document for the {amount} payment to {who} on {when}."
 
     def chase_all(self, now: datetime) -> list[str]:
-        sent: list[str] = []
+        """Write a request for every payment whose invoice is missing, when the policy allows it (§22, §25).
+
+        Requests go to the outbox; they count as asked only once a transport sends them
+        (:meth:`Orchestrator.deliver`). Returns the payments whose request was written now.
+        """
+        written: list[str] = []
         today = now.astimezone(TZ).date()
         for rec in sorted(self.repo.transactions.values(), key=lambda r: (r.tx.booked_on, r.id)):
             if rec.id in self.repo.chases or rec.document_ids or rec.private or rec.tx.amount >= 0:
@@ -1466,21 +1534,32 @@ class MissingEvidenceAgent(_Agent):
                 continue
             facts = ChaseFacts.build(rec.tx, supplier, company)
             message = compose_request(facts, token=thread_token(self.repo.tenant_id, rec.id), today=today,
-                                      message_id_domain="backoffice.example")
-            line = activity_line(facts)
+                                      message_id_domain=MESSAGE_ID_DOMAIN)
+            out = self.o.write_email("supplier_request", rec.id, company.id, message.to, message.subject, message.body,
+                                     now, headers=(("Message-ID", message.message_id),))
             self.repo.chases[rec.id] = ChaseRecord(tx_id=rec.id, supplier_id=supplier.id, company_id=company.id,
-                                                   message=message, sent_at=now, line=line)
-            self.repo.closure_log.append(ClosureActivity(
-                kind=ClosureKind.SUPPLIER_CHASED, at=now, entity_id=company.id, subject_id=supplier.id,
-                period=Month.of(rec.tx.booked_on)))
-            self.o.activity(now, "chased", line, company.id, evidence_ids=[rec.evidence_id])
-            self.log("request_invoice", subject_id=rec.id, evidence_ids=[rec.evidence_id],
-                     values={"to": message.to, "subject": message.subject}, response={"message_id": message.message_id})
-            sent.append(rec.id)
-        return sent
+                                                   message=message, written_at=now, line=activity_line(facts),
+                                                   outbox_id=out.id)
+            self.log("write_request", subject_id=rec.id, evidence_ids=[rec.evidence_id],
+                     values={"to": message.to, "subject": message.subject, "outbox_id": out.id})
+            written.append(rec.id)
+        return written
+
+    def sent(self, chase: ChaseRecord, at: datetime) -> None:
+        """A transport accepted the request: now the supplier has been asked (§22, month summary)."""
+        rec = self.repo.transactions[chase.tx_id]
+        chase.sent_at = at
+        self.repo.closure_log.append(ClosureActivity(
+            kind=ClosureKind.SUPPLIER_CHASED, at=at, entity_id=chase.company_id, subject_id=chase.supplier_id,
+            period=Month.of(rec.tx.booked_on)))
+        self.o.activity(at, "chased", chase.line, chase.company_id, evidence_ids=[rec.evidence_id])
+        self.log("request_invoice", subject_id=rec.id, evidence_ids=[rec.evidence_id],
+                 values={"to": chase.message.to, "subject": chase.message.subject},
+                 response={"message_id": chase.message.message_id})
 
 
-_AMOUNT_IN_QUESTION = re.compile(r"(?:€\s?(\d[\d.,]*\d|\d)|(\d[\d.,]*\d|\d)\s?(?:€|eur(?:os?)?\b))", re.I)
+_KIND_WORDS = {TransactionKind.TRANSFER_OUT: "transfer", TransactionKind.DIRECT_DEBIT: "direct debit",
+               TransactionKind.CARD: "card payment", TransactionKind.FEE: "bank charge"}
 
 
 class AccountantAgent(_Agent):
@@ -1488,7 +1567,8 @@ class AccountantAgent(_Agent):
 
     name = "accountant"
 
-    def receive(self, text: str, evidence_id: str, at: datetime) -> list[AccountantQuestion]:
+    def receive(self, text: str, evidence_id: str, at: datetime, *, subject: str = "",
+                message_id: str | None = None) -> list[AccountantQuestion]:
         found = []
         for i, line in enumerate(q.strip() for q in re.split(r"(?<=\?)\s+|\n", text)):
             if not line.endswith("?") or len(line) < 12:
@@ -1498,7 +1578,8 @@ class AccountantAgent(_Agent):
                 continue
             company_id = self._company_for(line) or next(iter(self.repo.companies))
             question = AccountantQuestion(id=qid, company_id=company_id, text=line, evidence_id=evidence_id,
-                                          asked_at=at)
+                                          asked_at=at, subject=" ".join(subject.split())[:200],
+                                          message_id=_reply_to(message_id))
             self.repo.accountant_questions[qid] = question
             self.repo.closure_log.append(ClosureActivity(
                 kind=ClosureKind.ACCOUNTANT_QUESTION_ASKED, at=at, entity_id=company_id, subject_id=qid))
@@ -1519,44 +1600,94 @@ class AccountantAgent(_Agent):
         return None
 
     def answer_all(self, now: datetime) -> list[AccountantQuestion]:
-        answered = []
+        """Write answers to the questions I truly understand, from evidence, when the owner allowed it (§25, §28).
+
+        A question is answered only when it is about exactly one closed payment with its document and every
+        claim in it is supported (backoffice.accountant_questions); anything else stays open for the owner.
+        The answer is written to the outbox; it counts as answered only once a transport sent it.
+        """
+        written = []
+        acct = self.repo.accountant
+        if acct is None:
+            return written
         for q in sorted(self.repo.accountant_questions.values(), key=lambda q: q.id):
             if q.status != "waiting":
                 continue
-            amount = _amount_in(q.text)
-            if amount is None:
+            amounts = set(amounts_in(q.text))
+            if len(amounts) != 1:
                 continue
+            amount = amounts.pop()
             candidates = [r for r in self.repo.transactions.values()
                           if abs(r.tx.amount) == amount and r.company_id == q.company_id and r.document_ids
                           and self.repo.items[r.item_id].stage is Stage.CLOSED]
             if len(candidates) != 1:
                 continue
             rec = candidates[0]
+            doc = self.repo.documents[rec.document_ids[0]]
+            reply = answer_question(q.text, self._facts(rec, doc), now.astimezone(TZ).date())
+            if reply is None:
+                continue  # not something I can answer from the evidence: it stays open for the owner
             decision = authorize(ActionKind.ROUTINE_ACCOUNTANT_RESPONSE, self.repo.policy, ActionContext(
                 tenant_id=self.repo.tenant_id, entity_id=q.company_id, subject_id=q.id))
             if not decision.allowed_now:
                 continue
-            doc = self.repo.documents[rec.document_ids[0]]
-            who = display_name(doc.document.supplier_name or rec.tx.counterparty)
-            month_name = Month.of(rec.tx.booked_on).name
-            answer = (f"Yes. The {format_money(abs(rec.tx.amount), rec.tx.currency)} payment to {who} on "
-                      f"{day_month(rec.tx.booked_on, now.date())} matches the "
-                      f"{doc.label.split(' · ')[0][:1].lower()}{doc.label.split(' · ')[0][1:]}"
-                      f" for {month_name}.")
-            q.status = "answered"
-            q.answer = answer
+            q.status = "written"
+            q.answer = reply.text
             q.answer_evidence_ids = (rec.evidence_id, *doc.evidence_ids)
-            self.repo.closure_log.append(ClosureActivity(
-                kind=ClosureKind.ACCOUNTANT_QUESTION_RESOLVED, at=now, entity_id=q.company_id, subject_id=q.id,
-                period=Month.of(rec.tx.booked_on)))
-            what = _purpose(doc)
-            self.o.activity(now, "answered",
-                            f"Answered your accountant: the {format_money(abs(rec.tx.amount), rec.tx.currency)} "
-                            f"payment to {who} is {what}.", q.company_id, evidence_ids=q.answer_evidence_ids)
+            q.period = Month.of(rec.tx.booked_on)
+            subject = q.subject if q.subject.lower().startswith("re:") else f"Re: {q.subject or 'your question'}"
+            headers = [("Message-ID", f"<answer-{q.id.replace('_', '-')}@{MESSAGE_ID_DOMAIN}>")]
+            if q.message_id:
+                headers += [("In-Reply-To", q.message_id), ("References", q.message_id)]
+            first = acct.person.split()[0] if acct.person.strip() else ""
+            body = (f"Hello{' ' + first if first else ''},\n\nYou asked: “{q.text}”\n{reply.text}\n\n"
+                    f"Kind regards,\n{self.repo.owner.full_name}")
+            out = self.o.write_email("accountant_answer", q.id, q.company_id, acct.email, subject[:200], body, now,
+                                     headers=tuple(headers))
+            q.outbox_id = out.id
             self.log("answer_accountant", subject_id=q.id, evidence_ids=list(q.answer_evidence_ids),
-                     response={"answer": answer, "reason": decision.reason_plain})
-            answered.append(q)
-        return answered
+                     values={"claims": list(reply.claims), "outbox_id": out.id},
+                     response={"answer": reply.text, "reason": decision.reason_plain})
+            written.append(q)
+        return written
+
+    def sent(self, q: AccountantQuestion, at: datetime) -> None:
+        """A transport delivered my answer: only now is the question answered for the accountant."""
+        q.status = "answered"
+        self.repo.closure_log.append(ClosureActivity(
+            kind=ClosureKind.ACCOUNTANT_QUESTION_RESOLVED, at=at, entity_id=q.company_id, subject_id=q.id,
+            period=q.period))
+        rec = next((r for r in self.repo.transactions.values() if r.evidence_id in q.answer_evidence_ids), None)
+        about = ""
+        if rec is not None:
+            about = (f" about the {format_money(abs(rec.tx.amount), rec.tx.currency)} payment to "
+                     f"{self.o.merchant_name(rec.tx)}")
+        self.o.activity(at, "answered", f"Answered your accountant{about}.", q.company_id,
+                        evidence_ids=q.answer_evidence_ids)
+
+    def _facts(self, rec: TxRecord, doc: DocumentRecord) -> PaymentFacts:
+        """What the evidence says about one payment and its document, for checking a question's claims."""
+        repo = self.repo
+        supplier = repo.resolver().resolve_transaction(rec.tx).supplier
+        if supplier is None:
+            supplier = repo.suppliers.get(doc.supplier_id or "")
+        names = [rec.tx.counterparty, doc.document.supplier_name or ""]
+        if supplier is not None:
+            names += [supplier.name, *supplier.aliases]
+        company = repo.companies.get(rec.company_id)
+        own = (company.name, repo.legal_names.get(company.id, company.name)) if company else ()
+        others = tuple(n for c in repo.companies.values() if company is None or c.id != company.id
+                       for n in (c.name, repo.legal_names.get(c.id, c.name)))
+        word = _DOC_LABELS.get(doc.document.doc_type, "Document").lower()
+        number = doc.document.invoice_number
+        return PaymentFacts(
+            amount=abs(rec.tx.amount), currency=rec.tx.currency, booked_on=rec.tx.booked_on,
+            kind=_KIND_WORDS.get(rec.tx.kind, "payment"), payee=self.o.merchant_name(rec.tx),
+            payee_names=tuple(n for n in names if n), company_names=own, other_company_names=others,
+            document=f"{word} {number}" if number else f"its {word}", document_word=word,
+            document_date=doc.document.issue_date,
+            description=tuple(line for e in doc.evidence_ids for line in description_lines(self.o.evidence_text(e))),
+        )
 
 
 class ClosureAgent(_Agent):
@@ -1831,6 +1962,10 @@ class Orchestrator:
         self.closure = ClosureAgent(self)
         self.auditor = AuditorAgent(self)
         self._activity_seq = 0
+        # What sends the emails the back office writes itself (backoffice.mailer): the demo's simulated
+        # outbox, or None. With None they wait in ``repo.outbox``; the production server sends each one
+        # from an event of its own (server/runtime.py) and never inside another change.
+        self.transport: Any = None
 
     # ----------------------------------------------------------------- shared helpers
 
@@ -1864,6 +1999,116 @@ class Orchestrator:
         self.repo.activity.append(ActivityEntry(
             id=f"a{self._activity_seq:04d}", at=at, kind=kind, text=text, company_id=company_id, amount=amount,
             currency=currency, evidence_ids=tuple(evidence_ids)))
+
+    # ----------------------------------------------------------------- the emails we write (§22, §25, §28)
+
+    def write_email(self, kind: str, subject_id: str, company_id: str | None, to: str, subject: str, body: str,
+                    at: datetime, *, headers: Sequence[tuple[str, str]] = ()) -> OutgoingMessage:
+        """Put one email in the outbox. It is written, not sent: :meth:`deliver` sends it."""
+        message = OutgoingMessage(id=f"mail_{len(self.repo.outbox) + 1:04d}", kind=kind, subject_id=subject_id,
+                                  company_id=company_id, to=to, subject=subject, body=body, written_at=at,
+                                  headers=tuple(headers))
+        self.repo.outbox[message.id] = message
+        self.log("mailer", "write_email", subject_id=subject_id,
+                 values={"id": message.id, "kind": kind, "to": to, "subject": subject})
+        return message
+
+    def waiting_messages(self) -> list[OutgoingMessage]:
+        return [m for m in self.repo.outbox.values() if not m.sent]
+
+    def deliver(self, at: datetime | None = None) -> list[str]:
+        """Send every waiting email through ``self.transport``. Only what it accepted counts as sent."""
+        if self.transport is None:
+            return []
+        now = at or self.repo.clock.now()
+        sent = []
+        for message in self.waiting_messages():
+            try:
+                self._transmit(message, self.transport)
+            except Exception as exc:  # it stays waiting; the owner is told (never "sent")
+                message.failures += 1
+                self.log("mailer", "send_failed", subject_id=message.id, response={"error": type(exc).__name__})
+                continue
+            self._sent(message, now, self.transport)
+            sent.append(message.id)
+        return sent
+
+    def send_waiting(self, message_id: str, transport: Any, at: datetime | None = None) -> bool:
+        """Send one waiting email now (the production server, one event per email).
+
+        A transport that refuses raises: the caller's change is then void and the email stays waiting.
+        """
+        message = self.repo.outbox.get(message_id)
+        if message is None or message.sent:
+            return False
+        self._transmit(message, transport)
+        self._sent(message, at or self.repo.clock.now(), transport)
+        self.run(at)
+        return True
+
+    @staticmethod
+    def _transmit(message: OutgoingMessage, transport: Any) -> None:
+        transport.send([message.to], message.subject, message.body, [], headers=dict(message.headers))
+
+    def _sent(self, message: OutgoingMessage, at: datetime, transport: Any) -> None:
+        message.status = "sent"
+        message.sent_at = at
+        self.log("mailer", "sent", subject_id=message.id, values={"kind": message.kind, "to": message.to},
+                 response={"simulated": is_simulated(transport)})
+        if message.kind == "supplier_request" and message.subject_id in self.repo.chases:
+            self.missing.sent(self.repo.chases[message.subject_id], at)
+        elif message.kind == "accountant_answer" and message.subject_id in self.repo.accountant_questions:
+            self.accountant.sent(self.repo.accountant_questions[message.subject_id], at)
+        elif message.kind == "correction_request" and message.subject_id in self.repo.documents:
+            record = self.repo.documents[message.subject_id]
+            who = display_name(record.document.supplier_name)
+            item = self.repo.items[record.item_id]
+            self.repo.closure_log.append(ClosureActivity(
+                kind=ClosureKind.SUPPLIER_CHASED, at=at, entity_id=message.company_id or self._holder_for_document(record),
+                subject_id=record.supplier_id or record.id, period=self.repo.item_month(item)))
+            self.activity(at, "chased", f"Asked {who} for a corrected invoice.", message.company_id,
+                          evidence_ids=record.evidence_ids)
+
+    def _announce_waiting(self, at: datetime) -> None:
+        """Tell the owner, once, about each email that is written but not sent (never counted as done)."""
+        for message in self.waiting_messages():
+            if message.announced:
+                continue
+            message.announced = True
+            text = "Wrote an email. It is waiting to be sent."
+            evidence: list[str] = []
+            if message.kind == "supplier_request" and (chase := self.repo.chases.get(message.subject_id)):
+                rec = self.repo.transactions[chase.tx_id]
+                who = self.merchant_name(rec.tx)
+                text = (f"Wrote to {who} asking for the invoice for the "
+                        f"{format_money(abs(rec.tx.amount), rec.tx.currency)} payment. It is waiting to be sent.")
+                evidence = [rec.evidence_id]
+            elif message.kind == "accountant_answer":
+                text = "Wrote an answer to your accountant. It is waiting to be sent."
+                q = self.repo.accountant_questions.get(message.subject_id)
+                evidence = list(q.answer_evidence_ids) if q else []
+            elif message.kind == "correction_request" and message.subject_id in self.repo.documents:
+                record = self.repo.documents[message.subject_id]
+                text = (f"Wrote to {display_name(record.document.supplier_name)} asking for a corrected invoice. "
+                        "It is waiting to be sent.")
+                evidence = list(record.evidence_ids)
+            self.activity(at, "waiting", text, message.company_id, evidence_ids=evidence)
+
+    def evidence_text(self, evidence_id: str) -> str:
+        """The readable text of one piece of evidence (text files, e-invoices, what the reader read)."""
+        try:
+            evidence = self.repo.evidence(evidence_id)
+        except Exception:
+            return ""
+        if evidence.format in _READABLE_FILES:
+            outcome = self.repo.reads.get(evidence_id)
+            return (outcome.text or outcome.reading_text or "") if outcome is not None else ""
+        if evidence.format not in (EvidenceFormat.TEXT, EvidenceFormat.UBL, EvidenceFormat.XML, EvidenceFormat.QR):
+            return ""
+        try:
+            return self.repo.registry.open(self.repo.tenant_id, evidence_id).decode("utf-8")
+        except (UnicodeDecodeError, ObjectNotFound, IntegrityError):
+            return ""
 
     # ----------------------------------------------------------------- arrivals
 
@@ -2053,7 +2298,8 @@ class Orchestrator:
         sender = parsed.sender.address if parsed.sender else None
         text = f"{parsed.subject}\n{parsed.text_body}"
         if self.repo.accountant and sender and sender.lower() == self.repo.accountant.email.lower():
-            questions = self.accountant.receive(parsed.text_body, message_id, at)
+            questions = self.accountant.receive(parsed.text_body, message_id, at, subject=parsed.subject,
+                                                message_id=parsed.thread.message_id)
             report.question_ids += [q.id for q in questions]
             return
         body_part = _Part(message_id, "email_body", text=parsed.text_body) if parsed.text_body.strip() else None
@@ -2551,6 +2797,8 @@ class Orchestrator:
                 break
         report.chased = self.missing.chase_all(now)
         self.accountant.answer_all(now)
+        report.sent = self.deliver(now)
+        self._announce_waiting(now)
         report.reopened = self.auditor.recheck()
         report.closed_months = self.closure.record_closures(now)
         self._record_recovered(now)
@@ -2774,9 +3022,17 @@ class Orchestrator:
             needs.answered_at = now
             self.advance(item, Stage.CONFLICT, [*record.evidence_ids, answer_ev], agent="fraud",
                          actor=f"{OWNER_ACTOR}:{repo.owner.email}", note="Kept blocked by the owner.")
-            self.activity(now, "protected", f"Kept the {who} payment blocked. I will ask {who} for a corrected invoice.",
-                          needs.company_id, evidence_ids=[answer_ev])
-            return AnswerOutcome(ok=True, message=f"Done. It stays blocked. I will ask {who} for a corrected invoice.")
+            self.activity(now, "protected", f"Kept the {who} payment blocked.", needs.company_id,
+                          evidence_ids=[answer_ev])
+            request, reason = self._request_correction(record, needs.company_id, answer_ev, now)
+            if request is None:
+                return AnswerOutcome(ok=True, message=f"Done. It stays blocked. {reason}")
+            self.deliver(now)
+            if request.sent:
+                return AnswerOutcome(ok=True, message=f"Done. It stays blocked. I asked {who} for a corrected invoice "
+                                                      f"at {request.to}.")
+            return AnswerOutcome(ok=True, message=f"Done. It stays blocked. I wrote to {who} at {request.to} asking "
+                                                  "for a corrected invoice. It is waiting to be sent.")
         if option_id != "confirmed_by_phone":
             raise ValueError("not one of the options")
         supplier = repo.suppliers.get(record.supplier_id or "")
@@ -2814,6 +3070,46 @@ class Orchestrator:
         self.activity(now, "protected", f"You confirmed {who}'s new bank details by phone. The payment can go ahead.",
                       needs.company_id, evidence_ids=[answer_ev])
         return AnswerOutcome(ok=True, message="Done. The payment will go to the new account.")
+
+    def _request_correction(self, record: DocumentRecord, company_id: str, answer_ev: str,
+                            now: datetime) -> tuple[OutgoingMessage | None, str]:
+        """The owner kept an invoice blocked: ask the supplier for a corrected one (§26).
+
+        Written to the supplier's address on file, never to the sender of the held invoice. The owner's tap
+        is the approval (it is not routine). Returns the email, or None and why none was written.
+        """
+        repo = self.repo
+        who = display_name(record.document.supplier_name)
+        supplier = repo.suppliers.get(record.supplier_id or "")
+        company = repo.companies.get(company_id)
+        doc = record.document
+        if supplier is None or not supplier.contact_email:
+            return None, f"I don't have an email address for {who}, so please ask them for a corrected invoice yourself."
+        if company is None or doc.gross_amount is None or doc.gross_amount == 0:
+            return None, f"I can't write to {who} about this invoice, so please ask them for a corrected one yourself."
+        approval = Approval(tenant_id=repo.tenant_id, action=ActionKind.SUPPLIER_INVOICE_REQUEST, subject_id=record.id,
+                            level=Requirement.OWNER, approved_by=f"{OWNER_ACTOR}:{repo.owner.email}", approved_at=now,
+                            entity_id=company.id)
+        decision = authorize(ActionKind.SUPPLIER_INVOICE_REQUEST, repo.policy, ActionContext(
+            tenant_id=repo.tenant_id, entity_id=company.id, subject_id=record.id, unusual=True, approval=approval))
+        self.log("fraud", "authorize_correction_request", subject_id=record.id, evidence_ids=[answer_ev],
+                 actor=OWNER_ACTOR, response={"allowed": decision.allowed_now, "reason": decision.reason_plain})
+        if not decision.allowed_now:
+            return None, f"Please ask {who} for a corrected invoice yourself."
+        try:
+            facts = ChaseFacts(
+                supplier_name=display_name(supplier.name), supplier_email=supplier.contact_email,
+                amount=abs(doc.gross_amount), currency=doc.currency, paid_on=doc.issue_date or now.astimezone(TZ).date(),
+                company_name=company.name.strip(), company_tax_id=company.tax_id, company_country=company.country,
+                invoice_number=clean_invoice_number(doc.invoice_number),
+                language=choose_language(supplier, supplier.contact_email))
+            message = compose_correction_request(facts, token=thread_token(repo.tenant_id, record.id),
+                                                 today=now.astimezone(TZ).date(), message_id_domain=MESSAGE_ID_DOMAIN)
+        except ValueError:
+            return None, f"I can't write to {who} about this invoice, so please ask them for a corrected one yourself."
+        out = self.write_email("correction_request", record.id, company.id, message.to, message.subject, message.body,
+                               now, headers=(("Message-ID", message.message_id),))
+        return out, ""
 
     def _answer_check(self, needs: NeedsYouRecord, option_id: str, answer_ev: str, now: datetime) -> AnswerOutcome:
         """The owner said which source shows the right value (or neither). Their answer is evidence (§19, §55)."""
@@ -3300,32 +3596,16 @@ def _unique_id(existing: Mapping[str, Any], base: str) -> str:
     return f"{base}_{n}"
 
 
+def _reply_to(message_id: str | None) -> str | None:
+    """A received Message-ID as an In-Reply-To header value ('<id@host>'), or None if it is not one plain id."""
+    bare = (message_id or "").strip().strip("<>")
+    return f"<{bare}>" if re.fullmatch(r"[^<>\s@]{1,200}@[^<>\s@]{1,100}", bare) else None
+
+
 def _amount_in(text: str) -> Decimal | None:
-    from backoffice.countries.pt import parse_pt_amount
-
-    m = _AMOUNT_IN_QUESTION.search(text)
-    if not m:
-        return None
-    raw = m.group(1) or m.group(2)
-    if re.fullmatch(r"\d{1,3}(,\d{3})+(\.\d{2})?", raw):  # "1,200" / "1,200.00" (English grouping)
-        return Decimal(raw.replace(",", ""))
-    if re.fullmatch(r"\d+", raw):
-        return Decimal(raw)
-    value = parse_pt_amount(raw)
-    if value is None:
-        try:
-            value = Decimal(raw)
-        except InvalidOperation:
-            return None
-    return value
-
-
-def _purpose(doc: DocumentRecord) -> str:
-    kind = doc.document.doc_type
-    if kind is DocumentType.INVOICE_RECEIPT and doc.document.vat_amount == 0:
-        month = Month.of(doc.document.issue_date).name if doc.document.issue_date else "the month"
-        return f"{month}'s rent, as its receipt shows"
-    return f"for {doc.label.split(' · ')[0].lower()}"
+    """The first money amount written in a question (backoffice.accountant_questions.amounts_in)."""
+    found = amounts_in(text)
+    return found[0] if found else None
 
 
 def _option_alias(question: Question, option_id: str) -> str:

@@ -63,10 +63,22 @@ export interface Connection {
   lastSyncedAt: ISODateTime;
   /** Optional pre-formatted label, e.g. "14:42 yesterday". */
   lastSyncedLabel?: string;
+  /** Plain words about the problem, when it is stale. */
+  message?: string;
+  /** Production: what reconnecting takes, e.g. "Sign in to Gmail again". */
+  action?: string;
+  /**
+   * Production: "catching_up" once the owner signed in again (or asked to try again). It stays
+   * "stale" until a sync has actually worked; only then does it come back as "healthy".
+   */
+  reconnect?: "catching_up";
 }
 
 export interface HomeData {
   greeting: string;
+  /** The engine's own status line ("Action required.", "I need 2 things from you."); it counts stale connections. */
+  headline?: string;
+  /** Open questions plus connections that need reconnecting. */
   needsYouCount: number;
   dueSoon: DueItem[];
   currentMonth: { key: MonthKey; label: string; percentClosed: number };
@@ -155,7 +167,9 @@ export type ActivityKind =
   | "checked"
   | "closed"
   | "protected"
-  | "learned";
+  | "learned"
+  /** An email written but not sent yet (no mailer accepted it). Never counted as handled. */
+  | "waiting";
 
 export interface ActivityItem {
   id: string;
@@ -296,6 +310,10 @@ export interface AccountantClientDetail extends AccountantClientRow {
     total: number;
     note: string;
   };
+  /** The month being prepared, the period the export covers (engine only). */
+  period?: { key: MonthKey; from: string; to: string };
+  /** Rules this accountant taught (engine only). */
+  rules?: { id: string; label: string; scope: string }[];
 }
 
 /* ---------- Sources (GET /api/sources) ---------- */

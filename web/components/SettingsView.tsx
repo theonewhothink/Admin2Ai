@@ -32,7 +32,7 @@ export function SettingsView({ home, who = owner, account }: { home: HomeData; w
 
       <div className="stack-6">
         <ReportDelivery />
-        <section aria-labelledby="conn-h">
+        <section aria-labelledby="conn-h" id="connections">
           <div className="section-head">
             <h2 id="conn-h" className="h2">
               Connections

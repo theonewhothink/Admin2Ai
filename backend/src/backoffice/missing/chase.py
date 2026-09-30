@@ -54,6 +54,7 @@ __all__ = [
     "activity_line",
     "choose_language",
     "clean_invoice_number",
+    "compose_correction_request",
     "compose_reminder",
     "compose_request",
     "day_month_pt",
@@ -297,6 +298,48 @@ def _reminder_text(facts: ChaseFacts, today: date) -> str:
         f"Hello,\n\nA quick reminder about {what} the {money} payment dated {when}. "
         f"Could you please send it when you can? Thank you.\n\n{_our_details(facts)}\n\n"
         f"Kind regards,\n{facts.company_name}"
+    )
+
+
+def _correction_text(facts: ChaseFacts, today: date) -> tuple[str, str]:
+    """``facts.paid_on`` is the invoice's date here: the invoice is on hold and was not paid."""
+    money, when = _money_and_date(facts, today)
+    number = facts.invoice_number
+    if facts.language is Language.PT:
+        what = f"a fatura {number}" if number else "uma fatura"
+        subject = f"Fatura {number}: pedido de fatura corrigida" if number else "Pedido de fatura corrigida"
+        body = (
+            f"Olá,\n\nRecebemos {what} de {money}, com data de {when}, e alguns dos seus dados não correspondem "
+            "aos que temos registados. Não a vamos pagar tal como está.\n\n"
+            "Poderiam, por favor, enviar-nos uma fatura corrigida, ou confirmar-nos que está correta? "
+            f"Agradecemos desde já.\n\n{_our_details(facts)}\n\nCom os melhores cumprimentos,\n{facts.company_name}"
+        )
+        return subject, body
+    what = f"invoice {number}" if number else "an invoice"
+    subject = f"Invoice {number}: corrected invoice, please" if number else "Corrected invoice, please"
+    body = (
+        f"Hello,\n\nWe received {what} for {money}, dated {when}, and some of its details do not match the ones "
+        "we have on file. We will not pay it as it stands.\n\n"
+        "Could you please send us a corrected invoice, or confirm that it is correct? Thank you.\n\n"
+        f"{_our_details(facts)}\n\nKind regards,\n{facts.company_name}"
+    )
+    return subject, body
+
+
+def compose_correction_request(facts: ChaseFacts, *, token: str, today: date,
+                               message_id_domain: str) -> ChaseMessage:
+    """Ask for a corrected invoice when one is on hold (§26). It goes to the address on file, never to the
+    sender of the held invoice, and never repeats the bank details that changed."""
+    subject, body = _correction_text(facts, today)
+    subject = f"{subject} (Ref. {token})"
+    _guard(subject, body)
+    return ChaseMessage(
+        to=facts.supplier_email,
+        subject=subject,
+        body=body,
+        language=facts.language,
+        token=token,
+        message_id=_message_id(token, 0, today, message_id_domain),
     )
 
 

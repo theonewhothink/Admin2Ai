@@ -8,7 +8,8 @@ import type { AccountantClientDetail } from "@/lib/types";
 
 export function AccountantClientView({ client }: { client: AccountantClientDetail }) {
   const exp = client.exportState;
-  const existingRules = client.id === "hazel-tree" ? ["Rent to M. García is office rent (account 621)."] : [];
+  // The rules the engine holds for this accountant (none in the sample data): never a made-up list.
+  const existingRules = (client.rules ?? []).map((r) => ({ label: r.label, scope: r.scope }));
 
   return (
     <div className="container page">
@@ -60,13 +61,12 @@ export function AccountantClientView({ client }: { client: AccountantClientDetai
           </div>
           <p className={styles.itemDetail}>{exp.note}</p>
           {exp.state !== "exported" ? (
-            <div>
-              <ExportButton
-                label={exp.state === "ready" ? `Export to ${client.software}` : `Export what’s ready`}
-                software={client.software}
-                count={exp.ready}
-              />
-            </div>
+            <ExportButton
+              label={exp.state === "ready" ? `Download for ${client.software}` : "Download what’s ready"}
+              software={client.software}
+              companyId={client.id}
+              period={client.period ? { from: client.period.from, to: client.period.to } : undefined}
+            />
           ) : null}
         </section>
 

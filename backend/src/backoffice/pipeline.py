@@ -153,7 +153,9 @@ def _current(item: TrackedItem, note: str, need: Any, chase: Any) -> str:
             getattr(need, "prompt", "") or (need.why[0] if need.why else ""))
         return f"Waiting for you: {ask}".strip()
     if chase is not None and item.stage not in (Stage.CLOSED, Stage.NOT_REQUIRED):
-        return f"{chase.line} Waiting for their reply."
+        if chase.sent:
+            return f"{chase.line} Waiting for their reply."
+        return "Wrote to the supplier asking for the invoice. It is waiting to be sent."
     if item.subject_type == "document" and item.stage is Stage.UNDERSTOOD:
         return "Read. Waiting to match it to a payment."
     return note or ""
@@ -195,7 +197,7 @@ def build_pipeline(svc: BackOfficeService) -> dict[str, Any]:
     rows.sort(key=lambda r: not r["open"])
 
     work = Counter(_agent(t.actor) for i in items for t in i.history)
-    extra = {"missing": len(repo.chases), "obligation": len(repo.obligations),
+    extra = {"missing": sum(1 for c in repo.chases.values() if c.sent), "obligation": len(repo.obligations),
              "accountant": len(repo.accountant_questions)}
     agents = []
     for key, (label, what) in AGENTS.items():

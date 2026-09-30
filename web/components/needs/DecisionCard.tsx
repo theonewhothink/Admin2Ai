@@ -13,8 +13,12 @@ type Phase = "open" | "sending" | "done" | "leaving";
 const HOLD_MS = 1600;
 const LEAVE_MS = 240;
 
-/** Handles the done → leaving → removed sequence shared by both card kinds. */
-function useResolution(onResolved: () => void) {
+/**
+ * Handles the done → leaving → removed sequence shared by both card kinds. With `serverMessage`, the
+ * engine's own reply (what really happened, e.g. whether the request to the supplier went out) is
+ * shown instead of the card's preset text whenever there is one.
+ */
+function useResolution(onResolved: () => void, serverMessage = false) {
   const [phase, setPhase] = useState<Phase>("open");
   const [message, setMessage] = useState("");
   const [failed, setFailed] = useState(false);
@@ -35,7 +39,7 @@ function useResolution(onResolved: () => void) {
     setPhase("sending");
     const res = await answerNeedsYou(id, optionId, remember);
     if (res.ok) {
-      setMessage(doneMessage);
+      setMessage(serverMessage && res.message ? res.message : doneMessage);
       setPhase("done");
     } else {
       setFailed(true);
@@ -229,7 +233,7 @@ function ChoiceCard({ item, companyName, onResolved }: CardProps<NeedsYouChoiceI
 function ApprovalCard({ item, companyName, onResolved }: CardProps<NeedsYouApprovalItem>) {
   const [verifying, setVerifying] = useState(false);
   const [called, setCalled] = useState(false);
-  const { phase, message, failed, submit } = useResolution(onResolved);
+  const { phase, message, failed, submit } = useResolution(onResolved, true);
   const busy = phase !== "open";
 
   const keepBlocked = () => void submit(item.id, item.keepBlocked.optionId, false, item.keepBlocked.message);

@@ -105,6 +105,9 @@ class BackOfficeService:
         # Sign-in secrets live only in the vault (connectors/vault.py), never in the repository.
         self.vault = vault if vault is not None else _default_vault()
         self.authorizer = authorizer
+        # Sends the emails the owner confirms (backoffice.mailer); the demo's simulated outbox by default,
+        # None for a real business until the server hands it one. Without it nothing counts as sent.
+        self.mailer: Any = getattr(orchestrator, "transport", None)
         self.sign_in: dict[str, dict[str, Any]] = {}
         # A real business (production): a connection covers a period only once it has actually been
         # synced (§47, "never green without it"). The demo's connections are simulated and cover
@@ -322,8 +325,24 @@ class BackOfficeService:
                 entry["lastSyncedLabel"] = since_phrase(c.last_synced_at, now, TZ) if c.last_synced_at else None
                 problem = connector_problem(c.name, kind_source[c.kind], c.last_synced_at, now, tz=TZ)
                 entry["message"] = f"{problem.title} {problem.detail}"
+                if self.real_sources:
+                    entry.update(self._reconnect_state(c))
             out.append(entry)
         return {"connections": out}
+
+    def _reconnect_state(self, c: ConnectorState) -> dict[str, Any]:
+        """Production only: what reconnecting this connection takes, and whether it is already under way."""
+        info = self.sign_in.get(c.id) or {}
+        provider = info.get("provider")
+        out: dict[str, Any] = {}
+        if c.kind == "email" and provider in ("google", "microsoft"):
+            out["action"] = f"Sign in to {c.name} again"
+        elif c.kind in ("email", "bank"):
+            out["action"] = "Try again"
+        waiting_for_owner = (self.sync_states.get(c.id) or {}).get("reconnect_required")
+        if info.get("reconnecting") and not info.get("pending") and not waiting_for_owner:
+            out["reconnect"] = "catching_up"  # signed in again (or retried): shown as connected once a sync works
+        return out
 
     def mark_connection_stale(self, connection_id: str, since: datetime | None = None) -> dict[str, Any]:
         """A connector stopped syncing (§47–48): the month can never show green until it is back."""
@@ -342,13 +361,55 @@ class BackOfficeService:
         c = self.repo.connectors.get(connection_id)
         if c is None:
             raise ServiceError(404, "I can't find that connection.")
+        if self.real_sources:
+            return self._reconnect_real(c)
+        # The demo's connections are simulated: reconnecting one brings it straight back.
         c.healthy = True
-        if not self.real_sources:  # a real connection covers new days only once they are synced
-            c.covered_until = c.last_synced_at = self._now()
+        c.covered_until = c.last_synced_at = self._now()
         self._clear_reconnect(c.id)
         self.orchestrator.log("closure", "connector_reconnected", subject_id=c.id)
         self.orchestrator.run()
-        return {"ok": True, "connection": next(x for x in self.connections()["connections"] if x["id"] == c.id)}
+        return {"ok": True, "connection": self._connection(c.id)}
+
+    def _connection(self, connection_id: str) -> dict[str, Any]:
+        return next(x for x in self.connections()["connections"] if x["id"] == connection_id)
+
+    def _reconnect_real(self, c: ConnectorState) -> dict[str, Any]:
+        """A real connection comes back only through a new sign-in or a sync that works again (§47–48).
+
+        Google and Microsoft mailboxes: the provider's sign-in address, for the owner to sign in again.
+        Other mailboxes and banks: the saved sign-in is tried again. Either way the connection stays
+        "needs reconnecting" until a sync has actually succeeded; nothing here says it is back.
+        """
+        info = dict(self.sign_in.get(c.id) or {})
+        provider = info.get("provider")
+        if c.kind == "email" and provider in ("google", "microsoft"):
+            label = "Google" if provider == "google" else "Microsoft"
+            url = None
+            if self.authorizer is not None:
+                try:
+                    url = self.authorizer.begin(provider, self.repo.tenant_id, c.id, login_hint=c.account)
+                except Exception:
+                    url = None
+            if not url:
+                raise ServiceError(503, f"{label} sign-in is not set up on this server yet, so I can't reconnect "
+                                        f"{c.account} from here.")
+            self.sign_in[c.id] = {**info, "pending": True, "reconnecting": True}
+            self.orchestrator.log("closure", "connector_sign_in_started", subject_id=c.id)
+            return {"ok": True, "authorizeUrl": url, "message": f"Sign in to {c.name} again to reconnect {c.account}.",
+                    "connection": self._connection(c.id)}
+        if c.kind not in ("email", "bank"):
+            raise ServiceError(409, "This connection does not need reconnecting.")
+        self._clear_reconnect(c.id)
+        self.sign_in[c.id] = {**info, "reconnecting": True}
+        self.orchestrator.log("closure", "connector_retry_requested", subject_id=c.id)
+        if c.kind == "email":
+            message = (f"I'll try {c.account} again with its saved app password. It shows as connected once it has "
+                       "synced. If the password changed, remove the mailbox in Sources and add it again.")
+        else:
+            message = (f"I'll try {c.name} again. It shows as connected once it has synced. If your bank asks you "
+                       "to approve access again, link it again in Sources.")
+        return {"ok": True, "message": message, "connection": self._connection(c.id)}
 
     # ----------------------------------------------------------------- Sources
 
@@ -635,6 +696,10 @@ class BackOfficeService:
         c.healthy = not state.get("reconnect_required")
         c.covered_from, c.covered_until = start, end
         c.last_synced_at = last or c.last_synced_at
+        info = self.sign_in.get(c.id) or {}
+        if c.healthy and info.get("reconnecting"):  # the first sync after reconnecting worked: it is back
+            self.sign_in[c.id] = {k: v for k, v in info.items() if k != "reconnecting"}
+            self.orchestrator.activity(self._now(), "checked", f"{c.name} is connected again: {c.account} synced.")
         expires = when("auth_expires_at")
         if c.kind == "bank" and expires is not None:
             self.sign_in[c.id] = {**self.sign_in.get(c.id, {}), "provider": "open_banking",
@@ -824,11 +889,37 @@ class BackOfficeService:
         if msg is None:
             raise ServiceError(404, "I can't find that email.")
         if isinstance(body, Mapping) and body.get("cancel"):
-            if msg.status == "draft":
+            if msg.status in ("draft", "waiting"):
                 msg.status = "cancelled"
+            if msg.status == "sent":
+                return {"ok": True, "status": msg.status, "message": "It was already sent."}
             return {"ok": True, "status": msg.status, "message": "Cancelled. Nothing was sent."}
         msg = op.send(message_id)
         return {"ok": True, "status": msg.status, "message": msg.delivery}
+
+    # ----------------------------------------------------------------- the send path (production: one event per email)
+
+    def waiting_messages(self) -> list[str]:
+        """Emails written or confirmed but not yet accepted by a mailer, oldest first."""
+        ids = [m.id for m in self.orchestrator.waiting_messages()]
+        op = getattr(self, "_assistant", None)
+        if op is not None:
+            ids += [m.id for m in op.outbox.values() if m.status == "waiting"]
+        return ids
+
+    def send_waiting(self, message_id: str) -> dict[str, Any]:
+        """Send one waiting email through ``self.mailer`` now. Raises when the mailer refuses it (it stays waiting)."""
+        if self.mailer is None:
+            raise ServiceError(409, "Email sending is not set up here.")
+        if message_id in self.repo.outbox:
+            sent = self.orchestrator.send_waiting(message_id, self.mailer)
+        else:
+            op = self.assistant
+            msg = op.outbox.get(message_id)
+            if msg is None:
+                raise ServiceError(404, "I can't find that email.")
+            sent = msg.status == "waiting" and op.send(message_id).status == "sent"
+        return {"ok": True, "sent": bool(sent)}
 
     def report_file(self, report_id: str) -> dict[str, Any]:
         r = self.assistant.reports.get(report_id)
@@ -981,13 +1072,18 @@ class BackOfficeService:
         if c is None:
             return
         now = self._now()
+        reconnecting = bool((self.sign_in.get(connection_id) or {}).get("reconnecting"))
         if self.real_sources:  # covered once the first sync has read it (the sync worker)
-            c.healthy = True
+            if not reconnecting:  # a reconnected mailbox shows as connected again only once a sync works
+                c.healthy = True
             self._clear_reconnect(connection_id)
         else:
             c.healthy, c.covered_from, c.covered_until, c.last_synced_at = True, now - timedelta(days=90), now, now
         self.sign_in[connection_id] = {**self.sign_in.get(connection_id, {}), "pending": False, "stored": True}
-        self.orchestrator.activity(now, "checked", f"Connected {c.account}.")
+        if reconnecting and self.real_sources:
+            self.orchestrator.activity(now, "checked", f"You signed in to {c.account} again. I'm catching up now.")
+        else:
+            self.orchestrator.activity(now, "checked", f"Connected {c.account}.")
         self.orchestrator.run()
 
     def remove_source(self, source_id: str) -> dict[str, Any]:
@@ -1322,7 +1418,9 @@ class BackOfficeService:
             },
             "keepBlocked": {
                 "label": "Keep blocked", "optionId": "keep_blocked",
-                "message": f"Done. It stays blocked. I will ask {who} for a corrected invoice.",
+                # What the tap does: a request for a corrected invoice to the address on file, if there is one.
+                "message": (f"Done. It stays blocked. I will ask {who} for a corrected invoice." if supplier is not None
+                            and supplier.contact_email else "Done. It stays blocked."),
             },
         }
 
@@ -1405,8 +1503,13 @@ class BackOfficeService:
                 evidence += [self._doc_evidence(doc), self._tx_evidence(rec)]
             else:
                 chase = repo.chases.get(rec.id)
-                tail = (f" I asked {who} for the invoice on {day_month(chase.sent_at.astimezone(TZ).date(), self._today())}."
-                        if chase else " I'm still looking for its invoice.")
+                if chase is not None and chase.sent_at is not None:
+                    tail = (f" I asked {who} for the invoice on "
+                            f"{day_month(chase.sent_at.astimezone(TZ).date(), self._today())}.")
+                elif chase is not None:
+                    tail = f" I wrote to {who} asking for the invoice. It is waiting to be sent."
+                else:
+                    tail = " I'm still looking for its invoice."
                 parts.append(f"Yes: {amount} on {when}.{tail}")
                 evidence.append(self._tx_evidence(rec))
         else:
@@ -1425,19 +1528,24 @@ class BackOfficeService:
         questions = sorted(self.repo.accountant_questions.values(), key=lambda x: (x.asked_at, x.id))
         if not questions:
             return {"answer": "Your accountant has not asked anything this month.", "evidence": []}
-        answered = [x for x in questions if x.status == "answered"]
-        waiting = [x for x in questions if x.status != "answered"]
+        answered = [x for x in questions if x.status == "answered"]  # the answer reached the accountant
+        written = [x for x in questions if x.status == "written"]  # written, waiting to be sent
+        waiting = [x for x in questions if x.status not in ("answered", "written")]
         n = len(questions)
         head = "One question" if n == 1 else f"{_count_word(n).capitalize()} questions"
-        parts = [f"{head}, {_count_word(len(answered))} answered." if waiting else f"{head}, all answered."]
+        parts = [f"{head}, {_count_word(len(answered))} answered." if written or waiting else f"{head}, all answered."]
         evidence = []
         for x in answered:
             parts.append(f"“{x.text}” {x.answer}")
             evidence.append({"label": f"Accountant question · {day_month(x.asked_at.astimezone(TZ).date(), self._today())}",
                              "id": x.evidence_id})
             evidence += [{"label": "Proof used in the answer", "id": e} for e in x.answer_evidence_ids[:2]]
+        for x in written:
+            parts.append(f"“{x.text}” I wrote this answer; it is waiting to be sent: {x.answer}")
+            evidence.append({"label": "Accountant question", "id": x.evidence_id})
+            evidence += [{"label": "Proof used in the answer", "id": e} for e in x.answer_evidence_ids[:2]]
         for x in waiting:
-            parts.append(f"Still open: “{x.text}”")
+            parts.append(f"Still open: “{x.text}” I can't answer that from the documents, so it needs your answer.")
             evidence.append({"label": "Accountant question", "id": x.evidence_id})
         return {"answer": " ".join(parts), "evidence": evidence}
 
@@ -1640,8 +1748,9 @@ class BackOfficeService:
                 pct = ((after - before) * 100 / before).quantize(Decimal("1"))
                 anomalies.append({"id": f"an_price_{name.lower()}", "title": f"{name} price went up {pct}%",
                                   "detail": f"{format_money(before)} → {format_money(after)}.", "tone": "attention"})
+        # Answered only once the answer reached the accountant's mailbox (the send path accepted it).
         questions = [{"id": q.id, "question": q.text, "status": "answered" if q.status == "answered" else "waiting",
-                      **({"answer": q.answer} if q.answer else {})}
+                      **({"answer": q.answer} if q.answer and q.status == "answered" else {})}
                      for q in sorted(repo.accountant_questions.values(), key=lambda q: q.id) if q.company_id == company_id]
         done = status.counts.done
         total = status.counts.total
@@ -1650,7 +1759,14 @@ class BackOfficeService:
                    "note": f"{month.name} is complete and ready to export to {software}."} if status.closed else
                   {"state": "partial", "ready": done, "total": total,
                    "note": f"{done} of {total} items are ready for {software}. The rest will follow when they close."})
+        last_day = (date(month.year + (month.month == 12), month.month % 12 + 1, 1) - timedelta(days=1))
+        rules = [{"id": r.id, "label": r.label, "scope": r.scope.value} for r in repo.rulebook.rules
+                 if r.active and r.author.value == "accountant" and repo.accountant is not None
+                 and r.author_id == repo.accountant.id]
         return {**row, "taxId": repo.companies[company_id].tax_id, "software": software,
+                "period": {"key": str(month), "from": date(month.year, month.month, 1).isoformat(),
+                           "to": last_day.isoformat()},
+                "rules": rules,
                 "evidence": [{"label": "Transactions", "value": str(len(txs))},
                              {"label": "Matched with a document", "value": str(matched)},
                              {"label": "Documents collected", "value": str(len(docs))},

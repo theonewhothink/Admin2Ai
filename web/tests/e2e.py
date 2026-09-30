@@ -87,6 +87,7 @@ class MockApi:
         self.requests: list[dict[str, Any]] = []
         self.users = {EMAIL: {"id": "u1", "email": EMAIL, "name": "Laura Martins", "password": PASSWORD}}
         self.lock = threading.Lock()
+        self.reconnects: list[str] = []
 
     def session_for(self, headers: Any) -> dict[str, Any] | None:
         cookie = SimpleCookie(headers.get("Cookie") or "")
@@ -168,8 +169,19 @@ def make_handler(api: MockApi) -> type[http.server.BaseHTTPRequestHandler]:
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
+            # The fake Google sign-in page a reconnect sends the owner to.
+            if path == "/fake-google":
+                return self.reply(200, raw=b"<!doctype html><title>Google sign-in</title><p>Sign in again</p>",
+                                  ctype="text/html")
             if method == "POST" and self.headers.get("X-Requested-With") != "admin2ai":
                 return self.reply(403, {"error": "csrf", "message": "Refresh the page and try again."})
+            reconnect = re.fullmatch(r"/api/connections/([^/]+)/reconnect", path)
+            if reconnect and session is not None:
+                # Production contract: a Google mailbox answers with the sign-in page, never "connected".
+                api.reconnects.append(reconnect.group(1))
+                port = self.server.server_address[1]
+                return self.reply(200, {"ok": True, "message": "Sign in to Gmail again to reconnect.",
+                                        "authorizeUrl": f"http://{HOST}:{port}/fake-google?c={reconnect.group(1)}"})
             if path == "/api/auth/login":
                 user = api.users.get(str(body.get("email", "")).lower())
                 if not user or user["password"] != body.get("password"):
@@ -208,6 +220,10 @@ def make_handler(api: MockApi) -> type[http.server.BaseHTTPRequestHandler]:
             if path == "/api/connections/bank/start":
                 return self.reply(200, {"redirectUrl": f"http://{HOST}:{self.server.server_address[1]}/fake-bank?institution={body.get('institutionId')}"})
             status, data = api.engine.dispatch(method, path + (f"?{query}" if query else ""), body or None)
+            if path == "/api/home":  # production labels a stale Google mailbox's button like this
+                data = data | {"connections": [c | ({"action": f"Sign in to {c['name']} again"}
+                                                    if c["status"] == "stale" and c["kind"] == "email" else {})
+                                               for c in data["connections"]]}
             if session["fresh"] and path == "/api/home":
                 data = data | {"connections": [c for c in data["connections"] if c["kind"] == "bank"] if session["bank"] else []}
             if session["fresh"] and path == "/api/companies":
@@ -376,6 +392,47 @@ def production() -> None:
         shots(page, "settings-account")
         page.get_by_role("button", name="Keep my account").click()
         check(page.evaluate("document.activeElement.textContent").strip() == "Delete account…", "focus returns to the button")
+
+        print("home: never all clear with a dead mailbox; reconnect means signing in again")
+        with api.lock:
+            api.engine.mark_connection_stale("gmail")
+            headline = api.engine.home()["headline"]
+        page.goto("/")
+        expect(page.get_by_text("Gmail needs reconnecting.")).to_be_visible(timeout=15000)
+        check(page.get_by_text("Everything is under control.").count() == 0, "a stale mailbox is never 'under control'")
+        expect(page.locator("main").get_by_text(headline, exact=True)).to_be_visible()
+        check(True, f"Home shows the engine's own headline ({headline})")
+        tile = page.locator("a.tile", has_text="Needs you")
+        check(tile.locator(".dot-attention").count() == 1 and tile.locator(".dot-good").count() == 0,
+              "Needs you tile is not green")
+        check(page.locator(".progress-attention").count() >= 1 and page.locator(".progress-good").count() == 0,
+              "the month bar is amber below 100%")
+        page.get_by_role("button", name="Sign in to Gmail again").click()
+        page.wait_for_url(re.compile(r"/fake-google\?c=gmail$"), timeout=15000)
+        check(api.reconnects == ["gmail"], "Reconnect asks the API and goes to the provider's sign-in page")
+        with api.lock:
+            api.engine.reconnect("gmail")
+        page.goto("/")
+        expect(page.get_by_role("heading", name=re.compile("^Good"))).to_be_visible(timeout=15000)
+        check(page.get_by_text("connected again").count() == 0, "never 'connected again' without a sync")
+
+        print("accountant: rules and export come from the engine")
+        page.goto("/accountant/hazel-tree")
+        page.get_by_role("textbox", name="Rule").fill("Treat all Adobe subscriptions as Software")
+        page.get_by_role("button", name="Teach").click()
+        expect(page.get_by_text(re.compile(r"It applies to \d+ payments? so far\."))).to_be_visible(timeout=15000)
+        taught = [r for r in api.requests if r["path"] == "/api/accountant/rules"]
+        check(bool(taught) and json.loads(taught[-1]["body"]) == {"text": "Treat all Adobe subscriptions as Software",
+                                                                   "scope": "client"} and taught[-1]["csrf"] == "admin2ai",
+              "Teach posts the rule to /api/accountant/rules")
+        check(page.get_by_text("61 past transactions").count() == 0, "no made-up rule results")
+        with page.expect_download() as dl:
+            page.get_by_role("button", name=re.compile("^Download")).click()
+        check(dl.value.suggested_filename.startswith("documents_Hazel-Tree_2026-09-01_2026-09-30"),
+              "Export downloads the engine's ZIP for the month")
+        expect(page.get_by_text(re.compile(r"^Downloaded documents_Hazel-Tree.*\d+ documents?, with the ledger"))).to_be_visible()
+        page.goto("/settings")  # back where the next steps start
+        expect(page.get_by_text("Signed in as")).to_be_visible(timeout=15000)
 
         print("sign out")
         page.get_by_role("button", name="Account and settings").click()
