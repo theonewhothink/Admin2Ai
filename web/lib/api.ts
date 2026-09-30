@@ -25,6 +25,7 @@ import { API_URL, BASE_PATH, browserEngine, clientRendered, production } from ".
 import type {
   AccountantClientDetail,
   AccountantClientRow,
+  AccountantInvitation,
   ActivityFeed,
   AnswerResult,
   AskAnswer,
@@ -527,17 +528,74 @@ const isClients: Guard<AccountantClientRow[]> = (v) => {
 const isClient: Guard<AccountantClientDetail | null> = (v) =>
   isRecord(v) && typeof v.id === "string" && Array.isArray(v.evidence) ? (v as unknown as AccountantClientDetail) : null;
 
-export async function getAccountantClients(): Promise<AccountantClientRow[]> {
-  if (production) return productionRead("/api/accountant/clients", { method: "GET" }, isClients);
-  if (!browserEngine) return sample.accountantClients;
-  return viaEngine<AccountantClientRow[]>("GET", "/api/accountant/clients", undefined, isClients, () => sample.accountantClients);
+/** The accountant's clients: the engine's or the backend's (sample rows only when there is neither). */
+export function getAccountantClients(): Promise<AccountantClientRow[]> {
+  return request<AccountantClientRow[]>("/api/accountant/clients", { method: "GET" }, isClients, () => sample.accountantClients);
 }
 
-export async function getAccountantClient(id: string): Promise<AccountantClientDetail | null> {
+export function getAccountantClient(id: string): Promise<AccountantClientDetail | null> {
   const path = `/api/accountant/clients/${encodeURIComponent(id)}`;
-  if (production) return productionRead(path, { method: "GET" }, isClient, { value: null });
-  if (!browserEngine) return sample.accountantClientDetail(id);
-  return viaEngine<AccountantClientDetail | null>("GET", path, undefined, isClient, () => sample.accountantClientDetail(id), { value: null });
+  return request<AccountantClientDetail | null>(
+    path,
+    { method: "GET" },
+    isClient,
+    () => sample.accountantClientDetail(id),
+    undefined,
+    { value: null },
+  );
+}
+
+/**
+ * The accountant's firm, as the engine knows it (the business's accountant). Null when there is no
+ * engine or backend to ask, or no accountant yet: the caller shows its own label.
+ */
+export async function getAccountantFirm(): Promise<{ name: string; person: string } | null> {
+  if (!liveData) return null;
+  const r = await call<{ default?: { firm?: string; name?: string } | null }>("GET", "/api/settings/accountant");
+  const d = r.ok ? r.body.default : null;
+  return d && typeof d.firm === "string" ? { name: d.firm, person: typeof d.name === "string" ? d.name : "" } : null;
+}
+
+/** Open one original from the accountant's view (an evidence link's `href`). Null, or a plain error message. */
+export function openEvidence(href: string): Promise<string | null> {
+  if (!liveData) return Promise.resolve("Connect the backend to open the originals.");
+  return download(href);
+}
+
+/** Teach a rule for one client (`path` is the client's `links.rules`). `label` is the rule in plain words. */
+export async function teachRule(
+  path: string,
+  text: string,
+  scope: "client" | "all",
+): Promise<AnswerResult & { label?: string }> {
+  const r = await call<{ message?: string; rule?: { label?: string } }>("POST", path, { text, scope });
+  const label = r.ok && typeof r.body.rule?.label === "string" ? r.body.rule.label : undefined;
+  return { ok: r.ok, message: typeof r.body.message === "string" ? r.body.message : undefined, label };
+}
+
+/** Invite a client business: "Your accountant has enabled Back Office for you." (§29). */
+export async function inviteClient(body: { email: string; clientName?: string; taxIds?: string[] }): Promise<AnswerResult> {
+  const r = await call<{ ok?: boolean; message?: string }>("POST", "/api/accountant/invitations", body);
+  // Written but not sent (no transport) is not a success: the reply says so with ok: false.
+  return { ok: r.ok && r.body.ok !== false, message: typeof r.body.message === "string" ? r.body.message : undefined };
+}
+
+export async function getInvitations(): Promise<AccountantInvitation[]> {
+  if (!liveData) return [];
+  const r = await call<{ invitations?: unknown }>("GET", "/api/accountant/invitations");
+  const list = r.ok ? arrayFrom(r.body, "invitations") : null;
+  return list ? list.filter((i): i is AccountantInvitation => isRecord(i) && typeof i.id === "string") : [];
+}
+
+/** The invited owner accepts (production): the accountant can then see the business. */
+export async function acceptInvitation(token: string): Promise<AnswerResult> {
+  if (!production) return { ok: false, message: "Invitations are accepted in the live app." };
+  const { ok, message } = await productionWrite("/api/invitations/accept", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token }),
+  });
+  return { ok, message };
 }
 
 export function getSources(): Promise<SourcesData> {

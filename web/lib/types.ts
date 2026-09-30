@@ -294,7 +294,38 @@ export interface AccountantClientRow {
   month: string;
   complete: number;
   missing: number;
+  /** What only the accountant can decide: tax flags and questions routed to them. */
   needsAccountant: number;
+  /** Production: the client business the company belongs to (when the accountant may see all of it). */
+  business?: string;
+}
+
+/** An original the accountant can open: `href` returns `{ filename, contentType, data }` (base64). */
+export interface EvidenceLink {
+  id: string;
+  label: string;
+  href: string;
+  kind?: "payment" | "document" | "email" | "letter" | "file";
+  sourceLabel?: string;
+  receivedAt?: string;
+  filename?: string | null;
+}
+
+/** One payment of the month and what proves it (§20, §54). */
+export interface ReconciliationRow {
+  id: string;
+  date: ISODate;
+  payee: string;
+  description: string;
+  amount: number;
+  direction: "in" | "out";
+  currency: string;
+  status: "closed" | "not_required" | "conflict" | "waiting_for_owner" | "open";
+  statusLabel: string;
+  tone: Tone;
+  documents: { id: string; label: string; href?: string; evidenceId?: string }[];
+  evidence: EvidenceLink[];
+  why: string[];
 }
 
 export interface AccountantClientDetail extends AccountantClientRow {
@@ -303,17 +334,41 @@ export interface AccountantClientDetail extends AccountantClientRow {
   evidence: { label: string; value: string }[];
   anomalies: { id: string; title: string; detail: string; tone: Tone }[];
   taxFlags: { id: string; title: string; detail: string }[];
-  questions: { id: string; question: string; status: "answered" | "waiting"; answer?: string }[];
+  questions: {
+    id: string;
+    question: string;
+    status: "answered" | "waiting";
+    answer?: string;
+    evidence?: EvidenceLink[];
+  }[];
   exportState: {
     state: "ready" | "partial" | "exported";
     ready: number;
     total: number;
     note: string;
   };
-  /** The month being prepared, the period the export covers (engine only). */
+  /** The month being prepared, the period the export covers. */
   period?: { key: MonthKey; from: string; to: string };
-  /** Rules this accountant taught (engine only). */
+  /** The company's own accountant, else the business's. */
+  accountant?: { name: string; firm: string; email: string } | null;
+  evidenceLinks?: EvidenceLink[];
+  reconciliation?: ReconciliationRow[];
+  missingDocuments?: { id: string; date: ISODate; payee: string; amount: number | null; currency: string; plan: string }[];
+  openReasons?: string[];
+  /** Rules of this client's accountant that apply to it: "client" (this client) or "all" (all clients). */
   rules?: { id: string; label: string; scope: string }[];
+  links?: { export: string; rules: string };
+}
+
+export interface AccountantInvitation {
+  id: string;
+  email: string;
+  clientName?: string | null;
+  taxIds: string[];
+  createdAt: string;
+  expiresAt: string;
+  status: string;
+  statusLabel: string;
 }
 
 /* ---------- Sources (GET /api/sources) ---------- */

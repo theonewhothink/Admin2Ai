@@ -36,6 +36,14 @@ Rules are ranked separately for each field they decide, by this key, best first:
 Lower-ranked rules that disagree with the winner are reported as resolved
 conflicts, so an accountant can see when an owner answer overrode their rule.
 
+Companies
+---------
+A business may have several companies, each with its own accountant (§28, §51).
+A rule may be limited to some of them (``Rule.entity_ids``): it is then used
+only for a subject whose ``entity_id`` is one of those companies, and never for
+a subject whose company is not known yet (fail closed). A rule without
+``entity_ids`` covers every company of its tenant, as before.
+
 Every lifecycle change (created, superseded, deactivated) is appended to the
 book's audit trail; rules are immutable and never edited in place (§55).
 """
@@ -151,18 +159,21 @@ class RuleSubject:
     account_id: str | None = None
     amount: Decimal | None = None
     supplier_tax_id: str | None = None
+    entity_id: str | None = None  # the company, when known (company-limited rules need it)
 
     def __post_init__(self) -> None:
         if isinstance(self.amount, float):
             raise TypeError("money must be Decimal, never float")
 
     @classmethod
-    def from_transaction(cls, tx: Transaction, *, key: str | None = None) -> RuleSubject:
+    def from_transaction(cls, tx: Transaction, *, key: str | None = None,
+                         entity_id: str | None = None) -> RuleSubject:
         return cls(
             counterparty_key=key or counterparty_key(tx.counterparty),
             card_last4=tx.card_last4,
             account_id=tx.account_id,
             amount=abs(tx.amount),
+            entity_id=entity_id or tx.entity_id,
         )
 
     @classmethod
@@ -171,6 +182,7 @@ class RuleSubject:
             counterparty_key=key or counterparty_key(doc.supplier_name),
             amount=abs(doc.gross_amount) if doc.gross_amount is not None else None,
             supplier_tax_id=doc.supplier_tax_id,
+            entity_id=doc.entity_id,
         )
 
     def merged(self, other: RuleSubject) -> RuleSubject:
@@ -181,6 +193,7 @@ class RuleSubject:
             account_id=self.account_id or other.account_id,
             amount=self.amount if self.amount is not None else other.amount,
             supplier_tax_id=self.supplier_tax_id or other.supplier_tax_id,
+            entity_id=self.entity_id or other.entity_id,
         )
 
 
@@ -363,6 +376,8 @@ class Rule(BaseModel):
     created_at: datetime
     label: str = ""  # plain words shown to people, e.g. the one-tap sentence (§38)
     active: bool = True
+    # Companies of the tenant this rule is limited to; empty = every company (see module docstring).
+    entity_ids: tuple[str, ...] = ()
 
     @field_validator("created_at")
     @classmethod
@@ -370,6 +385,14 @@ class Rule(BaseModel):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("created_at must be timezone-aware")
         return value
+
+    @field_validator("entity_ids")
+    @classmethod
+    def _entities(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        cleaned = tuple(sorted({v.strip() for v in value if isinstance(v, str) and v.strip()}))
+        if len(cleaned) != len(value):
+            raise ValueError("entity_ids must be distinct, non-empty company ids")
+        return cleaned
 
     @model_validator(mode="after")
     def _scope(self) -> Rule:
@@ -384,7 +407,13 @@ class Rule(BaseModel):
             raise ValueError(f"{self.scope.value} rules need a tenant")
         if not needs_tenant and self.tenant_id:
             raise ValueError("a rule for all clients cannot be tied to one tenant")
+        if not needs_tenant and self.entity_ids:
+            raise ValueError("a rule for all clients cannot be limited to one tenant's companies")
         return self
+
+    def covers(self, entity_id: str | None) -> bool:
+        """Whether this rule may be used for a subject of company ``entity_id`` (None: not known yet)."""
+        return not self.entity_ids or (entity_id is not None and entity_id in self.entity_ids)
 
     def applies_to(self, tenant_id: str, accountant_ids: frozenset[str]) -> bool:
         """Whether this rule may be used for ``tenant_id`` right now."""
@@ -398,7 +427,7 @@ class Rule(BaseModel):
 
     def slot(self) -> tuple[Any, ...]:
         """Rules in the same slot say the same kind of thing about the same facts."""
-        return (self.author, self.author_id, self.scope, self.tenant_id, self.match)
+        return (self.author, self.author_id, self.scope, self.tenant_id, self.entity_ids, self.match)
 
     def rank(self, field: RuleField) -> tuple[int, int, int]:
         """Lower is stronger. See the module docstring."""
@@ -637,7 +666,8 @@ class RuleBook:
         self, subject: RuleSubject, *, tenant_id: str, accountant_ids: Iterable[str] = ()
     ) -> RuleDecision:
         """Per-field decision for ``subject`` with conflicts reported (see module docstring)."""
-        matching = [r for r in self.applicable(tenant_id, accountant_ids) if r.match.matches(subject)]
+        matching = [r for r in self.applicable(tenant_id, accountant_ids)
+                    if r.covers(subject.entity_id) and r.match.matches(subject)]
         decisions: dict[RuleField, FieldDecision] = {}
         conflicts: list[RuleConflict] = []
         for field in RuleField:

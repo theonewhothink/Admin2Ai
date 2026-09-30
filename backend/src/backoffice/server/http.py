@@ -5,6 +5,15 @@ Every ``/api/*`` call needs a signed-in person, except ``/api/auth/*``,
 keys), ``/healthz`` and ``/readyz``. All other routes keep exactly the shapes
 the demo serves; they act on the signed-in person's business.
 
+Accountants (§28, §29, §51): an accountant membership may be limited to some
+companies of a business, and every read of such an accountant is filtered to
+those companies (``BackOfficeService.dispatch_scoped``; everything else is
+refused). ``GET /api/accountant/clients`` lists every client company of every
+business the person is an accountant of, as ``<business>~<company>`` ids that
+``/api/accountant/clients/<business>~<company>[/…]`` opens. An accountant
+invites a client business with ``POST /api/accountant/invitations``; the
+invited owner accepts with ``POST /api/invitations/accept``.
+
 Hardening: security headers on every response (HSTS, nosniff, a CSP that
 allows nothing, no framing, no referrer, no caching of API data), CORS only for
 BACKOFFICE_ALLOWED_ORIGINS (with credentials), request size limits, one JSON
@@ -15,6 +24,7 @@ stack trace.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import functools
 import hashlib
 import hmac
@@ -42,7 +52,7 @@ from .auth import COOKIE_NAME, CSRF_HEADER, CSRF_VALUE, SESSION_DAYS, AuthError,
 from .config import ServerConfig
 from .erasure import purger_from_config
 from .runtime import READ_ONLY_POSTS, ReplayDiverged, TenantManager, TenantNotFound
-from .store import Device, Store, StoreError, StoreUnavailable
+from .store import Device, Invitation, Store, StoreError, StoreUnavailable
 
 __all__ = ["JsonLogFormatter", "StoreNonces", "build_manager", "build_production_app", "configure_logging",
            "production_services"]
@@ -71,11 +81,17 @@ _ROUTE_WORDS = frozenset(
     "tool tasks done outbox send reports file documents export settings report accountant api-keys revoke remove "
     "connections stale reconnect clients rules audit pipeline auth signup login logout me account delete "
     "onboarding company oauth start callback bank devices v1 healthz readyz internal overview operations "
-    "readiness acceptance cost-centers allocate obligations transactions expected-invoices not-coming statement".split())
+    "readiness acceptance cost-centers allocate obligations transactions expected-invoices not-coming statement "
+    "invitations accept".split())
+# One client company of any business: /api/accountant/clients/<tenant id>~<company id>[/…] (§28, §29).
+_CLIENT_REF = re.compile(r"/api/accountant/clients/(?P<tenant>[A-Za-z0-9][A-Za-z0-9_.-]{0,127})~(?P<company>[^/~]+)"
+                         r"(?P<rest>/.*)?")
+_CLIENT_RULES = re.compile(r"/api/accountant/clients/([^/~]+)/rules")
 
 UNAVAILABLE = "I can't reach your data right now. Please try again in a minute."
 DIVERGED = "Your data is safe, but I can't open it right now. The team has been alerted."
 FORBIDDEN = "You don't have access to that."
+CLIENT_NOT_FOUND = "I can't find that client."
 ADMIN_ONLY = "This page is for the Admin2Ai team only."
 INTERNAL_VIEWS = frozenset({"overview", "operations", "readiness", "acceptance"})
 CSRF_BLOCKED = "This request was blocked for your safety. Please reload the page and try again."
@@ -803,6 +819,204 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
         return 200, manager.read_many(tenant_ids, lambda services: internal.handle(view, services, query),
                                       what=f"GET {route_template(target)}")
 
+    # ----------------------------------------------------------------- the accountant's clients (§28, §29, §51)
+
+    def _client_access(principal: Principal, tenant_id: str, company_id: str) -> frozenset[str] | None:
+        """May ``principal`` see ``company_id`` of business ``tenant_id``? Returns the company limit
+        of their membership there (None: every company); refuses as "not found" otherwise."""
+        if tenant_id == principal.tenant.id:
+            roles, limit = principal.roles, principal.companies
+        else:
+            loaded = store.principal(tenant_id, principal.user.id)
+            if loaded is None:
+                raise AuthError(404, "not_found", CLIENT_NOT_FOUND)
+            roles = loaded[2]
+            limit = auth.scope(tenant_id, principal.user.id, roles)
+        if not roles & {"owner", "admin", "accountant"} or (limit is not None and company_id not in limit):
+            raise AuthError(404, "not_found", CLIENT_NOT_FOUND)
+        return limit
+
+    def _client_request(principal: Principal, method: str, m: re.Match[str], body: dict[str, Any],
+                        query: str) -> tuple[int, dict[str, Any]]:
+        """``/api/accountant/clients/<business>~<company>[/…]``: one client company of any business the
+        signed-in person is an accountant (or owner) of, filtered to what their membership covers."""
+        tenant_id, company_id, rest = m.group("tenant"), m.group("company"), m.group("rest") or ""
+        limit = _client_access(principal, tenant_id, company_id)
+        local = f"/api/accountant/clients/{company_id}{rest}"
+        if method == "GET":
+            return manager.view(tenant_id, "GET", local + query, None, companies=limit, prefix=f"{tenant_id}~")
+        if rest == "/rules":
+            text = body.get("text")
+            scope = "client" if limit is not None else str(body.get("scope") or "client")
+            return manager.command(tenant_id, principal.user.id, "POST", local, {"text": text, "scope": scope})
+        return 404, {"error": "not_found", "message": "I can't find that."}
+
+    def _accountant_home(principal: Principal) -> tuple[int, dict[str, Any]] | None:
+        """Every client company of every business this person is an accountant of (None: they are
+        nobody's accountant, so the page shows their own business's companies, as before)."""
+        memberships = [t for t, role in store.memberships(principal.user.id) if role == "accountant"]
+        if not memberships:
+            return None
+        rows: list[dict[str, Any]] = []
+        for tenant in memberships:
+            limit = store.membership_companies(tenant.id, principal.user.id)
+            try:
+                status, out = manager.view(tenant.id, "GET", "/api/accountant/clients", None,
+                                           companies=frozenset(limit) if limit else None, prefix=f"{tenant.id}~")
+            except (TenantNotFound, ReplayDiverged):
+                log.warning("client_unavailable", extra={"tenant": tenant.id})
+                continue
+            if status == 200:
+                # The business's name is its first company's: an accountant of other companies does not get it.
+                named = {"business": tenant.name} if not limit else {}
+                rows += [{**r, **named} for r in out.get("clients", [])]
+        rows.sort(key=lambda r: (r["complete"], r["name"], r["id"]))
+        return 200, {"clients": rows}
+
+    def _limited_post(principal: Principal, target: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """A POST from an accountant limited to some companies: only their companies' rules and exports."""
+        tenant = principal.tenant.id
+        allowed = principal.companies or frozenset()
+        if target == "/api/documents/export":
+            return manager.view(tenant, "POST", target, body, companies=allowed)
+        own = _CLIENT_RULES.fullmatch(target)
+        if target == "/api/accountant/rules" or own:
+            company = own.group(1) if own else str(body.get("companyId") or "")
+            if company not in allowed:
+                return 403, {"error": "forbidden", "message": "Choose one of your clients for this rule."}
+            return manager.command(tenant, principal.user.id, "POST", "/api/accountant/rules",
+                                   {"text": body.get("text"), "scope": "client", "companyId": company})
+        return 403, {"error": "forbidden", "message": FORBIDDEN}
+
+    def _public_invitation(i: Invitation, at: datetime) -> dict[str, Any]:
+        if i.accepted_at is not None:
+            status, label = "accepted", "Accepted"
+        elif i.expires_at <= at:
+            status, label = "expired", "Expired"
+        elif i.sent_at is not None:
+            status, label = "sent", "Sent"
+        else:
+            status, label = "not_sent", "Not sent"
+        return {"id": i.id, "email": i.email, "clientName": i.client_name or None, "taxIds": list(i.tax_ids),
+                "createdAt": i.created_at.isoformat(), "expiresAt": i.expires_at.isoformat(),
+                "acceptedAt": i.accepted_at.isoformat() if i.accepted_at else None, "status": status,
+                "statusLabel": label}
+
+    def _invite(principal: Principal, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """The accountant invites a client business (§29). The email goes out through the mailer; the
+        invitation counts as sent only once the mailer accepted it."""
+        from backoffice import invitations as inv
+
+        try:
+            clean = inv.clean_invitation(body)
+        except ValueError as exc:
+            return 400, {"error": "bad_request", "message": str(exc)}
+        if clean.email == principal.user.email:
+            return 400, {"error": "bad_request", "message": "Enter your client's email address, not your own."}
+        mailer = manager.mailer
+        if mailer is None:
+            return 503, {"error": "unavailable",
+                         "message": "Email is not set up on this server yet, so I can't send invitations."}
+        at = auth.now()
+        token, digest = inv.new_token()
+        firm = clean.firm or (principal.tenant.name if principal.is_owner else "")
+        invitation = Invitation(
+            id="inv_" + secrets.token_hex(8), token_hash=digest, inviter_tenant_id=principal.tenant.id,
+            inviter_user_id=principal.user.id, inviter_email=principal.user.email, inviter_name=principal.user.name,
+            firm=firm, email=clean.email, client_name=clean.client_name, tax_ids=clean.tax_ids, created_at=at,
+            expires_at=inv.expiry(at))
+        store.create_invitation(invitation)
+        subject, text = inv.invitation_email(inviter=principal.user.name, firm=firm, client_name=clean.client_name,
+                                             link=f"{config.web_url}/invite#{token}", expires_at=invitation.expires_at)
+        try:
+            mailer.send([clean.email], subject, text, [])
+        except Exception:
+            log.warning("invitation_not_sent", extra={"tenant": principal.tenant.id})
+            return 502, {"error": "unavailable",
+                         "message": "I couldn't send the invitation email. Please try again in a few minutes."}
+        sent = auth.now()
+        store.mark_invitation_sent(invitation, sent)
+        return 200, {"ok": True, "invitation": _public_invitation(dataclasses.replace(invitation, sent_at=sent), sent),
+                     "message": f"Done. I sent the invitation to {clean.email}."}
+
+    def _accept(principal: Principal, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """The invited owner accepts (§29): the inviter becomes an accountant of this business, limited to
+        the companies the invitation names (by NIF) or the owner picks; the engine learns who they are."""
+        from backoffice import invitations as inv
+
+        token = body.get("token")
+        if not inv.token_ok(token):
+            return 404, {"error": "not_found", "message": inv.NOT_VALID}
+        digest = inv.hash_token(str(token))
+        found = store.invitation(digest)
+        if found is None:
+            return 404, {"error": "not_found", "message": inv.NOT_VALID}
+        at = auth.now()
+        try:
+            inv.check_acceptance(token_hash=digest, stored_hash=found.token_hash, email=principal.user.email,
+                                 invited_email=found.email, now=at, expires_at=found.expires_at,
+                                 accepted_at=found.accepted_at, inviter_id=found.inviter_user_id,
+                                 acceptor_id=principal.user.id)
+        except inv.InvitationRefused as exc:
+            codes = {403: "forbidden", 404: "not_found", 409: "conflict", 410: "gone"}
+            return exc.status, {"error": codes.get(exc.status, "error"), "message": exc.message}
+        companies = manager.read(principal.tenant.id, lambda svc: [(c, e.tax_id) for c, e in svc.repo.companies.items()],
+                                 what="invitation companies")
+        chosen = body.get("companyIds")
+        if found.tax_ids:
+            limit = inv.companies_for(found.tax_ids, companies)
+            if not limit:
+                return 409, {"error": "conflict", "message": "This invitation is for the company with NIF "
+                             f"{', '.join(found.tax_ids)}. Add that company first, then accept."}
+        elif isinstance(chosen, list) and chosen:
+            known = [c for c, _ in companies]
+            if any(c not in known for c in chosen):
+                return 400, {"error": "bad_request", "message": "I don't know that company."}
+            limit = tuple(c for c in known if c in chosen)
+        else:
+            limit = ()
+        if not store.accept_invitation(digest, tenant_id=principal.tenant.id, accepted_by=principal.user.id,
+                                       companies=limit, at=at):
+            return 409, {"error": "conflict", "message": inv.USED}
+        # The engine learns who the accountant is: their questions, rules and the monthly package (§28).
+        who = {"email": found.inviter_email, "name": found.inviter_name, "firm": found.firm}
+        for company in limit or (None,):
+            status, out = manager.set_accountant(principal.tenant.id, principal.user.id,
+                                                 {**who, **({"companyId": company} if company else {})})
+            if status != 200:
+                log.warning("invitation_accountant_not_set", extra={"tenant": principal.tenant.id})
+        name = found.firm or found.inviter_name or found.inviter_email
+        return 200, {"ok": True, "accountant": {"email": found.inviter_email, "name": found.inviter_name or None,
+                                                "firm": found.firm or None},
+                     "companies": list(limit),
+                     "message": f"Done. {name} is now your accountant and can see "
+                                f"{'the companies you chose' if limit else 'your companies'}."}
+
+    @app.get("/api/accountant/invitations")
+    @_guarded
+    async def invitations_list(request: Request) -> Response:
+        principal, refresh = await _signed_in(request)
+        found = await run_in_threadpool(store.invitations_from, principal.tenant.id, principal.user.id)
+        at = auth.now()
+        return _reply(200, {"invitations": [_public_invitation(i, at) for i in found]},
+                      refresh=(refresh, _token(request)[0]))
+
+    @app.post("/api/accountant/invitations")
+    @_guarded
+    async def invitations_create(request: Request) -> Response:
+        principal, refresh = await _signed_in(request)
+        body = await _json(request, required=True)
+        status, out = await run_in_threadpool(_invite, principal, body)
+        return _reply(status, out, refresh=(refresh, _token(request)[0]))
+
+    @app.post("/api/invitations/accept")
+    @_guarded
+    async def invitations_accept(request: Request) -> Response:
+        principal, refresh = await _signed_in(request, owner=True)
+        body = await _json(request, required=True)
+        status, out = await run_in_threadpool(_accept, principal, body)
+        return _reply(status, out, refresh=(refresh, _token(request)[0]))
+
     # ----------------------------------------------------------------- everything else the demo serves
 
     @app.api_route("/api/{path:path}", methods=["GET", "POST"])
@@ -813,16 +1027,27 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
             return _error(404, "not_found", "I can't find that.")
         principal, refresh = await _signed_in(request)
         tenant, actor = principal.tenant.id, principal.user.id
+        query = ("?" + request.url.query) if request.url.query else ""
+        client = _CLIENT_REF.fullmatch(target)
         if admin_only(target):
             if request.method != "GET":
                 return _error(405, "method_not_allowed", "That is not something I can do here.")
             status, out = await run_in_threadpool(_internal, principal, target, dict(request.query_params))
+        elif client is not None:
+            body = await _json(request) if request.method == "POST" else {}
+            status, out = await run_in_threadpool(_client_request, principal, request.method, client, body, query)
+        elif request.method == "GET" and target == "/api/accountant/clients" and \
+                (home := await run_in_threadpool(_accountant_home, principal)) is not None:
+            status, out = home
         elif request.method == "GET":
-            query = ("?" + request.url.query) if request.url.query else ""
-            status, out = await run_in_threadpool(manager.view, tenant, "GET", target + query, None)
+            # An accountant limited to some companies reads only those companies (§28, §52).
+            status, out = await run_in_threadpool(functools.partial(
+                manager.view, tenant, "GET", target + query, None, companies=principal.companies))
         else:
             body = await _json(request)
-            if target in READ_ONLY_POSTS:
+            if principal.limited:
+                status, out = await run_in_threadpool(_limited_post, principal, target, body)
+            elif target in READ_ONLY_POSTS:
                 status, out = await run_in_threadpool(manager.view, tenant, "POST", target, body)
             elif target == "/api/chat":
                 status, out = await run_in_threadpool(manager.chat, tenant, actor, body)

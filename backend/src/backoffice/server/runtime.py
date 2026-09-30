@@ -587,12 +587,21 @@ class TenantManager:
 
     # ----------------------------------------------------------------- what the API calls
 
-    def view(self, tenant_id: str, method: str, path: str, body: Any = None) -> tuple[int, dict[str, Any]]:
-        """A read: the state as of now, unchanged."""
+    def view(self, tenant_id: str, method: str, path: str, body: Any = None, *,
+             companies: frozenset[str] | None = None, prefix: str = "") -> tuple[int, dict[str, Any]]:
+        """A read: the state as of now, unchanged.
+
+        ``companies``: the reader is an accountant limited to these companies (§28, §52): only the
+        accountant's routes answer, filtered to them. ``prefix`` goes before client ids in the reply.
+        """
         with self.open(tenant_id) as rt:
             self.tick_if_due(rt)
-            return self._guarded_read(rt, f"{method} {path.split('?', 1)[0]}",
-                                      lambda svc: svc.dispatch(method, path, body))
+            what = f"{method} {path.split('?', 1)[0]}"
+            if companies is None and not prefix:
+                return self._guarded_read(rt, what, lambda svc: svc.dispatch(method, path, body))
+            scope = companies if companies is not None else frozenset(rt.service.repo.companies)
+            return self._guarded_read(rt, what,
+                                      lambda svc: svc.dispatch_scoped(method, path, body, scope, prefix=prefix))
 
     def read(self, tenant_id: str, reader: Callable[[BackOfficeService], Any], *, what: str = "read") -> Any:
         """Run ``reader`` on the tenant's service (no change allowed) as of now."""
@@ -724,8 +733,12 @@ class TenantManager:
             return self.record(rt, "company.added", data, actor, self.live_env())
 
     def set_accountant(self, tenant_id: str, actor: str, body: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
+        """The business's accountant, or (``companyId``) one company's own accountant (§28, §51)."""
         data = {"email": str(body.get("email") or ""), "name": str(body.get("name") or ""),
                 "software": str(body.get("software") or "")}
+        for key in ("companyId", "firm"):  # recorded only when given: older events replay unchanged
+            if body.get(key):
+                data[key] = str(body.get(key))
         with self.open(tenant_id) as rt:
             return self.record(rt, "accountant.set", data, actor, self.live_env())
 
@@ -857,7 +870,8 @@ def _company_added(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) 
 
 def _accountant_set(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
     d = event.data
-    return 200, rt.service.set_accountant(d.get("email"), d.get("name") or None, d.get("software") or None)
+    return 200, rt.service.set_accountant(d.get("email"), d.get("name") or None, d.get("software") or None,
+                                          d.get("companyId") or None, d.get("firm") or None)
 
 
 def _request(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:

@@ -267,8 +267,11 @@ def _get_paths(h: Any, token: str, seen: dict[str, Any]) -> list[str]:
              "/api/audit", "/api/pipeline", "/api/auth/me", "/api/account/export", "/healthz", "/readyz"]
     for c in companies:
         paths += [f"/api/companies/{c}", f"/api/months/{c}/2026-09", f"/api/months/{c}/2026-10",
-                  f"/api/accountant/clients/{c}", f"/api/companies/{c}/cost-centers",
-                  f"/api/companies/{c}/cost-centers?month=2026-09"]
+                  f"/api/accountant/clients/{c}", f"/api/accountant/clients/{c}/export",
+                  f"/api/companies/{c}/cost-centers", f"/api/companies/{c}/cost-centers?month=2026-09"]
+        # The accountant's evidence links, and the same originals through the owner's evidence route.
+        links = h.client.get(f"/api/accountant/clients/{c}", headers=H).json().get("evidenceLinks", [])
+        paths += [e["href"] for e in links[:2]] + [f"/api/evidence/{e['id']}/file" for e in links[:1]]
     paths += [f"/api/documents/{d}/file" for d in seen["documents"]]
     # One payment's and one document's detail (with any refund chain), and the deadlines from letters.
     paths += [f"/api/documents/{d}" for d in seen["documents"]]
@@ -276,6 +279,7 @@ def _get_paths(h: Any, token: str, seen: dict[str, Any]) -> list[str]:
     for cc in seen["cost_centers"]:
         paths += [f"/api/cost-centers/{cc}", f"/api/cost-centers/{cc}?from=2026-09-01&to=2026-09-30",
                   f"/api/cost-centers/{cc}/statement?month=2026-09", f"/api/cost-centers/{cc}/statement"]
+    paths += ["/api/settings/accountant", "/api/accountant/invitations"]
     return paths
 
 

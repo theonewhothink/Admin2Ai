@@ -13,20 +13,23 @@ interface ExportReply {
 }
 
 /**
- * The client's documents for the month as one ZIP (originals, a ledger and a manifest), built by the
- * engine (POST /api/documents/export) and saved in the browser. What is shown is what the engine
- * returned (the file and its document count) or its reason for failing; nothing is assumed.
+ * The client's documents for the month as one ZIP (originals, ledger.csv and manifest.json), built by the
+ * engine or the backend and saved in the browser: from the client's `links.export` (`path`), else
+ * POST /api/documents/export for the company and period. What is shown is what came back (the file and
+ * its document count) or its reason for failing; nothing is assumed.
  */
 export function ExportButton({
   label,
   software,
   companyId,
   period,
+  path,
 }: {
   label: string;
   software: string;
   companyId: string;
   period?: { from: string; to: string };
+  path?: string;
 }) {
   const [state, setState] = useState<"idle" | "working">("idle");
   const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
@@ -34,7 +37,9 @@ export function ExportButton({
   const run = async () => {
     setState("working");
     setResult(null);
-    const r = await call<ExportReply>("POST", "/api/documents/export", { company: companyId, ...(period ?? {}) });
+    const r = path
+      ? await call<ExportReply>("GET", path)
+      : await call<ExportReply>("POST", "/api/documents/export", { company: companyId, ...(period ?? {}) });
     setState("idle");
     const { filename, contentType, data, count } = r.body;
     if (!r.ok || !filename || !data) {
@@ -54,16 +59,18 @@ export function ExportButton({
           {state === "working" ? "Preparing…" : label}
         </button>
       </div>
-      {result ? (
-        <p
-          className={result.ok ? "good-text" : "meta"}
-          role={result.ok ? "status" : "alert"}
-          style={result.ok ? { display: "inline-flex", alignItems: "center", gap: 8, fontWeight: 550 } : undefined}
-        >
-          {result.ok ? <Icon name="check" size={18} strokeWidth={2.2} /> : null}
-          {result.text}
-        </p>
-      ) : null}
+      <div aria-live="polite">
+        {result ? (
+          <p
+            className={result.ok ? "good-text" : "meta"}
+            role={result.ok ? "status" : "alert"}
+            style={result.ok ? { display: "inline-flex", alignItems: "center", gap: 8, fontWeight: 550 } : undefined}
+          >
+            {result.ok ? <Icon name="check" size={18} strokeWidth={2.2} /> : null}
+            {result.text}
+          </p>
+        ) : null}
+      </div>
     </div>
   );
 }

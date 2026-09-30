@@ -1,8 +1,9 @@
 import Link from "next/link";
 import styles from "./accountant.module.css";
+import { FirmName } from "./FirmName";
+import { InviteClient } from "./InviteClient";
 import { Icon } from "@/components/Icon";
 import { Progress } from "@/components/ui";
-import { accountantFirm } from "@/lib/data";
 import type { AccountantClientRow } from "@/lib/types";
 
 export function AccountantHomeView({ clients }: { clients: AccountantClientRow[] }) {
@@ -14,10 +15,13 @@ export function AccountantHomeView({ clients }: { clients: AccountantClientRow[]
   return (
     <div className="container page">
       <header className="page-head">
-        <p className="meta">{accountantFirm.name}</p>
+        <p className="meta">
+          <FirmName />
+        </p>
         <h1 className="h1">Clients</h1>
         <p className="lead">
-          {month}. {clients.length} clients, {ready} ready to export.
+          {month ? `${month}. ` : ""}
+          {clients.length} {clients.length === 1 ? "client" : "clients"}, {ready} ready to export.
         </p>
       </header>
 
@@ -60,9 +64,10 @@ export function AccountantHomeView({ clients }: { clients: AccountantClientRow[]
             {clients.map((c) => (
               <tr key={c.id}>
                 <th scope="row">
-                  <Link href={`/accountant/${c.id}`} className={styles.rowLink}>
+                  <Link href={`/accountant/${encodeURIComponent(c.id)}`} className={styles.rowLink}>
                     {c.name}
                   </Link>
+                  {c.business && c.business !== c.name ? <span className={`meta ${styles.business}`}>{c.business}</span> : null}
                 </th>
                 <td className={`muted ${styles.monthCell}`}>{c.month}</td>
                 <td className={styles.completeCell}>
@@ -88,6 +93,11 @@ export function AccountantHomeView({ clients }: { clients: AccountantClientRow[]
             ))}
           </tbody>
         </table>
+        {clients.length === 0 ? <p className={`${styles.empty} ${styles.tableEmpty}`}>No clients yet. Invite one below.</p> : null}
+      </div>
+
+      <div className={styles.below}>
+        <InviteClient />
       </div>
     </div>
   );

@@ -863,6 +863,7 @@ class AccountantQuestion:
     message_id: str | None = None
     period: Month | None = None  # the month of the payment the answer is about
     outbox_id: str = ""
+    accountant_id: str = ""  # who asked (the company's accountant, §28)
 
 
 @dataclass
@@ -938,7 +939,9 @@ class Repository:
         self.suppliers: dict[str, Supplier] = {}
         self.supplier_phones: dict[str, str] = {}
         self.connectors: dict[str, ConnectorState] = {}
+        # The business's accountant (the default), and companies that have their own (§28, §51).
         self.accountant: AccountantProfile | None = None
+        self.company_accountants: dict[str, AccountantProfile] = {}
         self.store = MemoryObjectStore()
         self.registry = EvidenceRegistry(self.store, clock=self.clock.now)
         self.intake = ShareIntake(self.registry, clock=self.clock.now)
@@ -1106,6 +1109,38 @@ class Repository:
 
     def connectors_for(self, company_id: str) -> list[ConnectorState]:
         return [c for c in self.connectors.values() if c.kind in ("email", "bank") and company_id in c.company_ids]
+
+    # ----------------------------------------------------------------- accountants (§28, §51)
+
+    def accountant_for(self, company_id: str | None) -> AccountantProfile | None:
+        """The accountant of ``company_id``: its own, else the business's (the default)."""
+        return self.company_accountants.get(company_id or "") or self.accountant
+
+    def accountant_companies(self, email: str) -> list[str]:
+        """Companies whose accountant (own or default) has this email address, in order."""
+        wanted = (email or "").strip().lower()
+        return [c for c in self.companies if (a := self.accountant_for(c)) is not None and a.email.lower() == wanted]
+
+    def accountants(self) -> list[AccountantProfile]:
+        """Every accountant who serves at least one company (the default first), one per email address."""
+        out: dict[str, AccountantProfile] = {}
+        for company_id in self.companies:
+            a = self.accountant_for(company_id)
+            if a is not None:
+                out.setdefault(a.email.lower(), a)
+        if self.accountant is not None and self.accountant.email.lower() in out:
+            out = {self.accountant.email.lower(): self.accountant, **out}
+        return list(out.values())
+
+    def accountant_by_email(self, email: str | None) -> AccountantProfile | None:
+        """The accountant with this address, when they serve at least one company."""
+        wanted = (email or "").strip().lower()
+        return next((a for a in self.accountants() if a.email.lower() == wanted), None) if wanted else None
+
+    def accountant_ids_for(self, company_id: str | None) -> list[str]:
+        """Accountants whose rules may be used for ``company_id``'s payments (§28: only their own clients)."""
+        a = self.accountant_for(company_id)
+        return [a.id] if a is not None else []
 
     def open_needs(self) -> list[NeedsYouRecord]:
         return sorted((n for n in self.needs.values() if n.status == "open"), key=lambda n: (n.created_at, n.id))
@@ -1613,7 +1648,7 @@ class EntityAgent(_Agent):
     def assign(self, rec: TxRecord) -> EntityAssignment:
         docs = [self.repo.documents[d].document for d in rec.document_ids if d in self.repo.documents]
         document = docs[0] if len(docs) == 1 and docs[0].customer_tax_id else None
-        accountant_ids = [self.repo.accountant.id] if self.repo.accountant else []
+        accountant_ids = self.repo.accountant_ids_for(rec.company_id)
         result = assign_entity(
             entities=self.repo.entities, transaction=rec.tx, document=document, ownership=self.repo.ownership(),
             rulebook=self.repo.rulebook, accountant_ids=accountant_ids,
@@ -3395,8 +3430,18 @@ class AccountantAgent(_Agent):
 
     name = "accountant"
 
-    def receive(self, text: str, evidence_id: str, at: datetime, *, subject: str = "",
+    def receive(self, text: str, evidence_id: str, at: datetime,
+                accountant: AccountantProfile | None = None, *, subject: str = "",
                 message_id: str | None = None) -> list[AccountantQuestion]:
+        """Questions in an accountant's email, each filed under one of *that accountant's* companies.
+
+        A company with its own accountant only takes questions from that accountant; the
+        business's accountant speaks for the other companies (§28, §51).
+        """
+        allowed = self.repo.accountant_companies(accountant.email) if accountant is not None else \
+            list(self.repo.companies)
+        if not allowed:
+            return []
         found = []
         for i, line in enumerate(q.strip() for q in re.split(r"(?<=\?)\s+|\n", text)):
             if not line.endswith("?") or len(line) < 12:
@@ -3404,26 +3449,28 @@ class AccountantAgent(_Agent):
             qid = f"aq_{evidence_id[3:15]}_{i}"
             if qid in self.repo.accountant_questions:
                 continue
-            company_id = self._company_for(line) or next(iter(self.repo.companies))
+            company_id = self._company_for(line, allowed) or allowed[0]
             question = AccountantQuestion(id=qid, company_id=company_id, text=line, evidence_id=evidence_id,
                                           asked_at=at, subject=" ".join(subject.split())[:200],
-                                          message_id=_reply_to(message_id))
+                                          message_id=_reply_to(message_id),
+                                          accountant_id=accountant.id if accountant else "")
             self.repo.accountant_questions[qid] = question
             self.repo.closure_log.append(ClosureActivity(
                 kind=ClosureKind.ACCOUNTANT_QUESTION_ASKED, at=at, entity_id=company_id, subject_id=qid))
-            self.log("question_received", subject_id=qid, evidence_ids=[evidence_id], values={"text": line})
+            self.log("question_received", subject_id=qid, evidence_ids=[evidence_id],
+                     values={"text": line, "company": company_id, "accountant": question.accountant_id})
             found.append(question)
         return found
 
-    def _company_for(self, text: str) -> str | None:
+    def _company_for(self, text: str, allowed: Sequence[str]) -> str | None:
         folded = text.casefold()
         for entity in self.repo.entities:
-            if entity.name.casefold() in folded:
+            if entity.id in allowed and entity.name.casefold() in folded:
                 return entity.id
         amount = _amount_in(text)
         if amount is not None:
             for rec in self.repo.transactions.values():
-                if abs(rec.tx.amount) == amount:
+                if abs(rec.tx.amount) == amount and rec.company_id in allowed:
                     return rec.company_id
         return None
 
@@ -3435,11 +3482,11 @@ class AccountantAgent(_Agent):
         The answer is written to the outbox; it counts as answered only once a transport sent it.
         """
         written = []
-        acct = self.repo.accountant
-        if acct is None:
-            return written
         for q in sorted(self.repo.accountant_questions.values(), key=lambda q: q.id):
             if q.status != "waiting":
+                continue
+            acct = self.asker(q)
+            if acct is None:
                 continue
             amounts = set(amounts_in(q.text))
             if len(amounts) != 1:
@@ -3478,6 +3525,14 @@ class AccountantAgent(_Agent):
                      response={"answer": reply.text, "reason": decision.reason_plain})
             written.append(q)
         return written
+
+    def asker(self, q: AccountantQuestion) -> AccountantProfile | None:
+        """Who the answer goes to: the accountant who asked, else the company's accountant (§28, §51)."""
+        if q.accountant_id:
+            found = next((a for a in self.repo.accountants() if a.id == q.accountant_id), None)
+            if found is not None:
+                return found
+        return self.repo.accountant_for(q.company_id)
 
     def sent(self, q: AccountantQuestion, at: datetime) -> None:
         """A transport delivered my answer: only now is the question answered for the accountant."""
@@ -3963,7 +4018,7 @@ class CostCenterAgent(_Agent):
 
     def decide(self, facts: CostCenterFacts, history: Mapping[str, Mapping[str, int]] | None = None
                ) -> CostCenterDecision:
-        accountant_ids = [self.repo.accountant.id] if self.repo.accountant else []
+        accountant_ids = self.repo.accountant_ids_for(facts.company_id)
         return decide_cost_center(centers=self.centers(facts.company_id), facts=facts, rulebook=self.repo.rulebook,
                                   accountant_ids=accountant_ids, history=history, today=self.repo.today())
 
@@ -4216,7 +4271,7 @@ class CostCenterAgent(_Agent):
                           known: tuple[dict[tuple[str, str], tuple[int, int]], set[str]] | None = None) -> Any:
         counts, recharging = known if known is not None else ({}, set())
         centers = {c.id: c for c in self.centers(facts.company_id, active_only=False)}
-        accountant_ids = [self.repo.accountant.id] if self.repo.accountant else []
+        accountant_ids = self.repo.accountant_ids_for(facts.company_id)
         return decide_recharge(allocation=allocation, centers=centers, facts=facts, rulebook=self.repo.rulebook,
                                accountant_ids=accountant_ids, history=counts, recharging=recharging,
                                own_tax_ids=self.repo.own_tax_ids())
@@ -4717,9 +4772,10 @@ class Orchestrator:
         message_id = result.message.evidence.id
         sender = parsed.sender.address if parsed.sender else None
         text = f"{parsed.subject}\n{parsed.text_body}"
-        if self.repo.accountant and sender and sender.lower() == self.repo.accountant.email.lower():
-            questions = self.accountant.receive(parsed.text_body, message_id, at, subject=parsed.subject,
-                                                message_id=parsed.thread.message_id)
+        accountant = self.repo.accountant_by_email(sender)
+        if accountant is not None:
+            questions = self.accountant.receive(parsed.text_body, message_id, at, accountant,
+                                                subject=parsed.subject, message_id=parsed.thread.message_id)
             report.question_ids += [q.id for q in questions]
             return
         body_part = _Part(message_id, "email_body", text=parsed.text_body) if parsed.text_body.strip() else None
@@ -6538,10 +6594,34 @@ class Orchestrator:
 
     # ----------------------------------------------------------------- accountant rules (§28)
 
-    def accountant_rule(self, text: str, scope: str = "client", company_id: str | None = None) -> tuple[Rule, int]:
+    def rule_author(self, company_id: str | None) -> AccountantProfile:
+        """Whose rule this is: the company's accountant, else the business's (§28).
+
+        Raises PermissionError when no accountant is connected, and ValueError when
+        companies have different accountants and none was named.
+        """
         repo = self.repo
-        if repo.accountant is None:
+        if company_id is not None:
+            if company_id not in repo.companies:
+                raise ValueError("I don't know that client.")
+            author = repo.accountant_for(company_id)
+            if author is None:
+                raise PermissionError("no accountant is connected")
+            return author
+        if repo.accountant is not None:
+            return repo.accountant
+        found = repo.accountants()
+        if not found:
             raise PermissionError("no accountant is connected")
+        if len(found) > 1:
+            raise ValueError("Choose which client this rule is for.")
+        return found[0]
+
+    def accountant_rule(self, text: str, scope: str = "client", company_id: str | None = None) -> tuple[Rule, int]:
+        """An accountant's rule (§28). With ``company_id`` and the "client" scope it covers that company
+        only; "all" covers every company this accountant looks after (and their other clients)."""
+        repo = self.repo
+        author = self.rule_author(company_id)
         m = re.match(r"^\s*(?:treat|classify|book)\s+(?:all\s+)?(?P<who>.+?)\s+(?:subscriptions?\s+|payments?\s+|"
                      r"invoices?\s+|expenses?\s+|costs?\s+)?as\s+(?P<what>.+?)\s*\.?\s*$", text, re.I)
         if m is None:
@@ -6553,28 +6633,41 @@ class Orchestrator:
             raise ValueError("I could not tell which supplier the rule is about.")
         all_clients = scope in ("all", "all_clients", "all_clients_of_accountant")
         rule_scope = RuleScope.ALL_CLIENTS_OF_ACCOUNTANT if all_clients else RuleScope.CLIENT
+        entity_ids = (company_id,) if company_id is not None and not all_clients else ()
         now = repo.clock.now()
+        seed = f"{text}|{scope}" if company_id is None else f"{text}|{scope}|{company_id}|{author.id}"
         rule = Rule(
-            id="rule_" + hashlib.sha256(f"{text}|{scope}".encode()).hexdigest()[:12],
-            author=RuleAuthor.ACCOUNTANT, author_id=repo.accountant.id, scope=rule_scope,
-            tenant_id=None if all_clients else repo.tenant_id,
+            id="rule_" + hashlib.sha256(seed.encode()).hexdigest()[:12],
+            author=RuleAuthor.ACCOUNTANT, author_id=author.id, scope=rule_scope,
+            tenant_id=None if all_clients else repo.tenant_id, entity_ids=entity_ids,
             match=RuleMatch(counterparty_key=supplier.id if supplier else key),
             outcome=RuleOutcome(category=what[:1].upper() + what[1:]), created_at=now,
             label=f"Treat all {display_name(supplier.name) if supplier else who} costs as {what}",
         )
         repo.rulebook.add(rule, reason="accountant rule")
         affected = 0
-        accountant_ids = [repo.accountant.id]
         resolver = repo.resolver()
         for rec in repo.transactions.values():
-            subject = RuleSubject.from_transaction(rec.tx, key=resolver.resolve_transaction(rec.tx).key)
+            accountant_ids = repo.accountant_ids_for(rec.company_id)
+            if not rule.covers(rec.company_id) or author.id not in accountant_ids:
+                continue  # another company's payment: this rule is not used there
+            subject = RuleSubject.from_transaction(rec.tx, key=resolver.resolve_transaction(rec.tx).key,
+                                                   entity_id=rec.company_id)
             decision = repo.rulebook.evaluate(subject, tenant_id=repo.tenant_id, accountant_ids=accountant_ids)
             if decision.get(RuleField.CATEGORY) is not None and decision.category == rule.outcome.category:
                 affected += 1
-        self.log("accountant", "accountant_rule", subject_id=rule.id, actor=f"accountant:{repo.accountant.id}",
-                 values={"text": text, "scope": rule_scope.value}, response={"affected": affected})
+        self.log("accountant", "accountant_rule", subject_id=rule.id, actor=f"accountant:{author.id}",
+                 values={"text": text, "scope": rule_scope.value, "companies": list(entity_ids)},
+                 response={"affected": affected})
         self.activity(now, "learned", f"Your accountant taught me: {rule.label}.", company_id)
         return rule, affected
+
+    def accountant_rules(self, company_id: str) -> list[Rule]:
+        """Active accountant rules used for ``company_id``'s payments (its accountant's, for it)."""
+        repo = self.repo
+        ids = set(repo.accountant_ids_for(company_id))
+        return [r for r in repo.rulebook.applicable(repo.tenant_id, ids)
+                if r.author is RuleAuthor.ACCOUNTANT and r.covers(company_id)]
 
     # ----------------------------------------------------------------- views used by the service
 
