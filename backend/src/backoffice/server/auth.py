@@ -16,7 +16,10 @@
   own business). An email listed in BACKOFFICE_ADMIN_EMAILS becomes admin
   when its account is created. An accountant membership may be limited to
   some companies of the business (``Principal.companies``, §28, §51): every
-  read is then filtered to those companies (server/http.py).
+  read is then filtered to those companies (server/http.py). ``employee``
+  (backoffice.staff): a cardholder or someone who pays expenses themselves;
+  they may only read their own open card payments and upload receipts
+  (``EMPLOYEE_ROUTES``), nothing else of the business.
 """
 
 from __future__ import annotations
@@ -43,6 +46,7 @@ __all__ = [
     "COOKIE_NAME",
     "CSRF_HEADER",
     "CSRF_VALUE",
+    "EMPLOYEE_ROUTES",
     "Principal",
     "SESSION_DAYS",
     "hash_token",
@@ -56,7 +60,7 @@ SESSION_DAYS = 30
 SESSION_TOUCH = timedelta(hours=1)  # slide the expiry at most this often (one write per hour of use)
 RATE_LIMIT = 10
 RATE_WINDOW = timedelta(minutes=15)
-ROLE_ORDER = ("admin", "owner", "accountant")
+ROLE_ORDER = ("admin", "owner", "accountant", "employee")
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _TOKEN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
 
@@ -110,6 +114,11 @@ class Principal:
         """An accountant who may see only some companies of this business."""
         return self.companies is not None
 
+    @property
+    def employee_only(self) -> bool:
+        """An employee and nothing more: their own card payments and receipt uploads only."""
+        return "employee" in self.roles and not self.roles & {"owner", "admin", "accountant"}
+
     def public(self) -> dict[str, Any]:
         out = {"user": {"id": self.user.id, "email": self.user.email, "name": self.user.name},
                "tenant": {"id": self.tenant.id, "name": self.tenant.name}, "role": self.role}
@@ -123,6 +132,11 @@ ACCOUNTANT_POSTS = frozenset({"/api/ask", "/api/accountant/rules", "/api/documen
                               "/api/devices", "/api/devices/remove", "/api/accountant/invitations"})
 _ACCOUNTANT_CLIENT_POST = re.compile(r"^/api/accountant/clients/[^/]+/rules$")
 OWNER_ONLY_READS = frozenset({"/api/account/export"})
+# Everything an employee may call (backoffice.staff): who they are, signing out, their phone for
+# notifications, their own open card payments and their receipt uploads. Nothing else.
+EMPLOYEE_ROUTES = frozenset({("GET", "/api/auth/me"), ("POST", "/api/auth/logout"), ("POST", "/api/devices"),
+                             ("POST", "/api/devices/remove"), ("GET", "/api/employee/card-payments"),
+                             ("POST", "/api/employee/receipts")})
 
 
 def permitted(principal: Principal, method: str, path: str) -> bool:
@@ -136,6 +150,8 @@ def permitted(principal: Principal, method: str, path: str) -> bool:
         return principal.is_admin
     if principal.is_owner:
         return True
+    if principal.employee_only:
+        return ("GET" if method == "HEAD" else method, path) in EMPLOYEE_ROUTES
     if method in ("GET", "HEAD"):
         return path not in OWNER_ONLY_READS
     return path in ACCOUNTANT_POSTS or bool(_ACCOUNTANT_CLIENT_POST.match(path))
@@ -260,7 +276,7 @@ class AuthService:
         memberships = self.store.memberships(user.id)
         if not memberships:
             raise AuthError(401, "unauthorized", WRONG_CREDENTIALS)
-        rank = {r: i for i, r in enumerate(("owner", "admin", "accountant"))}
+        rank = {r: i for i, r in enumerate(("owner", "admin", "accountant", "employee"))}
         tenant = sorted(memberships, key=lambda m: (rank.get(m[1], 9), m[0].id))[0][0]
         loaded = self.store.principal(tenant.id, user.id)
         if loaded is None:

@@ -14,6 +14,11 @@ business the person is an accountant of, as ``<business>~<company>`` ids that
 invites a client business with ``POST /api/accountant/invitations``; the
 invited owner accepts with ``POST /api/invitations/accept``.
 
+Employees (backoffice.staff): an ``employee`` membership reads only their own
+open card payments (``GET /api/employee/card-payments``) and uploads receipts
+(``POST /api/employee/receipts``, JSON or multipart); the server, never the
+request, says who they are. Everything else is refused (server/auth.py).
+
 Hardening: security headers on every response (HSTS, nosniff, a CSP that
 allows nothing, no framing, no referrer, no caching of API data), CORS only for
 BACKOFFICE_ALLOWED_ORIGINS (with credentials), request size limits, one JSON
@@ -60,7 +65,8 @@ __all__ = ["JsonLogFormatter", "StoreNonces", "build_manager", "build_production
 log = logging.getLogger("backoffice.http")
 
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
-UPLOAD_PATHS = frozenset({"/api/evidence", "/api/evidence/upload", "/api/receipts", "/api/share"})
+UPLOAD_PATHS = frozenset({"/api/evidence", "/api/evidence/upload", "/api/receipts", "/api/share",
+                          "/api/employee/receipts", "/api/expense-claims"})
 # base64 in JSON grows a file by a third; a little room for the other fields.
 UPLOAD_LIMIT = MAX_UPLOAD_BYTES * 4 // 3 + 1024 * 1024
 PUBLIC_API = frozenset({"/api/auth/signup", "/api/auth/login", "/api/oauth/callback",
@@ -82,7 +88,7 @@ _ROUTE_WORDS = frozenset(
     "connections stale reconnect clients rules audit pipeline auth signup login logout me account delete "
     "onboarding company oauth start callback bank devices v1 healthz readyz internal overview operations "
     "readiness acceptance cost-centers allocate obligations transactions expected-invoices not-coming statement "
-    "invitations accept".split())
+    "invitations accept employee employees card-payments expense-claims".split())
 # One client company of any business: /api/accountant/clients/<tenant id>~<company id>[/…] (§28, §29).
 _CLIENT_REF = re.compile(r"/api/accountant/clients/(?P<tenant>[A-Za-z0-9][A-Za-z0-9_.-]{0,127})~(?P<company>[^/~]+)"
                          r"(?P<rest>/.*)?")
@@ -798,6 +804,34 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
     async def upload_receipt(request: Request) -> Response:
         return await _upload(request, "/api/evidence/upload")
 
+    @app.post("/api/employee/receipts")
+    @_guarded
+    async def employee_receipts(request: Request) -> Response:
+        """A receipt from an employee (for a payment on their card, or ``paidPersonally``: an expense claim),
+        or from the owner on their behalf (``employeeId``). An employee is always the signed-in person."""
+        from backoffice.api.app import _multipart
+
+        principal, refresh = await _signed_in(request)
+        data = await request.body()
+        content_type = request.headers.get("content-type", "")
+        if content_type.startswith("multipart/form-data"):
+            fields, file_part = _multipart(data, content_type)
+            if file_part is None:
+                return _error(400, "bad_request", "There was nothing to save.")
+            body: dict[str, Any] = {**fields, "filename": file_part["filename"],
+                                    "contentType": file_part["content_type"],
+                                    "dataBase64": base64.b64encode(file_part["data"]).decode("ascii")}
+        else:
+            body = await _json(request)
+        if isinstance(body.get("paidPersonally"), str):
+            body["paidPersonally"] = body["paidPersonally"].strip().lower() in ("true", "1", "yes", "on")
+        if principal.employee_only:
+            body = {k: v for k, v in body.items() if k not in ("employeeId", "employee", "employeeEmail")}
+            body["employeeEmail"] = principal.user.email
+        status, out = await run_in_threadpool(manager.command, principal.tenant.id, principal.user.id, "POST",
+                                              "/api/employee/receipts", body)
+        return _reply(status, out, refresh=(refresh, _token(request)[0]))
+
     # ----------------------------------------------------------------- the team's dashboard (admins only)
 
     def _internal(principal: Principal, target: str, query: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -1036,6 +1070,12 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
         elif client is not None:
             body = await _json(request) if request.method == "POST" else {}
             status, out = await run_in_threadpool(_client_request, principal, request.method, client, body, query)
+        elif principal.employee_only:
+            # An employee reads only their own card payments (§52, backoffice.staff); auth.py allowed the path.
+            if request.method != "GET":
+                return _error(403, "forbidden", FORBIDDEN)
+            status, out = await run_in_threadpool(functools.partial(
+                manager.view, tenant, "GET", target + query, None, employee=principal.user.email))
         elif request.method == "GET" and target == "/api/accountant/clients" and \
                 (home := await run_in_threadpool(_accountant_home, principal)) is not None:
             status, out = home

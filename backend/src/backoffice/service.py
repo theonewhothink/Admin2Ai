@@ -78,7 +78,8 @@ BANK_CONSENT_DAYS = 180  # PSD2 access consent (RTS Art. 10, as amended 2022): r
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _SLUG = re.compile(r"[^a-z0-9]+")
 # Needs-You questions shown as one plain choice with the engine's own prompt and options (§37).
-_PLAIN_QUESTIONS = ("company", "cash", "obligation", "refund", "obligation_company", "statement", "recharge")
+_PLAIN_QUESTIONS = ("company", "cash", "obligation", "refund", "obligation_company", "statement", "recharge",
+                    "receipt", "expense_claim")
 _ISSUER_NAMES = {"tax_authority": "Tax office", "social_security": "Social Security", "bank": "Your bank",
                  "landlord": "Your landlord", "insurer": "Your insurer"}
 _STAGE_WORDS = {Stage.DISCOVERED: "Found", Stage.ACQUIRED: "Received", Stage.UNDERSTOOD: "Read",
@@ -455,8 +456,10 @@ class BackOfficeService:
              "document collected", "documents collected"),
             ("h_missing", sum(1 for a in recent if a.kind == "recovered"),
              "missing invoice recovered", "missing invoices recovered"),
-            ("h_supplier", sum(1 for a in recent if a.kind == "chased"),
+            ("h_supplier", sum(1 for a in recent if a.kind == "chased" and a.tag != "staff"),
              "supplier email handled", "supplier emails handled"),
+            ("h_staff", sum(1 for a in recent if a.kind == "chased" and a.tag == "staff"),
+             "receipt asked from your team", "receipts asked from your team"),
             ("h_accountant", sum(1 for a in recent if a.kind == "answered" and "accountant" in a.text),
              "accountant question answered", "accountant questions answered"),
             ("h_protected", sum(1 for a in recent if a.kind == "protected" and "hold" in a.text),
@@ -587,9 +590,11 @@ class BackOfficeService:
              "detail": a.iban[:4] + " •••• " + a.iban[-4:] if a.iban else "", "status": bank_status(a.bank)}
             for a in repo.accounts.values() if a.iban
         ]
+        holders = self.orchestrator.staff.holder_of
         cards = [
             {"id": a.id, "name": f"Card •••• {a.card_last4}", "company": names.get(a.holder_id, ""),
-             "detail": a.bank + ("" if a.owned else " · personal card used for business"),
+             "detail": a.bank + ("" if a.owned else " · personal card used for business") +
+             (f" · {h.name}'s card" if (h := holders(a.card_last4)) is not None else ""),
              "status": bank_status(a.bank)}
             for a in repo.accounts.values() if a.card_last4
         ]
@@ -915,9 +920,14 @@ class BackOfficeService:
             raise ServiceError(409, "That card is already here.")
         bank = self._text(body, "bank", "Which bank issued the card?")
         company = self._company(body.get("companyId"))
+        held = bool(body.get("holderName") or body.get("holderEmail"))  # an employee's card (backoffice.staff)
+        if held:
+            self.staff_views.holder(body)  # checked before anything changes
         aid = self._slug("card", last4)
         self.repo.add_account(Account(id=aid, bank=bank, holder_id=company, card_last4=last4,
                                       owned=not bool(body.get("personal"))))
+        if held:
+            return {"id": aid, "message": self.staff_views.card_holder(aid, last4, body)}
         return {"id": aid, "message": f"Done. I will match card •••• {last4} to receipts."}
 
     def _add_supplier(self, body: Mapping[str, Any]) -> dict[str, Any]:
@@ -1631,7 +1641,7 @@ class BackOfficeService:
                           "text": f"I still need one thing from you: which company the {who} payment of "
                                   f"{format_money(abs(rec.tx.amount), rec.tx.currency)} belongs to."})
         for n in self._open_needs(company_id):
-            if n.kind not in ("company", "cash", "obligation", "refund") or \
+            if n.kind not in ("company", "cash", "obligation", "refund", "receipt", "expense_claim") or \
                     repo.item_month(repo.items[n.item_id]) != month:
                 continue
             lines.append({"id": f"r_{n.id}", "tone": "attention", "href": f"/needs-you#{n.id}", "linkLabel": "Answer",
@@ -1657,6 +1667,15 @@ class BackOfficeService:
             doc = repo.documents[item.subject_id]
             if doc.hold_reason:
                 lines.append({"id": f"r_{doc.id}", "text": doc.hold_reason, "tone": "attention"})
+                continue
+            if doc.claim_id is not None and doc.claim_id in repo.expense_claims:
+                # An employee's own money (backoffice.staff): open until the transfer paying them back.
+                claim = repo.expense_claims[doc.claim_id]
+                person = repo.employees.get(claim.employee_id)
+                lines.append({"id": f"r_{doc.id}", "tone": "neutral",
+                              "text": f"{person.name if person else 'An employee'} paid "
+                                      f"{format_money(claim.amount, claim.currency)} at {claim.merchant}. "
+                                      f"{self.orchestrator.staff.claim_status_line(claim, you=False)}"})
                 continue
             if doc.matched_tx_ids:
                 continue
@@ -1691,6 +1710,14 @@ class BackOfficeService:
         for rec in sorted(txs, key=lambda r: (r.tx.booked_on, r.id)):
             item = repo.items[rec.item_id]
             if item.stage is not Stage.CLOSED:
+                continue
+            if rec.claim_ids:  # pays an employee back for expense claims (backoffice.staff)
+                claim = repo.expense_claims.get(rec.claim_ids[0])
+                person = repo.employees.get(claim.employee_id) if claim is not None else None
+                out.append({"id": f"m_{rec.id}", "supplier": person.name if person else self.orchestrator.merchant_name(
+                    rec.tx), "description": "Expense claim paid back", "amount": _num(abs(rec.tx.amount)),
+                    "currency": rec.tx.currency, "date": rec.tx.booked_on.isoformat(),
+                    "reasons": [r.replace(": ", " ", 1) for r in rec.match_why]})
                 continue
             if rec.document_ids:
                 doc = repo.documents[rec.document_ids[0]]
@@ -1952,6 +1979,26 @@ class BackOfficeService:
         return result
 
     # ----------------------------------------------------------------- Cost centers (jobs, properties, vehicles ...)
+
+    @property
+    def staff_views(self):  # type: ignore[no-untyped-def]
+        from backoffice.staff_views import StaffViews
+
+        return StaffViews(self)
+
+    def dispatch_employee(self, method: str, path: str, body_json: Any, email: str) -> tuple[int, dict[str, Any]]:
+        """Route one request from an employee (production ``employee`` role): their own open card payments
+        and their receipt uploads, nothing else (backoffice.staff_views)."""
+        r = re.compile
+        routes = (
+            ("GET", r("/api/employee/card-payments"), lambda b: self.staff_views.card_payments(email)),
+            ("POST", r("/api/employee/receipts"),
+             lambda b: self.staff_views.employee_receipt({k: v for k, v in b.items()
+                                                          if k not in ("employeeId", "employee")}
+                                                         | {"employeeEmail": email})),
+        )
+        return self._route(method, path, body_json, routes,
+                           refuse=(403, {"error": "forbidden", "message": "You don't have access to that."}))
 
     def _cost_views(self):  # type: ignore[no-untyped-def]
         from backoffice.cost_centers import CostCenterViews
@@ -3214,6 +3261,15 @@ class BackOfficeService:
             ("GET", r("/api/audit"), lambda b: self.audit()),
             ("GET", r("/api/pipeline"), lambda b: self.pipeline()),
             ("GET", r("/api/internal/(overview|operations|readiness|acceptance)"), lambda b, view: self.internal(view, b)),
+            # Employee cards and staff expenses (backoffice.staff).
+            ("GET", r("/api/employees"), lambda b: self.staff_views.employees()),
+            ("POST", r("/api/employees"), lambda b: self.staff_views.save(b)),
+            ("POST", r(f"/api/employees/{seg}"), lambda b, i: self.staff_views.save(b, i)),
+            ("GET", r("/api/expense-claims"), lambda b: self.staff_views.claims()),
+            ("POST", r("/api/expense-claims"), lambda b: self.staff_views.owner_claim(b)),
+            ("GET", r("/api/employee/card-payments"),
+             lambda b: self.staff_views.card_payments(str(b.get("employee") or b.get("employeeId") or "") or None)),
+            ("POST", r("/api/employee/receipts"), lambda b: self.staff_views.employee_receipt(b)),
         )
 
 

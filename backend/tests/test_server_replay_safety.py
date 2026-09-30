@@ -280,6 +280,10 @@ def _get_paths(h: Any, token: str, seen: dict[str, Any]) -> list[str]:
         paths += [f"/api/cost-centers/{cc}", f"/api/cost-centers/{cc}?from=2026-09-01&to=2026-09-30",
                   f"/api/cost-centers/{cc}/statement?month=2026-09", f"/api/cost-centers/{cc}/statement"]
     paths += ["/api/settings/accountant", "/api/accountant/invitations"]
+    # Employee cards and staff expenses (backoffice.staff): the team, claims, and each person's card payments.
+    paths += ["/api/employees", "/api/expense-claims"]
+    paths += [f"/api/employee/card-payments?employee={e['id']}"
+              for e in h.client.get("/api/employees", headers=H).json()["employees"]]
     return paths
 
 
@@ -295,6 +299,10 @@ def test_every_read_leaves_the_tenant_unchanged(tmp_path: Path) -> None:
     report = h.client.post("/api/chat/tool", json={"name": "period_report", "input": {
         "date_from": "2026-09-01", "date_to": "2026-09-30"}}, headers=H).json()["result"]
     report_ids = [r["id"] for r in (report.get("reports") or [report]) if isinstance(r, dict) and "id" in r]
+    # The outlet's card is Rui's (backoffice.staff): its receipts are asked from him; reads change none of it.
+    staff = h.client.post("/api/employees", json={"name": "Rui Costa", "email": "rui@padaria.pt", "cards": ["2291"]},
+                          headers=H)
+    assert staff.status_code == 200, staff.text
     h.clock.step = h.clock.step * 0  # the day does not turn during the reads
     before, count = _digest(h.manager, tenant), len(h.store.events(tenant))
     admin_tenant = admin["tenant"]["id"]
