@@ -165,8 +165,10 @@ class MembershipAgent(_Agent):
         repo.items[item.id] = item
         record = DocumentRecord(document=document, evidence_ids=list(evidence_ids), origin=origin, received_at=at,
                                 item_id=item.id, observations=observations, sales=True, customer=row.member,
-                                text=f"{row.number} {row.member} {row.payer or ''} {row.period_label}", book="member")
+                                text=f"{row.number} {row.member} {row.payer or ''} {row.period_label}", book="member",
+                                country=repo.company_country(company))  # its company's country (§49)
         repo.documents[doc_id] = record
+        self.o._classify_sensitive(record, record.text)  # by its own wording, like every document (§52)
         repo.member_receipts[doc_id] = MemberReceipt(document_id=doc_id, row=row, company_id=company)
         self.o.advance(item, Stage.ACQUIRED, evidence_ids, agent="discovery", note="Receipt received in a list.")
         self.o.advance(item, Stage.UNDERSTOOD, evidence_ids, agent=self.name,
@@ -212,6 +214,7 @@ class MembershipAgent(_Agent):
             if r.company_id is not None or evidence not in record.evidence_ids:
                 continue
             r.company_id = company
+            record.country = repo.company_country(company)  # its company's country (§49)
             c = repo.companies[company]
             record.document = record.document.model_copy(update={
                 "entity_id": company, "supplier_tax_id": c.tax_id, "supplier_name": repo.legal_names.get(company)

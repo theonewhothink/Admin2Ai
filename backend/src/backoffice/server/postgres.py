@@ -385,6 +385,26 @@ class PostgresStore:
 
     # ----------------------------------------------------------------- accountants of some companies (0011)
 
+    def manager_scope(self, tenant_id: str, user_id: str) -> tuple[str, tuple[str, ...]] | None:
+        """(company, cost centers) of a manager membership (0014); None when the person is not one there."""
+        with self._tx(tenant=tenant_id, user=user_id) as cur:
+            cur.execute("SELECT company_ids, cost_center_ids FROM memberships WHERE tenant_id = %s AND user_id = %s "
+                        "AND role = 'manager' AND revoked_at IS NULL", (tenant_id, user_id))
+            row = cur.fetchone()
+            if not row or not row[0] or not row[1]:
+                return None
+            return str(row[0][0]), tuple(str(c) for c in row[1])
+
+    def add_manager(self, tenant_id: str, user_id: str, *, company: str, cost_centers: Sequence[str],
+                    invited_by: str | None = None, at: datetime | None = None) -> None:
+        """Give ``user_id`` a manager membership of ``company``'s ``cost_centers`` (0014)."""
+        with self._tx(tenant=tenant_id, user=invited_by or user_id) as cur:
+            cur.execute("INSERT INTO memberships (tenant_id, user_id, role, invited_by, created_at, company_ids, "
+                        "cost_center_ids) VALUES (%s, %s, 'manager', %s, coalesce(%s, now()), %s, %s) "
+                        "ON CONFLICT (tenant_id, user_id, role) DO UPDATE SET company_ids = EXCLUDED.company_ids, "
+                        "cost_center_ids = EXCLUDED.cost_center_ids, revoked_at = NULL",
+                        (tenant_id, user_id, invited_by, at, [company], list(dict.fromkeys(cost_centers))))
+
     def membership_companies(self, tenant_id: str, user_id: str) -> tuple[str, ...] | None:
         with self._tx(tenant=tenant_id, user=user_id) as cur:
             cur.execute("SELECT company_ids FROM memberships WHERE tenant_id = %s AND user_id = %s "

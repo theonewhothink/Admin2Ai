@@ -182,7 +182,9 @@ def test_scoped_reads_never_show_another_companys_documents_payments_evidence_or
              *(f"/api/evidence/{e}/file" for e in a_evidence), "/api/accountant/invitations", "/api/audit",
              "/api/pipeline", "/api/internal/overview", "/api/internal/operations", "/api/internal/readiness",
              # Employee cards and staff expenses (backoffice.staff): never an accountant's.
-             "/api/employees", "/api/expense-claims", "/api/employee/card-payments"]
+             "/api/employees", "/api/expense-claims", "/api/employee/card-payments",
+             # Who opened sensitive documents (backoffice.sensitivity): the owner's only.
+             "/api/documents/access-log"]
     allowed = {"company-b"}
     for p in paths:
         status, body = demo.dispatch_scoped("GET", p, None, allowed)
@@ -522,7 +524,9 @@ def test_an_accountant_of_company_b_cannot_read_company_a_through_any_get_route(
              f"/api/accountant/clients/{tenant}~{a}/evidence/{ev}/file",
              f"/api/accountant/clients/{tenant}~second-company/evidence/{ev}/file", "/healthz",
              # Employee cards and staff expenses (backoffice.staff): never an accountant's.
-             "/api/employees", "/api/expense-claims", "/api/employee/card-payments"]
+             "/api/employees", "/api/expense-claims", "/api/employee/card-payments",
+             # Who opened sensitive documents (backoffice.sensitivity): the owner's only.
+             "/api/documents/access-log"]
     for p in paths:
         res = h.client.get(p, headers=B)
         assert res.status_code in (200, 403, 404), (p, res.status_code, res.text)

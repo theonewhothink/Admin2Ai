@@ -76,7 +76,7 @@ __all__ = [
 
 # Obligations counted as "tax obligations verified" in the §2 summary.
 TAX_OBLIGATION_KINDS: frozenset[ObligationKind] = frozenset(
-    {ObligationKind.TAX_DEADLINE, ObligationKind.FILING}
+    {ObligationKind.TAX_DEADLINE, ObligationKind.FILING, ObligationKind.VAT_RETURN}
 )
 # Tracked subject: a recurring supplier invoice that is overdue (§23). Missing until it arrives.
 EXPECTED_INVOICE = "expected_invoice"

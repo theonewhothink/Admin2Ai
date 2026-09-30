@@ -1,7 +1,8 @@
 """The monthly accountant package, sent on schedule (§27 Day 0 / Day +1, §28; checklist N9, N10).
 
 On the working day the owner chose after month-end (the report settings, working day 3 by default;
-weekends and Portuguese public holidays do not count), each company's month goes to that company's
+weekends and the public holidays of the company's own country, from its pack, do not count: Portugal's
+for a Portuguese company, Spain's for a Spanish one, §49), each company's month goes to that company's
 accountant: the booked documents, supporting documents marked as such, ``ledger.csv``,
 ``evidence_index.csv``, ``manifest.json`` and the untouched originals (closure/package.py), as one ZIP
 attached to an email written through the send path. The originals are left out, and the email says so,
@@ -30,7 +31,6 @@ import zipfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
-from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
 from backoffice.closure import Month
@@ -51,8 +51,7 @@ from backoffice.policy import ActionContext, ActionKind, authorize
 if TYPE_CHECKING:  # the orchestrator imports this module
     from backoffice.orchestrator import Orchestrator, OutgoingMessage, Repository
 
-__all__ = ["MAX_ATTACHMENT_BYTES", "WORKING_DAY", "PackageAgent", "PackageRecord", "portuguese_holidays",
-           "working_day"]
+__all__ = ["MAX_ATTACHMENT_BYTES", "WORKING_DAY", "PackageAgent", "PackageRecord", "working_day"]
 
 WORKING_DAY = 3  # the report settings' default: working day 3 after month-end
 # An email attachment larger than this is not sent: many mail servers refuse messages above 10-25 MB, and
@@ -61,40 +60,18 @@ WORKING_DAY = 3  # the report settings' default: working day 3 after month-end
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 
 
-# --------------------------------------------------------------------------- working days (Portugal)
+# --------------------------------------------------------------------------- working days (the company's country)
 
 
-def _easter(year: int) -> date:
-    """Easter Sunday (anonymous Gregorian algorithm)."""
-    a, b, c = year % 19, year // 100, year % 100
-    d, e = b // 4, b % 4
-    f = (b + 8) // 25
-    g = (b - f + 1) // 3
-    h = (19 * a + b - d - g + 15) % 30
-    i, k = c // 4, c % 4
-    ell = (32 + 2 * e + 2 * i - h - k) % 7
-    m = (a + 11 * h + 22 * ell) // 451
-    month = (h + ell - 7 * m + 114) // 31
-    day = (h + ell - 7 * m + 114) % 31 + 1
-    return date(year, month, day)
+def working_day(year: int, month: int, n: int, country: str = "PT") -> date:
+    """The ``n``-th working day of a month: Monday to Friday, the national public holidays of ``country``
+    (the company's own, through its pack: Portugal's by default) excluded."""
+    from backoffice.countries import company_pack
 
-
-@lru_cache(maxsize=64)
-def portuguese_holidays(year: int) -> frozenset[date]:
-    """Portugal's national public holidays (Código do Trabalho, art. 234): the fixed ones, Good Friday,
-    Easter Sunday and Corpus Christi."""
-    easter = _easter(year)
-    fixed = [(1, 1), (4, 25), (5, 1), (6, 10), (8, 15), (10, 5), (11, 1), (12, 1), (12, 8), (12, 25)]
-    return frozenset({date(year, m, d) for m, d in fixed} | {easter - timedelta(days=2), easter,
-                                                              easter + timedelta(days=60)})
-
-
-def working_day(year: int, month: int, n: int) -> date:
-    """The ``n``-th working day of a month: Monday to Friday, public holidays in Portugal excluded."""
     if n < 1:
         raise ValueError("working days are counted from 1")
     day, seen = date(year, month, 1), 0
-    holidays = portuguese_holidays(year)
+    holidays = company_pack(country).public_holidays(year)
     while True:
         if day.weekday() < 5 and day not in holidays:
             seen += 1
@@ -182,10 +159,11 @@ class PackageAgent:
                 "whenOpen": saved.get("whenOpen") or "send", "copyOwner": bool(saved.get("copyOwner", True)),
                 "recipients": list(saved.get("recipients") or ())}
 
-    def due_on(self, month: Month) -> date:
-        """The day ``month`` goes to the accountant: the chosen working day of the month after it."""
+    def due_on(self, month: Month, company_id: str | None = None) -> date:
+        """The day ``month`` goes to the accountant: the chosen working day of the month after it, counted in
+        the company's own country (its public holidays, §49; the business's first company's when not given)."""
         after = month.next()
-        return working_day(after.year, after.month, self.settings()["day"])
+        return working_day(after.year, after.month, self.settings()["day"], self.repo.company_country(company_id))
 
     def recipients(self, company_id: str) -> tuple[str, tuple[str, ...]] | None:
         """(to, copies): that company's accountant first; others the owner listed for it; the owner's copy."""
@@ -220,13 +198,14 @@ class PackageAgent:
         repo = self.repo
         today = now.astimezone(TZ).date()
         month = Month.of(today).previous()
-        if today < self.due_on(month):
+        due = {company_id: self.due_on(month, company_id) for company_id in repo.companies}
+        if not due or today < min(due.values()):
             return []
         cfg = self.settings()
         written: list[str] = []
         for company_id in sorted(repo.companies):
-            if company_id not in cfg["companies"]:
-                continue
+            if company_id not in cfg["companies"] or today < due[company_id]:
+                continue  # not chosen, or its own country's working day is not here yet
             done = self.records(company_id, month)
             closed = (company_id, str(month)) in repo.closed_months
             if done and (done[-1].complete or not closed):
@@ -343,7 +322,7 @@ class PackageAgent:
                  values={"company": company_id, "month": str(month), "to": to, "copies": list(cc),
                          "outbox_id": out.id, "sha256": package.sha256, "size": record.size,
                          "originals": originals, "complete": closed, "still_open": list(still_open)},
-                 response={"due_on": self.due_on(month).isoformat(),
+                 response={"due_on": self.due_on(month, company_id).isoformat(),
                            "written_on": now.astimezone(TZ).date().isoformat()})
         return record
 
@@ -437,7 +416,7 @@ class PackageAgent:
         last = records[-1]
         sent = [r for r in records if r.delivered]
         message = self.repo.outbox.get(last.outbox_id)
-        out: dict[str, Any] = {"dueOn": self.due_on(month).isoformat(), "complete": last.complete,
+        out: dict[str, Any] = {"dueOn": self.due_on(month, company_id).isoformat(), "complete": last.complete,
                                "to": last.to, "filename": last.filename, "originals": last.originals}
         if not sent:
             if message is not None and self.o.held_back(message):

@@ -19,7 +19,12 @@
   read is then filtered to those companies (server/http.py). ``employee``
   (backoffice.staff): a cardholder or someone who pays expenses themselves;
   they may only read their own open card payments and upload receipts
-  (``EMPLOYEE_ROUTES``), nothing else of the business.
+  (``EMPLOYEE_ROUTES``), nothing else of the business. ``manager``
+  (backoffice.managers): runs one or more outlets (cost centers) of one
+  company (``Principal.cost_centers``); they may only read and answer their
+  outlets' questions, documents, payments and spending and send receipts for
+  them (``MANAGER_ROUTES``); never another outlet or company, a bank
+  connection, a setting or a sensitive document.
 """
 
 from __future__ import annotations
@@ -47,6 +52,7 @@ __all__ = [
     "CSRF_HEADER",
     "CSRF_VALUE",
     "EMPLOYEE_ROUTES",
+    "MANAGER_ROUTES",
     "Principal",
     "SESSION_DAYS",
     "hash_token",
@@ -60,7 +66,7 @@ SESSION_DAYS = 30
 SESSION_TOUCH = timedelta(hours=1)  # slide the expiry at most this often (one write per hour of use)
 RATE_LIMIT = 10
 RATE_WINDOW = timedelta(minutes=15)
-ROLE_ORDER = ("admin", "owner", "accountant", "employee")
+ROLE_ORDER = ("admin", "owner", "accountant", "manager", "employee")
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _TOKEN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
 
@@ -96,6 +102,8 @@ class Principal:
     via: str  # "cookie" | "bearer"
     # An accountant (and nothing more) limited to these companies of the business; None = every company.
     companies: frozenset[str] | None = None
+    # A manager (and nothing more): the cost centers (outlets) of their one company they run.
+    cost_centers: frozenset[str] | None = None
 
     @property
     def role(self) -> str:
@@ -117,13 +125,20 @@ class Principal:
     @property
     def employee_only(self) -> bool:
         """An employee and nothing more: their own card payments and receipt uploads only."""
-        return "employee" in self.roles and not self.roles & {"owner", "admin", "accountant"}
+        return "employee" in self.roles and not self.roles & {"owner", "admin", "accountant", "manager"}
+
+    @property
+    def manager_only(self) -> bool:
+        """An outlet manager and nothing more: their outlets' questions, documents, payments and receipts."""
+        return "manager" in self.roles and not self.roles & {"owner", "admin", "accountant"}
 
     def public(self) -> dict[str, Any]:
         out = {"user": {"id": self.user.id, "email": self.user.email, "name": self.user.name},
                "tenant": {"id": self.tenant.id, "name": self.tenant.name}, "role": self.role}
         if self.companies is not None:
             out["companies"] = sorted(self.companies)
+        if self.manager_only:
+            out["costCenters"] = sorted(self.cost_centers or ())
         return out
 
 
@@ -131,12 +146,23 @@ class Principal:
 ACCOUNTANT_POSTS = frozenset({"/api/ask", "/api/accountant/rules", "/api/documents/export", "/api/auth/logout",
                               "/api/devices", "/api/devices/remove", "/api/accountant/invitations"})
 _ACCOUNTANT_CLIENT_POST = re.compile(r"^/api/accountant/clients/[^/]+/rules$")
-OWNER_ONLY_READS = frozenset({"/api/account/export"})
+OWNER_ONLY_READS = frozenset({"/api/account/export", "/api/documents/access-log"})
 # Everything an employee may call (backoffice.staff): who they are, signing out, their phone for
 # notifications, their own open card payments and their receipt uploads. Nothing else.
 EMPLOYEE_ROUTES = frozenset({("GET", "/api/auth/me"), ("POST", "/api/auth/logout"), ("POST", "/api/devices"),
                              ("POST", "/api/devices/remove"), ("GET", "/api/employee/card-payments"),
                              ("POST", "/api/employee/receipts")})
+# Everything an outlet manager may call (backoffice.managers): who they are, signing out, their phone, and
+# their outlets' questions, documents, payments, spending and receipts. The engine filters each to them.
+_ID = "[^/]+"
+MANAGER_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = tuple((m, re.compile(p)) for m, p in (
+    ("GET", "/api/auth/me"), ("POST", "/api/auth/logout"), ("POST", "/api/devices"), ("POST", "/api/devices/remove"),
+    ("GET", "/api/manager/outlets"), ("POST", "/api/manager/receipts"),
+    ("GET", "/api/needs-you"), ("POST", f"/api/needs-you/{_ID}/answer"),
+    ("GET", "/api/documents"), ("GET", f"/api/documents/{_ID}"), ("GET", f"/api/documents/{_ID}/file"),
+    ("GET", f"/api/transactions/{_ID}"), ("GET", f"/api/cost-centers/{_ID}"),
+    ("GET", f"/api/cost-centers/{_ID}/statement"),
+))
 
 
 def permitted(principal: Principal, method: str, path: str) -> bool:
@@ -152,6 +178,9 @@ def permitted(principal: Principal, method: str, path: str) -> bool:
         return True
     if principal.employee_only:
         return ("GET" if method == "HEAD" else method, path) in EMPLOYEE_ROUTES
+    if principal.manager_only:
+        verb = "GET" if method == "HEAD" else method
+        return any(m == verb and p.fullmatch(path) for m, p in MANAGER_ROUTES)
     if method in ("GET", "HEAD"):
         return path not in OWNER_ONLY_READS
     return path in ACCOUNTANT_POSTS or bool(_ACCOUNTANT_CLIENT_POST.match(path))
@@ -276,14 +305,14 @@ class AuthService:
         memberships = self.store.memberships(user.id)
         if not memberships:
             raise AuthError(401, "unauthorized", WRONG_CREDENTIALS)
-        rank = {r: i for i, r in enumerate(("owner", "admin", "accountant", "employee"))}
+        rank = {r: i for i, r in enumerate(("owner", "admin", "accountant", "manager", "employee"))}
         tenant = sorted(memberships, key=lambda m: (rank.get(m[1], 9), m[0].id))[0][0]
         loaded = self.store.principal(tenant.id, user.id)
         if loaded is None:
             raise AuthError(401, "unauthorized", WRONG_CREDENTIALS)
         user, tenant, roles = loaded
-        return self._issue(Principal(user, tenant, roles, "", "bearer", self.scope(tenant.id, user.id, roles)),
-                           client, status=200)
+        return self._issue(Principal(user, tenant, roles, "", "bearer", self.scope(tenant.id, user.id, roles),
+                                     self.outlets(tenant.id, user.id, roles)), client, status=200)
 
     def scope(self, tenant_id: str, user_id: str, roles: frozenset[str]) -> frozenset[str] | None:
         """The companies an accountant-only member may see (None: every company, or not only an accountant)."""
@@ -291,6 +320,14 @@ class AuthService:
             return None
         companies = self.store.membership_companies(tenant_id, user_id)
         return frozenset(companies) if companies else None
+
+    def outlets(self, tenant_id: str, user_id: str, roles: frozenset[str]) -> frozenset[str] | None:
+        """The cost centers a manager-only member runs (None: not only a manager). A manager membership
+        without outlets sees nothing (an empty set), never everything."""
+        if roles & {"owner", "admin", "accountant"} or "manager" not in roles:
+            return None
+        scope = self.store.manager_scope(tenant_id, user_id)
+        return frozenset(scope[1]) if scope else frozenset()
 
     def _issue(self, principal: Principal, client: str, *, status: int) -> Issued:
         token = secrets.token_urlsafe(32)
@@ -300,7 +337,7 @@ class AuthService:
             client="mobile" if client == "mobile" else "web", created_at=now, last_seen_at=now,
             expires_at=now + timedelta(days=SESSION_DAYS)))
         return Issued(Principal(principal.user, principal.tenant, principal.roles, hash_token(token), "bearer",
-                                principal.companies), token, status)
+                                principal.companies, principal.cost_centers), token, status)
 
     def reauthenticate(self, principal: Principal, password: Any, *, ip: str | None) -> None:
         """Ask for the password again before something irreversible (account deletion)."""
@@ -328,7 +365,8 @@ class AuthService:
         if now - session.last_seen_at >= SESSION_TOUCH:
             self.store.extend_session(token_hash, now, now + timedelta(days=SESSION_DAYS))
             extended = True
-        return Principal(user, tenant, roles, token_hash, via, self.scope(tenant.id, user.id, roles)), extended
+        return Principal(user, tenant, roles, token_hash, via, self.scope(tenant.id, user.id, roles),
+                         self.outlets(tenant.id, user.id, roles)), extended
 
     def logout(self, principal: Principal) -> None:
         self.store.revoke_session(principal.token_hash, self.now())

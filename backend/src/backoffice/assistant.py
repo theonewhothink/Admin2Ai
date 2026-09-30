@@ -39,6 +39,8 @@ from backoffice.domain.models import ObligationKind
 from backoffice.learning import counterparty_key, day_month, display_name, fold, format_money, learn_from_transactions
 from backoffice.learning.plain import count_phrase, join_and
 from backoffice.mailer import SIMULATED_NOTE, is_simulated
+from backoffice.policy.privacy import TokenVault, redact
+from backoffice.sensitivity import CATEGORY_WORDS, scrub, summary_line
 from backoffice.spending import CATEGORIES, MONTH_NAMES, Ledger, Line, Money, category_label
 from backoffice.understanding import (
     Period,
@@ -178,14 +180,20 @@ class Operator:
             "quality": d.quality.name.lower(), "origin": rec.origin,
             "filename": (ev.filename if ev and ev.filename else f"{d.id}.bin"),
             "evidenceIds": list(rec.evidence_ids),
+            # Sensitive (§52): only the owner and the company's accountant see it; every opening is logged.
+            **({"sensitive": True, "sensitiveReason": CATEGORY_WORDS.get(rec.sensitive, "")} if rec.sensitive else {}),
         }
 
-    def document_file(self, document_id: str) -> tuple[str, str, bytes] | None:
+    def document_file(self, document_id: str, *, opened: bool = True) -> tuple[str, str, bytes] | None:
+        """The document's original (name, type, bytes). Reading a sensitive one's original is noted for the
+        access log (``opened``: False when only its name is needed)."""
         rec = self.repo.documents.get(document_id)
         if rec is None or not rec.evidence_ids:
             return None
         ev = self.repo.registry.get(self.repo.tenant_id, rec.evidence_ids[0])
         data = self.repo.registry.open(self.repo.tenant_id, rec.evidence_ids[0])
+        if opened and rec.sensitive:
+            self.svc.note_opened([document_id])
         return (ev.filename or f"{document_id}.bin", ev.mime_type or "application/octet-stream", data)
 
     def export_zip(self, *, company_id: str = "", date_from: date | None = None,
@@ -2424,7 +2432,46 @@ def _needs_kind(op: Operator, needs_id: str) -> str:
 
 
 def run_tool(op: Operator, name: str, args: dict[str, Any], cards: list[dict[str, Any]]) -> Any:
-    """Run one tool against the engine. Raises ValueError/KeyError with a message the model can act on."""
+    """Run one tool against the engine. Raises ValueError/KeyError with a message the model can act on.
+
+    Its result is what a chat model reads: a sensitive document (§52) appears in it only as its
+    summary line (kind, date, company), never its content, people or amounts. The cards, shown to
+    the owner only, keep the details.
+    """
+    result = _run_tool(op, name, args, cards)
+    documents, evidence, activity = sensitive_lines(op)
+    if not documents:
+        return result
+    if name == "recent_activity":
+        result = [{"id": a["id"], "at": a.get("at"), "summary": activity[a["id"]], "sensitive": True}
+                  if isinstance(a, dict) and a.get("id") in activity else a for a in result]
+    return scrub(result, documents=documents, evidence=evidence)
+
+
+def sensitive_lines(op: Operator) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    """Summary lines of the sensitive documents: by document id (and their open questions' ids), by evidence id,
+    and by the id of each activity entry about one."""
+    repo = op.repo
+    documents: dict[str, str] = {}
+    evidence: dict[str, str] = {}
+    for rec in repo.documents.values():
+        if not rec.sensitive:
+            continue
+        day = rec.document.issue_date or rec.received_at.date()
+        line = summary_line(rec.sensitive, date_text=f"{day.day} {day:%B %Y}", company=op._company(rec.document.entity_id))
+        documents[rec.id] = line
+        for e in rec.evidence_ids:
+            evidence[e] = line
+    if not documents:
+        return {}, {}, {}
+    for n in repo.needs.values():
+        if n.subject_id in documents:
+            documents[n.id] = documents[n.subject_id]
+    activity = {a.id: evidence[e] for a in repo.activity for e in a.evidence_ids if e in evidence}
+    return documents, evidence, activity
+
+
+def _run_tool(op: Operator, name: str, args: dict[str, Any], cards: list[dict[str, Any]]) -> Any:
     svc = op.svc
     if name == "business_status":
         home = svc.home()
@@ -2475,7 +2522,7 @@ def run_tool(op: Operator, name: str, args: dict[str, Any], cards: list[dict[str
         cards.append({"type": "report", **{k: v for k, v in r.items() if k != "csv"}})
         return {k: v for k, v in r.items() if k != "csv"}
     if name == "draft_email":
-        att = [{"kind": "document", "id": i, "name": (op.document_file(i) or (i,))[0]}
+        att = [{"kind": "document", "id": i, "name": (op.document_file(i, opened=False) or (i,))[0]}
                for i in args.get("document_ids", []) if i in op.repo.documents]
         att += [{"kind": "report", "id": i, "name": op.reports[i]["filename"]}
                 for i in args.get("report_ids", []) if i in op.reports]
@@ -2654,6 +2701,17 @@ def _tool_category(brain: RuleBrain, value: Any) -> str | None:
     raise ValueError("Unknown category. Use one of: " + ", ".join([c.id for c in CATEGORIES] + ["other"]) + ".")
 
 
+def _restored(value: Any, vault: TokenVault) -> Any:
+    """A tool input from the model with our tokens ("[EMAIL_1]") put back, so tools see real values."""
+    if isinstance(value, str):
+        return vault.restore(value)
+    if isinstance(value, dict):
+        return {k: _restored(v, vault) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_restored(v, vault) for v in value]
+    return value
+
+
 class ClaudeBrain:
     """Claude with tool use over :class:`Operator` (manual loop, server only)."""
 
@@ -2672,6 +2730,10 @@ class ClaudeBrain:
         return run_tool(self.op, name, args, cards)
 
     def handle(self, message: str, history: list[dict[str, str]] | None = None) -> dict[str, Any]:
+        """One chat turn with the model. Every tool result is redacted before it leaves (§53: bank accounts,
+        cards, contact details and addresses become tokens kept here, backoffice.policy.privacy); sensitive
+        documents appear only as their summary line (run_tool). The answer is restored here for the owner."""
+        vault = TokenVault()
         messages: list[dict[str, Any]] = [
             {"role": h["role"], "content": h["content"]} for h in (history or [])[-10:]
             if h.get("role") in ("user", "assistant") and isinstance(h.get("content"), str)
@@ -2689,15 +2751,15 @@ class ClaudeBrain:
             uses = [b for b in response.content if b.type == "tool_use"]
             if response.stop_reason != "tool_use" or not uses:
                 text = "".join(b.text for b in response.content if b.type == "text").strip()
-                return _reply(text or "Done.", cards)
+                return _reply(vault.restore(text) or "Done.", cards)
             results = []
             for b in uses:
                 try:
-                    out = self._run(b.name, dict(b.input), cards)
-                    results.append({"type": "tool_result", "tool_use_id": b.id,
-                                    "content": json.dumps(out, default=str)[:60000]})
+                    out = self._run(b.name, _restored(dict(b.input), vault), cards)
+                    content = redact(json.dumps(out, default=str, ensure_ascii=False), vault=vault).text
+                    results.append({"type": "tool_result", "tool_use_id": b.id, "content": content[:60000]})
                 except Exception as exc:  # the model sees the failure and can recover
                     results.append({"type": "tool_result", "tool_use_id": b.id, "is_error": True,
-                                    "content": str(exc)[:500]})
+                                    "content": redact(str(exc)[:500], vault=vault).text})
             messages.append({"role": "user", "content": results})
         return _reply("That took too many steps. Try asking in smaller parts.", cards)

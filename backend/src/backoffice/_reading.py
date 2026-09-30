@@ -42,6 +42,10 @@ _MONTH_YEAR = re.compile(r"(?<![a-z0-9])([a-z]{3,10})\.?\s*(?:de\s+|/|-|\s)\s*(\
 _NUMERIC_MONTH = re.compile(r"(?<![\d/.-])(?:(\d{1,2})[/.-](\d{4})|(\d{4})-(\d{2}))(?![\d/.-])")
 _PT_NIF = re.compile(r"(?<![\dA-Z])(?:PT\s?)?([1-9]\d{8})(?!\d)")
 _GB_VAT = re.compile(r"(?<![A-Z0-9])GB\s?(\d{3}\s?\d{4}\s?\d{2}(?:\s?\d{3})?)(?!\d)")
+# A tax number with a letter in it (a Spanish NIF, NIE or CIF), with an optional country prefix: read through the
+# packs of the countries a company can run in (tax_ids), never on its shape alone.
+_LETTERED_TAX_ID = re.compile(r"(?<![A-Za-z0-9])(?:[A-Z]{2}[ \-]?)?[A-Z0-9][ \-.]?\d{7}[ \-.]?[A-Z0-9](?![A-Za-z0-9])")
+_TAX_PREFIX = re.compile(r"^[A-Z]{2}[ \-]?(?=[A-Z0-9][ \-.]?\d{7})")
 
 
 def money(raw: str | None) -> Decimal | None:
@@ -117,10 +121,35 @@ def month_named(text: str, *, default_year: int | None = None) -> tuple[int, int
 
 
 def tax_ids(text: str) -> list[str]:
-    """Tax numbers written in ``text``: Portuguese NIFs (9 digits) and UK VAT numbers ('GB123456789')."""
+    """Tax numbers written in ``text``: Portuguese NIFs (9 digits), the lettered tax numbers of the other countries
+    a company can run in, each kept only when that country's pack checks it (a Spanish NIF, NIE or CIF with its
+    check character: 'B12345674', '12345678Z'; §49), and UK VAT numbers ('GB123456789')."""
     out = [m.group(1) for m in _PT_NIF.finditer(text or "")]
+    out += _pack_tax_ids(text or "")
     out += ["GB" + re.sub(r"\s", "", m.group(1)) for m in _GB_VAT.finditer(text or "")]
     return list(dict.fromkeys(out))
+
+
+def _pack_tax_ids(text: str) -> list[str]:
+    """Lettered tax numbers ('B-1234567-4', 'ES B12345674', 'X1234567L') a company country's pack validates."""
+    from backoffice.countries import CountryPackError, company_countries, company_pack
+
+    candidates = [m.group(0) for m in _LETTERED_TAX_ID.finditer(text)]
+    candidates = [c for c in candidates if re.search(r"[A-Z]", _TAX_PREFIX.sub("", c))]
+    if not candidates:
+        return []
+    out: list[str] = []
+    packs = [company_pack(country) for country in company_countries()]
+    for raw in candidates:
+        for pack in packs:
+            try:
+                check = pack.validate_tax_id(raw)
+            except (CountryPackError, ValueError):
+                continue
+            if check.valid and check.normalized:
+                out.append(check.normalized)
+                break
+    return out
 
 
 def csv_rows(text: str) -> tuple[list[str], list[list[str]]] | None:

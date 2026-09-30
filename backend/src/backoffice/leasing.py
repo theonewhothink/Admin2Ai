@@ -21,7 +21,7 @@ Pure Python over the orchestrator's records, like the other agents.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -82,7 +82,7 @@ class LeaseAgent(_Agent):
     def accept_text(self, text: str, evidence_ids: list[str], *, at: datetime, origin: str, report: IngestReport,
                     sender: str | None = None, message_text: str = "") -> bool:
         try:
-            contract = read_lease(text)
+            contract = read_lease(text, home=self.repo.primary_country())
         except Exception as exc:  # a reader bug must never lose the upload: it is read like any other file
             self.log("lease_read_failed", subject_id=evidence_ids[0], evidence_ids=evidence_ids,
                      response={"error": type(exc).__name__})
@@ -105,6 +105,9 @@ class LeaseAgent(_Agent):
         company = repo.company_for_tax_id(contract.customer_tax_id) if contract.customer_tax_id else None
         if company is None and len(repo.companies) == 1:
             company = next(iter(repo.companies))
+        if company is not None and contract.country == repo.primary_country():
+            # Its company's country's practice (§49): a Spanish company's contract is not read as Portuguese.
+            contract = replace(contract, country=repo.company_country(company))
         supplier = self._supplier(contract, sender)
         doc_id = "doc_" + hashlib.sha256(f"{evidence_ids[0]}|lease|{contract.number}".encode()).hexdigest()[:16]
         quality = Quality.RED if contract.problems else Quality.GREEN if contract.complete else Quality.AMBER
@@ -119,8 +122,10 @@ class LeaseAgent(_Agent):
         record = DocumentRecord(document=document, evidence_ids=list(evidence_ids), origin=origin, received_at=at,
                                 item_id=item.id, observations={}, reasons=contract.problems, sender=sender,
                                 message_text=message_text, supplier_id=supplier.id if supplier else None,
-                                text=text[:20_000], book="lease" if contract.kind == "leasing" else "renting")
+                                text=text[:20_000], book="lease" if contract.kind == "leasing" else "renting",
+                                country=repo.company_country(company))  # its company's country (§49)
         repo.documents[doc_id] = record
+        self.o._classify_sensitive(record, text, message_text)  # by its own wording, like every document (§52)
         lease = LeaseRecord(document_id=doc_id, contract=contract, company_id=company,
                             supplier_id=supplier.id if supplier else None)
         repo.leases[doc_id] = lease
@@ -434,6 +439,9 @@ class LeaseAgent(_Agent):
                                                       "I will read it.")
             company = option.values["company"]
             lease.company_id = company
+            record.country = repo.company_country(company)  # its company's country, and its practice (§49)
+            if lease.contract.country == repo.primary_country():
+                lease.contract = replace(lease.contract, country=record.country)
             record.document = record.document.model_copy(update={"entity_id": company})
             self.o.advance(item, Stage.UNDERSTOOD, [*record.evidence_ids, answer_ev], agent=self.name,
                            actor=OWNER_ACTOR, note=f"You said it is {repo.company_name(company)}'s.")

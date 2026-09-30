@@ -48,7 +48,9 @@ from __future__ import annotations
 
 import re
 from bisect import bisect_left, bisect_right, insort
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from decimal import Decimal
@@ -255,6 +257,7 @@ _GENERIC_CONSEQUENCE: dict[ObligationKind, str] = {
     ObligationKind.TOURIST_TAX_DECLARATION: "Declaring late may lead to a fine.",
     ObligationKind.GRANT_DOCUMENTS: "The grant may be delayed or cancelled if the documents are late.",
     ObligationKind.GRANT_PAYMENT: "Nothing to pay. I check that the money arrives.",
+    ObligationKind.VAT_RETURN: "Filing late may lead to a fine and a surcharge.",
 }
 
 _PROOF_FOR_KIND: dict[ObligationKind, ProofKind] = {
@@ -263,6 +266,7 @@ _PROOF_FOR_KIND: dict[ObligationKind, ProofKind] = {
     ObligationKind.DEBT_COLLECTION: ProofKind.PAYMENT,
     ObligationKind.PAYMENT_DEADLINE: ProofKind.PAYMENT,
     ObligationKind.FILING: ProofKind.SUBMISSION,
+    ObligationKind.VAT_RETURN: ProofKind.SUBMISSION,
     ObligationKind.GOVERNMENT_REQUEST: ProofKind.REPLY,
     ObligationKind.KYC_REQUEST: ProofKind.REPLY,
     ObligationKind.BANK_REQUEST: ProofKind.REPLY,
@@ -289,7 +293,8 @@ def proof_for(kind: ObligationKind) -> ProofKind:
 
 
 # Default routing (§25, §28): the accountant usually files returns; the owner does the rest.
-_RESPONSIBLE: dict[ObligationKind, str] = {ObligationKind.FILING: "accountant"}
+_RESPONSIBLE: dict[ObligationKind, str] = {ObligationKind.FILING: "accountant",
+                                           ObligationKind.VAT_RETURN: "accountant"}
 
 _ACCEPTED_FACTS: dict[ProofKind, frozenset[ProofKind]] = {
     ProofKind.PAYMENT: frozenset({ProofKind.PAYMENT}),
@@ -637,45 +642,93 @@ def _tiered(
 
 # =========================================================================== classification
 
-_P = {
-    name: phrase_pattern(phrases)
-    for name, phrases in {
-        "kyc": _KYC, "payment": _PAYMENT, "filing": _FILING, "request": _REQUEST,
-        "debt": _DEBT, "renewal": _RENEWAL, "insurance": _INSURANCE, "license": _LICENSE,
-        "rent": _RENT, "bank_request": _BANK_REQUEST, "payment_deadline": _PAYMENT_DEADLINE,
-        "auto_renew": _AUTO_RENEW, "strong_date": _STRONG_DATE_ANCHORS,
-        "weak_date": _WEAK_DATE_ANCHORS, "strong_amount": _STRONG_AMOUNT_ANCHORS,
-        "weak_amount": _WEAK_AMOUNT_ANCHORS, "tourist_tax": _TOURIST_TAX, "grant_alone": _GRANT_ALONE,
-        "grant_paired": _GRANT_PAIRED, "grant_core": _GRANT_CORE, "not_grant": _NOT_GRANT,
-        "grant_documents": _GRANT_DOCUMENTS,
-        "grant_paid": _GRANT_PAID, "grant_agency": tuple(_GRANT_AGENCIES),
-    }.items()
+# The core's own wording (English and Portuguese), by category. A country pack adds its own
+# (``CompanyPack.obligation_vocabulary``): the business's companies' packs are passed in as
+# ``vocabulary`` and merged for the call (issuer phrases under "issuer:<issuer>").
+_BASE_PHRASES: dict[str, tuple[str, ...]] = {
+    "kyc": _KYC, "payment": _PAYMENT, "filing": _FILING, "request": _REQUEST,
+    "debt": _DEBT, "renewal": _RENEWAL, "insurance": _INSURANCE, "license": _LICENSE,
+    "rent": _RENT, "bank_request": _BANK_REQUEST, "payment_deadline": _PAYMENT_DEADLINE,
+    "auto_renew": _AUTO_RENEW, "strong_date": _STRONG_DATE_ANCHORS,
+    "weak_date": _WEAK_DATE_ANCHORS, "strong_amount": _STRONG_AMOUNT_ANCHORS,
+    "weak_amount": _WEAK_AMOUNT_ANCHORS, "tourist_tax": _TOURIST_TAX, "grant_alone": _GRANT_ALONE,
+    "grant_paired": _GRANT_PAIRED, "grant_core": _GRANT_CORE, "not_grant": _NOT_GRANT,
+    "grant_documents": _GRANT_DOCUMENTS,
+    "grant_paid": _GRANT_PAID, "grant_agency": tuple(_GRANT_AGENCIES),
+    # A periodic VAT return a country names as such ("modelo 303"): none in the core's own wording.
+    "vat_return": (),
+    **{f"issuer:{issuer.value}": phrases for issuer, phrases in _ISSUER_PHRASES.items()},
 }  # fmt: skip
-_ISSUER_PATTERNS = {issuer: phrase_pattern(p) for issuer, p in _ISSUER_PHRASES.items()}
+_NEVER = re.compile(r"(?!x)x")
+
+
+def _compile(phrases: dict[str, tuple[str, ...]]) -> dict[str, re.Pattern[str]]:
+    return {name: phrase_pattern(p) if p else _NEVER for name, p in phrases.items()}
+
+
+_P = _compile(_BASE_PHRASES)
 _CONSEQUENCE_PATTERNS = [(label, phrase_pattern(p)) for label, p in _CONSEQUENCE_PHRASES]
+# The patterns in use for the current call (the core's, or with the companies' countries' wording).
+_ACTIVE: ContextVar[dict[str, re.Pattern[str]] | None] = ContextVar("obligation_patterns", default=None)
+_TITLES: ContextVar[dict[str, str] | None] = ContextVar("obligation_titles", default=None)
+_MERGED: dict[tuple[tuple[str, tuple[str, ...]], ...], dict[str, re.Pattern[str]]] = {}
+
+
+def _pats() -> dict[str, re.Pattern[str]]:
+    return _ACTIVE.get() or _P
+
+
+@contextmanager
+def _wording(vocabulary: Mapping[str, Sequence[str]] | None) -> Iterator[None]:
+    """Use the core's wording plus ``vocabulary`` (folded phrases by category) for one call."""
+    if not vocabulary:
+        yield
+        return
+    key = tuple(sorted((k, tuple(v)) for k, v in vocabulary.items()))
+    patterns = _MERGED.get(key)
+    if patterns is None:
+        merged = {name: tuple(phrases) for name, phrases in _BASE_PHRASES.items()}
+        extra: dict[str, tuple[str, ...]] = {}
+        for name, phrases in vocabulary.items():
+            if name.startswith("title:"):
+                continue
+            if name in _C_PHRASES:
+                extra[name] = (*extra.get(name, ()), *phrases)
+            else:
+                merged[name] = (*merged.get(name, ()), *phrases)
+        confirmations = {name: (*phrases, *extra.get(name, ())) for name, phrases in _C_PHRASES.items()}
+        patterns = _MERGED[key] = {**_compile(merged), **{f"c:{k}": v for k, v in _compile(confirmations).items()}}
+    titles = {k[len("title:"):]: v[0] for k, v in vocabulary.items() if k.startswith("title:") and v}
+    token, title_token = _ACTIVE.set(patterns), _TITLES.set(titles)
+    try:
+        yield
+    finally:
+        _ACTIVE.reset(token)
+        _TITLES.reset(title_token)
 
 
 def _has(name: str, folded: str) -> bool:
-    return _P[name].search(folded) is not None
+    return _pats()[name].search(folded) is not None
 
 
 def _issuer(folded: str, source_kind: SourceKind | None) -> Issuer:
-    if _P["grant_agency"].search(folded):  # a grant letter may name Social Security among the proofs it wants
+    pats = _pats()
+    if pats["grant_agency"].search(folded):  # a grant letter may name Social Security among the proofs it wants
         return Issuer.GRANT_AGENCY
     for issuer in (Issuer.TAX_AUTHORITY, Issuer.SOCIAL_SECURITY):
-        if _ISSUER_PATTERNS[issuer].search(folded):
+        if pats[f"issuer:{issuer.value}"].search(folded):
             return issuer
     if source_kind in _SOURCE_ISSUER:
         return _SOURCE_ISSUER[source_kind]
     for issuer in (Issuer.BANK, Issuer.INSURER, Issuer.LANDLORD, Issuer.MUNICIPALITY):
-        if _ISSUER_PATTERNS[issuer].search(folded):
+        if pats[f"issuer:{issuer.value}"].search(folded):
             return issuer
     return Issuer.OTHER
 
 
 def grant_agency(text: str) -> str | None:
     """The grant agency a text names, as the owner knows it ('IFAP', 'Portugal 2030'), or None."""
-    m = _P["grant_agency"].search(fold(text))
+    m = _pats()["grant_agency"].search(fold(text))
     return _GRANT_AGENCIES.get(" ".join(m.group(0).split())) if m else None
 
 
@@ -687,13 +740,15 @@ def mentions_tourist_tax(text: str) -> bool:
 def is_grant_text(text: str) -> bool:
     """A grant or subsidy communication: an agency named, a word that means a grant on its own ('subsídio',
     'subsidy'), or two grant words together ('candidatura' and 'apoio'). Payroll allowances ('subsídio de
-    férias') and support lines ('apoio ao cliente') never count."""
-    folded = _P["not_grant"].sub(" ", fold(text))
-    if _P["grant_agency"].search(folded) or _P["grant_alone"].search(folded):
+    férias') and support lines ('apoio ao cliente') never count. While a letter is read, the wording of the
+    companies' countries (their packs' obligation vocabulary) counts too."""
+    pats = _pats()
+    folded = pats["not_grant"].sub(" ", fold(text))
+    if pats["grant_agency"].search(folded) or pats["grant_alone"].search(folded):
         return True
-    if not _P["grant_core"].search(folded):
+    if not pats["grant_core"].search(folded):
         return False
-    return len({" ".join(m.group(0).split()) for m in _P["grant_paired"].finditer(folded)}) >= 2
+    return len({" ".join(m.group(0).split()) for m in pats["grant_paired"].finditer(folded)}) >= 2
 
 
 def _grant_kind(folded: str, has_amount: bool) -> ObligationKind | None:
@@ -706,6 +761,8 @@ def _grant_kind(folded: str, has_amount: bool) -> ObligationKind | None:
 
 
 def _government_kind(folded: str, has_amount: bool) -> ObligationKind:
+    if _has("vat_return", folded):  # a periodic VAT return its country names as such ("modelo 303")
+        return ObligationKind.VAT_RETURN
     paying = _has("payment", folded)
     if paying and has_amount:
         return ObligationKind.TAX_DEADLINE
@@ -731,7 +788,7 @@ def _classify(folded: str, issuer: Issuer, has_amount: bool) -> ObligationKind |
     if _has("tourist_tax", folded):  # the municipality's tourist tax: the payment, or the declaration
         return ObligationKind.TOURIST_TAX if has_amount else ObligationKind.TOURIST_TAX_DECLARATION
     if is_grant_text(folded):
-        return _grant_kind(_P["not_grant"].sub(" ", folded), has_amount)
+        return _grant_kind(_pats()["not_grant"].sub(" ", folded), has_amount)
     if issuer in (Issuer.TAX_AUTHORITY, Issuer.SOCIAL_SECURITY):
         return _government_kind(folded, has_amount)
     if _has("debt", folded):
@@ -748,6 +805,8 @@ def _classify(folded: str, issuer: Issuer, has_amount: bool) -> ObligationKind |
 
 
 def _title(kind: ObligationKind, issuer: Issuer) -> str:
+    if kind is ObligationKind.VAT_RETURN:
+        return (_TITLES.get() or {}).get(kind.value) or "VAT return"
     social = issuer is Issuer.SOCIAL_SECURITY
     if kind is ObligationKind.TAX_DEADLINE:
         return "Social Security payment" if social else "Tax payment"
@@ -920,7 +979,7 @@ class _Pick:
 def _pick_date(folded: str, received_on: date) -> _Pick:
     """Deadline date. A lone unanchored date counts only if it lies ahead (not the letter's date)."""
     hits = _date_hits(folded, received_on)
-    chosen, tier = _tiered(folded, hits, _P["strong_date"], _P["weak_date"], window=40)
+    chosen, tier = _tiered(folded, hits, _pats()["strong_date"], _pats()["weak_date"], window=40)
     values = sorted({h.value for h in chosen})  # type: ignore[type-var]
     if tier == "lone":
         values = [v for v in values if v >= received_on]  # type: ignore[operator]
@@ -942,8 +1001,9 @@ def _with_bare(marked: Sequence[_Hit], bare: Sequence[_Hit]) -> list[_Hit]:
 
 def _pick_amount(folded: str) -> _Pick:
     marked = _amount_hits(folded)
-    strong = _anchored(folded, _P["strong_amount"], _with_bare(marked, _bare_amount_hits(folded)), 30)
-    chosen = strong or _tiered(folded, marked, _P["strong_amount"], _P["weak_amount"], window=30)[0]
+    pats = _pats()
+    strong = _anchored(folded, pats["strong_amount"], _with_bare(marked, _bare_amount_hits(folded)), 30)
+    chosen = strong or _tiered(folded, marked, pats["strong_amount"], pats["weak_amount"], window=30)[0]
     values = sorted({h.value for h in chosen})  # type: ignore[type-var]
     if not values:
         return _Pick(None, False, None)
@@ -992,6 +1052,7 @@ def detect_obligation(
     source_kind: SourceKind | None = None,
     entities: Sequence[LegalEntity] = (),
     default_entity_id: str | None = None,
+    vocabulary: Mapping[str, Sequence[str]] | None = None,
 ) -> ObligationFinding | None:
     """Read one letter or message and return the obligation it creates, if any (§24).
 
@@ -1005,7 +1066,25 @@ def detect_obligation(
     does not judge authenticity: "update your details or your account will be
     suspended" is also how phishing reads, so only pass messages that already
     passed the sender checks (§26).
+
+    ``vocabulary`` is the wording of the business's companies' countries (their packs'
+    ``obligation_vocabulary``), read together with the core's English and Portuguese.
     """
+    with _wording(vocabulary):
+        return _detect_obligation(text, tenant_id=tenant_id, received_on=received_on, sender=sender,
+                                  source_kind=source_kind, entities=entities, default_entity_id=default_entity_id)
+
+
+def _detect_obligation(
+    text: str,
+    *,
+    tenant_id: str,
+    received_on: date,
+    sender: str,
+    source_kind: SourceKind | None,
+    entities: Sequence[LegalEntity],
+    default_entity_id: str | None,
+) -> ObligationFinding | None:
     body = fold(text)
     everything = fold(f"{sender} {text}")
     amount_pick = _pick_amount(body)
@@ -1217,10 +1296,19 @@ _CONTRACT = ("contrato", "contract", "subscricao", "subscription", "assinatura",
 _VALIDITY = ("ate", "until", "valido ate", "valida ate", "valid until", "valid to", "validade", "nova validade",
              "nova data de validade", "new expiry date", "expires on", "expira em", "expira a", "termina em",
              "ends on", "renovado ate", "renovada ate", "renewed until")  # fmt: skip
-_C = {name: phrase_pattern(phrases) for name, phrases in {
+_C_PHRASES: dict[str, tuple[str, ...]] = {
     "still_asking": _STILL_ASKING, "decided": _DECIDED, "renewed": _RENEWED, "submitted": _SUBMITTED,
     "answered": _ANSWERED, "contract": _CONTRACT, "validity": _VALIDITY,
-}.items()}  # fmt: skip
+}  # fmt: skip
+_C = _compile(_C_PHRASES)
+
+
+def _cpats() -> dict[str, re.Pattern[str]]:
+    """The confirmation patterns in use: the core's, or with the companies' countries' wording."""
+    active = _ACTIVE.get()
+    if active is None:
+        return _C
+    return {name: active[f"c:{name}"] for name in _C_PHRASES}
 _CONFIRMED_LINE = {
     ProofKind.REPLY: "They confirm they received what they asked for",
     ProofKind.SUBMISSION: "Filing receipt",
@@ -1258,7 +1346,7 @@ class ConfirmationFinding:
 def _validity(body: str, received_on: date) -> date | None:
     """The date a renewal now runs until: the one date after a validity word, else the one future date."""
     hits = _date_hits(body, received_on)
-    anchored = _anchored(body, _C["validity"], hits, 40)
+    anchored = _anchored(body, _cpats()["validity"], hits, 40)
     pool = anchored or hits
     values = sorted({h.value for h in pool if h.value > received_on})  # type: ignore[operator]
     return values[0] if len(values) == 1 else None  # type: ignore[return-value]
@@ -1274,11 +1362,11 @@ def _confirmed_kinds(proof: ProofKind, body: str, issuer: Issuer) -> frozenset[O
             return frozenset({ObligationKind.LICENSE_RENEWAL})
         if issuer is Issuer.INSURER or _has("insurance", body):
             return frozenset({ObligationKind.INSURANCE_RENEWAL})
-        if _C["contract"].search(body):
+        if _cpats()["contract"].search(body):
             return frozenset({ObligationKind.CONTRACT_RENEWAL})
         return RENEWAL_KINDS
     if proof is ProofKind.SUBMISSION:
-        return frozenset({ObligationKind.FILING})
+        return frozenset({ObligationKind.FILING, ObligationKind.VAT_RETURN})
     if _has("kyc", body):
         return frozenset({ObligationKind.KYC_REQUEST})
     if issuer is Issuer.BANK:
@@ -1296,6 +1384,7 @@ def detect_confirmation(
     source_kind: SourceKind | None = None,
     entities: Sequence[LegalEntity] = (),
     default_entity_id: str | None = None,
+    vocabulary: Mapping[str, Sequence[str]] | None = None,
 ) -> ConfirmationFinding | None:
     """Read one letter or message that says an obligation was done, or None (§24).
 
@@ -1303,14 +1392,30 @@ def detect_confirmation(
     entrega", "Your contract has been terminated". A message that is still asking for something
     ("we still need", "please send", "unless") is never a confirmation. Like detection, this reads
     wording only: the caller decides whether it matches exactly one obligation on file.
+    ``vocabulary``: the wording of the business's companies' countries, as for detection.
     """
+    with _wording(vocabulary):
+        return _detect_confirmation(text, received_on=received_on, sender=sender, source_kind=source_kind,
+                                    entities=entities, default_entity_id=default_entity_id)
+
+
+def _detect_confirmation(
+    text: str,
+    *,
+    received_on: date,
+    sender: str,
+    source_kind: SourceKind | None,
+    entities: Sequence[LegalEntity],
+    default_entity_id: str | None,
+) -> ConfirmationFinding | None:
     body = fold(text)
     everything = fold(f"{sender} {text}")
-    if not body or _C["still_asking"].search(body):
+    pats = _cpats()
+    if not body or pats["still_asking"].search(body):
         return None
     proof = next((p for name, p in (("decided", ProofKind.DECISION), ("renewed", ProofKind.RENEWAL),
                                     ("submitted", ProofKind.SUBMISSION), ("answered", ProofKind.REPLY))
-                  if _C[name].search(body)), None)
+                  if pats[name].search(body)), None)
     if proof is None:
         return None
     issuer = _issuer(everything, source_kind)

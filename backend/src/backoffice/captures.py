@@ -14,14 +14,14 @@ Three things the mobile capture path needs on the server (checklist D2, E10, G3)
 * **A copy is one document.** A photographed invoice and the same invoice as a PDF by email become one
   document with both originals when their numbers match (Orchestrator._duplicate_of). A photo whose
   number could not be read, but whose supplier, date and total match an invoice already on file, is
-  merged only when the rules prove it is the same document (the same ATCUD, the Portuguese unique
-  document code); otherwise it waits and the owner is asked once whether it is the same invoice: it
-  never becomes a second expense on a guess (§3, verification.duplicates "near").
+  merged only when the rules of the company's own country prove it is the same document (its pack's
+  unique document code: the same ATCUD for a Portuguese company; Spain has none, §49); otherwise it
+  waits and the owner is asked once whether it is the same invoice: it never becomes a second expense
+  on a guess (§3, verification.duplicates "near").
 """
 
 from __future__ import annotations
 
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -40,10 +40,9 @@ if TYPE_CHECKING:  # the orchestrator imports this module
         Repository,
     )
 
-__all__ = ["CAPTURE_WAIT", "CaptureAgent", "PendingCapture", "PendingCopy", "atcud_in", "retake_prompt"]
+__all__ = ["CAPTURE_WAIT", "CaptureAgent", "PendingCapture", "PendingCopy", "document_code", "retake_prompt"]
 
 CAPTURE_WAIT = timedelta(days=1)  # the other pages of a scan did not come: read what arrived
-_ATCUD = re.compile(r"\bATCUD\s*[:\-]?\s*([A-Z0-9]{8,}-\d+)\b", re.IGNORECASE)
 
 # One calm sentence per problem a new photo would fix (§11, §69), the worst first.
 _RETAKE = (
@@ -61,17 +60,15 @@ def retake_prompt(flags: Sequence[str]) -> str | None:
     return next((text for flag, text in _RETAKE if flag in flags), None)
 
 
-def atcud_in(text: str) -> str | None:
-    """The ATCUD printed on a Portuguese document (its unique code), when one valid code is there."""
-    from backoffice.countries.pt.atcud import ATCUDError, parse_atcud
+def document_code(text: str, country: str) -> tuple[str, str] | None:
+    """(name, value) of the unique document code ``text`` prints under the rules of ``country`` (the company's
+    pack: a Portuguese document's ATCUD), when exactly one valid code is there; None otherwise."""
+    from backoffice.countries import CountryPackError, company_pack
 
-    found = set()
-    for raw in _ATCUD.findall(text or ""):
-        try:
-            found.add(str(parse_atcud(raw.upper())))
-        except ATCUDError:
-            continue
-    return found.pop() if len(found) == 1 else None
+    try:
+        return company_pack(country).document_code(text or "")
+    except CountryPackError:
+        return None
 
 
 @dataclass
@@ -235,10 +232,15 @@ class CaptureAgent:
             found.append(rec)
         return min(found, key=lambda r: (r.received_at, r.id)) if found else None
 
-    def proven_copy(self, text: str, existing: DocumentRecord) -> bool:
-        """The rules prove it is the same document: the same ATCUD (Portugal's unique document code) on both."""
-        mine, theirs = atcud_in(text), atcud_in(existing.text)
-        return mine is not None and mine == theirs
+    def proven_copy(self, text: str, existing: DocumentRecord, home: str | None = None) -> str | None:
+        """The rule that proves it is the same document ("ATCUD": the same Portuguese unique document code on
+        both), read with the pack of the company's own country; None when nothing proves it. ``home`` is the
+        country of the company the new copy is for: a copy for a company in another country is never proven."""
+        country = existing.country
+        if home is not None and home != country:
+            return None
+        mine, theirs = document_code(text, country), document_code(existing.text, country)
+        return mine[0] if mine is not None and mine == theirs else None
 
     def ask_same(self, existing: DocumentRecord, parts: list[Any], evidence_ids: Sequence[str], *, at: datetime,
                  origin: str, retrieved: bool, options: dict[str, Any], report: IngestReport) -> None:

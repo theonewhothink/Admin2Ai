@@ -603,28 +603,38 @@ class TenantManager:
 
     def view(self, tenant_id: str, method: str, path: str, body: Any = None, *,
              companies: frozenset[str] | None = None, prefix: str = "",
-             employee: str | None = None) -> tuple[int, dict[str, Any]]:
+             employee: str | None = None, manager: frozenset[str] | None = None,
+             viewer: tuple[str, str] | None = None) -> tuple[int, dict[str, Any]]:
         """A read: the state as of now, unchanged.
 
         ``companies``: the reader is an accountant limited to these companies (§28, §52): only the
         accountant's routes answer, filtered to them. ``prefix`` goes before client ids in the reply.
         ``employee``: the reader is this employee (their email): only their own card payments answer.
+        ``manager``: the reader manages these cost centers (outlets): only their outlets' routes answer.
+        ``viewer`` (email, role): who is reading; a sensitive document's original read here is recorded
+        with it (§52), as an event of its own.
         """
         with self.open(tenant_id) as rt:
             self.tick_if_due(rt)
             what = f"{method} {path.split('?', 1)[0]}"
             if employee is not None:
                 return self._guarded_read(rt, what, lambda svc: svc.dispatch_employee(method, path, body, employee))
+            if manager is not None:
+                return self._guarded_read(rt, what, lambda svc: svc.dispatch_manager(method, path, body, manager),
+                                          viewer=viewer)
             if companies is None and not prefix:
-                return self._guarded_read(rt, what, lambda svc: svc.dispatch(method, path, body))
+                return self._guarded_read(rt, what, lambda svc: svc.dispatch(method, path, body), viewer=viewer)
             scope = companies if companies is not None else frozenset(rt.service.repo.companies)
             return self._guarded_read(rt, what,
-                                      lambda svc: svc.dispatch_scoped(method, path, body, scope, prefix=prefix))
+                                      lambda svc: svc.dispatch_scoped(method, path, body, scope, prefix=prefix),
+                                      viewer=viewer)
 
-    def read(self, tenant_id: str, reader: Callable[[BackOfficeService], Any], *, what: str = "read") -> Any:
-        """Run ``reader`` on the tenant's service (no change allowed) as of now."""
+    def read(self, tenant_id: str, reader: Callable[[BackOfficeService], Any], *, what: str = "read",
+             viewer: tuple[str, str] | None = None) -> Any:
+        """Run ``reader`` on the tenant's service (no change allowed) as of now. A sensitive document's original
+        it reads is recorded with ``viewer`` (email, role), as an event of its own (§52)."""
         with self.open(tenant_id) as rt:
-            return self._guarded_read(rt, what, reader)
+            return self._guarded_read(rt, what, reader, viewer=viewer)
 
     def read_many(self, tenant_ids: Sequence[str], reader: Callable[[list[BackOfficeService]], Any], *,
                   what: str = "read") -> Any:
@@ -652,12 +662,24 @@ class TenantManager:
             self._check_unchanged(rt, digest, what)
         return result
 
-    def _guarded_read(self, rt: TenantRuntime, what: str, reader: Callable[[BackOfficeService], Any]) -> Any:
+    def _guarded_read(self, rt: TenantRuntime, what: str, reader: Callable[[BackOfficeService], Any], *,
+                      viewer: tuple[str, str] | None = None) -> Any:
         svc = rt.service
         before = state_digest(svc)
+        svc.take_opened()
         with svc.repo.clock.peek(self.now()):
             result = reader(svc)
+        opened = svc.take_opened()
         self._check_unchanged(rt, before, what)
+        if opened:
+            # Every read of a sensitive document's original is on the record (§52): who, when, which.
+            who, role = viewer or ("unknown", "unknown")
+            try:
+                self.record(rt, "documents.opened", {"documentIds": opened, "who": who, "role": role},
+                            f"access:{role}", self.live_env())
+            except StoreUnavailable:
+                log.warning("access_not_recorded", extra={"tenant": rt.tenant_id})
+                raise
         return result
 
     def _check_unchanged(self, rt: TenantRuntime, before: str, what: str) -> None:
@@ -678,8 +700,10 @@ class TenantManager:
                 "reader": self.reader is not None, **extra}
 
     def command(self, tenant_id: str, actor: str, method: str, path: str,
-                body: Mapping[str, Any] | None) -> tuple[int, dict[str, Any]]:
-        """A change requested through the API: recorded as one event, then applied."""
+                body: Mapping[str, Any] | None, *, manager: frozenset[str] | None = None,
+                manager_email: str | None = None) -> tuple[int, dict[str, Any]]:
+        """A change requested through the API: recorded as one event, then applied. ``manager``: an outlet
+        manager's change, applied (live and on replay) through their outlets' routes only."""
         body = dict(body or {})
         if method == "POST" and path == _API_KEYS:
             return self.create_api_key(tenant_id, actor, body)
@@ -699,6 +723,8 @@ class TenantManager:
                 index.append(IndexOp("remove_api_key", revoke.group(1)))
             data: dict[str, Any] = {"method": method, "path": path, "body": clean,
                                     "env": self._facts(authorize=authorize is not None)}
+            if manager is not None:  # recorded only for a manager: older events replay unchanged
+                data["manager"] = {"costCenters": sorted(manager), "email": manager_email or ""}
             uploads = _uploads(clean, env)
             if method == "POST" and path in INGEST_PATHS:
                 # Links in what arrives (a shared link, an email's invoice links) are opened now, before the
@@ -786,6 +812,9 @@ class TenantManager:
     def add_company(self, tenant_id: str, actor: str, body: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
         data = {"name": str(body.get("name") or ""), "taxId": str(body.get("taxId") or ""),
                 "legalName": str(body.get("legalName") or "")}
+        country = str(body.get("country") or "").strip().upper()
+        if country and country != "PT":  # recorded only for another country: older events replay unchanged
+            data["country"] = country
         with self.open(tenant_id) as rt:
             return self.record(rt, "company.added", data, actor, self.live_env())
 
@@ -922,12 +951,15 @@ def _tenant_created(m: TenantManager, rt: TenantRuntime, event: Event, env: Env)
                                               owner_email=str(owner.get("email", "")), now=event.at,
                                               vault=env.vault if env.vault is not None else _ReplayVault())
     rt.svc.vault = env.vault
+    # Reads never change a tenant here: a sensitive original read is recorded as its own event (§52).
+    rt.svc.inline_access_log = False
     return 201, {"ok": True}
 
 
 def _company_added(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
     d = event.data
-    return 200, rt.service.add_company(d.get("name"), d.get("taxId") or None, d.get("legalName") or None)
+    return 200, rt.service.add_company(d.get("name"), d.get("taxId") or None, d.get("legalName") or None,
+                                       country=d.get("country") or None)
 
 
 def _accountant_set(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
@@ -941,6 +973,15 @@ def _request(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tup
     body = restore_files(d.get("body") or {}, lambda ref: m.get_file(rt.tenant_id, ref, env))
     if env.live:
         body.update(env.secret_fields)
+    scope = d.get("manager")
+    if isinstance(scope, Mapping):  # an outlet manager's change: through their outlets' routes only
+        svc = rt.service
+        svc.viewer = (str(scope.get("email") or ""), "manager")
+        try:
+            return svc.dispatch_manager(str(d["method"]), str(d["path"]), body,
+                                        frozenset(str(c) for c in scope.get("costCenters") or ()))
+        finally:
+            svc.viewer = ("owner", "owner")
     return rt.service.dispatch(str(d["method"]), str(d["path"]), body)
 
 
@@ -1039,6 +1080,13 @@ def _void(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[
     return 200, {"ok": True}
 
 
+def _documents_opened(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
+    """Sensitive documents' originals someone read (§52): the access log the owner reads."""
+    d = event.data
+    return 200, rt.service.record_access([str(i) for i in d.get("documentIds") or []], who=str(d.get("who") or ""),
+                                         role=str(d.get("role") or ""))
+
+
 _HANDLERS: dict[str, Handler] = {
     "tenant.created": _tenant_created,
     "company.added": _company_added,
@@ -1057,4 +1105,5 @@ _HANDLERS: dict[str, Handler] = {
     "tick": _tick,
     "outbox.send": _outbox_send,
     "void": _void,
+    "documents.opened": _documents_opened,
 }

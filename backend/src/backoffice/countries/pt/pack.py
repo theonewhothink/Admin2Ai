@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Collection, Mapping, Sequence
 from datetime import date
 from decimal import Decimal
@@ -10,14 +11,20 @@ from backoffice.countries.base import (
     FiscalQRResult,
     NamedObservation,
     NativeDocumentType,
+    PeriodicObligation,
     TaxIdCheck,
     Term,
     VATRate,
 )
-from backoffice.domain.models import DocumentType, ExtractionMethod
+from backoffice.domain.models import DocumentType, ExtractionMethod, VatPart
 
-from . import documents, nif, qr, text_fields
+from . import atcud, documents, holidays, nif, qr, text_fields
 from . import vat as pt_vat
+
+
+_QR_START = re.compile(r"A:\d{9}\*B:")
+_ATCUD = re.compile(r"\bATCUD\s*[:\-]?\s*([A-Z0-9]{8,}-\d+)\b", re.IGNORECASE)
+_ZERO = Decimal(0)
 
 
 class PortugalPack:
@@ -26,6 +33,9 @@ class PortugalPack:
     country_code = "PT"
     country_name = "Portugal"
     currency = "EUR"
+    language = "pt"
+    # Lines that start with these words are never the supplier's name.
+    title_words = ("nif", "fatura", "invoice", "data", "atcud")
 
     @property
     def document_types(self) -> Mapping[str, NativeDocumentType]:
@@ -85,7 +95,62 @@ class PortugalPack:
             usable=_can_support_payment(code),
             notes=tuple(str(w) for w in code.checks.warnings),
             payload=code,
+            issuer_tax_id=code.issuer_nif,
+            buyer_is_final_consumer=code.buyer_is_final_consumer,
+            currency=code.currency,
+            vat_parts=_vat_parts(code),
         )
+
+    def find_fiscal_qr(self, line: str) -> str | None:
+        """The AT fiscal QR payload in a decoded-QR text line ("A:509442013*B:..."), or None."""
+        m = _QR_START.search(line or "")
+        if m and qr.looks_like_pt_qr(line[m.start():].strip()):
+            return line[m.start():].strip()
+        return None
+
+    def read_text(
+        self,
+        text: str,
+        source: str,
+        *,
+        method: ExtractionMethod = ExtractionMethod.OCR,
+        known_customer_tax_ids: Collection[str] = (),
+        known_supplier_tax_ids: Collection[str] = (),
+    ) -> text_fields.TextFieldsResult:
+        """Portuguese labels, NIFs with their roles and the final consumer (a TextReading and more)."""
+        return text_fields.extract_text_fields(text, source, method=method,
+                                               known_customer_tax_ids=known_customer_tax_ids,
+                                               known_supplier_tax_ids=known_supplier_tax_ids)
+
+    def document_kind(self, text: str) -> DocumentType | None:
+        """None: the core's own names (Portuguese and English) are Portugal's."""
+        return None
+
+    def obligation_vocabulary(self) -> Mapping[str, tuple[str, ...]]:
+        """Nothing to add: the core reads Portuguese and English letters already."""
+        return {}
+
+    def periodic_obligations(self, company_id: str, today: date) -> tuple[PeriodicObligation, ...]:
+        """None yet: Portuguese deadlines come from the letters and messages that announce them."""
+        return ()
+
+    def is_private_person(self, tax_id: str | None) -> bool:
+        """A NIF starting with 1, 2 or 3 belongs to a private person (the check digits are not needed)."""
+        return bool(tax_id) and str(tax_id)[:1] in "123"
+
+    def public_holidays(self, year: int) -> frozenset[date]:
+        """Portugal's national public holidays (Código do Trabalho, art. 234)."""
+        return holidays.national_holidays(year)
+
+    def document_code(self, text: str) -> tuple[str, str] | None:
+        """The ATCUD printed on a Portuguese document (its unique code), when one valid code is there."""
+        found = set()
+        for raw in _ATCUD.findall(text or ""):
+            try:
+                found.add(str(atcud.parse_atcud(raw.upper())))
+            except atcud.ATCUDError:
+                continue
+        return ("ATCUD", found.pop()) if len(found) == 1 else None
 
     def extract_text_fields(
         self,
@@ -106,6 +171,33 @@ def _region(value: str) -> pt_vat.PTRegion | None:
         return pt_vat.PTRegion.parse(value)
     except ValueError:
         return None
+
+
+def _vat_parts(code: qr.PTQRCode) -> tuple[VatPart, ...]:
+    """The code's amounts by VAT rate (rates in percent; exempt at 0%, non-taxable without a rate)."""
+    merged: dict[Decimal | None, tuple[Decimal, Decimal]] = {}
+
+    def add(rate: Decimal | None, net: Decimal, vat: Decimal) -> None:
+        old = merged.get(rate, (_ZERO, _ZERO))
+        merged[rate] = (old[0] + net, old[1] + vat)
+
+    for block in code.tax_blocks:
+        if block.exempt_base:
+            add(Decimal(0), block.exempt_base, _ZERO)
+        for bucket, base, vat in block.rate_pairs():
+            try:
+                fraction = pt_vat.rate_for(block.region, bucket, code.issue_date)
+            except (ValueError, KeyError):
+                fraction = None
+            pct = None
+            if fraction is not None:
+                pct = fraction * 100
+                pct = pct.quantize(Decimal(1)) if pct == pct.to_integral_value() else pct.normalize()
+            add(pct, base, vat)
+    for extra in (code.non_taxable, code.stamp_duty):
+        if extra:
+            add(None, extra, _ZERO)
+    return tuple(VatPart(rate=rate, net=net, vat=vat) for rate, (net, vat) in merged.items())
 
 
 def _can_support_payment(code: qr.PTQRCode) -> bool:

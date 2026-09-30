@@ -477,6 +477,7 @@ class ObligationKind(str, Enum):
     # payment announced (approved or made) that is to arrive in the bank.
     GRANT_DOCUMENTS = "grant_documents"
     GRANT_PAYMENT = "grant_payment"
+    VAT_RETURN = "vat_return"  # a periodic VAT return its country's calendar sets (Spain's modelo 303)
 
 
 class Obligation(BaseModel):

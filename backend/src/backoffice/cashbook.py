@@ -186,8 +186,10 @@ class CashAgent(_Agent):
         repo.items[item.id] = item
         record = DocumentRecord(document=document, evidence_ids=list(evidence_ids), origin=origin, received_at=at,
                                 item_id=item.id, observations=observations, sales=True, text=text[:4000],
-                                reasons=() if day.adds_up else (day.mismatch(),), book="till")
+                                reasons=() if day.adds_up else (day.mismatch(),), book="till",
+                                country=repo.company_country(company))  # its company's country (§49)
         repo.documents[doc_id] = record
+        self.o._classify_sensitive(record, record.text)  # by its own wording, like every document (§52)
         till = TillRecord(document_id=doc_id, till=day, company_id=company,
                           card_status="none" if day.card == 0 else "waiting")
         repo.till_days[doc_id] = till
@@ -254,6 +256,7 @@ class CashAgent(_Agent):
                                                   "I will read it.")
         company = option.values["company"]
         till.company_id = company
+        record.country = repo.company_country(company)  # its company's country (§49)
         company_record = repo.companies[company]
         record.document = record.document.model_copy(update={
             "entity_id": company, "supplier_tax_id": company_record.tax_id,

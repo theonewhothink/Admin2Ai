@@ -14,8 +14,9 @@ The monthly amounts must add up (before VAT + VAT = with VAT); a contract whose 
 used on a guess. :meth:`LeaseContract.schedule` is the payment plan: one line per month from the first
 payment, on the same day of the month.
 
-Which evidence closes a monthly payment depends on the country (:data:`CONTRACT_WITH_STATEMENT`): in
-Portugal the leasing company invoices every rent ("fatura" per "renda"), so each payment needs that invoice;
+Which evidence closes a monthly payment depends on the country (:data:`CONTRACT_WITH_STATEMENT`; the
+company's own country unless the contract is plainly British, §49): in Portugal (and in Spain, "factura"
+per "cuota") the leasing company invoices every rent ("fatura" per "renda"), so each payment needs that invoice;
 in the United Kingdom a hire agreement that sets out every payment and its VAT can stand as the tax document
 for them, so the agreement plus the leasing company's statement showing the payment is enough. These are
 conventions of each country's practice as commonly described, not verified with every tax office
@@ -203,8 +204,10 @@ def _party(lines: list[str], folded: list[str], pattern: re.Pattern[str]) -> tup
     return None, None, None
 
 
-def read_lease(text: str) -> LeaseContract | None:
-    """The contract in ``text``, or None when it is not a leasing or renting contract."""
+def read_lease(text: str, home: str = "PT") -> LeaseContract | None:
+    """The contract in ``text``, or None when it is not a leasing or renting contract. ``home`` is the country of
+    the company it is for (§49): its practice applies unless the contract is plainly British (a GB VAT number or
+    pounds)."""
     if not text or not text.strip():
         return None
     lines = [line for line in text.splitlines()]
@@ -243,7 +246,7 @@ def read_lease(text: str) -> LeaseContract | None:
         near = " ".join(lines[max(0, lessor_at - 1):lessor_at + 5])
         found_email = _EMAIL.search(near)
         email = found_email.group(0).lower() if found_email else None
-    country = "GB" if (lessor_tax or "").startswith("GB") or currency == "GBP" else "PT"
+    country = "GB" if (lessor_tax or "").startswith("GB") or currency == "GBP" else home
     missing = tuple(name for name, value in (("the leasing company", lessor), ("the first payment date", start),
                                              ("the term", term), ("the monthly payment", gross)) if not value)
     return LeaseContract(
