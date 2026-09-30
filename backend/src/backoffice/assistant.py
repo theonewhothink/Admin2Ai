@@ -1038,8 +1038,13 @@ class RuleBrain:
                 parts.append(f"I left out {self._m(moved)} moved between {between}.")
             if cards:
                 parts.append(f"I left out {self._m(cards)} paying off cards: their purchases are counted one by one.")
+            cash = sum((x.amount for x in m.left_out if x.kind == "cash_withdrawal"), Decimal(0))
+            if cash:
+                parts.append(f"I left out {self._m(cash)} taken out in cash for your cash box: the cash receipts are "
+                             "the costs.")
         parts += self._recharge_lines(m)
         parts += self._given_back_lines(m)
+        parts += self._returned_lines(m)
         parts += self._staff_claim_lines(m)
         parts += self._pending_lines(m, s)
         if m.private_count:
@@ -1158,11 +1163,15 @@ class RuleBrain:
                          f"{head}: {m.lines[0].merchant} on {self._day(m.lines[0].on)}.")
             parts += self._deposit_lines(m)
             parts += self._sales_lines(m)
+            parts += self._till_lines(m)
+            parts += self._member_lines(m)
             if moved:
                 parts.append(f"I left out {self._m(sum((x.amount for x in moved), Decimal(0)))} moved between your "
                              "own accounts and companies.")
         parts += self._paid_back_lines(m)
         parts += self._given_back_lines(m)
+        parts += self._returned_lines(m)
+        parts += self._cash_banked_lines(m)
         parts += self._held_back_lines(m, u.slots.company_ids)
         parts += self._waiting_payout_lines(m)
         if m.previous is not None and u.slots.compare:
@@ -1196,6 +1205,62 @@ class RuleBrain:
             return ["All of it is deposits for work not invoiced yet." if several else
                     "It is a deposit for work not invoiced yet."]
         return [f"That includes {self._m(held)} in deposits for work not invoiced yet."]
+
+    def _till_lines(self, m: Money) -> list[str]:
+        """'That includes €225.00 in cash sales from your till reports.' (checklist X5)"""
+        cash = sum((x.amount for x in m.lines if x.kind == "till_cash"), Decimal(0))
+        if not cash:
+            return []
+        if cash == m.total:
+            return ["All of it is cash sales from your till reports."]
+        return [f"That includes {self._m(cash)} in cash sales from your till reports."]
+
+    def _member_lines(self, m: Money) -> list[str]:
+        """'That includes €405.00 in memberships and fees from 9 people who pay you every month.' (X12)"""
+        line = self.svc.orchestrator.members.income_line(m.lines)
+        return [line] if line else []
+
+    def _cash_banked_lines(self, m: Money) -> list[str]:
+        """Cash paid into the bank: the till's cash, never counted twice (X5)."""
+        if not m.cash_banked:
+            return []
+        out = []
+        known = [x for x in m.cash_banked if x.has_document]
+        unknown = [x for x in m.cash_banked if not x.has_document]
+        if known:
+            total = self._m(sum((x.amount for x in known), Decimal(0)))
+            out.append(f"I left out {total} of cash paid into the bank: it is the till's cash, counted from your till "
+                       "reports.")
+        if len(unknown) == 1:
+            x = unknown[0]
+            out.append(f"Not counted yet: {self._m(x.amount)} of cash paid into the bank on {self._day(x.on)}. I don't "
+                       "have the till reports it comes from.")
+        elif unknown:
+            total = self._m(sum((x.amount for x in unknown), Decimal(0)))
+            out.append(f"Not counted yet: {total} of cash paid into the bank in {len(unknown)} deposits. I don't have "
+                       "the till reports it comes from.")
+        return out
+
+    def _returned_lines(self, m: Money) -> list[str]:
+        """'I left out €45.00 from Ana Lopes on 5 September: the payment came back on 12 September.' (X12)"""
+        from backoffice.members import payer_name
+
+        repo = self.repo
+        out = []
+        for x in sorted(m.returned, key=lambda x: (x.on, x.id))[:3]:
+            rec = repo.transactions.get(x.id)
+            who = payer_name(rec.tx) if rec is not None else x.merchant
+            if x.kind == "payment_returned":
+                back = repo.transactions.get(repo.returned_payments.get(x.id, ""))
+                when = f" on {self._day(back.tx.booked_on)}" if back else ""
+                out.append(f"I left out {self._m(x.amount)} from {who} on {self._day(x.on)}: the payment came "
+                           f"back{when}.")
+            else:
+                out.append(f"I left out {self._m(x.amount)} that went back to {who} on {self._day(x.on)}: "
+                           "their payment came back.")
+        if len(m.returned) > 3:
+            out.append(f"And {len(m.returned) - 3} more that came back.")
+        return out
 
     def _given_back_lines(self, m: Money) -> list[str]:
         """'I left out the €1,000.00 deposit from Maria Silva: it went back to them.' (never income, never a cost)."""
@@ -1403,11 +1468,18 @@ class RuleBrain:
         if m.direction == "in":
             notes += self._deposit_lines(m)
             notes += self._sales_lines(m)
+            notes += self._till_lines(m)
+            notes += self._member_lines(m)
+            notes += self._cash_banked_lines(m)
             notes += self._waiting_payout_lines(m)
         notes += self._given_back_lines(m)
-        moved = sum((x.amount for x in m.left_out if x.kind != "reimbursement"), Decimal(0))
+        notes += self._returned_lines(m)
+        moved = sum((x.amount for x in m.left_out if x.kind not in ("reimbursement", "cash_withdrawal")), Decimal(0))
         if moved:
             notes.append(f"Left out {self._m(moved)} moved between your own accounts and companies.")
+        cash = sum((x.amount for x in m.left_out if x.kind == "cash_withdrawal"), Decimal(0))
+        if cash:
+            notes.append(f"Left out {self._m(cash)} taken out in cash for your cash box.")
         if m.direction == "out":
             notes += self._staff_claim_lines(m)
         notes += self._pending_lines(m, s)
@@ -1453,7 +1525,7 @@ class RuleBrain:
                  "loan": "loan_repayments", "income": "customer_payments", "refund": "refunds",
                  "interest": "bank_interest", "tax_refund": "tax_refunds",
                  "sales": "sales_through_card_terminals_and_platforms", "platform_fee": "payment_and_platform_fees",
-                 "deposit": "deposits_for_work_not_invoiced_yet"}
+                 "deposit": "deposits_for_work_not_invoiced_yet", "till_cash": "cash_sales_from_till_reports"}
         out: dict[str, Any] = {
             "period": {"from": p.start.isoformat(), "to": p.end.isoformat(), "label": p.label},
             "records_cover": {"from": first.isoformat(), "to": last.isoformat()},
@@ -1475,6 +1547,13 @@ class RuleBrain:
         }
         if m.given_back:  # a deposit that went back when a booking was cancelled: neither income nor a cost (X8)
             out["left_out"]["deposits_given_back_eur"] = float(sum((x.amount for x in m.given_back), Decimal(0)))
+        if m.returned:  # a member's direct debit that came back, and the payment it returned (X12)
+            out["left_out"]["payments_that_came_back_eur"] = float(sum((x.amount for x in m.returned), Decimal(0)))
+        if m.cash_banked:  # the till's cash going to the bank: counted from the till reports, never twice (X5)
+            out["left_out"]["cash_paid_into_the_bank_eur"] = float(sum((x.amount for x in m.cash_banked), Decimal(0)))
+        cash_out = sum((x.amount for x in m.left_out if x.kind == "cash_withdrawal"), Decimal(0))
+        if cash_out:  # cash taken out for the cash box: its receipts are the costs (X4)
+            out["left_out"]["cash_taken_out_for_the_cash_box_eur"] = float(cash_out)
         totals = self._sales_totals(m)
         if totals is not None:
             out["sales_from_payout_reports"] = {
@@ -1673,6 +1752,17 @@ class RuleBrain:
         reports += [self.svc.orchestrator.missing.plan_expected(e) for e in expected[:3]]
         report_chips += [{"label": f"{self.repo.company_name(e.company_id)} · {e.period.name}",
                           "id": f"month:{e.company_id}:{e.period}"} for e in expected]
+        # Money in waiting for the business's own receipts or till reports (X12, X5): never asked of the customer.
+        own = self.ledger.missing_own(start=p.start if p else None, end=p.end if p else None,
+                                      company_ids=s.company_ids)
+        if own:
+            reports.append("One payment in is waiting for your own receipt or till report:" if len(own) == 1 else
+                           f"{count_phrase(len(own), 'payment')} in are waiting for your own receipts or till reports:")
+            reports += [plan for _, plan in own[:3]]
+            if len(own) > 3:
+                reports.append(f"And {len(own) - 3} more.")
+            report_chips += [{"label": self.ledger.payment_label(x), "id": x.evidence_id} for x, _ in own
+                             if x.evidence_id]
         if not items:
             head = f"Every payment that needs an invoice has one{when}."
             if expected:

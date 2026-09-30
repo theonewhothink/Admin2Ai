@@ -625,6 +625,10 @@ class DocumentRecord:
     billing_name: str | None = None
     billing_address: str | None = None
     payslip: Payslip | None = None  # a payslip: the salary it proves (checklist J3)
+    # Read and matched by its own agent, never by amount in the general matching: "lease" or "renting" (a leasing
+    # or renting contract, backoffice.leasing), "till" (a day of a till report, backoffice.cashbook), "member" (a
+    # receipt from a receipts list, backoffice.members).
+    book: str = ""
 
     @property
     def id(self) -> str:
@@ -647,6 +651,11 @@ class DocumentRecord:
         if doc.doc_type is DocumentType.PAYOUT_REPORT:  # "Payout report of 18 September": the date, not the provider's id
             day = doc.issue_date
             number = f" of {day.day} {_MONTH_NAMES[day.month - 1]}" if day else ""
+        elif self.book == "till":  # "Till report of 17 September · €1,650.40"
+            kind, day = "Till report", doc.issue_date
+            number = f" of {day.day} {_MONTH_NAMES[day.month - 1]}" if day else ""
+        elif self.book in ("lease", "renting"):
+            kind = "Leasing contract" if self.book == "lease" else "Renting contract"
         amount = f" · {format_money(doc.gross_amount, doc.currency)}" if doc.gross_amount is not None else ""
         return f"{kind}{number}{amount}"
 
@@ -681,6 +690,10 @@ class TxRecord:
     cardholder: str | None = None  # the cardholder the bank's card details name (backoffice.staff)
     claim_ids: list[str] = field(default_factory=list)  # expense claims this transfer pays back (backoffice.staff)
     notes: list[str] = field(default_factory=list)  # plain facts worth knowing, never a hold ("paid from ...")
+    # More evidence its closing carries: the owner's answers and earlier bank lines that explain it (e.g. a
+    # direct debit that came back before this payment of the same period, backoffice.members).
+    extra_evidence_ids: list[str] = field(default_factory=list)
+    proof_note: str = ""  # why ``proof_evidence_ids`` prove it, in plain words (a tax letter when empty)
 
     @property
     def id(self) -> str:
@@ -1227,6 +1240,19 @@ class Repository:
         self.payroll_employees: dict[str, str] = {}
         self.payroll_by: dict[str, str] = {}
         self.payslip_requests: dict[str, str] = {}
+        # Leasing and renting contracts by their document id, and the payments of their plans (payment id ->
+        # (contract document id, line of the plan)) (checklist X24, backoffice.leasing).
+        self.leases: dict[str, Any] = {}
+        self.lease_payments: dict[str, tuple[str, int]] = {}
+        # Days of till reports by their document id, and the owner's counts of the cash box (checklist X4, X5,
+        # backoffice.cashbook).
+        self.till_days: dict[str, Any] = {}
+        self.cash_counts: list[Any] = []
+        # Receipts from receipts lists by their document id; direct debits that came back: the bank line giving
+        # the money back -> the payment it returns, and the other way round (checklist X12, backoffice.members).
+        self.member_receipts: dict[str, Any] = {}
+        self.payment_returns: dict[str, str] = {}
+        self.returned_payments: dict[str, str] = {}
 
     # ----------------------------------------------------------------- set-up
 
@@ -2209,14 +2235,16 @@ class ReconciliationAgent(_Agent):
                and not repo.items[r.item_id].is_done
                and r.decision.expectation is not EvidenceExpectation.PAYOUT_REPORT
                and not (r.decision.expectation is EvidenceExpectation.PAYROLL and r.decision.quality is Quality.GREEN)
-               and (r.decision.requires_document or r.decision.quality is not Quality.GREEN)]
+               and (r.decision.requires_document or r.decision.quality is not Quality.GREEN)
+               and not self.o.matched_elsewhere(r)]
         docs = [d for d in repo.documents.values()
                 if not d.on_hold and d.document.quality is not Quality.RED
                 and (not d.matched_tx_ids or staged.open_for_parts(d))
                 and d.document.doc_type not in (DocumentType.PAYOUT_REPORT, DocumentType.PAYROLL)
                 and not repo.items[d.item_id].is_done
                 and not d.supporting and not d.paid_in_cash and not d.supports_tx_ids and staged.matchable(d)
-                and d.claim_id is None]  # paid with an employee's own money: an expense claim (backoffice.staff)
+                and d.claim_id is None  # paid with an employee's own money: an expense claim (backoffice.staff)
+                and not d.book]  # a leasing contract, a till report or a receipt from a list: matched by its agent
         accepted: list[Match] = []
         if txs and docs:
             netted = self._netting(docs)
@@ -2359,7 +2387,7 @@ class ReconciliationAgent(_Agent):
         # A statement read line by line is checked by the statement agent: its balance is not a purchase amount.
         docs = [d for d in repo.documents.values()
                 if d.supporting and not d.supports_tx_ids and not d.on_hold and d.document.gross_amount is not None
-                and d.id not in repo.statements]
+                and d.id not in repo.statements and not d.book]
         txs = [r for r in repo.transactions.values()
                if r.decision is not None and r.decision.requires_document and not r.private and r.tx.amount != 0]
         if not docs or not txs:
@@ -3406,6 +3434,10 @@ class MissingEvidenceAgent(_Agent):
                     "answers may settle it.")
         if rec.decision is not None and rec.decision.expectation is EvidenceExpectation.PAYOUT_REPORT:
             return self.o.settlement.plan(rec, amount, when)
+        # A leasing payment, cash paid into the bank, a member's payment without its receipt (X24, X5, X12).
+        book = self.o.leases.plan(rec) or self.o.cash.plan(rec) or self.o.members.plan(rec)
+        if book is not None:
+            return book
         staged = None if rec.supporting_document_ids or rec.id in self.repo.chases else self.o.staged.plan(rec)
         if staged is not None:  # a deposit waiting for its invoice, or money that may give one back (X8)
             return staged
@@ -5675,8 +5707,9 @@ class ClosureAgent(_Agent):
                                         agent=self.name, quality=Quality.GREEN, note=rec.decision.reason)
                 continue
             if rec.proof_evidence_ids:
-                evidence = [rec.evidence_id, *rec.proof_evidence_ids]
-                moved += self._close(item, evidence, note="The payment matches the tax letter's amount and reference.")
+                evidence = [rec.evidence_id, *rec.proof_evidence_ids, *rec.extra_evidence_ids]
+                moved += self._close(item, evidence, note=rec.proof_note or
+                                     "The payment matches the tax letter's amount and reference.")
                 continue
             given_back = self.o.staged.settled_without_document(rec)
             if given_back is not None:  # a deposit given back, and the money that gave it back (checklist X8)
@@ -5706,8 +5739,11 @@ class ClosureAgent(_Agent):
                 evidence.append(rec.refund_answer_ev)
             if rec.part_answer_ev:  # the owner said this payment is part of an invoice
                 evidence.append(rec.part_answer_ev)
+            evidence += [e for e in rec.extra_evidence_ids if e not in evidence]
             moved += self._close(item, evidence, note=rec.match_headline or "Matched to its document.")
             for d in docs:
+                if d.book == "till":
+                    continue  # a till report closes on its card takings, not on a cash deposit (backoffice.cashbook)
                 if self.o.staged.is_staged(d):
                     continue  # paid in parts: it closes once every part is in (``_settle_staged``)
                 if self.o.is_supplier_refund(rec, d):
@@ -5846,6 +5882,9 @@ class ClosureAgent(_Agent):
         moved = 0
         if item.is_done:
             return 0
+        if item.stage is Stage.NEEDS_OWNER and any(t.to_stage is Stage.CLOSED for t in item.history):
+            # Closed once, opened again (a member's payment that came back), now proven again: it resumes closed.
+            return self.o.advance(item, Stage.CLOSED, evidence, agent=self.name, quality=Quality.GREEN, note=note)
         for stage in (Stage.VERIFIED, Stage.MATCHED, Stage.CONFIRMED, Stage.CLOSED):
             if _reached(item, stage) and item.stage is not Stage.NEEDS_OWNER:
                 continue
@@ -5933,6 +5972,9 @@ class AuditorAgent(_Agent):
         rec = repo.transactions[item.subject_id]
         if rec.proof_evidence_ids:
             return None
+        cash = self.o.cash.problem(rec)  # cash paid into the bank: its till reports (backoffice.cashbook)
+        if cash is not None:
+            return cash or None
         if rec.claim_ids:  # pays back expense claims (backoffice.staff)
             return self.o.staff.reimbursement_problem(rec)
         if not rec.document_ids:
@@ -6120,6 +6162,7 @@ class CostCenterAgent(_Agent):
         match = repo.resolver().resolve_transaction(tx)
         account = repo.accounts.get(tx.account_id)
         texts = [("the bank line", " ".join(p for p in (tx.counterparty, tx.description, tx.reference or "") if p))]
+        texts += self.o.leases.texts_for(rec)  # a leasing payment: the asset and plate in its contract (X24)
         emails: list[str] = []
         evidence = [rec.evidence_id]
         lines: tuple[Any, ...] = ()
@@ -6528,6 +6571,14 @@ class Orchestrator:
 
         self.staff = StaffAgent(self)
         self.payroll = PayrollAgent(self)
+        # Leasing, cash and memberships build on this module's agents, like the staff agent.
+        from backoffice.cashbook import CashAgent
+        from backoffice.leasing import LeaseAgent
+        from backoffice.members import MembershipAgent
+
+        self.leases = LeaseAgent(self)  # leasing and renting contracts (X24)
+        self.cash = CashAgent(self)  # till reports, cash paid into the bank, the cash box (X4, X5)
+        self.members = MembershipAgent(self)  # memberships, tuition and fees, and their receipts (X12)
         self._activity_seq = 0
         # What sends the emails the back office writes itself (backoffice.mailer): the demo's simulated
         # outbox, or None. With None they wait in ``repo.outbox``; the production server sends each one
@@ -6864,9 +6915,13 @@ class Orchestrator:
         return report
 
     def _process_evidence(self, evidence: Evidence, *, at: datetime, origin: str, report: IngestReport) -> None:
+        if self._read_books_file(evidence, at=at, origin=origin, report=report):
+            return  # a leasing contract, a till report or a receipts list (text or CSV)
         if self.settlement.accept(evidence, at=at, origin=origin, report=report):
             return  # a payout report (CSV / JSON): read by the settlement agent
         parts = self._parts_for(evidence.id)
+        if parts and self._read_books_parts(parts, at=at, origin=origin, report=report):
+            return  # the same, from a PDF's text or a photo
         if not parts:
             report.stored_only = True
             report.message = self._unread_message(evidence)
@@ -6881,6 +6936,40 @@ class Orchestrator:
         record = self._document_from_parts(parts, at=at, origin=origin, retrieved=False, report=report)
         if record is None and any(p.kind == "read" for p in parts):
             report.message = "Got it. I stored it, but I couldn't find invoice details in it."
+
+    _BOOK_FORMATS = frozenset({EvidenceFormat.TEXT, EvidenceFormat.CSV})
+
+    def _read_books(self, text: str, evidence_ids: list[str], *, at: datetime, origin: str, report: IngestReport,
+                    sender: str | None = None, message_text: str = "") -> bool:
+        """A leasing contract (X24), a till report (X5) or a receipts list (X12), each read by its own agent.
+        True when one of them took it; anything else is read as usual."""
+        if not text.strip():
+            return False
+        for agent in (self.leases, self.cash, self.members):
+            if agent.accept_text(text, evidence_ids, at=at, origin=origin, report=report, sender=sender,
+                                 message_text=message_text):
+                return True
+        return False
+
+    def _read_books_file(self, evidence: Evidence, *, at: datetime, origin: str, report: IngestReport,
+                         sender: str | None = None, message_text: str = "") -> bool:
+        if evidence.format not in self._BOOK_FORMATS:
+            return False
+        try:
+            text = self.repo.registry.open(self.repo.tenant_id, evidence.id).decode("utf-8")
+        except (UnicodeDecodeError, ObjectNotFound, IntegrityError):
+            return False
+        return self._read_books(text, [evidence.id], at=at, origin=origin, report=report, sender=sender,
+                                message_text=message_text)
+
+    def _read_books_parts(self, parts: Sequence[_Part], *, at: datetime, origin: str, report: IngestReport,
+                          sender: str | None = None, message_text: str = "") -> bool:
+        read = [p for p in parts if p.kind == "read" and (p.text or p.reading_text)]
+        if not read:
+            return False
+        text = "\n".join(p.text or p.reading_text for p in read)
+        return self._read_books(text, list(dict.fromkeys(p.evidence_id for p in read)), at=at, origin=origin,
+                                report=report, sender=sender, message_text=message_text)
 
     def _read_letter(self, text: str, evidence_id: str, *, at: datetime, report: IngestReport,
                      sender: str = "") -> bool:
@@ -7018,9 +7107,15 @@ class Orchestrator:
         groups: list[list[_Part]] = []
         hint = f"{parsed.sender_domain or ''} {parsed.subject}"  # names the provider when the report does not
         for f in result.files:
+            if self._read_books_file(f.evidence, at=at, origin=origin, report=report, sender=sender,
+                                     message_text=text):
+                continue  # a leasing contract, a till report or a receipts list
             if self.settlement.accept(f.evidence, at=at, origin=origin, report=report, hint=hint):
                 continue
             file_parts = self._parts_for(f.evidence.id)
+            if file_parts and self._read_books_parts(file_parts, at=at, origin=origin, report=report, sender=sender,
+                                                     message_text=text):
+                continue
             if file_parts:
                 groups.append(file_parts)
             else:
@@ -7804,6 +7899,9 @@ class Orchestrator:
             moved += self.settlement.settle(now)  # payouts first: their reports and commission invoices
             moved += self.staged.settle(now)  # deposits, advance and final invoices, parts held back (X8)
             moved += self.payroll.prove()  # salaries: only by that month's payslip for that employee (J3)
+            moved += self.leases.settle(now)  # each leasing payment to its line of the plan and its invoice (X24)
+            moved += self.cash.settle(now)  # till reports: card part to card payouts, cash to cash deposits (X5)
+            moved += self.members.settle(now)  # memberships and fees to their receipts, debits that came back (X12)
             matches = self.reconciliation.match()
             for m in matches:
                 self._reverify_with_bank(m)
@@ -8794,8 +8892,8 @@ class Orchestrator:
         if needs.kind == "cost_center":
             # Checked before anything is recorded: a split that doesn't add up changes nothing.
             chosen = self._cost_center_choice(needs, option_id, split)
-        elif needs.kind in ("statement", "recharge", *_STAGED_QUESTIONS, *self.staff.NEEDS_KINDS) and \
-                option_id not in {o.id for o in needs.options}:
+        elif needs.kind in ("statement", "recharge", *_STAGED_QUESTIONS, *self.staff.NEEDS_KINDS,
+                            *self.book_questions()) and option_id not in {o.id for o in needs.options}:
             raise ValueError("not one of the options")
         answer_ev = self._record_answer(needs, option_id, now, split=split if needs.kind == "cost_center" else None)
         self.owner_time(now, kind=InteractionKind.APPROVAL if needs.kind == "approval" else InteractionKind.ANSWER,
@@ -8825,10 +8923,25 @@ class Orchestrator:
             outcome = self.staged.answer(needs, option_id, answer_ev, now)
         elif needs.kind in self.staff.NEEDS_KINDS:
             outcome = self.staff.answer(needs, option_id, answer_ev, now)
+        elif needs.kind in self.book_questions():
+            outcome = self._book_agent(needs.kind).answer(needs, option_id, answer_ev, now)
         else:
             outcome = self._answer_choice(needs, option_id, remember, answer_ev, now)
         self.run(now)
         return outcome
+
+    def book_questions(self) -> tuple[str, ...]:
+        """Question kinds of the leasing, cash and membership agents."""
+        return (*self.leases.NEEDS_KINDS, *self.cash.NEEDS_KINDS, *self.members.NEEDS_KINDS)
+
+    def _book_agent(self, kind: str) -> Any:
+        return next(a for a in (self.leases, self.cash, self.members) if kind in a.NEEDS_KINDS)
+
+    def matched_elsewhere(self, rec: TxRecord) -> bool:
+        """A payment its own agent matches (never by amount alone in the general matching): a leasing payment of
+        a plan, cash paid into the bank, a direct debit that came back and the payment it returns."""
+        return (self.leases.kept_from_matching(rec) or self.members.kept_from_matching(rec)
+                or (rec.decision is not None and rec.decision.rule == "cash_deposit"))
 
     def _record_answer(self, needs: NeedsYouRecord, option_id: str, now: datetime, *, split: Any = None) -> str:
         record = {"needs_id": needs.id, "option_id": option_id, "answered_by": self.repo.owner.email,

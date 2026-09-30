@@ -60,6 +60,16 @@ provider's commission invoice when it matched). A payout whose report has not
 arrived (or disagrees with the bank) is not counted at all: answers list it as
 waiting for its report.
 
+**Cash** (backoffice.cashbook): the till's cash sales are money in from its till reports (kind ``till_cash``,
+dated on the day of the report); the card part of a till report is counted through the card terminal's payouts
+above, never twice. Cash paid into the bank (kind ``cash_deposit``) is that same cash going to the bank: never
+counted as sales again, and said so (or, while no till report explains it, said as not counted yet). Cash taken
+out of the bank for the cash box (kind ``cash_withdrawal``) is not a cost: the cash receipts it paid for are.
+
+**Direct debits that came back** (backoffice.members): a member's payment and the bank line that gave it back
+(kinds ``payment_returned`` and ``debit_returned``) are neither income nor a cost, and are said so; the period
+they were for is unpaid again until the member's next payment, which is income when it arrives.
+
 Pure Python (runs in the browser build too).
 """
 
@@ -176,8 +186,9 @@ _KIND: dict[EvidenceExpectation, str] = {
 _KIND_CATEGORY = {"tax": "tax", "bank_fee": "bank_fees", "payroll": "payroll", "loan": "loan",
                   "platform_fee": "platform_fees"}
 COST_KINDS = frozenset({"cost", "tax", "bank_fee", "payroll", "loan", "platform_fee"})
-IN_KINDS = frozenset({"income", "refund", "interest", "tax_refund", "sales", "deposit"})
-NOT_SPENDING = frozenset({"transfer", "card_repayment", "reimbursement"})
+IN_KINDS = frozenset({"income", "refund", "interest", "tax_refund", "sales", "deposit", "till_cash"})
+NOT_SPENDING = frozenset({"transfer", "card_repayment", "reimbursement", "cash_withdrawal"})
+RETURNED = frozenset({"payment_returned", "debit_returned"})  # a direct debit that came back, and its payment
 GIVEN_BACK = frozenset({"deposit_returned", "deposit_refund"})  # a deposit and the money that gave it back
 _ZERO = Decimal(0)
 _PURCHASE_DOCS = frozenset({DocumentType.INVOICE, DocumentType.INVOICE_RECEIPT, DocumentType.SIMPLIFIED_INVOICE,
@@ -275,6 +286,10 @@ class Money:
     given_back: list[Line] = field(default_factory=list)
     # Staff expense claims waiting for the owner's OK (not counted yet).
     claims_waiting: list[Line] = field(default_factory=list)
+    # Cash paid into the bank (in): the till's cash, counted from its till reports, never twice.
+    cash_banked: list[Line] = field(default_factory=list)
+    # Direct debits that came back, and the payments they returned: neither income nor a cost.
+    returned: list[Line] = field(default_factory=list)
 
     @property
     def count(self) -> int:
@@ -346,6 +361,14 @@ class Ledger:
                 out.append(cash)
         for claim in getattr(repo, "expense_claims", {}).values():
             line = self._claim_line(claim)
+            if line is not None:
+                out.append(line)
+        for till in getattr(repo, "till_days", {}).values():
+            line = self._till_line(till)
+            if line is not None:
+                out.append(line)
+        for receipt in getattr(repo, "member_receipts", {}).values():
+            line = self._desk_line(receipt)
             if line is not None:
                 out.append(line)
         out = self._client_parts(out)
@@ -440,6 +463,36 @@ class Ledger:
             description="Paid in cash", paid_in_cash=True,
         )
 
+    def _till_line(self, till: Any) -> Line | None:
+        """The cash sales of one day's till report (the card part is counted through the card payouts)."""
+        if not till.usable or not till.till.cash:
+            return None
+        record = self.repo.documents.get(till.document_id)
+        day = till.till
+        return Line(
+            id=f"{till.document_id}:cash", on=day.day, amount=day.cash, direction="in", currency=day.currency,
+            merchant="Cash sales", supplier_id=None, company_id=till.company_id, pending=False, private=False,
+            kind="till_cash", category="sales",
+            evidence_id=record.evidence_ids[0] if record is not None and record.evidence_ids else None,
+            document_ids=(till.document_id,), history=False, needs_document=False, has_document=True,
+            description=f"Till report{' ' + day.number if day.number else ''}", paid_in_cash=True,
+        )
+
+    def _desk_line(self, receipt: Any) -> Line | None:
+        """A member who paid in cash at the desk: the business's receipt is the only record (no bank line)."""
+        if not receipt.row.cash or receipt.status != "paid" or receipt.company_id is None:
+            return None
+        record = self.repo.documents.get(receipt.document_id)
+        row = receipt.row
+        return Line(
+            id=receipt.document_id, on=row.issued_on, amount=row.amount, direction="in", currency="EUR",
+            merchant=row.member, supplier_id=None, company_id=receipt.company_id, pending=False, private=False,
+            kind="income", category="income",
+            evidence_id=record.evidence_ids[0] if record is not None and record.evidence_ids else None,
+            document_ids=(receipt.document_id,), history=False, needs_document=False, has_document=True,
+            description=f"Receipt {row.number}, {row.period_label}", paid_in_cash=True,
+        )
+
     def _claim_line(self, claim: Any) -> Line | None:
         """A receipt an employee paid with their own money (backoffice.staff): the business's cost once
         approved, counted once, on the receipt's date; waiting for the owner's OK it is not counted yet."""
@@ -508,6 +561,14 @@ class Ledger:
         claims = list(getattr(rec, "claim_ids", None) or []) if rec is not None else []
         if claims:
             kind = "reimbursement"  # pays an employee back: the receipts they paid are the cost (counted once)
+        if decision.rule == "cash_deposit" and tx.amount > 0:
+            kind = "cash_deposit"  # the till's cash going to the bank: its till reports are the sales
+        elif decision.rule in ("cash_withdrawal", "cash_box") and tx.amount < 0:
+            kind = "cash_withdrawal"  # cash for the cash box: its receipts are the costs
+        if rec is not None and rec.id in getattr(repo, "payment_returns", {}):
+            kind = "debit_returned"  # gave a member's payment back
+        elif rec is not None and rec.id in getattr(repo, "returned_payments", {}):
+            kind = "payment_returned"  # a member's payment that came back
         own = next((e.name for e in repo.entities if tx.counterparty_iban and tx.counterparty_iban in e.own_ibans),
                    None)
         provider, status = "", ""
@@ -580,6 +641,10 @@ class Ledger:
     def _category(self, tx: Transaction, kind: str, supplier: Any, key: str, rec: Any, folded: str,
                   accountant_ids: list[str], company: str | None = None) -> str:
         repo = self.repo
+        if kind in ("cash_deposit", "cash_withdrawal"):
+            return "cash"  # cash between the bank and the cash box (its label is the owner's word)
+        if kind in RETURNED:
+            return "returned"
         if kind in ("transfer", "card_repayment", "payout", "reimbursement") or kind in IN_KINDS:
             return kind
         try:
@@ -688,6 +753,8 @@ class Ledger:
         clients: list[Line] = []
         given_back: list[Line] = []
         claims_waiting: list[Line] = []
+        cash_banked: list[Line] = []
+        returned: list[Line] = []
         private = other_currency = 0
         for x in base:
             if x.private:
@@ -697,6 +764,16 @@ class Ledger:
                 # A deposit that went back, and the money that gave it back: neither income nor a cost.
                 if not company_ids or x.company_id in company_ids:
                     given_back.append(x)
+                continue
+            if x.kind in RETURNED:
+                # A member's payment that came back, and the bank line that gave it back: neither in nor out.
+                if not company_ids or x.company_id in company_ids:
+                    returned.append(x)
+                continue
+            if x.kind == "cash_deposit":
+                # Cash paid into the bank: the till's cash sales are counted from its till reports.
+                if not company_ids or x.company_id in company_ids:
+                    cash_banked.append(x)
                 continue
             if x.kind == "claim_waiting":
                 # An employee's receipt waiting for the owner's OK: not a company cost yet.
@@ -742,7 +819,7 @@ class Ledger:
                        history_months=self._history_months(counted), waiting_payouts=waiting,
                        recharged=[x for x in clients if x.kind == "recharge"],
                        paid_back=[x for x in clients if x.kind != "recharge"], given_back=given_back,
-                       claims_waiting=claims_waiting)
+                       claims_waiting=claims_waiting, cash_banked=cash_banked, returned=returned)
         if compare is not None:
             p_start, p_end, p_label = compare
             result.previous = self.money(p_start, p_end, direction=direction, company_ids=company_ids,
@@ -824,6 +901,24 @@ class Ledger:
             out.append((x, self.svc.orchestrator.missing.plan(rec)))
         return out
 
+    def missing_own(self, *, start: date | None = None, end: date | None = None,
+                    company_ids: Sequence[str] = ()) -> list[tuple[Line, str]]:
+        """Money in waiting for the business's own evidence: a member's fee without its receipt, cash paid into the
+        bank without its till reports (checklist X12, X5). Never asked of the customer; the plan says what to do."""
+        repo = self.repo
+        orchestrator = self.svc.orchestrator
+        out = []
+        for x in self.select(start=start, end=end, direction="in"):
+            rec = repo.transactions.get(x.id)
+            if rec is None or x.private or rec.document_ids or repo.items[rec.item_id].is_done:
+                continue
+            if company_ids and x.company_id not in company_ids:
+                continue
+            plan = orchestrator.members.plan(rec) or orchestrator.cash.plan(rec)
+            if plan:
+                out.append((x, plan))
+        return out
+
     def missing_reports(self, *, start: date | None = None, end: date | None = None,
                         company_ids: Sequence[str] = ()) -> list[tuple[Line, str]]:
         """Payouts still without a payout report that proves them, with the plan for each (§20, §22)."""
@@ -849,8 +944,12 @@ class Ledger:
             invoice = "history"
         elif x.kind == "payout":
             invoice = "matched" if x.status == "settled" else "missing"  # its payout report
-        elif x.kind in ("sales", "platform_fee"):
-            invoice = "matched"  # read from the payout report that matched the bank
+        elif x.kind in ("sales", "platform_fee", "till_cash"):
+            invoice = "matched"  # read from the payout report that matched the bank, or the till report
+        elif x.kind == "cash_deposit":
+            invoice = "matched" if x.has_document else "missing"  # the till reports it comes from
+        elif x.kind in RETURNED:
+            invoice = "not needed"  # the two bank lines explain each other
         elif x.kind == "deposit":
             invoice = "matched" if x.has_document else "missing"  # your invoice for the work will take it off
         elif not x.needs_document:
