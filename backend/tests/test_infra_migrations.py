@@ -24,6 +24,7 @@ from backoffice.domain.models import (  # noqa: E402
     SourceKind,
     TransactionKind,
 )
+from backoffice.reconciliation import MatchKind  # noqa: E402
 from backoffice_db import (  # noqa: E402
     MIGRATIONS_DIR,
     Migration,
@@ -58,11 +59,14 @@ def test_only_the_embeddings_migration_needs_pgvector() -> None:
 
 
 def _domain_values(name: str) -> set[str]:
-    match = re.search(
-        rf"CREATE DOMAIN {name} AS text CHECK \(VALUE IN \((?P<body>.*?)\)\);", ALL_SQL, re.S
-    )
-    assert match, f"domain {name} not found"
-    return set(re.findall(r"'([a-z_]+)'", match.group("body")))
+    """The values a domain allows after every migration: its CREATE DOMAIN, or the constraint a
+    later migration replaced it with (ALTER DOMAIN ... ADD CONSTRAINT ... CHECK), the last one winning."""
+    found = list(re.finditer(
+        rf"(?:CREATE DOMAIN {name} AS text|ALTER DOMAIN {name} ADD CONSTRAINT \w+)\s+CHECK \(VALUE IN "
+        rf"\((?P<body>.*?)\)\);", ALL_SQL, re.S,
+    ))
+    assert found, f"domain {name} not found"
+    return set(re.findall(r"'([a-z_]+)'", found[-1].group("body")))
 
 
 @pytest.mark.parametrize(
@@ -76,6 +80,7 @@ def _domain_values(name: str) -> set[str]:
         ("transaction_kind", TransactionKind),
         ("obligation_kind", ObligationKind),
         ("item_stage", Stage),
+        ("match_kind", MatchKind),
     ],
 )
 def test_sql_enumerations_mirror_the_domain_model(domain: str, enum: type[Enum]) -> None:

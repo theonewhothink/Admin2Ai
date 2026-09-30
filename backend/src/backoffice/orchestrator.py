@@ -18,6 +18,9 @@ Pipeline for one piece of evidence::
     Fraud          hard stops: changed IBAN, recipient mismatch, ... (§26)
     Entity         which company (§51), taught rules (§38)
     Reconciliation expected evidence (§21), then transaction <-> document matching (§20)
+    Settlement     payouts from card terminals and payment / sales platforms: the provider's payout
+                   report is read (CSV / JSON), must add up to the cent, and must equal the bank payout;
+                   then gross sales, fees and refunds are known and the payout closes (§20, §21)
     Obligation     tax letters become obligations; payments prove them (§24)
     Missing        a plan for every payment still without its document; supplier chasing (§22)
     Accountant     routine accountant questions answered from evidence (§28)
@@ -142,11 +145,28 @@ from backoffice.missing import ChaseFacts, ChaseMessage, activity_line, compose_
 from backoffice.policy import ActionContext, ActionKind, Approval, Decision, TenantPolicy, authorize
 from backoffice.policy.actions import Requirement
 from backoffice.reconciliation import (
+    EvidenceExpectation,
     ExpectationDecision,
     ExpectedEvidenceEngine,
     Match,
+    MatchKind,
+    PayoutProvider,
     SupplierResolver,
+    compatible_providers,
+    payout_provider,
+    provider_named,
     reconcile,
+)
+from backoffice.settlements import (
+    PayoutCandidate,
+    PayoutDecision,
+    PayoutOutcome,
+    SettlementReport,
+    SettlementReportError,
+    likely_payouts,
+    match_payouts,
+    parse_settlement_reports,
+    provider_label,
 )
 from backoffice.verification import DocumentAssessment, assess_document, currency_mark, lineage
 from backoffice.verification._display import field_label, join, method_label, show_many
@@ -174,6 +194,7 @@ __all__ = [
     "PortalDocument",
     "Repository",
     "RunReport",
+    "SettlementRecord",
     "TxRecord",
 ]
 
@@ -407,6 +428,9 @@ class DocumentRecord:
         doc = self.document
         kind = _DOC_LABELS.get(doc.doc_type, "Document")
         number = f" {doc.invoice_number}" if doc.invoice_number else ""
+        if doc.doc_type is DocumentType.PAYOUT_REPORT:  # "Payout report of 18 September": the date, not the provider's id
+            day = doc.issue_date
+            number = f" of {day.day} {_MONTH_NAMES[day.month - 1]}" if day else ""
         amount = f" · {format_money(doc.gross_amount, doc.currency)}" if doc.gross_amount is not None else ""
         return f"{kind}{number}{amount}"
 
@@ -491,6 +515,30 @@ class ObligationRecord:
     satisfied_by: tuple[str, ...] = ()
 
 
+@dataclass
+class SettlementRecord:
+    """A payout report (a provider's settlement statement) and what it proves (§20, §21).
+
+    ``status``: ``waiting`` (for its payout in the bank), ``settled`` (the bank payout
+    ``transaction_id`` matched it to the cent), ``does_not_add_up`` (its own figures
+    disagree: a conflict question), ``conflict`` (it disagrees with the bank payout:
+    a question), ``set_aside`` (the owner is getting a corrected one) or ``replaced``
+    (a corrected report for the same payout settled it).
+    """
+
+    document_id: str
+    report: SettlementReport
+    status: str = "waiting"
+    transaction_id: str | None = None  # the bank payout it settled, or is (probably) about
+    headline: str = ""
+    problem: str = ""  # "does_not_add_up" | "bank_differs": why it cannot prove its payout
+    commission_document_ids: list[str] = field(default_factory=list)  # the provider's invoices for these fees
+
+    @property
+    def settled(self) -> bool:
+        return self.status == "settled"
+
+
 @dataclass(frozen=True)
 class ChaseRecord:
     tx_id: str
@@ -556,6 +604,7 @@ _DOC_LABELS = {
     DocumentType.TAX_NOTICE: "Tax notice",
     DocumentType.STATEMENT: "Statement",
     DocumentType.CONTRACT: "Contract",
+    DocumentType.PAYOUT_REPORT: "Payout report",
 }
 
 
@@ -588,6 +637,7 @@ class Repository:
         self.closure_log: list[ClosureActivity] = []
         self.interactions: list[OwnerInteraction] = []
         self.obligations: dict[str, ObligationRecord] = {}
+        self.settlements: dict[str, SettlementRecord] = {}  # payout reports, keyed by their document id
         self.chases: dict[str, ChaseRecord] = {}
         self.accountant_questions: dict[str, AccountantQuestion] = {}
         self.rulebook = RuleBook()
@@ -1080,12 +1130,15 @@ class ReconciliationAgent(_Agent):
 
     def match(self) -> list[Match]:
         repo = self.repo
+        # Payouts and payout reports are paired by the settlement agent, never with an invoice.
         txs = [r for r in repo.transactions.values()
                if r.decision is not None and not r.document_ids and not r.private
                and not repo.items[r.item_id].is_done
+               and r.decision.expectation is not EvidenceExpectation.PAYOUT_REPORT
                and (r.decision.requires_document or r.decision.quality is not Quality.GREEN)]
         docs = [d for d in repo.documents.values()
                 if not d.on_hold and not d.matched_tx_ids and d.document.quality is not Quality.RED
+                and d.document.doc_type is not DocumentType.PAYOUT_REPORT
                 and not repo.items[d.item_id].is_done]
         if not txs or not docs:
             return []
@@ -1117,6 +1170,426 @@ class ReconciliationAgent(_Agent):
                 for t in m.transaction_ids:
                     repo.transactions[t].likely_document_ids = list(m.document_ids)
         return accepted
+
+
+_REPORT_FORMATS = frozenset({EvidenceFormat.CSV, EvidenceFormat.JSON})
+_COMMISSION_DOCS = frozenset({DocumentType.INVOICE, DocumentType.INVOICE_RECEIPT, DocumentType.SIMPLIFIED_INVOICE})
+_MONTH_NAMES = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+                "November", "December")
+
+
+class SettlementAgent(_Agent):
+    """Payouts from card terminals and payment / sales platforms (§20, §21).
+
+    A payout into the bank is the provider's net settlement, not customer revenue:
+    its evidence is the provider's payout report. This agent reads such reports
+    (structured CSV / JSON, never OCR), refuses any that do not add up to the
+    cent (one plain question), pairs each with its bank payout (same provider,
+    currency and reference or days; the net must equal the bank amount to the
+    cent) and matches the provider's commission invoice to the fees the payouts
+    kept. Only a payout proven this way closes, with the report as evidence (§3).
+    """
+
+    name = "settlement"
+
+    # ------------------------------------------------------------------ reading
+
+    def accept(self, evidence: Evidence, *, at: datetime, origin: str, report: IngestReport, hint: str = "") -> bool:
+        """Read ``evidence`` as a payout report. False when it is not one (the caller reads it as usual)."""
+        if evidence.format not in _REPORT_FORMATS:
+            return False
+        data = self.repo.registry.open(self.repo.tenant_id, evidence.id)
+        try:
+            found = parse_settlement_reports(data, source=evidence.id, filename=evidence.filename, hint=hint)
+        except SettlementReportError as exc:
+            report.stored_only = True
+            report.message = f"Got it. I stored it. It looks like a payout report, but {_lower_first(str(exc))}"
+            self.log("report_unreadable", subject_id=evidence.id, evidence_ids=[evidence.id],
+                     response={"reason": str(exc)})
+            return True
+        except Exception as exc:  # a reader bug must never lose the upload: it is read like any other file
+            self.log("report_read_failed", subject_id=evidence.id, evidence_ids=[evidence.id],
+                     response={"error": type(exc).__name__})
+            return False
+        if not found:
+            return False
+        for settlement in found:
+            self.record(settlement, evidence, at=at, origin=origin, report=report)
+        return True
+
+    def record(self, found: SettlementReport, evidence: Evidence, *, at: datetime, origin: str,
+               report: IngestReport) -> DocumentRecord:
+        repo = self.repo
+        same = self._same_payout(found)
+        if same is not None:  # the same payout again (another copy, or CSV and JSON): one record, more evidence
+            doc = repo.documents[same.document_id]
+            report.document_ids.append(doc.id)
+            if evidence.id in doc.evidence_ids:
+                report.message, report.already_known = "Got it. I already had this one.", True
+                return doc
+            doc.evidence_ids = [*doc.evidence_ids, evidence.id]
+            for name, obs in found.observations.items():
+                doc.observations.setdefault(name, []).extend(obs)
+            doc.document = doc.document.model_copy(update={"evidence_ids": doc.evidence_ids})
+            report.message, report.already_known = "Got it. I already had this payout report.", True
+            self.log("merge_report", subject_id=doc.id, evidence_ids=[evidence.id])
+            return doc
+        seed = f"{evidence.id}|{found.provider.key}|{found.payout_id}|{found.payout_date}|{found.currency}|{found.net}"
+        doc_id = "doc_" + hashlib.sha256(seed.encode()).hexdigest()[:16]
+        if doc_id in repo.documents:
+            report.document_ids.append(doc_id)
+            report.message, report.already_known = "Got it. I already had this one.", True
+            return repo.documents[doc_id]
+        quality = Quality.RED if not found.adds_up else (Quality.GREEN if found.net_stated else Quality.AMBER)
+        company = self._company_hint(found)
+        document = Document(
+            id=doc_id, tenant_id=repo.tenant_id, evidence_ids=[evidence.id], doc_type=DocumentType.PAYOUT_REPORT,
+            supplier_name=found.provider.title, invoice_number=found.payout_id,
+            payment_reference=found.payout_id, issue_date=found.payout_date, currency=found.currency,
+            gross_amount=found.net, quality=quality,
+        )
+        item = TrackedItem(id="item_" + doc_id, tenant_id=repo.tenant_id, subject_type="document", subject_id=doc_id)
+        repo.items[item.id] = item
+        record = DocumentRecord(
+            document=document, evidence_ids=[evidence.id], origin=origin, received_at=at, item_id=item.id,
+            observations={name: list(obs) for name, obs in found.observations.items()},
+            reasons=() if found.adds_up else (found.mismatch_sentence(),), checks=self._checks(found),
+        )
+        repo.documents[doc_id] = record
+        settlement = SettlementRecord(document_id=doc_id, report=found,
+                                      status="waiting" if found.adds_up else "does_not_add_up",
+                                      problem="" if found.adds_up else "does_not_add_up")
+        repo.settlements[doc_id] = settlement
+        self.o.advance(item, Stage.ACQUIRED, [evidence.id], agent="discovery", note="Payout report received.")
+        self.o.advance(item, Stage.UNDERSTOOD, [evidence.id], agent=self.name,
+                       note="Read the sales, fees, refunds and the amount paid out.")
+        self.log("read_report", subject_id=doc_id, evidence_ids=[evidence.id], parser=found.format,
+                 values={"provider": found.provider.key, "payout_id": found.payout_id,
+                         "payout_date": found.payout_date, "currency": found.currency,
+                         "gross_sales": found.gross_sales, "fees": found.fees, "refunds": found.refunds,
+                         "chargebacks": found.chargebacks, "adjustments": found.adjustments, "net": found.net,
+                         "lines": len(found.lines)},
+                 validations=[{"check": "adds_up", "ok": found.adds_up, "difference": found.difference,
+                               "rows_that_do_not_add_up": len(found.rows_that_do_not_add_up)}],
+                 response={"quality": quality.value})
+        label = found.provider.label
+        on = f" on {day_month(found.payout_date, repo.today())}" if found.payout_date else ""
+        self.o.activity(at, "collected", f"Collected the payout report from {label}: "
+                        f"{found.money(found.net)} paid out{on}.", company, amount=found.net,
+                        currency=found.currency, evidence_ids=[evidence.id])
+        report.document_ids.append(doc_id)
+        if not found.adds_up:
+            self.o.advance(item, Stage.CONFLICT, [evidence.id], agent=self.name, note=found.mismatch_sentence())
+            needs = self._ask(
+                record, found, company, at,
+                prompt=f"The payout report from {label} does not add up: {found.mismatch_sentence()} "
+                       "What should I do?",
+                why=(*found.breakdown(), "Until you answer, I won't count or close this payout."),
+                option=f"Set it aside. I'll get a corrected report from {label}.")
+            report.message = f"Got it. I need one answer from you: {needs.prompt}"
+        return record
+
+    def _same_payout(self, found: SettlementReport) -> SettlementRecord | None:
+        if not found.payout_id or not found.adds_up:
+            return None
+        return next((s for s in self.repo.settlements.values()
+                     if s.report.identity == found.identity and s.report.adds_up
+                     and s.status in ("waiting", "settled")), None)
+
+    def _company_hint(self, found: SettlementReport) -> str | None:
+        """Whose payout this is, before it is paired: the payouts that could be it, or the only company."""
+        repo = self.repo
+        companies = {r.company_id for r in repo.transactions.values()
+                     if r.decision is not None and r.decision.expectation is EvidenceExpectation.PAYOUT_REPORT
+                     and (p := payout_provider(r.tx)) is not None and compatible_providers(p, found.provider)}
+        if len(companies) == 1:
+            return companies.pop()
+        return next(iter(repo.companies)) if len(repo.companies) == 1 else None
+
+    def _checks(self, found: SettlementReport, bank: FieldObservation | None = None) -> dict[str, VerifiedField]:
+        """Each figure with the observations behind it (§18): GREEN when the report adds up."""
+        checks: dict[str, VerifiedField] = {}
+        amounts = {"gross_sales", "fees", "refunds", "chargebacks", "adjustments", "net_amount"}
+        for name, obs in found.observations.items():
+            observed = [*obs, *([bank] if bank is not None and name == "net_amount" else [])]
+            stated = next((o for o in observed if o.method is not ExtractionMethod.ARITHMETIC), observed[0])
+            if name in amounts and not found.adds_up:
+                quality, reasons = Quality.RED, [found.mismatch_sentence()]
+            elif name == "net_amount" and not found.net_stated and bank is None:
+                quality, reasons = Quality.AMBER, ["The report does not state the payout; the bank will confirm it."]
+            else:
+                quality, reasons = Quality.GREEN, []
+            checks[name] = VerifiedField(name=name, value=stated.value, quality=quality, observations=observed,
+                                         reasons=reasons)
+        return checks
+
+    def _ask(self, record: DocumentRecord, found: SettlementReport, company: str | None, at: datetime, *,
+             prompt: str, why: Sequence[str], option: str) -> NeedsYouRecord:
+        """One plain question about a payout report; nothing is counted or closed meanwhile (§19, §37)."""
+        repo = self.repo
+        company = company or record.document.entity_id or next(iter(repo.companies))
+        needs_id = _unique_id(repo.needs, f"nd_{found.provider.key}_payout")
+        needs = NeedsYouRecord(id=needs_id, kind="check", subject_type="document", subject_id=record.id,
+                               item_id=record.item_id, company_id=company, created_at=at,
+                               why=tuple(dict.fromkeys(why)), prompt=prompt,
+                               options=(CheckOption(id="neither", label=option),))
+        repo.needs[needs_id] = needs
+        self.log("ask_owner", subject_id=record.id, evidence_ids=record.evidence_ids,
+                 values={"prompt": prompt}, response={"needs_you": needs_id})
+        label = found.provider.label
+        if found.adds_up:
+            line = f"The payout report from {label} does not match what arrived in your bank. I asked you about it."
+        else:
+            line = f"The payout report from {label} does not add up. I asked you what to do."
+        self.o.activity(at, "checked", line, company, evidence_ids=record.evidence_ids)
+        return needs
+
+    # ------------------------------------------------------------------ pairing (every run)
+
+    def settle(self, now: datetime) -> int:
+        """Pair waiting reports with bank payouts; match commission invoices to the fees kept."""
+        repo = self.repo
+        waiting = {doc_id: s.report for doc_id, s in sorted(repo.settlements.items())
+                   if s.status == "waiting" and not repo.items[repo.documents[doc_id].item_id].is_done}
+        payouts = []
+        for rec in sorted(repo.transactions.values(), key=lambda r: r.id):
+            if rec.private or rec.document_ids or rec.decision is None or repo.items[rec.item_id].is_done:
+                continue
+            if rec.decision.expectation is not EvidenceExpectation.PAYOUT_REPORT:
+                continue
+            provider = payout_provider(rec.tx) or provider_named(rec.tx.counterparty, rec.tx.description)
+            if provider is not None:
+                payouts.append(PayoutCandidate(rec.tx, provider))
+        moved = 0
+        if waiting and payouts:
+            candidates = {c.transaction.id: c for c in payouts}
+            for decision in match_payouts(payouts, waiting):
+                moved += self._apply(decision, candidates[decision.transaction_id], now)
+        self._link_unusable(payouts)
+        return moved + self._commissions(now)
+
+    def _link_unusable(self, payouts: Sequence[PayoutCandidate]) -> None:
+        """A report that does not add up names its payout: that payout says so instead of asking for a report."""
+        repo = self.repo
+        for doc_id, s in sorted(repo.settlements.items()):
+            if s.problem != "does_not_add_up" or s.transaction_id or s.status not in ("does_not_add_up", "set_aside"):
+                continue
+            found = likely_payouts(s.report, [c for c in payouts if not repo.transactions[c.transaction.id].document_ids])
+            if len(found) != 1:
+                continue
+            rec, doc = repo.transactions[found[0]], repo.documents[doc_id]
+            s.transaction_id = rec.id
+            rec.likely_document_ids = sorted({*rec.likely_document_ids, doc_id})
+            if doc.document.entity_id is None:
+                doc.document = doc.document.model_copy(update={"entity_id": rec.company_id})
+            self.log("link_report", subject_id=doc_id, evidence_ids=[rec.evidence_id, *doc.evidence_ids],
+                     values={"transaction": rec.id}, response={"quality": Quality.RED.value})
+
+    def _apply(self, decision: PayoutDecision, candidate: PayoutCandidate, now: datetime) -> int:
+        repo = self.repo
+        rec = repo.transactions[decision.transaction_id]
+        doc = repo.documents[decision.report_id]
+        settlement = repo.settlements[decision.report_id]
+        found = settlement.report
+        label = provider_label(found, candidate)
+        evidence = [rec.evidence_id, *doc.evidence_ids]
+        company = rec.company_id
+        if decision.outcome is PayoutOutcome.AMBIGUOUS:  # never a silent pick: every candidate stays open
+            reports = sorted({decision.report_id, *(r for r, _ in decision.alternatives)})
+            for tx_id in sorted({rec.id, *(t for _, t in decision.alternatives)}):
+                other = repo.transactions[tx_id]
+                if other.likely_document_ids != reports:
+                    other.likely_document_ids = reports
+                    self.log("payout_ambiguous", subject_id=tx_id, evidence_ids=[other.evidence_id],
+                             validations=list(decision.why), values={"reports": reports},
+                             response={"quality": decision.quality.value})
+            return 0
+        if doc.document.entity_id is None:
+            doc.document = doc.document.model_copy(update={"entity_id": company})
+        settlement.transaction_id = rec.id
+        settlement.headline = decision.headline
+        if decision.outcome is PayoutOutcome.AMOUNT_DIFFERS:
+            settlement.status, settlement.problem = "conflict", "bank_differs"
+            rec.likely_document_ids = [doc.id]
+            self.log("payout_differs", subject_id=doc.id, evidence_ids=evidence, validations=list(decision.why),
+                     values={"transaction": rec.id, "report_net": found.net, "bank": rec.tx.amount},
+                     response={"quality": decision.quality.value, "kind": decision.kind.value})
+            self.o.advance(repo.items[doc.item_id], Stage.CONFLICT, evidence, agent=self.name,
+                           note=decision.headline)
+            self._ask(doc, found, company, now, prompt=f"{decision.headline} What should I do?", why=decision.why,
+                      option=f"Set it aside. I'll ask {label} about the difference.")
+            return 1
+        # Settled: the report adds up and the bank confirms its net, to the cent (§3).
+        bank = FieldObservation(value=rec.tx.amount, source=rec.evidence_id, method=ExtractionMethod.BANK,
+                                confidence=0.99, location="bank: the payout as booked")
+        doc.observations.setdefault("net_amount", []).append(bank)
+        doc.checks = self._checks(found, bank)
+        doc.document = doc.document.model_copy(update={"quality": Quality.GREEN})
+        doc.matched_tx_ids = [rec.id]
+        rec.document_ids = [doc.id]
+        rec.match_why = decision.why
+        rec.match_headline = decision.headline
+        rec.likely_document_ids = []
+        settlement.status = "settled"
+        self.log("settle_payout", subject_id=doc.id, evidence_ids=evidence, validations=list(decision.why),
+                 values={"transaction": rec.id, "gross_sales": found.gross_sales, "fees": found.fees,
+                         "refunds": found.refunds, "chargebacks": found.chargebacks,
+                         "adjustments": found.adjustments, "net": found.net, "bank": rec.tx.amount},
+                 response={"quality": decision.quality.value, "kind": MatchKind.PAYOUT_SETTLEMENT.value,
+                           "by_reference": decision.by_reference})
+        kept = [f"{found.money(found.fees)} in {found.provider.fee_word}"] if found.fees else []
+        if found.refunds:
+            kept.append(f"{found.money(found.refunds)} refunded")
+        if found.chargebacks:
+            kept.append(f"{found.money(found.chargebacks)} in disputed payments")
+        tail = f", {_join_and(kept)}" if kept else ""
+        self.o.activity(now, "checked", f"Matched the {found.money(rec.tx.amount)} payout from {label} to its "
+                        f"report: {found.money(found.gross_sales)} in sales{tail}.", company,
+                        amount=rec.tx.amount, currency=found.currency, evidence_ids=evidence)
+        self._retire_replaced(settlement, rec, now)
+        return 1
+
+    def _retire_replaced(self, settled: SettlementRecord, rec: TxRecord, now: datetime) -> None:
+        """Reports a corrected one replaced: dismissed with the settled report as evidence."""
+        repo = self.repo
+        key = (settled.report.payout_id or "").strip().upper()
+        doc = repo.documents[settled.document_id]
+        for other in sorted(repo.settlements.values(), key=lambda s: s.document_id):
+            if other is settled or other.status not in ("does_not_add_up", "conflict", "set_aside"):
+                continue
+            same_id = bool(key) and (other.report.payout_id or "").strip().upper() == key and \
+                compatible_providers(other.report.provider, settled.report.provider)
+            if not same_id and other.transaction_id != rec.id:
+                continue
+            other.status = "replaced"
+            old = repo.documents[other.document_id]
+            self.o.advance(repo.items[old.item_id], Stage.NOT_REQUIRED, [*doc.evidence_ids, rec.evidence_id],
+                           agent=self.name, quality=Quality.GREEN, note="Replaced by a corrected payout report.")
+            for needs in repo.needs.values():
+                if needs.subject_id == old.id and needs.status == "open":
+                    needs.status, needs.resolution = "resolved", "evidence"
+            self.log("replace_report", subject_id=old.id, evidence_ids=[*doc.evidence_ids, rec.evidence_id])
+
+    def _commissions(self, now: datetime) -> int:
+        """The provider's commission invoice, matched to the fees its payouts kept (never to a bank payment)."""
+        repo = self.repo
+        settled = [s for s in sorted(repo.settlements.values(), key=lambda s: s.document_id) if s.settled]
+        if not settled:
+            return 0
+        moved = 0
+        for s in settled:  # an invoice matched earlier that has since been verified closes now
+            for doc_id in s.commission_document_ids:
+                doc = repo.documents[doc_id]
+                if doc.document.quality is Quality.GREEN and not repo.items[doc.item_id].is_done:
+                    moved += self._close_commission(doc, [s])
+        for doc in sorted(repo.documents.values(), key=lambda d: d.id):
+            d = doc.document
+            if d.doc_type not in _COMMISSION_DOCS or doc.on_hold or doc.matched_tx_ids or d.gross_amount is None:
+                continue
+            if d.quality is Quality.RED or repo.items[doc.item_id].is_done:
+                continue
+            supplier = repo.suppliers.get(doc.supplier_id or "")
+            provider = provider_named(d.supplier_name, *(([supplier.name, *supplier.aliases]) if supplier else ()))
+            if provider is None:
+                continue
+            chosen = self._fees_for(d, provider, settled)
+            if chosen is None:
+                continue
+            moved += self._attach_commission(doc, chosen, now)
+        return moved
+
+    def _fees_for(self, d: Document, provider: PayoutProvider,
+                  settled: Sequence[SettlementRecord]) -> list[SettlementRecord] | None:
+        """One payout whose fees are the invoice total, else one month of payouts whose fees add up to it."""
+        same = [s for s in settled if compatible_providers(s.report.provider, provider) and s.report.fees > 0
+                and s.report.currency == (d.currency or "EUR").upper() and not s.commission_document_ids]
+        exact = [s for s in same if s.report.fees == d.gross_amount]
+        if len(exact) == 1:
+            return exact
+        if exact or d.issue_date is None:
+            return None  # two payouts fit equally well: never a silent pick
+        issued = d.issue_date
+        before = (issued.year - (issued.month == 1), 12 if issued.month == 1 else issued.month - 1)
+        fits = []
+        for year, month in (before, (issued.year, issued.month)):
+            group = [s for s in same if s.report.payout_date is not None
+                     and (s.report.payout_date.year, s.report.payout_date.month) == (year, month)]
+            if len(group) > 1 and sum((s.report.fees for s in group), _ZERO) == d.gross_amount:
+                fits.append(group)
+        return fits[0] if len(fits) == 1 else None
+
+    def _attach_commission(self, doc: DocumentRecord, chosen: list[SettlementRecord], now: datetime) -> int:
+        repo = self.repo
+        reports = [repo.documents[s.document_id] for s in chosen]
+        report_evidence = [e for r in reports for e in r.evidence_ids]
+        fees = sum((s.report.fees for s in chosen), _ZERO)
+        provider = chosen[0].report.provider
+        where = ("payout report: the " + provider.fee_word + " taken from the payout" if len(chosen) == 1 else
+                 f"payout reports: the {provider.fee_word} taken from {len(chosen)} payouts")
+        doc.observations.setdefault("gross_amount", []).append(FieldObservation(
+            value=fees, source=report_evidence[0], method=ExtractionMethod.API, confidence=0.95, location=where))
+        assessment = self.o.verification.assess(doc.observations, doc.document.doc_type, subject_id=doc.id,
+                                                evidence_ids=[*doc.evidence_ids, *report_evidence],
+                                                owner=doc.owner_values)
+        self.o._apply_assessment(doc, assessment)
+        tx_ids = [s.transaction_id for s in chosen if s.transaction_id]
+        doc.matched_tx_ids = list(tx_ids)
+        company = repo.transactions[tx_ids[0]].company_id if tx_ids else None
+        if doc.document.entity_id is None and company:
+            doc.document = doc.document.model_copy(update={"entity_id": company})
+        for s in chosen:
+            s.commission_document_ids.append(doc.id)
+        self.log("match_commission_invoice", subject_id=doc.id, evidence_ids=[*doc.evidence_ids, *report_evidence],
+                 values={"payouts": tx_ids, "fees": fees}, response={"quality": doc.document.quality.value})
+        who = provider.title
+        noun = "payout" if len(chosen) == 1 else "payouts"
+        self.o.activity(now, "checked", f"Matched the {who} invoice to the {provider.fee_word} taken from your "
+                        f"{noun}. Nothing to pay: it was already kept from the {noun}.", company,
+                        amount=fees, currency=doc.document.currency, evidence_ids=[*doc.evidence_ids, *report_evidence])
+        return 1 + (self._close_commission(doc, chosen) if doc.document.quality is Quality.GREEN else 0)
+
+    def _close_commission(self, doc: DocumentRecord, chosen: Sequence[SettlementRecord]) -> int:
+        repo = self.repo
+        evidence = [*doc.evidence_ids]
+        for s in chosen:
+            evidence += repo.documents[s.document_id].evidence_ids
+            if s.transaction_id:
+                evidence.append(repo.transactions[s.transaction_id].evidence_id)
+        word = chosen[0].report.provider.fee_word
+        return self.o.closure._close(repo.items[doc.item_id], list(dict.fromkeys(evidence)),
+                                     note=f"Its total matches the {word} taken from the payouts.")
+
+    # ------------------------------------------------------------------ plain words
+
+    def plan(self, rec: TxRecord, amount: str, when: str) -> str:
+        """The next step for a payout still without its report (§22), in plain words."""
+        mine = [s for s in self.repo.settlements.values() if s.transaction_id == rec.id]
+        provider = payout_provider(rec.tx) or provider_named(rec.tx.counterparty, rec.tx.description)
+        label = provider_label(mine[0].report) if mine else (provider.label if provider else "the provider")
+        for s in mine:
+            if s.status not in ("conflict", "does_not_add_up", "set_aside"):
+                continue
+            problem = ("came with a payout report that does not add up" if s.problem == "does_not_add_up"
+                       else "does not match its payout report")
+            next_step = ("I'm waiting for a corrected one." if s.status == "set_aside" else
+                         "I asked you what to do." if s.problem == "does_not_add_up" else "I asked you about it.")
+            return f"The {amount} payout from {label} on {when} {problem}. {next_step}"
+        if rec.likely_document_ids:
+            return (f"The {amount} payout from {label} on {when} and its payout report could be paired more than "
+                    "one way. I won't pair them on a guess.")
+        return (f"The {amount} payout from {label} on {when} needs its payout report, so I can count the sales, "
+                f"{provider.fee_word if provider else 'fees'} and refunds behind it. Upload the report here or "
+                "forward the email it came in.")
+
+
+def _lower_first(text: str) -> str:
+    return text[:1].lower() + text[1:] if text else text
+
+
+def _join_and(items: Sequence[str]) -> str:
+    if len(items) <= 1:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " and " + items[-1]
 
 
 class ObligationAgent(_Agent):
@@ -1185,6 +1658,8 @@ class MissingEvidenceAgent(_Agent):
         amount = format_money(abs(rec.tx.amount), rec.tx.currency)
         who = self.o.merchant_name(rec.tx)
         when = day_month(rec.tx.booked_on, self.repo.today())
+        if rec.decision is not None and rec.decision.expectation is EvidenceExpectation.PAYOUT_REPORT:
+            return self.o.settlement.plan(rec, amount, when)
         chase = self.repo.chases.get(rec.id)
         if chase is not None:
             return (f"I asked {who} for the invoice for the {amount} payment on {when}. "
@@ -1201,8 +1676,9 @@ class MissingEvidenceAgent(_Agent):
         sent: list[str] = []
         today = now.astimezone(TZ).date()
         for rec in sorted(self.repo.transactions.values(), key=lambda r: (r.tx.booked_on, r.id)):
-            if rec.id in self.repo.chases or rec.document_ids or rec.private or rec.tx.amount >= 0:
-                continue
+            payout = rec.decision is not None and rec.decision.expectation is EvidenceExpectation.PAYOUT_REPORT
+            if rec.id in self.repo.chases or rec.document_ids or rec.private or (rec.tx.amount >= 0 and not payout):
+                continue  # money in is not chased; a payout still counts as missing its report (§22)
             item = self.repo.items[rec.item_id]
             if item.is_done or item.stage in (Stage.NEEDS_OWNER, Stage.CONFLICT):
                 continue
@@ -1449,6 +1925,15 @@ class AuditorAgent(_Agent):
         docs = [repo.documents.get(d) for d in rec.document_ids]
         if any(d is None or d.on_hold or d.document.quality is not Quality.GREEN for d in docs):
             return "The document for this payment no longer checks out."
+        settlement = next((s for s in repo.settlements.values() if s.document_id in rec.document_ids), None)
+        if settlement is not None:
+            report = settlement.report
+            if not settlement.settled or settlement.transaction_id != rec.id:
+                return "The payout has lost its payout report."
+            if not report.adds_up:
+                return "The payout report no longer adds up."
+            if report.net != rec.tx.amount or report.currency != rec.tx.currency.strip().upper():
+                return "The payout report no longer matches what arrived in the bank."
         total = sum((d.document.gross_amount or _ZERO) for d in docs if d is not None)
         if len(docs) == 1 and total != abs(rec.tx.amount):
             return "The amounts of the payment and its document no longer agree."
@@ -1474,6 +1959,7 @@ class Orchestrator:
         self.fraud = FraudAgent(self)
         self.entity = EntityAgent(self)
         self.reconciliation = ReconciliationAgent(self)
+        self.settlement = SettlementAgent(self)
         self.obligations = ObligationAgent(self)
         self.missing = MissingEvidenceAgent(self)
         self.accountant = AccountantAgent(self)
@@ -1601,6 +2087,8 @@ class Orchestrator:
         return report
 
     def _process_evidence(self, evidence: Evidence, *, at: datetime, origin: str, report: IngestReport) -> None:
+        if self.settlement.accept(evidence, at=at, origin=origin, report=report):
+            return  # a payout report (CSV / JSON): read by the settlement agent
         parts = self._parts_for(evidence.id)
         if not parts:
             report.stored_only = True
@@ -1706,7 +2194,10 @@ class Orchestrator:
             return
         body_part = _Part(message_id, "email_body", text=parsed.text_body) if parsed.text_body.strip() else None
         groups: list[list[_Part]] = []
+        hint = f"{parsed.sender_domain or ''} {parsed.subject}"  # names the provider when the report does not
         for f in result.files:
+            if self.settlement.accept(f.evidence, at=at, origin=origin, report=report, hint=hint):
+                continue
             file_parts = self._parts_for(f.evidence.id)
             if file_parts:
                 groups.append(file_parts)
@@ -1969,6 +2460,7 @@ class Orchestrator:
             report.passes += 1
             moved = self._entities(now)
             self.reconciliation.classify([r for r in self.repo.transactions.values() if r.decision is None])
+            moved += self.settlement.settle(now)  # payouts first: their reports and commission invoices
             matches = self.reconciliation.match()
             for m in matches:
                 self._reverify_with_bank(m)
@@ -2214,6 +2706,17 @@ class Orchestrator:
         needs.status = "answered"
         needs.answer = option.id
         needs.answered_at = now
+        settlement = repo.settlements.get(record.id)
+        if settlement is not None and not option.values:
+            # A payout report that does not add up, or does not match the bank: set aside, never used.
+            settlement.status = "set_aside"
+            label = settlement.report.provider.label
+            self.settlement.log("set_aside", subject_id=record.id, evidence_ids=[*record.evidence_ids, answer_ev],
+                                actor=OWNER_ACTOR, response={"reason": "the owner is getting a corrected report"})
+            self.activity(now, "answered", f"You set the payout report from {label} aside until a corrected one "
+                          "arrives.", needs.company_id, evidence_ids=[answer_ev])
+            return AnswerOutcome(ok=True, message=f"Done. I set it aside. When {label} sends a corrected report, "
+                                                  "I will read it.")
         if not option.values:
             self.verification.log("set_aside", subject_id=record.id, evidence_ids=[*record.evidence_ids, answer_ev],
                                   actor=OWNER_ACTOR, response={"reason": "neither value is right"})

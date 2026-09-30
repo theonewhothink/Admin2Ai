@@ -53,7 +53,7 @@ from backoffice.domain.models import (
 
 from ._subset import find_subsets
 from ._text import currency_code, format_money, is_currency_code, scale_to_int, squash
-from .bank import BankMetadata, is_card_settlement
+from .bank import BankMetadata, is_card_repayment
 from .expected import EvidenceExpectation, ExpectationDecision
 from .fx import FxRateSource, divide
 from .history import PaymentHistory
@@ -94,11 +94,22 @@ _ZERO = Decimal(0)
 
 
 class MatchKind(str, Enum):
+    """The shape of a match.
+
+    ``CARD_SETTLEMENT`` is a credit-card *repayment* (money out paying off the
+    business's own card) matched to the card statement; the value is kept for
+    stored audit records. ``PAYOUT_SETTLEMENT`` is the opposite direction: a
+    card terminal or payment / sales platform paying the business its sales,
+    net of fees and refunds, matched to the provider's payout report
+    (:mod:`backoffice.settlements`). The two are never interchangeable.
+    """
+
     ONE_TO_ONE = "one_to_one"
     ONE_TO_MANY = "one_payment_many_documents"
     MANY_TO_ONE = "many_payments_one_document"
     PARTIAL = "partial_payment"
-    CARD_SETTLEMENT = "card_settlement"
+    CARD_SETTLEMENT = "card_settlement"  # paying off a credit card (money out)
+    PAYOUT_SETTLEMENT = "payout_settlement"  # a provider paying out sales (money in)
 
 
 class MatchTag(str, Enum):
@@ -355,7 +366,10 @@ class _Run:
         self.docs = {d.id: d for d in sorted(documents, key=_doc_key)}
         self.doc_order = {doc_id: i for i, doc_id in enumerate(self.docs)}
         self.open_txs: dict[str, Transaction] = {}
-        self.settlements: dict[str, Transaction] = {}
+        self.settlements: dict[str, Transaction] = {}  # card repayments (money out)
+        # Sales payouts (money in, net of fees): only their payout report proves them
+        # (backoffice.settlements). They stay unmatched here, never paired with an invoice.
+        self.payouts: dict[str, Transaction] = {}
         self.full: dict[str, Decimal] = {}
         self.remaining: dict[str, Decimal] = {}
         self.touched: set[str] = set()
@@ -397,7 +411,10 @@ class _Run:
                 return
             # A wording-based guess (AMBER, §57) must not hide real evidence.
             self.likely_no_document[tx.id] = decision.reason
-        if is_card_settlement(tx, self.ctx.metadata(tx)) or (
+        if decision is not None and decision.expectation is EvidenceExpectation.PAYOUT_REPORT:
+            self.payouts[tx.id] = tx
+            return
+        if is_card_repayment(tx, self.ctx.metadata(tx)) or (
             decision is not None
             and decision.expectation is EvidenceExpectation.CARD_STATEMENT
         ):
@@ -406,6 +423,10 @@ class _Run:
             self.open_txs[tx.id] = tx
 
     def _load_document(self, doc: Document, balance: Decimal | None) -> None:
+        if doc.doc_type is DocumentType.PAYOUT_REPORT:
+            # Proves a payout (money in, net of fees), matched by backoffice.settlements.
+            self.skipped[doc.id] = "payout report"
+            return
         if not is_currency_code(doc.currency):
             self.skipped[doc.id] = "unknown currency"
             return
@@ -1003,7 +1024,8 @@ class _Run:
 
     def _result(self) -> ReconciliationResult:
         left = sorted(
-            [*self.open_txs, *self.settlements], key=self.tx_order.__getitem__
+            [*self.open_txs, *self.settlements, *self.payouts],
+            key=self.tx_order.__getitem__,
         )
         likely = tuple(t for t in left if t in self.likely_no_document)
         left = [t for t in left if t not in self.likely_no_document]

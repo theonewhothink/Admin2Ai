@@ -440,6 +440,7 @@ def test_reasons_are_plain_language() -> None:
         tx("-845", "LIQUIDACAO CARTAO"),
         tx("0", "X"),
         tx("-1", "PAYPAL *X", TransactionKind.CARD, card_last4="1"),
+        tx("951.00", "STRIPE PAYMENTS EUROPE", TransactionKind.TRANSFER_IN),  # a payout: its payout report
     ]
     seen = set()
     for decision in engine().classify_all(samples).values():

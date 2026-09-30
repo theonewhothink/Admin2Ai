@@ -214,6 +214,9 @@ class DocumentType(str, Enum):
     PAYROLL = "payroll"
     LOAN_STATEMENT = "loan_statement"
     CONTRACT = "contract"
+    # A card terminal's or payment/sales platform's settlement statement: the sales, fees,
+    # refunds and disputes behind one payout into the bank (backoffice.settlements).
+    PAYOUT_REPORT = "payout_report"
     OTHER = "other"
 
 

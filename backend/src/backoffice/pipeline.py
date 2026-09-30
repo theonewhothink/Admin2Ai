@@ -57,6 +57,8 @@ AGENTS: dict[str, tuple[str, str]] = {
     "verification": ("Checker", "Checks the numbers against each other and a second source."),
     "entity": ("Company assignment", "Works out which of your companies each item belongs to."),
     "reconciliation": ("Matcher", "Pairs payments with invoices."),
+    "settlement": ("Payout checker", "Checks payouts from card terminals and sales platforms against their payout "
+                                     "reports: sales, fees and refunds."),
     "closure": ("Closure", "Checks, matches and closes items, only with evidence."),
     "missing": ("Invoice chaser", "Finds missing invoices, and asks the supplier when they can't be found."),
     "obligation": ("Deadlines", "Tracks tax payments and other things with a due date."),
