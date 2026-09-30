@@ -146,7 +146,7 @@ class Principal:
 ACCOUNTANT_POSTS = frozenset({"/api/ask", "/api/accountant/rules", "/api/documents/export", "/api/auth/logout",
                               "/api/devices", "/api/devices/remove", "/api/accountant/invitations"})
 _ACCOUNTANT_CLIENT_POST = re.compile(r"^/api/accountant/clients/[^/]+/rules$")
-OWNER_ONLY_READS = frozenset({"/api/account/export", "/api/documents/access-log"})
+OWNER_ONLY_READS = frozenset({"/api/account/export", "/api/documents/access-log", "/api/billing"})
 # Everything an employee may call (backoffice.staff): who they are, signing out, their phone for
 # notifications, their own open card payments and their receipt uploads. Nothing else.
 EMPLOYEE_ROUTES = frozenset({("GET", "/api/auth/me"), ("POST", "/api/auth/logout"), ("POST", "/api/devices"),

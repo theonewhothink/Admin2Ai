@@ -553,7 +553,7 @@ def test_a_manager_cannot_read_another_outlet_company_or_setting_through_any_get
              "/api/accountant/invitations", "/api/audit", "/api/pipeline", "/api/internal/overview",
              "/api/internal/operations", "/api/internal/readiness", f"/api/accountant/clients/{tenant}~{a}",
              "/api/employees", "/api/expense-claims", "/api/employee/card-payments", "/api/documents/access-log",
-             "/api/manager/outlets", "/api/account/export", "/healthz"]
+             "/api/manager/outlets", "/api/account/export", "/healthz", "/api/billing"]
     for p in paths:
         res = h.client.get(p, headers=R)
         assert res.status_code in (200, 403, 404), (p, res.status_code, res.text)

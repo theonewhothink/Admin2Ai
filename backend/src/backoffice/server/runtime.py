@@ -36,6 +36,8 @@ request); with ``strict_reads`` (tests) it raises :class:`ReadChangedState`.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
 import re
 import threading
@@ -46,6 +48,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
+from backoffice.billing import HOLDABLE_PATHS
 from backoffice.domain.models import deterministic
 from backoffice.orchestrator import TZ
 from backoffice.service import BackOfficeService, ServiceError
@@ -273,6 +276,7 @@ class TenantManager:
         notifier: Any = None,
         reader: Any = None,
         link_fetcher: Any = None,
+        billing: Any = None,
         cache_size: int = 200,
         strict_reads: bool = False,
     ) -> None:
@@ -290,6 +294,9 @@ class TenantManager:
         # The live link fetcher (backoffice.evidence.links.LinkFetcher). Like the reader it only ever runs
         # before an event is recorded (server/links.py); applies follow links through the recorded results.
         self.link_fetcher = link_fetcher
+        # The payment provider (server/billing.py), or None. With one, new businesses are held to their plan
+        # (backoffice.billing): evidence over a limit, after the grace period, waits instead of being read.
+        self.billing = billing
         self.cache_size = cache_size
         # Reads must never change a tenant. In tests a read that does raises; in production it is
         # logged and the tenant is rebuilt from its log on the next request.
@@ -564,7 +571,10 @@ class TenantManager:
         rt = TenantRuntime(tenant_id)
         events: list[Event] = []
         env = Env(live=True, vault=self.vault)
-        for kind, data in (("tenant.created", {"owner": {"name": owner_name, "email": owner_email}}),
+        created: dict[str, Any] = {"owner": {"name": owner_name, "email": owner_email}}
+        if self.billing is not None:  # recorded only with payments: older logs replay unchanged
+            created["billing"] = {"enforced": True}
+        for kind, data in (("tenant.created", created),
                            ("company.added", {"name": company_name, "taxId": tax_id or "", "legalName": ""})):
             at = self._event_time(rt)
             if rt.svc is not None:
@@ -594,8 +604,11 @@ class TenantManager:
             return
         if self.now().date() <= svc.repo.clock.today():
             return
+        env = Env(live=True, vault=self.vault, mailer=self.mailer)
+        # Evidence that waited for the plan is read today (a new month): read and fetched before the event.
+        data = self._release_data(rt, env) if svc.release_due(self.now().date()) else {}
         try:
-            self.record(rt, "tick", {}, "system", Env(live=True, vault=self.vault, mailer=self.mailer))
+            self.record(rt, "tick", data, "system", env)
         except StoreUnavailable:
             log.warning("tick_skipped", extra={"tenant": rt.tenant_id})
 
@@ -630,10 +643,13 @@ class TenantManager:
                                       viewer=viewer)
 
     def read(self, tenant_id: str, reader: Callable[[BackOfficeService], Any], *, what: str = "read",
-             viewer: tuple[str, str] | None = None) -> Any:
+             viewer: tuple[str, str] | None = None, today: bool = False) -> Any:
         """Run ``reader`` on the tenant's service (no change allowed) as of now. A sensitive document's original
-        it reads is recorded with ``viewer`` (email, role), as an event of its own (§52)."""
+        it reads is recorded with ``viewer`` (email, role), as an event of its own (§52). ``today``: the day's
+        time-driven work runs first, as for the pages the owner opens (:meth:`view`)."""
         with self.open(tenant_id) as rt:
+            if today:
+                self.tick_if_due(rt)
             return self._guarded_read(rt, what, reader, viewer=viewer)
 
     def read_many(self, tenant_ids: Sequence[str], reader: Callable[[list[BackOfficeService]], Any], *,
@@ -725,6 +741,12 @@ class TenantManager:
                                     "env": self._facts(authorize=authorize is not None)}
             if manager is not None:  # recorded only for a manager: older events replay unchanged
                 data["manager"] = {"costCenters": sorted(manager), "email": manager_email or ""}
+            if method == "POST" and path in HOLDABLE_PATHS and self.billing is not None and \
+                    rt.service.intake_held(self.now().date()):
+                # Over the plan after its grace period (backoffice.billing): kept, not read or fetched now; read
+                # when the plan covers it. Recorded, so every replay keeps it waiting too.
+                data["held"] = True
+                return self.record(rt, "request", data, actor, env, index=index)
             uploads = _uploads(clean, env)
             if method == "POST" and path in INGEST_PATHS:
                 # Links in what arrives (a shared link, an email's invoice links) are opened now, before the
@@ -868,6 +890,9 @@ class TenantManager:
             refs = [self.put_file(tenant_id, raw, env) for raw in messages]
             data: dict[str, Any] = {"connectionId": connection_id, "messages": [{OBJECT: ref} for ref in refs],
                                     "state": dict(state) if state is not None else None, "env": self._facts()}
+            if messages and self.billing is not None and rt.service.intake_held(self.now().date()):
+                data["held"] = True  # kept, read once the plan covers them (backoffice.billing)
+                return self.record(rt, "sync.mail", data, "system:sync", env)
             files: list[tuple[bytes, str | None, str | None]] = [(raw, "message.eml", "message/rfc822")
                                                                   for raw in messages]
             links, fetched = self._fetch_links(rt, links_in_files(tenant_id, files), env)  # §9: before the event
@@ -927,6 +952,61 @@ class TenantManager:
             raise ValueError(str(body.get("result") or "That did not work."))
         return body.get("result")
 
+    # ----------------------------------------------------------------- the plan (backoffice.billing)
+
+    def _release_data(self, rt: TenantRuntime, env: Env) -> dict[str, Any]:
+        """What an event that reads the evidence waiting for the plan must carry: the files read and the links
+        fetched now, before it is recorded (as for any upload), so applying it never reads or fetches anything."""
+        from backoffice.service import capture_fields
+
+        svc = rt.service
+        files: list[tuple[Any, ...]] = []
+        urls: list[str] = []
+        for item in svc.billing.waiting:
+            if item.get("kind") == "mail":
+                files += [(bytes(raw), "message.eml", "message/rfc822") for raw in item.get("messages") or ()]
+                continue
+            body = item.get("body") or {}
+            raw = body.get("dataBase64") or body.get("data_base64")
+            if isinstance(raw, str) and raw:
+                try:
+                    blob = base64.b64decode(raw, validate=False)
+                except (binascii.Error, ValueError):
+                    blob = b""
+                if blob:
+                    mime = body.get("contentType") or body.get("content_type") or body.get("mimeType") or \
+                        body.get("mime_type")
+                    files.append((blob, _text_or_none(body.get("filename")), _text_or_none(mime),
+                                  tuple(capture_fields(body).get("quality") or ())))
+            if item.get("path") == "/api/share":
+                urls += links_in_share(body)
+        data: dict[str, Any] = {"env": self._facts()}
+        links, fetched = self._fetch_links(rt, [*links_in_files(rt.tenant_id, files), *urls], env)
+        if links:
+            data["links"] = links
+        reads = pre_read(svc, self.reader, [*files, *fetched])
+        if reads:
+            data["reads"] = reads
+        return data
+
+    def billing_event(self, tenant_id: str, event: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
+        """One verified payment-provider event (backoffice.billing.reduce_event) as one event in the business's log.
+        An event already applied is not recorded again: Stripe may send the same one many times."""
+        with self.open(tenant_id) as rt:
+            svc = rt.service
+            event_id = str(event.get("id") or "")
+            if not event_id or svc.billing.seen(event_id):
+                return 200, {"ok": True, "duplicate": True}
+            env = self.live_env()
+            data: dict[str, Any] = {"event": dict(event)}
+            if svc.release_due(self.now().date(), event):
+                data.update(self._release_data(rt, env))
+            obj = event.get("object") if isinstance(event.get("object"), Mapping) else {}
+            customer = obj.get("customer")
+            index = [IndexOp("link_billing_customer", str(customer))] if customer and \
+                customer != svc.billing.customer else []
+            return self.record(rt, "billing.event", data, "system:billing", env, index=index)
+
     def browser_tool(self, tenant_id: str, actor: str, body: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
         """``POST /api/chat/tool`` (the browser chat): changing tools are events, the rest are reads."""
         from backoffice.assistant import CHANGING_TOOLS
@@ -953,6 +1033,9 @@ def _tenant_created(m: TenantManager, rt: TenantRuntime, event: Event, env: Env)
     rt.svc.vault = env.vault
     # Reads never change a tenant here: a sensitive original read is recorded as its own event (§52).
     rt.svc.inline_access_log = False
+    # Whether new evidence waits for the plan is decided before each event is recorded, and recorded (below).
+    rt.svc.decides_holds = False
+    rt.svc.billing.enforced = bool((event.data.get("billing") or {}).get("enforced"))
     return 201, {"ok": True}
 
 
@@ -973,6 +1056,8 @@ def _request(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tup
     body = restore_files(d.get("body") or {}, lambda ref: m.get_file(rt.tenant_id, ref, env))
     if env.live:
         body.update(env.secret_fields)
+    if d.get("held"):  # waits for the plan, kept (backoffice.billing)
+        return rt.service.hold_request(str(d["path"]), body)
     scope = d.get("manager")
     if isinstance(scope, Mapping):  # an outlet manager's change: through their outlets' routes only
         svc = rt.service
@@ -1046,7 +1131,7 @@ def _bank_linked(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) ->
 def _sync_mail(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
     d = event.data
     raws = [m.get_file(rt.tenant_id, ref[OBJECT], env) for ref in d.get("messages") or []]
-    return 200, rt.service.sync_mail(str(d.get("connectionId")), raws, d.get("state"))
+    return 200, rt.service.sync_mail(str(d.get("connectionId")), raws, d.get("state"), held=bool(d.get("held")))
 
 
 def _sync_bank(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
@@ -1068,7 +1153,14 @@ def _links_fetched(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) 
 
 def _tick(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
     rt.service.orchestrator.run()
+    rt.service.billing_tick()  # a new month, a grace period that ended (backoffice.billing)
     return 200, {"ok": True}
+
+
+def _billing_event(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
+    """What the payment provider said (verified before it was recorded), applied once (backoffice.billing)."""
+    data = event.data.get("event")
+    return 200, rt.service.billing_event(data if isinstance(data, Mapping) else {})
 
 
 def _outbox_send(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
@@ -1106,4 +1198,5 @@ _HANDLERS: dict[str, Handler] = {
     "outbox.send": _outbox_send,
     "void": _void,
     "documents.opened": _documents_opened,
+    "billing.event": _billing_event,
 }

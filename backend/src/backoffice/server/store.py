@@ -126,7 +126,7 @@ class Invitation:
 class IndexOp:
     """A lookup row written in the same transaction as an event (accountant API keys)."""
 
-    op: str  # "add_api_key" | "remove_api_key"
+    op: str  # "add_api_key" | "remove_api_key" | "link_billing_customer" (key_id: the provider's customer id)
     key_id: str
     key_hash: str = ""
     at: datetime | None = None
@@ -169,6 +169,10 @@ class Store(Protocol):
 
     # accountant API keys
     def api_key_tenant(self, key_hash: str) -> str | None: ...
+
+    # the payment provider's customers (backoffice.billing, 0015), and who counts as a person with access
+    def billing_tenant(self, customer_id: str) -> str | None: ...
+    def member_count(self, tenant_id: str) -> int: ...
 
     # accountants limited to some companies, and clients invited by their accountant (§28, §29, §51)
     def membership_companies(self, tenant_id: str, user_id: str) -> tuple[str, ...] | None: ...
@@ -225,6 +229,7 @@ class _Data:
     # (tenant, user) -> (company, cost centers) of a manager membership
     manager_scopes: dict[tuple[str, str], tuple[str, tuple[str, ...]]] = field(default_factory=dict)
     invitations: dict[str, Invitation] = field(default_factory=dict)  # token hash -> invitation
+    billing_customers: dict[str, str] = field(default_factory=dict)  # payment provider customer id -> tenant
 
 
 class MemoryStore:
@@ -468,6 +473,8 @@ class MemoryStore:
                     for h, (t, k) in list(self._d.api_keys.items()):
                         if t == tenant_id and k == op.key_id:
                             del self._d.api_keys[h]
+                elif op.op == "link_billing_customer":
+                    self._d.billing_customers.setdefault(op.key_id, tenant_id)  # a customer is one business's
                 else:
                     raise StoreError(f"unknown index op {op.op}")
             existing.extend(events)
@@ -523,6 +530,17 @@ class MemoryStore:
         found = self._d.api_keys.get(key_hash)
         return found[0] if found else None
 
+    def billing_tenant(self, customer_id: str) -> str | None:
+        """The business a payment-provider customer pays for (linked by the event that first named it)."""
+        self._up()
+        return self._d.billing_customers.get(customer_id)
+
+    def member_count(self, tenant_id: str) -> int:
+        """People with access who count for a plan: owners, admins, employees and managers (never accountants)."""
+        self._up()
+        with self._lock:
+            return len({u for t, u, r in self._d.memberships if t == tenant_id and r != "accountant"})
+
     def save_nonce(self, tenant_id: str, nonce: str, expires_at: datetime) -> None:
         self._up()
         with self._lock:
@@ -551,6 +569,7 @@ class MemoryStore:
             self._d.sessions = {h: s for h, s in self._d.sessions.items() if s.tenant_id != tenant_id}
             self._d.devices = {k: d for k, d in self._d.devices.items() if k[0] != tenant_id}
             self._d.api_keys = {h: v for h, v in self._d.api_keys.items() if v[0] != tenant_id}
+            self._d.billing_customers = {c: t for c, t in self._d.billing_customers.items() if t != tenant_id}
             self._d.nonces = {k: v for k, v in self._d.nonces.items() if k[0] != tenant_id}
             self._d.tenants.pop(tenant_id, None)
             if not any(u == user_id for _, u, _ in self._d.memberships):

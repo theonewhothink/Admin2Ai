@@ -7149,6 +7149,9 @@ class Orchestrator:
 
         self.packages = PackageAgent(self)
         self.captures = CaptureAgent(self)
+        from backoffice.line_prices import LinePrices  # prices on invoice lines, read from the documents (X20)
+
+        self.line_prices = LinePrices(self)
         self._activity_seq = 0
         # What sends the emails the back office writes itself (backoffice.mailer): the demo's simulated
         # outbox, or None. With None they wait in ``repo.outbox``; the production server sends each one

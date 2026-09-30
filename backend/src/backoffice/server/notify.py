@@ -1,13 +1,14 @@
 """Push notifications to the owner's phone, through Expo, for the few things that need them (§42).
 
-Only four things ever notify:
+Only five things ever notify:
 
 * a new hard approval: a payment on hold because the bank details changed
   or the invoice needs checking (§25, §26);
 * a connection that needs reconnecting (§47, §48);
 * a supplier's site that needs the owner to sign in (or a code) before the
   invoice behind its link can be fetched (§9: "Supplier X needs authentication.");
-* a month that closed.
+* a month that closed;
+* a payment for the business's plan that did not go through (backoffice.billing).
 
 Nothing else: "invoice processed" is quiet success. Messages are computed
 from the tenant's state before and after each live change (never during a
@@ -54,6 +55,7 @@ class Facts:
     stale: frozenset[str]
     closed: frozenset[tuple[str, str]]
     sign_ins: frozenset[str] = frozenset()  # invoice links whose site asks the owner to sign in
+    payment_failed: str | None = None  # the day a payment for the plan failed (backoffice.billing), until it goes through
 
 
 def facts(svc: Any) -> Facts:
@@ -63,7 +65,15 @@ def facts(svc: Any) -> Facts:
         stale=frozenset(c.id for c in repo.connectors.values() if not c.healthy),
         closed=frozenset(repo.closed_months),
         sign_ins=frozenset(url for url, link in getattr(repo, "links_seen", {}).items() if link.status == "sign_in"),
+        payment_failed=_payment_failed(svc),
     )
+
+
+def _payment_failed(svc: Any) -> str | None:
+    billing = getattr(svc, "billing", None)
+    if billing is None or billing.status != "past_due" or billing.payment_failed_on is None:
+        return None
+    return billing.payment_failed_on.isoformat()
 
 
 def messages_for(svc: Any, before: Facts, after: Facts) -> list[PushMessage]:
@@ -103,6 +113,10 @@ def messages_for(svc: Any, before: Facts, after: Facts) -> list[PushMessage]:
             label = month
         who = names[0] if len(names) == 1 else ", ".join(names[:-1]) + f" and {names[-1]}"
         out.append(PushMessage("Month closed", f"{label} is closed for {who}.", "/"))
+    if after.payment_failed and after.payment_failed != before.payment_failed:
+        notice = svc.billing.notice(svc.repo.clock.today())
+        if notice:
+            out.append(PushMessage("Payment did not go through", notice, "/settings#billing"))
     return out
 
 

@@ -286,6 +286,7 @@ def _get_paths(h: Any, token: str, seen: dict[str, Any]) -> list[str]:
               for e in h.client.get("/api/employees", headers=H).json()["employees"]]
     paths += ["/api/settings/mailboxes", "/api/onboarding", "/api/settings/automation"]
     paths += ["/api/documents/access-log"]  # who opened sensitive documents (backoffice.sensitivity)
+    paths += ["/api/billing"]  # the plan, usage and limits (backoffice.billing)
     return paths
 
 

@@ -62,6 +62,7 @@ from .money import MAX_ABS_AMOUNT, db_amount, db_currency
 from .tenancy import (
     API_KEY_SETTING,
     APP_ROLE,
+    BILLING_CUSTOMER_SETTING,
     ERASURE_SETTING,
     EVIDENCE_ADMIN_ROLE,
     GROUP_ROLES,
@@ -88,6 +89,7 @@ __all__ = [
     "API_KEY_SETTING",
     "APP_ROLE",
     "AppliedMigration",
+    "BILLING_CUSTOMER_SETTING",
     "CatalogProblem",
     "ConnectionParams",
     "ERASURE_SETTING",

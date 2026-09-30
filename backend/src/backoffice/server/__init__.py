@@ -15,6 +15,7 @@ tenant into a multi-tenant service:
 * :mod:`.worker`    ``python -m backoffice.server.worker``;
 * :mod:`.auth`      sign-up, sign-in, sessions, CSRF guard, roles, rate limits;
 * :mod:`.notify`    Expo push notifications, for the few things that need the owner;
+* :mod:`.billing`   payments for the plans through Stripe: checkout, portal, signed webhooks;
 * :mod:`.account`   GDPR export and erasure;
 * :mod:`.http`      the FastAPI application that puts it together.
 

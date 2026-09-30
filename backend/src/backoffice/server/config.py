@@ -1,7 +1,7 @@
 """Settings of the production API, read once from the environment.
 
 Every variable is documented in ``.env.example``. Secrets (database password,
-vault key, OAuth client secrets, GoCardless keys, SMTP password, Expo and
+vault key, OAuth client secrets, GoCardless keys, Stripe keys, SMTP password, Expo and
 Anthropic tokens) only ever come from the environment, which the platform
 fills from its secrets manager; none has a usable default.
 """

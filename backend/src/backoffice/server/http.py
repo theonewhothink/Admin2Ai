@@ -31,6 +31,15 @@ Sensitive documents (backoffice.sensitivity): every read of a sensitive
 document's original is recorded with who read it (an event in the tenant's
 log); the owner reads the access log at ``GET /api/documents/access-log``.
 
+Plans and payments (backoffice.billing, server/billing.py), for the owner only:
+``GET /api/billing`` (plan, usage, limits, one plain line when over a limit),
+``POST /api/billing/checkout`` ``{"plan": ...}`` (the address of Stripe's
+checkout page, or of its page to change plan for a business that already
+pays) and ``POST /api/billing/portal`` (Stripe's customer portal). Stripe
+reports back at ``POST /api/billing/webhook``: public, and read only once its
+signature is checked; each event is recorded in the business's log and applied
+once. Card details only ever go to Stripe.
+
 Hardening: security headers on every response (HSTS, nosniff, a CSP that
 allows nothing, no framing, no referrer, no caching of API data), CORS only for
 BACKOFFICE_ALLOWED_ORIGINS (with credentials), request size limits, one JSON
@@ -63,6 +72,8 @@ from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backoffice.internal import admin_only
+
+from backoffice.billing import PAID_PLANS, event_customer, event_tenant, plan_for, reduce_event
 
 from .account import erase_account, export_account
 from .auth import COOKIE_NAME, CSRF_HEADER, CSRF_VALUE, SESSION_DAYS, AuthError, AuthService, Principal, permitted
@@ -101,11 +112,12 @@ _ROUTE_WORDS = frozenset(
     "onboarding company oauth start callback bank devices v1 healthz readyz internal overview operations "
     "readiness acceptance cost-centers allocate obligations transactions expected-invoices not-coming statement "
     "invitations accept employee employees card-payments expense-claims profile mailboxes seen automation manager "
-    "outlets sensitive access-log".split())
+    "outlets sensitive access-log billing checkout portal webhook".split())
 # One client company of any business: /api/accountant/clients/<tenant id>~<company id>[/…] (§28, §29).
 _CLIENT_REF = re.compile(r"/api/accountant/clients/(?P<tenant>[A-Za-z0-9][A-Za-z0-9_.-]{0,127})~(?P<company>[^/~]+)"
                          r"(?P<rest>/.*)?")
 _CLIENT_RULES = re.compile(r"/api/accountant/clients/([^/~]+)/rules")
+_TENANT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 UNAVAILABLE = "I can't reach your data right now. Please try again in a minute."
 DIVERGED = "Your data is safe, but I can't open it right now. The team has been alerted."
@@ -328,12 +340,13 @@ def _default_services(config: ServerConfig) -> dict[str, Any]:
 
             return GoCardlessBankAccountData(config.gocardless_secret_id, config.gocardless_secret_key,
                                              base_url=config.gocardless_api_url or GOCARDLESS_API)
+    from .billing import billing_from_env
     from .links import link_fetcher_from_env
 
     return {"store": store, "objects": objects, "vault": vault, "authorizer": authorizer,
             "mailer": mailer_from_env(), "brain_factory": brain_factory, "notifier": notifier,
             "aggregator": aggregator, "reader": reader_from_env(), "link_fetcher": link_fetcher_from_env(),
-            "now": now}
+            "billing": billing_from_env(), "now": now}
 
 
 def production_services(config: ServerConfig, overrides: Mapping[str, Any]) -> dict[str, Any]:
@@ -350,7 +363,7 @@ def build_manager(config: ServerConfig, services: Mapping[str, Any]) -> TenantMa
         authorizer=services.get("authorizer"), mailer=services.get("mailer"),
         brain_factory=services.get("brain_factory"), notifier=services.get("notifier"),
         reader=services.get("reader"), link_fetcher=services.get("link_fetcher"),
-        cache_size=config.tenant_cache_size,
+        billing=services.get("billing"), cache_size=config.tenant_cache_size,
         strict_reads=bool(services.get("strict_reads", config.strict_reads)))
 
 
@@ -881,6 +894,132 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
             manager.command, principal.tenant.id, principal.user.id, "POST", "/api/manager/receipts", body,
             manager=principal.cost_centers or frozenset(), manager_email=principal.user.email))
         return _reply(status, out, refresh=(refresh, _token(request)[0]))
+
+    # ----------------------------------------------------------------- the plan and payments (backoffice.billing)
+
+    payments = services.get("billing")  # server/billing.py StripeBilling, or None: no payments on this server
+
+    def _clients(principal: Principal) -> int:
+        """Client businesses this owner is the accountant of (the accountant plan is priced per active client)."""
+        return sum(1 for t, role in store.memberships(principal.user.id)
+                   if role == "accountant" and t.id != principal.tenant.id)
+
+    @app.get("/api/billing")
+    @_guarded
+    async def billing_view(request: Request) -> Response:
+        principal, refresh = await _signed_in(request, owner=True)
+        tenant = principal.tenant.id
+
+        def build() -> dict[str, Any]:
+            users, clients = store.member_count(tenant), _clients(principal)
+            return manager.read(tenant, lambda svc: svc.billing_view(users=users, clients=clients,
+                                                                      payments=payments is not None),
+                                what="GET /api/billing", today=True)
+
+        return _reply(200, await run_in_threadpool(build), refresh=(refresh, _token(request)[0]))
+
+    def _billing_facts(tenant: str) -> dict[str, Any]:
+        return manager.read(tenant, lambda svc: svc.billing_facts(), what="billing facts")
+
+    @app.post("/api/billing/checkout")
+    @_guarded
+    async def billing_checkout(request: Request) -> Response:
+        """The address of the payment page for ``{"plan": ...}``. Nothing changes here: the plan changes when the
+        payment provider says it was paid (the webhook)."""
+        from .billing import BillingError
+
+        principal, refresh = await _signed_in(request, owner=True)
+        body = await _json(request)
+        wanted = str(body.get("plan") or "").strip().lower()
+        if payments is None:
+            raise AuthError(503, "unavailable", "Payments are not set up on this server yet.")
+        plan = plan_for(wanted)
+        if plan is None or wanted not in PAID_PLANS or not payments.offers(wanted):
+            raise AuthError(400, "bad_request", "Choose Solo, Business, Multi-company or Accountant.")
+        tenant, web = principal.tenant.id, config.web_url
+
+        def start() -> tuple[int, dict[str, Any]]:
+            facts = _billing_facts(tenant)
+            if facts["demo"]:
+                return 409, {"error": "conflict", "message": "This is the demo business, so there is nothing to pay."}
+            if facts["plan"] == wanted and facts["status"] == "active":
+                return 409, {"error": "conflict", "message": f"You are already on the {plan.name} plan."}
+            if facts["subscription"] and facts["customer"] and facts["status"] != "canceled":
+                url = payments.portal(customer=facts["customer"], return_url=f"{web}/settings/?billing=changed",
+                                      subscription=facts["subscription"])
+                return 200, {"url": url, "via": "portal", "plan": wanted,
+                             "message": f"Choose {plan.name} on the next page to change your plan."}
+            url = payments.checkout(tenant_id=tenant, plan_id=wanted, customer=facts["customer"],
+                                    email=principal.user.email, clients=_clients(principal),
+                                    success_url=f"{web}/settings/?billing=done",
+                                    cancel_url=f"{web}/settings/?billing=cancelled")
+            return 200, {"url": url, "via": "checkout", "plan": wanted}
+
+        try:
+            status, out = await run_in_threadpool(start)
+        except BillingError:
+            log.warning("billing_checkout_failed", extra={"tenant": tenant})
+            raise AuthError(502, "unavailable", "The payment page did not open. Please try again in a few minutes.") \
+                from None
+        return _reply(status, out, refresh=(refresh, _token(request)[0]))
+
+    @app.post("/api/billing/portal")
+    @_guarded
+    async def billing_portal(request: Request) -> Response:
+        """The address of the payment provider's portal: card, invoices, cancelling."""
+        from .billing import BillingError
+
+        principal, refresh = await _signed_in(request, owner=True)
+        if payments is None:
+            raise AuthError(503, "unavailable", "Payments are not set up on this server yet.")
+        tenant = principal.tenant.id
+
+        def open_portal() -> tuple[int, dict[str, Any]]:
+            facts = _billing_facts(tenant)
+            if not facts["customer"]:
+                return 409, {"error": "conflict", "message": "You don't have a paid plan yet. Choose a plan first."}
+            return 200, {"url": payments.portal(customer=facts["customer"],
+                                                return_url=f"{config.web_url}/settings/?billing=back")}
+
+        try:
+            status, out = await run_in_threadpool(open_portal)
+        except BillingError:
+            log.warning("billing_portal_failed", extra={"tenant": tenant})
+            raise AuthError(502, "unavailable", "The billing page did not open. Please try again in a few minutes.") \
+                from None
+        return _reply(status, out, refresh=(refresh, _token(request)[0]))
+
+    @app.post("/api/billing/webhook")
+    @_guarded
+    async def billing_webhook(request: Request) -> Response:
+        """Stripe says what happened. Public, but nothing is read from it before its signature is checked; each
+        event is recorded once in its business's log. Anything not ours is acknowledged and ignored."""
+        from .billing import WebhookRefused
+
+        if payments is None:
+            return _error(404, "not_found", "I can't find that.")
+        payload = await request.body()
+        try:
+            event = payments.verify(payload, request.headers.get("stripe-signature"), now().timestamp())
+        except WebhookRefused as exc:
+            log.warning("billing_webhook_refused", extra={"reason": str(exc)})
+            return _error(400, "bad_signature", "This request is not signed by the payment provider.")
+        reduced = reduce_event(event, payments.price_plans())
+        if reduced is None:
+            return JSONResponse({"received": True})
+        customer = event_customer(event)
+        linked = await run_in_threadpool(store.billing_tenant, customer) if customer else None
+        named = event_tenant(event)
+        tenant = linked or named
+        if tenant is None or not _TENANT_ID.match(tenant) or (linked and named and linked != named):
+            log.warning("billing_webhook_unmatched", extra={"reason": str(reduced["type"])})
+            return JSONResponse({"received": True, "ignored": True})
+        request.state.log_tenant = tenant
+        try:
+            await run_in_threadpool(manager.billing_event, tenant, reduced)
+        except TenantNotFound:  # an erased business: nothing to change, and Stripe need not try again
+            return JSONResponse({"received": True, "ignored": True})
+        return JSONResponse({"received": True})
 
     # ----------------------------------------------------------------- the team's dashboard (admins only)
 

@@ -61,6 +61,7 @@ from backoffice.learning import (
     learn_from_transactions,
     suggest_rule_from_answer,
 )
+from backoffice.learning.plain import count_phrase
 from backoffice.orchestrator import (
     TZ,
     DocumentRecord,
@@ -72,6 +73,8 @@ from backoffice.orchestrator import (
     TxRecord,
 )
 from backoffice.domain.models import Supplier
+from backoffice.billing import DEMO_PLAN, HOLDABLE_PATHS, PAID_PLANS, PLANS, BillingState, Usage, plan_for
+from backoffice.line_prices import threshold_words, unit_money
 from backoffice.purchases import CAPITAL_ASSET_FLAG, possible_capital_asset
 
 __all__ = ["BackOfficeService", "ServiceError"]
@@ -186,13 +189,20 @@ class BackOfficeService:
         self._opened: list[str] = []
         self.inline_access_log = True
         self.viewer: tuple[str, str] = ("owner", "owner")
+        # The plan and what the payment provider said (backoffice.billing). ``decides_holds``: this service decides
+        # itself whether new evidence waits for the plan (the demo, tests); the production server decides before
+        # recording each event and says so in it (server/runtime.py), so a replay follows the record.
+        self.billing = BillingState()
+        self.decides_holds = True
 
     @classmethod
     def demo(cls) -> BackOfficeService:
         """Laura's three companies with September 2026 processed by the real pipeline."""
         from backoffice.demo import build_demo
 
-        return cls(build_demo())
+        svc = cls(build_demo())
+        svc.billing = BillingState(plan="demo")  # the demo is never billed and never calls a payment provider
+        return svc
 
     @classmethod
     def new_tenant(cls, tenant_id: str, *, owner_name: str, owner_email: str, now: datetime,
@@ -214,6 +224,8 @@ class BackOfficeService:
         repo = Repository(tenant_id=tenant_id, owner=owner, now=now)
         svc = cls(Orchestrator(repo), vault=vault, authorizer=authorizer)
         svc.real_sources = True
+        # Starts on Free; what arrived before today is the free audit's history and never counts (§60).
+        svc.billing = BillingState(plan="free", started_on=now.astimezone(TZ).date())
         # A business that signs up goes through onboarding: its first run learns before it asks (§5), and the
         # time to first value and the owner's set-up time are measured from now (§58, §59).
         svc.orchestrator.begin_onboarding(now)
@@ -273,6 +285,7 @@ class BackOfficeService:
         self.orchestrator.log("entity", "company_added", subject_id=company_id, values=added,
                               actor=f"owner:{self.repo.owner.email}")
         self.orchestrator.run()
+        self.billing_check()  # a company over the plan's allowance: the owner is told, nothing is refused
         return {"ok": True, "company": self.company(company_id), "message": f"Done. {name} is set up."}
 
     def set_accountant(self, email: Any, name: Any = None, software: Any = None, company_id: Any = None,
@@ -942,15 +955,22 @@ class BackOfficeService:
         self.orchestrator.connection_read(c.id)  # its first 90 days are in (§6)
         return max(1, round((end - start).total_seconds() / 86400)) if start and end else 90
 
-    def sync_mail(self, connection_id: str, messages: Sequence[bytes], state: Mapping[str, Any] | None
-                  ) -> dict[str, Any]:
-        """Messages read from a connected mailbox, then (last batch) what the mailbox sync remembers."""
+    def sync_mail(self, connection_id: str, messages: Sequence[bytes], state: Mapping[str, Any] | None,
+                  *, held: bool = False) -> dict[str, Any]:
+        """Messages read from a connected mailbox, then (last batch) what the mailbox sync remembers.
+
+        ``held``: the server decided these messages wait for the plan (backoffice.billing): they are kept and read
+        once it covers them; the mailbox's own sync goes on as usual."""
         c = self.repo.connectors.get(connection_id)
         if c is None or c.kind != "email":
             raise ServiceError(404, "I can't find that mailbox.")
+        if messages and (held or (self.decides_holds and self.intake_held())):
+            self._hold({"kind": "mail", "connection": connection_id, "messages": [bytes(m) for m in messages]})
+            messages = ()  # kept, waiting for the plan: read as soon as it covers them (backoffice.billing)
         for raw in messages:
             self.orchestrator.ingest_file(raw, filename="message.eml", content_type="message/rfc822",
                                           source_kind=SourceKind.EMAIL, origin="email")
+        self.billing_check()
         if state is not None:
             days = self._synced(c, state)
             if days is not None:
@@ -2775,12 +2795,26 @@ class BackOfficeService:
 
     def _price_answer(self) -> dict[str, Any]:
         changes = self.orchestrator.price_changes()
-        if not changes:
+        # Prices on invoice lines (X20): a product that cost unusually more than its last purchases.
+        unit = self.orchestrator.line_prices.recent_increases(self._today())
+        if not changes and not unit:
             return {"answer": "None of your regular costs went up in the last three months.", "evidence": []}
-        lines = [f"{name}: {format_money(before)} → {format_money(after)}" for name, before, after, _ in changes]
-        count = "One went up" if len(changes) == 1 else f"{len(changes)} went up"
-        evidence = [{"label": f"{name} · {format_money(after)}", "id": ev[0]} for name, _, after, ev in changes if ev]
-        return {"answer": f"{count} in the last three months. " + ". ".join(lines) + ".", "evidence": evidence}
+        parts: list[str] = []
+        evidence: list[dict[str, str]] = []
+        if changes:
+            lines = [f"{name}: {format_money(before)} → {format_money(after)}" for name, before, after, _ in changes]
+            count = "One went up" if len(changes) == 1 else f"{len(changes)} went up"
+            parts.append(f"{count} in the last three months. " + ". ".join(lines) + ".")
+            evidence += [{"label": f"{name} · {format_money(after)}", "id": ev[0]}
+                         for name, _, after, ev in changes if ev]
+        if unit:
+            head = ("One price on your invoices" if len(unit) == 1 else
+                    f"{_count_word(len(unit)).capitalize()} prices on your invoices")
+            parts.append(f"{head} went up {threshold_words()} or more against the last purchases: "
+                         + "; ".join(c.line() for c in unit) + ".")
+            evidence += [{"label": f"{c.purchase.supplier} {c.purchase.invoice}", "id": c.purchase.evidence_id}
+                         for c in unit]
+        return {"answer": " ".join(parts), "evidence": evidence}
 
     def _attention_answer(self) -> dict[str, Any]:
         needs = self._open_needs()
@@ -3072,6 +3106,16 @@ class BackOfficeService:
                 pct = ((after - before) * 100 / before).quantize(Decimal("1"))
                 anomalies.append({"id": f"an_price_{name.lower()}", "title": f"{name} price went up {pct}%",
                                   "detail": f"{format_money(before)} → {format_money(after)}.", "tone": "attention"})
+        # Prices on this month's invoice lines that jumped against the product's last purchases (X20): a line, never
+        # a hold.
+        for c in self.orchestrator.line_prices.increases_in(company_id, month.first_day, month.last_day):
+            p = c.purchase
+            anomalies.append({
+                "id": f"an_unit_{p.document_id}_{_SLUG.sub('-', p.product_key.lower()).strip('-')}",
+                "title": f"{p.product} price went up {c.percent}%",
+                "detail": f"{p.supplier}: {unit_money(c.before)} → {unit_money(c.after)} {p.per} on invoice "
+                          f"{p.invoice}; {c.compared()}.",
+                "tone": "attention"})
         anomalies += self._statement_anomalies(company_id)
         for record in self._month_documents(company_id, month, txs):
             # An unusual currency is a check, not a hold (checklist Q6): the accountant sees it here.
@@ -3743,6 +3787,7 @@ class BackOfficeService:
         missing = [r for r in repo.transactions.values() if r.decision is not None and r.decision.requires_document
                    and not r.document_ids and not r.proof_evidence_ids and not r.private]
         changes = self.orchestrator.price_changes()
+        unit = self.orchestrator.line_prices.recent_increases(today)  # prices on invoice lines that jumped (X20)
         other = [n for n in self._open_needs() if n.kind == "choice"]
         report = render_business_audit(BusinessAuditFindings(
             period_start=start, period_end=today - timedelta(days=1), expenses=len(expenses), expenses_total=total,
@@ -3760,9 +3805,10 @@ class BackOfficeService:
              "tone": "attention" if missing else "good",
              "examples": [f"{self.orchestrator.merchant_name(r.tx)} {format_money(abs(r.tx.amount))} on "
                           f"{day_month(r.tx.booked_on, today)}" for r in missing[:3]]},
-            {"id": "f_increased", "value": str(len(changes)), "label": "costs went up",
-             "tone": "attention" if changes else "good",
-             "examples": [f"{n} {format_money(b)} → {format_money(a)}" for n, b, a, _ in changes]},
+            {"id": "f_increased", "value": str(len(changes) + len(unit)), "label": "costs went up",
+             "tone": "attention" if changes or unit else "good",
+             "examples": [f"{n} {format_money(b)} → {format_money(a)}" for n, b, a, _ in changes]
+             + [c.line() for c in unit]},
             {"id": "f_other", "value": str(len(other)), "label": "items may belong to another company",
              "tone": "attention" if other else "good",
              "examples": [f"{self.orchestrator.merchant_name(repo.transactions[n.subject_id].tx)} "
@@ -3775,9 +3821,210 @@ class BackOfficeService:
             company = "Your business"
         else:
             company = names[0] if len(names) == 1 else ", ".join(names[:-1]) + f" and {names[-1]}"
+        lines = list(report.lines)
+        if unit:
+            lines.append(f"{_count_word(len(unit)).capitalize()} {'price' if len(unit) == 1 else 'prices'} on "
+                         f"invoices went up {threshold_words()} or more: " + "; ".join(c.line() for c in unit))
         return {"companyName": company, "periodLabel": "the last 90 days", "headline": report.headline,
-                "lines": list(report.lines), "callToAction": report.call_to_action, "findings": findings,
+                "lines": lines, "callToAction": report.call_to_action, "findings": findings,
                 "log": {"records": chain.checked, "intact": chain.ok, "head": chain.head_hash}}
+
+    # ----------------------------------------------------------------- Plan and billing (§60, §61)
+
+    def billing_usage(self, *, today: date | None = None, users: int | None = None, clients: int = 0) -> Usage:
+        """What the business uses this month: companies, and documents that arrived this month (those issued
+        before it joined are the free audit's history and never count)."""
+        day = today or self._today()
+        month = Month.of(day)
+        start = self.billing.started_on
+        documents = 0
+        for d in self.repo.documents.values():
+            received = d.received_at.astimezone(TZ).date()
+            if not month.contains(received):
+                continue
+            if start is not None and (d.document.issue_date or received) < start:
+                continue
+            documents += 1
+        return Usage(str(month), len(self.repo.companies), documents, users, clients)
+
+    def _billing_over(self, state: BillingState, day: date) -> tuple[list[str], date | None]:
+        """The evidence limits (companies, documents) ``state`` is over on ``day``, and when its grace started."""
+        usage = self.billing_usage(today=day)
+        over = [n for n in state.over(usage, day) if n in ("companies", "documents")]
+        return over, (state.over_since or day) if over else None
+
+    def intake_held(self, day: date | None = None, state: BillingState | None = None) -> bool:
+        """Would new evidence wait for the plan (kept, not read) on ``day``? (backoffice.billing)"""
+        state = state or self.billing
+        day = day or self._today()
+        if not state.enforced or state.is_demo:
+            return False
+        over, since = self._billing_over(state, day)
+        if not over:
+            return False
+        return replace(state, over_since=since, waiting=[]).holding(self.billing_usage(today=day), day)
+
+    def release_due(self, day: date, event: Mapping[str, Any] | None = None) -> bool:
+        """Would the evidence waiting for the plan be read on ``day`` (after the provider ``event``, if any)?"""
+        if not self.billing.waiting:
+            return False
+        state = replace(self.billing, events=list(self.billing.events), waiting=[])
+        if event is not None:
+            state.apply(event, day)
+        return not self.intake_held(day, state)
+
+    def billing_check(self) -> None:
+        """Keep the grace period's start: the first day over a limit the business is held to, cleared once it is
+        within its limits again. The owner reads one plain line about it in Activity (§69)."""
+        state = self.billing
+        if not state.enforced or state.is_demo:
+            return
+        today = self._today()
+        over, since = self._billing_over(state, today)
+        if over and state.over_since is None:
+            state.over_since = since
+            self.orchestrator.log("billing", "over_limit", values={"over": over, "plan": state.effective(today).id})
+            prompt = state.prompt(self.billing_usage(today=today), today)
+            if prompt:
+                self.orchestrator.activity(self._now(), "waiting", prompt)
+        elif not over and state.over_since is not None:
+            state.over_since = None
+            self.orchestrator.log("billing", "within_limits", values={"plan": state.effective(today).id})
+
+    def _hold(self, item: dict[str, Any]) -> None:
+        state = self.billing
+        state.waiting.append({**item, "at": self._now().isoformat()})
+        self.orchestrator.log("billing", "evidence_held", values={"kind": item["kind"], "waiting": len(state.waiting)})
+        if len(state.waiting) == 1:
+            self.orchestrator.activity(self._now(), "waiting",
+                                       f"Your {state.effective(self._today()).name} plan's limit is reached, so new "
+                                       "documents are kept safely and wait until you upgrade or the month turns. "
+                                       "Nothing is lost.")
+
+    def hold_request(self, path: str, body_json: Any) -> tuple[int, dict[str, Any]]:
+        """Keep one upload or share without reading it: it waits for the plan (backoffice.billing). The phone may
+        delete its copy (the bytes are stored and their hash checked); nothing is ever lost."""
+        import hashlib
+
+        body = _body(body_json)
+        message = "Saved. It waits for your plan: it is read as soon as you upgrade or the month turns."
+        if path in ("/api/evidence/upload", "/api/receipts"):
+            try:
+                data = _b64(body.get("dataBase64") or body.get("data_base64"))
+            except ServiceError as exc:
+                return exc.status, {"error": "bad_request", "message": exc.message}
+            digest = hashlib.sha256(data).hexdigest()
+            claimed = str(body.get("sha256") or "").strip().lower()
+            if not data or (claimed and claimed != digest):
+                return self._route("POST", path, body, self._routes())  # refused as usual: nothing to keep
+            self._hold({"kind": "request", "path": path, "body": dict(body)})
+            return 200, {"client_upload_id": body.get("client_item_id") or body.get("clientItemId")
+                         or f"rcpt-{digest[:40]}", "status": "stored", "sha256": digest,
+                         "received_at": self._now().isoformat(), "evidence_id": None, "delete_local": True,
+                         "retry": False, "reason": None, "owner_message": message, "signature": None,
+                         "duplicate": False, "message": message, "held": True}
+        if path == "/api/evidence" and not (body.get("dataBase64") or body.get("data_base64")):
+            return self._route("POST", path, body, self._routes())  # nothing to keep: refused as usual
+        self._hold({"kind": "request", "path": path, "body": dict(body)})
+        return 200, {"ok": True, "message": message, "evidenceIds": [], "documents": [], "transactions": [],
+                     "pendingLinks": [], "storedOnly": True, "held": True}
+
+    def release_held(self) -> int:
+        """Read what waited for the plan, in the order it arrived, once the plan covers it (an upgrade, a new
+        month). Returns how many items were read."""
+        state = self.billing
+        if not state.waiting or self.intake_held():
+            return 0
+        items, state.waiting = list(state.waiting), []
+        decides, self.decides_holds = self.decides_holds, False
+        documents = 0
+        try:
+            for item in items:
+                if item.get("kind") == "mail":
+                    for raw in item.get("messages") or ():
+                        report = self.orchestrator.ingest_file(raw, filename="message.eml",
+                                                               content_type="message/rfc822",
+                                                               source_kind=SourceKind.EMAIL, origin="email")
+                        documents += len(set(report.document_ids))
+                else:
+                    status, out = self._route("POST", str(item.get("path")), item.get("body") or {}, self._routes())
+                    documents += len(out.get("documents") or ()) if status == 200 else 0
+        finally:
+            self.decides_holds = decides
+        self.orchestrator.log("billing", "held_evidence_released", values={"items": len(items),
+                                                                          "documents": documents})
+        self.orchestrator.activity(self._now(), "checked", f"Your plan covers it again: I read the "
+                                   f"{count_phrase(len(items), 'item')} that were waiting.")
+        self.orchestrator.run()
+        self.billing_check()
+        return len(items)
+
+    def billing_event(self, event: Mapping[str, Any]) -> dict[str, Any]:
+        """One payment-provider event (already verified and reduced, backoffice.billing.reduce_event), applied
+        once; what waited for the plan is read when the new plan covers it."""
+        state = self.billing
+        if state.is_demo:
+            raise ServiceError(409, "This is the demo, so nothing here is billed.")
+        before = (state.plan, state.status, state.payment_failed_on)
+        result = state.apply(event, self._today())
+        if not result.get("applied"):
+            return {"ok": True, "duplicate": True}
+        self.orchestrator.log("billing", "provider_event", values={
+            "type": str(event.get("type")), "event": str(event.get("id")), "plan": state.plan, "status": state.status},
+            actor="system:billing")
+        today = self._today()
+        if (state.plan, state.status) != before[:2] and state.status == "active" and state.plan != "free":
+            self.orchestrator.activity(self._now(), "checked", f"Your {state.chosen().name} plan is active.")
+        if state.payment_failed_on is not None and before[2] is None:
+            self.orchestrator.activity(self._now(), "waiting", state.notice(today) or "")
+        if state.plan == "free" and before[0] != "free":
+            self.orchestrator.activity(self._now(), "checked", "Your plan ended. You are on the Free plan now. "
+                                       "Nothing is deleted.")
+        self.billing_check()
+        released = self.release_held()
+        return {"ok": True, "plan": state.plan, "status": state.status, "released": released}
+
+    def billing_tick(self) -> int:
+        """The day's billing work (a new month, a grace period that ended): what waited is read when it may be."""
+        self.billing_check()
+        return self.release_held()
+
+    def billing_view(self, body: Mapping[str, Any] | None = None, *, users: int | None = None, clients: int = 0,
+                     payments: bool = False) -> dict[str, Any]:
+        """``GET /api/billing`` (owner only): the plan, what the business uses, its limits and, when over one, one
+        plain line. ``payments``: a payment provider is set up (the production server); the demo never has one."""
+        state = self.billing
+        today = self._today()
+        plans = [p.public() for p in PLANS.values()]
+        if state.is_demo:
+            usage = self.billing_usage(users=users, clients=clients)
+            return {"plan": {**DEMO_PLAN.public(), "status": "active", "renewsOn": None}, "demo": True,
+                    "usage": usage.public(), "limits": DEMO_PLAN.public()["limits"], "over": [], "prompt": None,
+                    "notice": None, "graceUntil": None, "waiting": 0, "held": False, "plans": plans,
+                    "canUpgrade": False, "canManage": False,
+                    "message": "This is the demo business, so nothing here is billed."}
+        usage = self.billing_usage(users=users, clients=clients)
+        plan = state.effective(today)
+        grace = state.grace_until(Usage(usage.month, usage.companies, usage.documents, None, usage.clients), today)
+        return {"plan": {**state.chosen().public(), "status": state.status, "renewsOn": _iso(state.renews_on)},
+                "demo": False, "usage": usage.public(), "limits": plan.public()["limits"],
+                "over": state.over(usage, today), "prompt": state.prompt(usage, today), "notice": state.notice(today),
+                "graceUntil": _iso(grace) if state.enforced else None, "waiting": len(state.waiting),
+                "held": self.intake_held(today), "plans": plans, "canUpgrade": payments,
+                "canManage": payments and bool(state.customer), "message": None}
+
+    def billing_refused(self, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """``POST /api/billing/checkout`` and ``/portal`` without a payment provider (the demo, the browser)."""
+        if self.billing.is_demo:
+            raise ServiceError(409, "This is the demo business, so there is nothing to pay.")
+        raise ServiceError(409, "Payments are not set up here yet.")
+
+    def billing_facts(self) -> dict[str, Any]:
+        """What the server needs to start a checkout or open the billing portal (never shown as is)."""
+        state = self.billing
+        return {"plan": state.plan, "status": state.status, "customer": state.customer,
+                "subscription": state.subscription, "demo": state.is_demo,
+                "paidPlans": list(PAID_PLANS), "known": plan_for(state.plan) is not None}
 
     # ----------------------------------------------------------------- routing
 
@@ -3787,7 +4034,14 @@ class BackOfficeService:
         Returns ``(status, json)``; errors come back as ``{"error": ..., "message": ...}``
         with a plain message, never a stack trace (§48, §70).
         """
-        return self._route(method, path, body_json, self._routes())
+        if self.decides_holds and (method or "").upper() == "POST" and self.billing.enforced:
+            target = unquote((path or "/").partition("?")[0]).rstrip("/")
+            if target in HOLDABLE_PATHS and self.intake_held():
+                return self.hold_request(target, body_json)
+        status, out = self._route(method, path, body_json, self._routes())
+        if self.billing.enforced and (method or "").upper() == "POST" and status == 200:
+            self.billing_check()
+        return status, out
 
     def _route(self, method: str, path: str, body_json: Any, routes: Sequence[Any], *,
                refuse: tuple[int, dict[str, Any]] | None = None) -> tuple[int, dict[str, Any]]:
@@ -3914,6 +4168,9 @@ class BackOfficeService:
             ("POST", r("/api/settings/accountant"), lambda b: self.accountant_settings(b or {"email": ""})),
             ("GET", r(f"/api/evidence/{seg}/file"), lambda b, e: self.evidence_file(e)),
             ("GET", r("/api/audit"), lambda b: self.audit()),
+            # The plan (backoffice.billing). Paying goes through the production server's payment provider only.
+            ("GET", r("/api/billing"), lambda b: self.billing_view(b)),
+            ("POST", r("/api/billing/(?:checkout|portal)"), lambda b: self.billing_refused(b)),
             ("GET", r("/api/pipeline"), lambda b: self.pipeline()),
             ("GET", r("/api/internal/(overview|operations|readiness|acceptance)"), lambda b, view: self.internal(view, b)),
             # Employee cards and staff expenses (backoffice.staff).

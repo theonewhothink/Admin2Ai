@@ -531,6 +531,18 @@ _OPTION_WORDS = {
 _ACTIONS = frozenset({"report"})
 # A question about a supplier's account statement ("Does our Vodafone statement match?").
 _STATEMENT_Q = re.compile(r"\b(?:account\s+)?statements?\b|\bextratos?\b|\bconta\s+corrente\b", re.I)
+# A question about what a product cost per unit ("How much did flour cost per kg this year?"), on folded text:
+# answered from the prices on invoice lines (backoffice.line_prices) when it names a product bought.
+_UNIT_PRICE_Q = re.compile(r"\bper (?:kg|kgs|kilos?|kilograms?|litres?|liters?|l|units?|pieces?|items?|bags?|"
+                           r"boxe?s?|dozen|bottles?|packs?)\b|\ba (?:kilo|kg|litre|liter)\b|\bunit (?:price|cost)s?\b|"
+                           r"\b(?:price|cost)s? per\b|\bpor (?:kg|quilo|kilo|litro|unidade|saco|caixa)\b|"
+                           r"\bprecos? (?:por|unitarios?)\b|\bprecios? (?:por|unitarios?)\b")
+_BASIS_WORDS = (("kg", r"\b(?:kg|kgs|kilos?|kilograms?|quilos?)\b"), ("l", r"\b(?:l|litres?|liters?|litros?)\b"),
+                ("unit", r"\b(?:units?|pieces?|items?|each|unidades?)\b"), ("bag", r"\b(?:bags?|sacos?)\b"),
+                ("box", r"\b(?:boxe?s?|caixas?)\b"), ("dozen", r"\bdozen\b"), ("bottle", r"\bbottles?\b"),
+                ("pack", r"\bpacks?\b"))
+_BASIS_UNITS = {"kg": "kg", "l": "litres", "unit": "units", "bag": "bags", "box": "boxes", "dozen": "dozen",
+                "bottle": "bottles", "pack": "packs", "can": "cans", "hour": "hours", "m": "metres", "": "items"}
 _CADENCE = {"weekly": "a week", "monthly": "a month", "quarterly": "a quarter", "annual": "a year"}
 
 HELP_TEXT = ("I answer from your records and prepare things for you to confirm. Ask what you spent or received in "
@@ -630,6 +642,10 @@ class RuleBrain:
             self.svc.orchestrator.log("ask", "answer_question", response={
                 "question": t[:500], "intent": "supplier_statement",
                 "evidence": [e["id"] for e in answer.all_evidence()]})
+            return answer
+        if _UNIT_PRICE_Q.search(fold(t)) and (answer := self._unit_prices(u, t)) is not None:
+            self.svc.orchestrator.log("ask", "answer_question", response={
+                "question": t[:500], "intent": "unit_price", "evidence": [e["id"] for e in answer.all_evidence()]})
             return answer
         if not actions and (u.intent in _ACTIONS or u.slots.emails or u.slots.to_accountant):
             return _Answer("I can prepare that in the chat, where you check it and confirm with one tap.")
@@ -2141,6 +2157,52 @@ class RuleBrain:
                                    f"{self._day(r.renews_on)}: {r.detail[:1].lower()}{r.detail[1:]}."
                                    for r in (named or coming)), *lines]), evidence=evidence)
 
+    def _unit_prices(self, u: Understanding, message: str) -> _Answer | None:
+        """"How much did flour cost per kg this year?": from the prices on invoice lines that add up (X20). None
+        when the question names no product bought (it is then some other question)."""
+        from backoffice.line_prices import product_concepts, summarise, unit_money
+
+        groups = self.svc.orchestrator.line_prices.find(message)
+        if not groups:
+            return None
+        folded = fold(message)
+        concepts = sorted(product_concepts(folded))
+        name = concepts[0] if len(concepts) == 1 else groups[0][-1].product
+        want = next((basis for basis, pattern in _BASIS_WORDS if re.search(pattern, folded)), None)
+        period = u.slots.period
+        when = period.phrase if period is not None else "on your invoices"
+        bought = [p for g in groups for p in g if period is None or period.start <= p.on <= period.end]
+        if not bought:
+            return _Answer(f"I can't see {name} on your invoices {when}." if period is not None else
+                           f"I can't see {name} on your invoices yet.")
+        if want is None:  # the basis it was bought by most often
+            counts: dict[str, int] = {}
+            for p in bought:
+                counts[p.basis] = counts.get(p.basis, 0) + 1
+            want = max(sorted(counts), key=lambda b: counts[b])
+        chosen = [p for p in bought if p.basis == want]
+        if not chosen:
+            asked = "per litre" if want == "l" else f"per {want}"
+            return _Answer(f"I can't give a price {asked} for {name} {when}: its invoices price it "
+                           f"{join_and(sorted({p.per for p in bought}))}.")
+        per = chosen[0].per
+        s = summarise(chosen)
+        quantity = f"{s['quantity'].quantize(Decimal('0.01')).normalize():,f} {_BASIS_UNITS.get(want, want)}"
+        text = (f"{name[:1].upper()}{name[1:]} cost {unit_money(s['average'])} {per} on average {when}: {quantity} "
+                f"on {count_phrase(s['invoices'], 'invoice')} from {join_and(s['suppliers'])}")
+        if s["low"] != s["high"]:
+            text += f", from {unit_money(s['low'])} to {unit_money(s['high'])} {per}"
+        latest = s["latest"]
+        text += f". The last was {unit_money(latest.unit_price)} {per} on {self._day(latest.on)} ({latest.invoice})."
+        seen: set[str] = set()
+        evidence = []
+        for p in sorted(chosen, key=lambda p: (p.on, p.document_id), reverse=True):
+            if p.document_id not in seen:
+                seen.add(p.document_id)
+                evidence.append({"label": f"{p.supplier} {p.invoice} · {unit_money(p.unit_price)} {per}",
+                                 "id": p.evidence_id})
+        return _Answer(text, evidence=evidence[:6])
+
     def _i_subscriptions(self, u: Understanding) -> _Answer:
         prices = self.svc._price_answer()
         if _INCREASE.search(u.text):
@@ -2630,9 +2692,16 @@ def _run_tool(op: Operator, name: str, args: dict[str, Any], cards: list[dict[st
         answer = brain._i_subscriptions(understand("what are my subscriptions", brain.vocab, svc._today()))
         if answer.evidence:
             cards.append({"type": "evidence", "items": answer.evidence})
-        return {"summary": answer.text,
-                "price_increases": [{"name": n, "before_eur": float(b), "after_eur": float(a)}
-                                    for n, b, a, _ in svc.orchestrator.price_changes()]}
+        out: dict[str, Any] = {"summary": answer.text,
+                               "price_increases": [{"name": n, "before_eur": float(b), "after_eur": float(a)}
+                                                   for n, b, a, _ in svc.orchestrator.price_changes()]}
+        unit = svc.orchestrator.line_prices.recent_increases(svc._today())
+        if unit:  # prices on invoice lines that jumped against the product's last purchases (X20)
+            out["unit_price_increases"] = [
+                {"product": c.purchase.product, "supplier": c.purchase.supplier, "per": c.purchase.per,
+                 "before_eur": float(c.before), "after_eur": float(c.after), "percent": c.percent,
+                 "invoice": c.purchase.invoice, "date": c.purchase.on.isoformat()} for c in unit]
+        return out
     if name == "due_soon":
         today = svc._today()
         return {"today": today.isoformat(), "due_soon": svc._due_soon(),

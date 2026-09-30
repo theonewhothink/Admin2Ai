@@ -93,8 +93,8 @@ READINESS: tuple[ReadinessItem, ...] = (
         "operations",
     ),
     ReadinessItem(
-        "billing", "Payments and billing", "pending", 0,
-        "Not started. The plans (Free, Solo, Business, Multi-company, Accountant) need a payment provider.",
+        "billing", "Payments and billing", "pending", 55,
+        "Plans, limits and Stripe checkout, portal and webhooks are built and tested. Needs a Stripe account and live keys.",
         "billing",
     ),
 )

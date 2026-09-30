@@ -24,7 +24,7 @@ from .einvoice import _UBL_PREFIXES, UBL_NS, _unwrap
 from .fields import StructuredDataError
 from .safexml import parse_xml
 
-__all__ = ["InvoiceDetails", "read_invoice_details"]
+__all__ = ["InvoiceDetails", "PricedLine", "read_invoice_details", "read_priced_lines"]
 
 _DECIMAL = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)")
 
@@ -34,6 +34,24 @@ class InvoiceDetails:
     references: tuple[str, ...]  # header texts: notes, project, order and cost references, delivery address
     lines: tuple[DocumentLine, ...]
     vat_parts: tuple[VatPart, ...]  # per VAT rate: taxable amount and VAT, as the invoice states them
+
+
+@dataclass(frozen=True)
+class PricedLine:
+    """One e-invoice line as priced (backoffice.line_prices): what, how much, per which unit, at which price.
+
+    ``unit_code`` is the UN/ECE Recommendation 20 code of the invoiced quantity ("KGM", "LTR", "H87");
+    ``price`` is the net price per ``base_quantity`` of that unit, as the line states it (None when absent).
+    """
+
+    description: str
+    code: str | None  # the seller's product code (SellersItemIdentification), else a standard one (GTIN)
+    quantity: Decimal | None
+    unit_code: str | None
+    price: Decimal | None
+    base_quantity: Decimal | None
+    net: Decimal | None  # LineExtensionAmount
+    vat_rate: Decimal | None
 
 
 def _text(element: ET.Element | None) -> str | None:
@@ -122,3 +140,41 @@ def read_invoice_details(data: bytes | str) -> InvoiceDetails | None:
             parts.append(VatPart(rate=_decimal(find("cac:TaxCategory/cbc:Percent", sub)), net=base, vat=tax))
         break
     return InvoiceDetails(tuple(references), tuple(lines), tuple(parts))
+
+
+def read_priced_lines(data: bytes | str) -> tuple[PricedLine, ...]:
+    """Every line of a UBL invoice with its quantity, unit, price and VAT rate; empty for anything else.
+
+    A credit note's lines are not prices paid, and lines in another currency than the invoice's are not
+    read: both come back empty.
+    """
+    try:
+        root = _unwrap(parse_xml(data))
+    except (StructuredDataError, ValueError):
+        return ()
+    if root.tag != f"{{{UBL_NS['inv']}}}Invoice":
+        return ()
+
+    def find(path: str, element: ET.Element) -> ET.Element | None:
+        return element.find(path, _UBL_PREFIXES)
+
+    currency = _text(root.find("cbc:DocumentCurrencyCode", _UBL_PREFIXES))
+    out: list[PricedLine] = []
+    for line in root.findall("cac:InvoiceLine", _UBL_PREFIXES):
+        amount = find("cbc:LineExtensionAmount", line)
+        price = find("cac:Price/cbc:PriceAmount", line)
+        for element in (amount, price):
+            unit = element.get("currencyID") if element is not None else None
+            if unit and currency and unit.strip().upper() != currency.upper():
+                return ()
+        quantity = find("cbc:InvoicedQuantity", line)
+        code = (_text(find("cac:Item/cac:SellersItemIdentification/cbc:ID", line))
+                or _text(find("cac:Item/cac:StandardItemIdentification/cbc:ID", line)))
+        out.append(PricedLine(
+            description=_text(find("cac:Item/cbc:Name", line)) or _text(find("cac:Item/cbc:Description", line)) or "",
+            code=code, quantity=_decimal(quantity),
+            unit_code=(quantity.get("unitCode") or "").strip().upper() or None if quantity is not None else None,
+            price=_decimal(price), base_quantity=_decimal(find("cac:Price/cbc:BaseQuantity", line)),
+            net=_decimal(amount), vat_rate=_decimal(find("cac:Item/cac:ClassifiedTaxCategory/cbc:Percent", line)),
+        ))
+    return tuple(out)

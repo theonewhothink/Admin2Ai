@@ -329,6 +329,9 @@ class PostgresStore:
                     elif op.op == "remove_api_key":
                         cur.execute("DELETE FROM accountant_api_keys WHERE tenant_id = %s AND key_id = %s",
                                     (tenant_id, op.key_id))
+                    elif op.op == "link_billing_customer":  # 0015: a customer is one business's, the first one
+                        cur.execute("INSERT INTO billing_customers (customer_id, tenant_id) VALUES (%s, %s) "
+                                    "ON CONFLICT (customer_id) DO NOTHING", (op.key_id, tenant_id))
                     else:
                         raise StoreError(f"unknown index op {op.op}")
         except (psycopg.errors.UniqueViolation, psycopg.errors.IntegrityConstraintViolation) as exc:
@@ -382,6 +385,22 @@ class PostgresStore:
             cur.execute("SELECT tenant_id FROM accountant_api_keys WHERE key_hash = %s", (key_hash,))
             row = cur.fetchone()
             return row[0] if row else None
+
+    # ----------------------------------------------------------------- plans (0015, backoffice.billing)
+
+    def billing_tenant(self, customer_id: str) -> str | None:
+        """The business a payment-provider customer pays for (a webhook presents the customer id)."""
+        with self._tx(settings={self._db.BILLING_CUSTOMER_SETTING: customer_id}) as cur:
+            cur.execute("SELECT tenant_id FROM billing_customers WHERE customer_id = %s", (customer_id,))
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def member_count(self, tenant_id: str) -> int:
+        """People with access who count for a plan: owners, admins, employees and managers (never accountants)."""
+        with self._tx(tenant=tenant_id) as cur:
+            cur.execute("SELECT count(DISTINCT user_id) FROM memberships WHERE tenant_id = %s "
+                        "AND revoked_at IS NULL AND role <> 'accountant'", (tenant_id,))
+            return int(cur.fetchone()[0])
 
     # ----------------------------------------------------------------- accountants of some companies (0011)
 
