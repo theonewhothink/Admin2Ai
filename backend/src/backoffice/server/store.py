@@ -31,7 +31,8 @@ __all__ = [
     "User",
 ]
 
-ROLES = ("owner", "accountant", "admin")
+# An employee (backoffice.staff) may only upload receipts and read their own open card payments (auth.py).
+ROLES = ("owner", "accountant", "admin", "employee")
 
 
 class StoreError(Exception):

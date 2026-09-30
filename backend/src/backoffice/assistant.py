@@ -1040,6 +1040,7 @@ class RuleBrain:
                 parts.append(f"I left out {self._m(cards)} paying off cards: their purchases are counted one by one.")
         parts += self._recharge_lines(m)
         parts += self._given_back_lines(m)
+        parts += self._staff_claim_lines(m)
         parts += self._pending_lines(m, s)
         if m.private_count:
             parts.append(f"I left out {count_phrase(m.private_count, 'payment')} you marked as not for your companies.")
@@ -1290,6 +1291,31 @@ class RuleBrain:
             out.append(f"And {self._m(rest)} bought for {len(by_client) - 3} more clients, to recharge to them.")
         return out
 
+    def _staff_claim_lines(self, m: Money) -> list[str]:
+        """Staff expense claims (backoffice.staff): what is still to be paid back, what waits for your OK, and
+        transfers paying employees back, left out because their receipts are the cost (counted once)."""
+        out = []
+        owed: dict[str, list[Decimal]] = {}
+        for x in m.to_pay_back:
+            owed.setdefault(x.employee, []).append(x.amount)
+        for who, amounts in sorted(owed.items()):
+            out.append(f"{who} is still to be paid back {self._m(sum(amounts, Decimal(0)))} for "
+                       f"{count_phrase(len(amounts), 'expense claim')}.")
+        if len(m.claims_waiting) == 1:
+            x = m.claims_waiting[0]
+            out.append(f"Not counted yet: {x.employee}'s {self._m(x.amount)} receipt from {x.merchant}, waiting for "
+                       "your OK to pay it back.")
+        elif m.claims_waiting:
+            out.append(f"Not counted yet: {len(m.claims_waiting)} expense claims "
+                       f"({self._m(sum((x.amount for x in m.claims_waiting), Decimal(0)))}), waiting for your OK.")
+        paid: dict[str, Decimal] = {}
+        for x in m.reimbursements:
+            paid[x.employee or x.merchant] = paid.get(x.employee or x.merchant, Decimal(0)) + x.amount
+        for who, amount in sorted(paid.items()):
+            out.append(f"I left out {self._m(amount)} paid back to {who}: those expenses are counted once, from their "
+                       "receipts.")
+        return out
+
     def _paid_back_lines(self, m: Money) -> list[str]:
         """Money from clients that is not revenue: costs they paid back, and client money held for them."""
         out = []
@@ -1379,9 +1405,11 @@ class RuleBrain:
             notes += self._sales_lines(m)
             notes += self._waiting_payout_lines(m)
         notes += self._given_back_lines(m)
-        moved = sum((x.amount for x in m.left_out), Decimal(0))
+        moved = sum((x.amount for x in m.left_out if x.kind != "reimbursement"), Decimal(0))
         if moved:
             notes.append(f"Left out {self._m(moved)} moved between your own accounts and companies.")
+        if m.direction == "out":
+            notes += self._staff_claim_lines(m)
         notes += self._pending_lines(m, s)
         coverage = " ".join(self._coverage_notes(m, p)) if m.covered else self._coverage_line()
         previous = None
@@ -1456,6 +1484,15 @@ class RuleBrain:
                 "other_adjustments_eur": float(totals["adjustments"]),
                 "paid_out_to_bank_eur": float(totals["paid_out"]),
                 "note": "Gross sales count as money in; the fees are costs; the net payout itself is not counted."}
+        if m.reimbursements:
+            out["left_out"]["transfers_paying_employees_back_eur"] = float(
+                sum((x.amount for x in m.reimbursements), Decimal(0)))
+        if m.to_pay_back or m.claims_waiting:
+            out["staff_expense_claims"] = {
+                "to_pay_back": [{**self.payment_facts(x), "employee": x.employee} for x in m.to_pay_back],
+                "waiting_for_owner_approval_not_counted": [{**self.payment_facts(x), "employee": x.employee}
+                                                           for x in m.claims_waiting],
+                "note": "An employee's receipt is the cost, counted once; the transfer paying them back is not."}
         if m.waiting_payouts:
             out["payouts_not_counted_yet"] = [{**self.payment_facts(x), "provider": x.provider,
                                                "why": _PAYOUT_WAIT_FACT[x.status]} for x in m.waiting_payouts]

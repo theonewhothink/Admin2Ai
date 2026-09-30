@@ -486,13 +486,15 @@ class BankRow:
     counterparty_iban: str | None = None
     reference: str | None = None
     currency: str = "EUR"
+    # The cardholder's name when the bank's card details give it (employee cards, backoffice.staff).
+    cardholder: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.amount, float) or not isinstance(self.amount, Decimal):
             raise TypeError("money must be Decimal, never float")
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        out = {
             "bank_id": self.bank_id,
             "account_id": self.account_id,
             "booked_on": self.booked_on.isoformat(),
@@ -505,6 +507,9 @@ class BankRow:
             "counterparty_iban": self.counterparty_iban,
             "reference": self.reference,
         }
+        if self.cardholder:  # only when the bank named one: every other row keeps its evidence id
+            out["cardholder"] = self.cardholder
+        return out
 
 
 @dataclass
@@ -551,6 +556,9 @@ class DocumentRecord:
     owner_confirmed: str | None = None  # evidence id of the owner's answer confirming a cash receipt
     hold_reason: str = ""  # plain reason it waits although nothing is missing (e.g. a large first purchase)
     recipients: tuple[str, ...] = ()  # addresses the email was sent to (an alias can point to a cost center)
+    # A receipt an employee paid with their own money: the expense claim it belongs to (backoffice.staff).
+    # It never proves a company payment; the transfer that pays the employee back closes it.
+    claim_id: str | None = None
     # Who issued it and from which country (checklist P7): a foreign issuer is checked by rules that
     # hold anywhere, never by Portuguese ones. None, or a Portuguese issuer: the Portuguese rules.
     issuer: IssuerProfile | None = None
@@ -616,6 +624,8 @@ class TxRecord:
     not_for_document_ids: list[str] = field(default_factory=list)
     part_answer_ev: str | None = None  # the owner said this payment is part of an invoice (evidence id)
     deposit_refund_of: str | None = None  # the deposit this payment gave back (that deposit's payment id)
+    cardholder: str | None = None  # the cardholder the bank's card details name (backoffice.staff)
+    claim_ids: list[str] = field(default_factory=list)  # expense claims this transfer pays back (backoffice.staff)
 
     @property
     def id(self) -> str:
@@ -669,6 +679,7 @@ class ActivityEntry:
     amount: Decimal | None = None
     currency: str = "EUR"
     evidence_ids: tuple[str, ...] = ()
+    tag: str = ""  # "staff": about an employee's receipt or expense claim (backoffice.staff)
 
 
 @dataclass
@@ -1064,6 +1075,11 @@ class Repository:
         self.reads: dict[str, Any] = {}  # evidence id -> ReadOutcome (what was read, by which steps)
         # Jobs, properties, vehicles, outlets, events, courses or clients of each company (cost centers).
         self.cost_centers: dict[str, CostCenter] = {}
+        # Employees who hold company cards or pay expenses themselves (backoffice.staff): by their own id;
+        # receipts asked from a cardholder, by payment id; expense claims to pay back, by their own id.
+        self.employees: dict[str, Any] = {}
+        self.receipt_requests: dict[str, Any] = {}
+        self.expense_claims: dict[str, Any] = {}
 
     # ----------------------------------------------------------------- set-up
 
@@ -1340,7 +1356,8 @@ class DiscoveryAgent(_Agent):
             item = TrackedItem(id="item_" + tx_id, tenant_id=self.repo.tenant_id, subject_type="transaction",
                                subject_id=tx_id)
             self.repo.items[item.id] = item
-            record = TxRecord(tx=tx, evidence_id=reg.evidence.id, item_id=item.id, holder_id=account.holder_id)
+            record = TxRecord(tx=tx, evidence_id=reg.evidence.id, item_id=item.id, holder_id=account.holder_id,
+                              cardholder=" ".join((row.cardholder or "").split())[:120] or None)
             self.repo.transactions[tx_id] = record
             self.o.advance(item, Stage.ACQUIRED, [reg.evidence.id], agent=self.name,
                            note="Bank transaction imported.")
@@ -1712,10 +1729,13 @@ class FraudAgent(_Agent):
             d.document for d in self.repo.documents.values()
             if d.id != record.id and d.supplier_id and d.supplier_id == record.supplier_id and not d.on_hold
         ]
+        # A receipt one of your employees passes on (their reply, their forward) did not come from the supplier:
+        # their address is not a changed supplier domain. Every other check still runs (backoffice.staff).
+        sender = None if self.o.staff.employee_by_email(record.sender) is not None else record.sender
         result = assess(FraudCase(
             entities=self.repo.entities, supplier=supplier, document=record.document,
             history=sorted(history, key=lambda d: (d.issue_date or date.min, d.id)),
-            sender=record.sender, message_text=record.message_text,
+            sender=sender, message_text=record.message_text,
         ))
         self.log("assess", subject_id=record.id, evidence_ids=record.evidence_ids,
                  values={"hard_stop": result.hard_stop},
@@ -1835,7 +1855,8 @@ class ReconciliationAgent(_Agent):
                 and (not d.matched_tx_ids or staged.open_for_parts(d))
                 and d.document.doc_type is not DocumentType.PAYOUT_REPORT
                 and not repo.items[d.item_id].is_done
-                and not d.supporting and not d.paid_in_cash and not d.supports_tx_ids and staged.matchable(d)]
+                and not d.supporting and not d.paid_in_cash and not d.supports_tx_ids and staged.matchable(d)
+                and d.claim_id is None]  # paid with an employee's own money: an expense claim (backoffice.staff)
         accepted: list[Match] = []
         if txs and docs:
             netted = self._netting(docs)
@@ -2797,6 +2818,9 @@ class MissingEvidenceAgent(_Agent):
             return staged
         if rec.decision is not None and rec.decision.expectation is EvidenceExpectation.REFUND_OR_CREDIT_NOTE:
             return self._refund_plan(rec, amount, who, when)
+        staff = self.o.staff.plan(rec)  # paid with an employee's card: the receipt is asked from them
+        if staff is not None:
+            return staff
         chase = self.repo.chases.get(rec.id)
         if chase is not None and chase.sent:
             return (f"I asked {who} for the invoice for the {amount} payment on {when}. "
@@ -2869,6 +2893,8 @@ class MissingEvidenceAgent(_Agent):
                     subject_id=rec.id, period=Month.of(rec.tx.booked_on)))
             if rec.decision.provider.value != "supplier" or rec.likely_document_ids or rec.tx.entity_id is None:
                 continue
+            if self.o.staff.asks_cardholder(rec):
+                continue  # paid with an employee's card: the receipt is asked from them, not the supplier
             match = self.repo.resolver().resolve_transaction(rec.tx)
             supplier = match.supplier
             if supplier is None or not supplier.contact_email:
@@ -5053,8 +5079,8 @@ class ClosureAgent(_Agent):
             item = repo.items[record.item_id]
             if not record.paid_in_cash or record.matched_tx_ids or record.on_hold or item.is_done:
                 continue
-            if item.stage in (Stage.NEEDS_OWNER, Stage.CONFLICT):
-                continue
+            if item.stage in (Stage.NEEDS_OWNER, Stage.CONFLICT) or record.claim_id is not None:
+                continue  # an employee's own money is an expense claim, not the company's cash (backoffice.staff)
             company = record.document.entity_id
             verified = record.document.quality is Quality.GREEN or record.owner_confirmed is not None
             if company is None or not verified:
@@ -5157,6 +5183,8 @@ class AuditorAgent(_Agent):
                 return "This document is on hold."
             if doc.supporting:
                 return "A document that is not an invoice cannot close anything."
+            if doc.claim_id is not None:  # an expense claim: closed by its approval and the transfer paying it back
+                return self.o.staff.claim_problem(doc)
             if doc.owner_confirmed is not None and doc.paid_in_cash and doc.document.quality is not Quality.RED:
                 return None  # a cash receipt the owner confirmed: their answer is the evidence (§19, §55)
             if doc.document.quality is not Quality.GREEN:
@@ -5167,6 +5195,8 @@ class AuditorAgent(_Agent):
         rec = repo.transactions[item.subject_id]
         if rec.proof_evidence_ids:
             return None
+        if rec.claim_ids:  # pays back expense claims (backoffice.staff)
+            return self.o.staff.reimbursement_problem(rec)
         if not rec.document_ids:
             if self.o.staged.settled_without_document(rec) is not None:
                 return None  # a deposit given back, proven by both bank lines (checklist X8)
@@ -5756,6 +5786,9 @@ class Orchestrator:
         self.cost_centers = CostCenterAgent(self)
         self.statements = StatementAgent(self)
         self.staged = StagedPaymentsAgent(self)
+        from backoffice.staff import StaffAgent  # imported here: it builds on this module's agents
+
+        self.staff = StaffAgent(self)
         self._activity_seq = 0
         # What sends the emails the back office writes itself (backoffice.mailer): the demo's simulated
         # outbox, or None. With None they wait in ``repo.outbox``; the production server sends each one
@@ -5789,11 +5822,12 @@ class Orchestrator:
         return 1
 
     def activity(self, at: datetime, kind: str, text: str, company_id: str | None = None, *,
-                 amount: Decimal | None = None, currency: str = "EUR", evidence_ids: Sequence[str] = ()) -> None:
+                 amount: Decimal | None = None, currency: str = "EUR", evidence_ids: Sequence[str] = (),
+                 tag: str = "") -> None:
         self._activity_seq += 1
         self.repo.activity.append(ActivityEntry(
             id=f"a{self._activity_seq:04d}", at=at, kind=kind, text=text, company_id=company_id, amount=amount,
-            currency=currency, evidence_ids=tuple(evidence_ids)))
+            currency=currency, evidence_ids=tuple(evidence_ids), tag=tag))
 
     # ----------------------------------------------------------------- the emails we write (§22, §25, §28)
 
@@ -5859,6 +5893,8 @@ class Orchestrator:
         elif message.kind in ("statement_request", "statement_correction") and \
                 message.subject_id in self.repo.statements:
             self.statements.sent(message, at)
+        elif message.kind in self.staff.MESSAGE_KINDS:
+            self.staff.sent(message, at)
         elif message.kind == "correction_request" and message.subject_id in self.repo.documents:
             record = self.repo.documents[message.subject_id]
             who = display_name(record.document.supplier_name)
@@ -5902,6 +5938,8 @@ class Orchestrator:
                 what, who = self.statements.describe(message)
                 text = f"Wrote to {who} asking for {what}. It is waiting to be sent."
                 evidence = list(self.repo.documents[message.subject_id].evidence_ids)
+            elif message.kind in self.staff.MESSAGE_KINDS:
+                text, evidence = self.staff.waiting_line(message)
             self.activity(at, "waiting", text, message.company_id, evidence_ids=evidence)
 
     def evidence_text(self, evidence_id: str) -> str:
@@ -5924,7 +5962,9 @@ class Orchestrator:
 
     def ingest_file(self, data: bytes, *, filename: str | None = None, content_type: str | None = None,
                     source_kind: SourceKind = SourceKind.UPLOAD, at: datetime | None = None,
-                    origin: str = "upload") -> IngestReport:
+                    origin: str = "upload", run: bool = True) -> IngestReport:
+        """One file arrives. ``run=False``: read it but let the caller say more about it before the agents
+        run (an employee's receipt paid with their own money is an expense claim, never the company's)."""
         at = self.repo.clock.advance_to(at) if at else self.repo.clock.now()
         if (filename or "").lower().endswith(".csv") or (content_type or "").startswith("text/csv"):
             rows = _parse_bank_csv(data)
@@ -5933,7 +5973,8 @@ class Orchestrator:
         outcome = self.discovery.file(data, filename=filename, content_type=content_type,
                                       source_kind=source_kind, at=at)
         report = self._process_outcome(outcome, at=at, origin=origin)
-        self.run(at)
+        if run:
+            self.run(at)
         return report
 
     def share(self, payload: SharePayload, at: datetime | None = None) -> IngestReport:
@@ -6139,6 +6180,9 @@ class Orchestrator:
                                                 subject=parsed.subject, message_id=parsed.thread.message_id)
             report.question_ids += [q.id for q in questions]
             return
+        # An employee answering my request for a card receipt (backoffice.staff): matched by its thread.
+        reply = self.staff.reply_to(parsed, message_id, at)
+        first_document = len(report.document_ids)
         body_part = _Part(message_id, "email_body", text=parsed.text_body) if parsed.text_body.strip() else None
         groups: list[list[_Part]] = []
         hint = f"{parsed.sender_domain or ''} {parsed.subject}"  # names the provider when the report does not
@@ -6175,6 +6219,8 @@ class Orchestrator:
             self._read_letter(text, message_id, at=at, report=report, sender=writer)
         for nested in result.attached_emails:
             self._process_email(nested, at=at, origin=origin, report=report)
+        if reply is not None:
+            self.staff.replied(reply, report.document_ids[first_document:], at)
 
     # ----------------------------------------------------------------- documents
 
@@ -6826,17 +6872,20 @@ class Orchestrator:
         """Run every agent in the fixed order until nothing moves (at most ``MAX_PASSES``)."""
         now = self.repo.clock.advance_to(at) if at else self.repo.clock.now()
         report = RunReport()
+        self.staff.learn(now)  # cardholders the bank's card details name (employee cards)
         for _ in range(self.MAX_PASSES):
             report.passes += 1
             moved = self._entities(now)
             moved += self._link_credit_notes(now)
             self.reconciliation.classify([r for r in self.repo.transactions.values() if r.decision is None])
             moved += self.reconciliation.customer_refunds()  # money back to a customer: your own credit note
+            moved += self.staff.settle(now)  # a transfer paying an employee back their approved expense claims
             moved += self.settlement.settle(now)  # payouts first: their reports and commission invoices
             moved += self.staged.settle(now)  # deposits, advance and final invoices, parts held back (X8)
             matches = self.reconciliation.match()
             for m in matches:
                 self._reverify_with_bank(m)
+            moved += self.staff.link_receipts()  # a receipt an employee sent for a payment on their card
             moved += self._match_customer_refunds()
             moved += self._settle_partial_refunds(now)
             proven = self.obligations.prove()
@@ -6852,6 +6901,7 @@ class Orchestrator:
         self.statements.review(now)  # suppliers' account statements: nothing at all without one
         report.chased = self.missing.chase_all(now)
         self.missing.chase_expected(now)
+        self.staff.follow_up(now)  # receipts asked from cardholders, reminders, expense claims to approve
         self.accountant.answer_all(now)
         report.sent = self.deliver(now)
         self._announce_waiting(now)
@@ -7308,9 +7358,11 @@ class Orchestrator:
             return
         if self.staged.is_staged(self.repo.documents[match.document_ids[0]]):
             return  # a part of an invoice paid in parts: the bank never shows its whole total
+        self.reverify_pair(self.repo.transactions[match.transaction_ids[0]],
+                           self.repo.documents[match.document_ids[0]])
 
-        rec = self.repo.transactions[match.transaction_ids[0]]
-        doc = self.repo.documents[match.document_ids[0]]
+    def reverify_pair(self, rec: TxRecord, doc: DocumentRecord) -> None:
+        """One payment and its one document: the bank's booked amount confirms the document's total (§19)."""
         evidence = [*doc.evidence_ids, rec.evidence_id]
         # Paid net of a linked credit note: the payment plus the credit is what the invoice's total must show.
         credit = sum((abs(c.document.gross_amount or _ZERO) for c in self.credits_for(doc.id)
@@ -7412,7 +7464,7 @@ class Orchestrator:
         if needs.kind == "cost_center":
             # Checked before anything is recorded: a split that doesn't add up changes nothing.
             chosen = self._cost_center_choice(needs, option_id, split)
-        elif needs.kind in ("statement", "recharge", *_STAGED_QUESTIONS) and \
+        elif needs.kind in ("statement", "recharge", *_STAGED_QUESTIONS, *self.staff.NEEDS_KINDS) and \
                 option_id not in {o.id for o in needs.options}:
             raise ValueError("not one of the options")
         answer_ev = self._record_answer(needs, option_id, now, split=split if needs.kind == "cost_center" else None)
@@ -7442,6 +7494,8 @@ class Orchestrator:
             outcome = self._answer_recharge(needs, option_id, remember, answer_ev, now)
         elif needs.kind in _STAGED_QUESTIONS:
             outcome = self.staged.answer(needs, option_id, answer_ev, now)
+        elif needs.kind in self.staff.NEEDS_KINDS:
+            outcome = self.staff.answer(needs, option_id, answer_ev, now)
         else:
             outcome = self._answer_choice(needs, option_id, remember, answer_ev, now)
         self.run(now)
@@ -8549,7 +8603,7 @@ def _auditable(value: Any) -> Any:
 
 
 def _parse_bank_csv(data: bytes) -> list[BankRow] | None:
-    """A bank export: date,amount,counterparty,description,account[,card,iban,reference,kind]."""
+    """A bank export: date,amount,counterparty,description,account[,card,iban,reference,kind,cardholder]."""
     try:
         text = data.decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -8575,7 +8629,7 @@ def _parse_bank_csv(data: bytes) -> list[BankRow] | None:
             bank_id=f"csv-{digest}-{i}", account_id=row["account"], booked_on=booked, amount=amount,
             counterparty=row["counterparty"], description=row.get("description", ""), kind=kind,
             card_last4=row.get("card") or None, counterparty_iban=row.get("iban") or None,
-            reference=row.get("reference") or None,
+            reference=row.get("reference") or None, cardholder=row.get("cardholder") or None,
         ))
     return rows
 

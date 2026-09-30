@@ -43,6 +43,12 @@ deposit and the balance add up to it. A deposit given back when a booking was ca
 income nor spending: the deposit (kind ``deposit_returned``) and the money that gave it back (kind
 ``deposit_refund``) are left out of both, and said.
 
+**Staff expense claims** (backoffice.staff): a receipt an employee paid with their own money is the
+business's cost once the owner approved paying it back (kind ``cost``, dated on the receipt), counted once;
+the transfer that later pays the employee back is not a second cost (kind ``reimbursement``, left out and
+said so). Answers name what is still to be paid back, and claims waiting for the owner's OK are not
+counted yet.
+
 **Payouts** from card terminals and payment / sales platforms (SIBS, Stripe,
 PayPal, Booking.com, Glovo, ...) are net settlements, never customer revenue
 on their own. Once the provider's payout report has matched the bank payout
@@ -171,7 +177,7 @@ _KIND_CATEGORY = {"tax": "tax", "bank_fee": "bank_fees", "payroll": "payroll", "
                   "platform_fee": "platform_fees"}
 COST_KINDS = frozenset({"cost", "tax", "bank_fee", "payroll", "loan", "platform_fee"})
 IN_KINDS = frozenset({"income", "refund", "interest", "tax_refund", "sales", "deposit"})
-NOT_SPENDING = frozenset({"transfer", "card_repayment"})
+NOT_SPENDING = frozenset({"transfer", "card_repayment", "reimbursement"})
 GIVEN_BACK = frozenset({"deposit_returned", "deposit_refund"})  # a deposit and the money that gave it back
 _ZERO = Decimal(0)
 _PURCHASE_DOCS = frozenset({DocumentType.INVOICE, DocumentType.INVOICE_RECEIPT, DocumentType.SIMPLIFIED_INVOICE,
@@ -229,6 +235,10 @@ class Line:
     status: str = ""  # payouts: "settled" | "report_missing" | "report_disagrees" | "report_does_not_add_up"
     client: str = ""  # recharge / paid_back / client_money: the client's cost center
     recovered: Decimal = _ZERO  # recharge: the part the client has already paid back
+    # Staff expense claims (backoffice.staff): who paid it with their own money, and the claim's status
+    # ("waiting" | "approved" | "paid"); a reimbursement: who was paid back.
+    employee: str = ""
+    claim_status: str = ""
 
     @property
     def category_label(self) -> str:
@@ -263,10 +273,22 @@ class Money:
     paid_back: list[Line] = field(default_factory=list)
     # Deposits given back when a booking was cancelled (in), or the money that gave them back (out): never counted.
     given_back: list[Line] = field(default_factory=list)
+    # Staff expense claims waiting for the owner's OK (not counted yet).
+    claims_waiting: list[Line] = field(default_factory=list)
 
     @property
     def count(self) -> int:
         return len(self.lines)
+
+    @property
+    def to_pay_back(self) -> list[Line]:
+        """Counted expense claims the employee has not been paid back for yet."""
+        return [x for x in self.lines if x.claim_status == "approved"]
+
+    @property
+    def reimbursements(self) -> list[Line]:
+        """Transfers paying employees back: left out, their receipts are the cost."""
+        return [x for x in self.left_out if x.kind == "reimbursement"]
 
     @property
     def sales(self) -> list[Line]:
@@ -322,6 +344,10 @@ class Ledger:
             cash = self._cash_line(record)
             if cash is not None:
                 out.append(cash)
+        for claim in getattr(repo, "expense_claims", {}).values():
+            line = self._claim_line(claim)
+            if line is not None:
+                out.append(line)
         out = self._client_parts(out)
         out = self._deposit_parts(out)
         out += self._settled_payouts({x.id: x for x in out})
@@ -390,7 +416,8 @@ class Ledger:
         """A purchase paid in cash: its receipt is its only evidence (§11). Counted once the receipt
         closed as a company's cost; waiting for the owner's answer it is pending, like any payment."""
         repo = self.repo
-        if not record.paid_in_cash or record.matched_tx_ids or record.document.gross_amount is None:
+        if not record.paid_in_cash or record.matched_tx_ids or record.document.gross_amount is None \
+                or getattr(record, "claim_id", None):  # an employee's own money: its expense claim's line
             return None
         from backoffice.domain.lifecycle import Stage
 
@@ -411,6 +438,29 @@ class Ledger:
             category=category, evidence_id=record.evidence_ids[0] if record.evidence_ids else None,
             document_ids=(record.id,), history=False, needs_document=True, has_document=True,
             description="Paid in cash", paid_in_cash=True,
+        )
+
+    def _claim_line(self, claim: Any) -> Line | None:
+        """A receipt an employee paid with their own money (backoffice.staff): the business's cost once
+        approved, counted once, on the receipt's date; waiting for the owner's OK it is not counted yet."""
+        if claim.status not in ("waiting", "approved", "paid"):
+            return None  # declined: not a company cost
+        repo = self.repo
+        record = repo.documents.get(claim.document_id)
+        employee = repo.employees.get(claim.employee_id)
+        who = employee.name if employee is not None else "an employee"
+        text = self._document_text(record) if record is not None else ""
+        category = next((cat for phrase, cat in _EVIDENCE_PHRASES if _has_phrase(text, phrase)), OTHER.id)
+        description = {"waiting": f"Paid by {who}, waiting for your OK to pay it back",
+                       "approved": f"Paid by {who}, to pay back", "paid": f"Paid by {who}, paid back"}[claim.status]
+        return Line(
+            id=claim.id, on=claim.spent_on, amount=claim.amount, direction="out", currency=claim.currency,
+            merchant=claim.merchant, supplier_id=record.supplier_id if record is not None else None,
+            company_id=claim.company_id, pending=False, private=False,
+            kind="cost" if claim.status != "waiting" else "claim_waiting", category=category,
+            evidence_id=claim.evidence_ids[0] if claim.evidence_ids else None, document_ids=(claim.document_id,),
+            history=False, needs_document=True, has_document=True, description=description, employee=who,
+            claim_status=claim.status,
         )
 
     def _settled_payouts(self, by_id: dict[str, Line]) -> list[Line]:
@@ -455,6 +505,9 @@ class Ledger:
             kind = "cost"  # "the bank statement is enough" taught for something that is not a bank charge
         if tx.amount > 0:
             kind = {"bank_fee": "interest", "tax": "tax_refund", "cost": "income"}.get(kind, kind)
+        claims = list(getattr(rec, "claim_ids", None) or []) if rec is not None else []
+        if claims:
+            kind = "reimbursement"  # pays an employee back: the receipts they paid are the cost (counted once)
         own = next((e.name for e in repo.entities if tx.counterparty_iban and tx.counterparty_iban in e.own_ibans),
                    None)
         provider, status = "", ""
@@ -497,7 +550,13 @@ class Ledger:
         category = self._category(tx, kind, supplier, match.key, rec, folded,
                                   repo.accountant_ids_for(rule_company), rule_company)
         docs = tuple(rec.document_ids) if rec is not None else ()
+        employee = ""
+        if claims:
+            first = repo.expense_claims.get(claims[0])
+            person = repo.employees.get(first.employee_id) if first is not None else None
+            employee = person.name if person is not None else ""
         return Line(
+            employee=employee,
             id=tx.id, on=tx.booked_on, amount=abs(tx.amount), direction="in" if tx.amount > 0 else "out",
             currency=tx.currency, merchant=merchant, supplier_id=supplier.id if supplier else None,
             company_id=company, pending=waiting, private=private, kind=kind, category=category,
@@ -521,7 +580,7 @@ class Ledger:
     def _category(self, tx: Transaction, kind: str, supplier: Any, key: str, rec: Any, folded: str,
                   accountant_ids: list[str], company: str | None = None) -> str:
         repo = self.repo
-        if kind in ("transfer", "card_repayment", "payout") or kind in IN_KINDS:
+        if kind in ("transfer", "card_repayment", "payout", "reimbursement") or kind in IN_KINDS:
             return kind
         try:
             taught = repo.rulebook.evaluate(RuleSubject.from_transaction(tx, key=key, entity_id=company),
@@ -628,6 +687,7 @@ class Ledger:
         waiting: list[Line] = []
         clients: list[Line] = []
         given_back: list[Line] = []
+        claims_waiting: list[Line] = []
         private = other_currency = 0
         for x in base:
             if x.private:
@@ -637,6 +697,11 @@ class Ledger:
                 # A deposit that went back, and the money that gave it back: neither income nor a cost.
                 if not company_ids or x.company_id in company_ids:
                     given_back.append(x)
+                continue
+            if x.kind == "claim_waiting":
+                # An employee's receipt waiting for the owner's OK: not a company cost yet.
+                if not company_ids or x.company_id in company_ids:
+                    claims_waiting.append(x)
                 continue
             if x.kind in ("recharge", "paid_back", "client_money"):
                 # A client's money, not the business's own: reported on its own, never in a total.
@@ -676,7 +741,8 @@ class Ledger:
                        private_count=private, other_currency=other_currency, covered=covered,
                        history_months=self._history_months(counted), waiting_payouts=waiting,
                        recharged=[x for x in clients if x.kind == "recharge"],
-                       paid_back=[x for x in clients if x.kind != "recharge"], given_back=given_back)
+                       paid_back=[x for x in clients if x.kind != "recharge"], given_back=given_back,
+                       claims_waiting=claims_waiting)
         if compare is not None:
             p_start, p_end, p_label = compare
             result.previous = self.money(p_start, p_end, direction=direction, company_ids=company_ids,

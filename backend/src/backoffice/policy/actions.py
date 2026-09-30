@@ -8,7 +8,8 @@ Every action the operator can take has a fixed level:
   responses, uploads, document delivery. Runs on its own only when the tenant
   granted it (for all companies or one company).
 * OWNER_APPROVAL: unusual external communication, tax interpretation changes,
-  contractual changes. Approved one instance at a time.
+  contractual changes, staff expense claims (money an employee paid themselves,
+  to pay back). Approved one instance at a time.
 * HARD_APPROVAL: money movement, tax filing, bank detail change, legally
   binding acceptance, deletion of original evidence. Approved one instance at a
   time and can never be pre-granted.
@@ -77,6 +78,7 @@ class ActionKind(str, Enum):
     UNUSUAL_EXTERNAL_COMMUNICATION = "unusual_external_communication"
     TAX_INTERPRETATION_CHANGE = "tax_interpretation_change"
     CONTRACTUAL_CHANGE = "contractual_change"
+    EXPENSE_CLAIM_APPROVAL = "expense_claim_approval"  # a staff expense claim, to pay back (backoffice.staff)
     # Hard approval (always)
     MONEY_MOVEMENT = "money_movement"
     TAX_FILING = "tax_filing"
@@ -104,6 +106,7 @@ ACTION_LEVELS: dict[ActionKind, ActionLevel] = {
     _A.UNUSUAL_EXTERNAL_COMMUNICATION: _L.OWNER_APPROVAL,
     _A.TAX_INTERPRETATION_CHANGE: _L.OWNER_APPROVAL,
     _A.CONTRACTUAL_CHANGE: _L.OWNER_APPROVAL,
+    _A.EXPENSE_CLAIM_APPROVAL: _L.OWNER_APPROVAL,
     _A.MONEY_MOVEMENT: _L.HARD_APPROVAL,
     _A.TAX_FILING: _L.HARD_APPROVAL,
     _A.BANK_DETAIL_CHANGE: _L.HARD_APPROVAL,
@@ -134,6 +137,7 @@ _VERB: dict[ActionKind, str] = {
     _A.UNUSUAL_EXTERNAL_COMMUNICATION: "send this message",
     _A.TAX_INTERPRETATION_CHANGE: "change how this is taxed",
     _A.CONTRACTUAL_CHANGE: "change this contract",
+    _A.EXPENSE_CLAIM_APPROVAL: "agree to pay this expense back",
     _A.MONEY_MOVEMENT: "move this money",
     _A.TAX_FILING: "submit this tax filing",
     _A.BANK_DETAIL_CHANGE: "change these bank details",

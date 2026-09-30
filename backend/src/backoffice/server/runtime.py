@@ -240,7 +240,7 @@ def bank_row(data: Mapping[str, Any]) -> Any:
                    counterparty=str(data.get("counterparty") or ""), description=str(data.get("description") or ""),
                    kind=TransactionKind(str(data.get("kind") or "card")), card_last4=data.get("card_last4"),
                    counterparty_iban=data.get("counterparty_iban"), reference=data.get("reference"),
-                   currency=str(data.get("currency") or "EUR"))
+                   currency=str(data.get("currency") or "EUR"), cardholder=data.get("cardholder") or None)
 
 
 def _error(exc: ServiceError) -> tuple[int, dict[str, Any]]:
@@ -588,15 +588,19 @@ class TenantManager:
     # ----------------------------------------------------------------- what the API calls
 
     def view(self, tenant_id: str, method: str, path: str, body: Any = None, *,
-             companies: frozenset[str] | None = None, prefix: str = "") -> tuple[int, dict[str, Any]]:
+             companies: frozenset[str] | None = None, prefix: str = "",
+             employee: str | None = None) -> tuple[int, dict[str, Any]]:
         """A read: the state as of now, unchanged.
 
         ``companies``: the reader is an accountant limited to these companies (§28, §52): only the
         accountant's routes answer, filtered to them. ``prefix`` goes before client ids in the reply.
+        ``employee``: the reader is this employee (their email): only their own card payments answer.
         """
         with self.open(tenant_id) as rt:
             self.tick_if_due(rt)
             what = f"{method} {path.split('?', 1)[0]}"
+            if employee is not None:
+                return self._guarded_read(rt, what, lambda svc: svc.dispatch_employee(method, path, body, employee))
             if companies is None and not prefix:
                 return self._guarded_read(rt, what, lambda svc: svc.dispatch(method, path, body))
             scope = companies if companies is not None else frozenset(rt.service.repo.companies)

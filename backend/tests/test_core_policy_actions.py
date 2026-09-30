@@ -70,6 +70,7 @@ def test_levels_match_spec_section_25():
     }  # fmt: skip
     assert {a.value for a in OWNER} == {
         "unusual_external_communication", "tax_interpretation_change", "contractual_change",
+        "expense_claim_approval",  # staff expenses paid personally: the owner's one tap, never automatic
     }  # fmt: skip
     assert {a.value for a in HARD} == {
         "money_movement", "tax_filing", "bank_detail_change",
