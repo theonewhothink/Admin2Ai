@@ -113,6 +113,85 @@ class BackOfficeService:
 
         return cls(build_demo())
 
+    @classmethod
+    def new_tenant(cls, tenant_id: str, *, owner_name: str, owner_email: str, now: datetime,
+                   vault: Any = None, authorizer: Any = None) -> BackOfficeService:
+        """An empty real business: the owner, no companies yet, the clock at ``now``.
+
+        Companies come with :meth:`add_company`; everything else is learned
+        from the evidence that arrives (§4 zero configuration).
+        """
+        from backoffice.orchestrator import OwnerProfile, Repository
+
+        full_name = " ".join(str(owner_name or "").split())[:120]
+        email = str(owner_email or "").strip().lower()
+        if not full_name:
+            raise ServiceError(400, "What is your name?")
+        if not _EMAIL.match(email):
+            raise ServiceError(400, "That doesn't look like an email address.")
+        owner = OwnerProfile(first_name=full_name.split()[0], full_name=full_name, email=email)
+        repo = Repository(tenant_id=tenant_id, owner=owner, now=now)
+        return cls(Orchestrator(repo), vault=vault, authorizer=authorizer)
+
+    def add_company(self, name: Any, tax_id: Any, legal_name: Any = None) -> dict[str, Any]:
+        """Add one of the owner's companies. A Portuguese NIF is checked with the country pack."""
+        from backoffice.countries.pt.nif import validate_nif
+
+        name = " ".join(str(name or "").split())
+        if not name:
+            raise ServiceError(400, "What is the company called?")
+        if len(name) > 120:
+            raise ServiceError(400, "That name is too long.")
+        legal = " ".join(str(legal_name or "").split()) or name
+        if len(legal) > 160:
+            raise ServiceError(400, "That legal name is too long.")
+        nif = ""
+        if tax_id not in (None, ""):
+            check = validate_nif(str(tax_id))
+            if not check.valid or not check.normalized:
+                raise ServiceError(400, check.message or "That NIF doesn't look right. Please check it.")
+            nif = check.normalized
+            if any(e.tax_id == nif for e in self.repo.companies.values()):
+                raise ServiceError(409, "That company is already here.")
+        base = _SLUG.sub("-", name.lower()).strip("-")[:40] or "company"
+        company_id, n = base, 2
+        while company_id in self.repo.companies:
+            company_id, n = f"{base}-{n}", n + 1
+        self.repo.add_company(id=company_id, name=name, legal_name=legal, tax_id=nif)
+        # Sources that read for every company (mailboxes, the accountant) now cover this one too.
+        for c in self.repo.connectors.values():
+            if c.kind in ("email", "accountant") and company_id not in c.company_ids:
+                c.company_ids = (*c.company_ids, company_id)
+        self.orchestrator.log("entity", "company_added", subject_id=company_id,
+                              values={"tax_id": nif or None}, actor=f"owner:{self.repo.owner.email}")
+        self.orchestrator.run()
+        return {"ok": True, "company": self.company(company_id), "message": f"Done. {name} is set up."}
+
+    def set_accountant(self, email: Any, name: Any = None, software: Any = None) -> dict[str, Any]:
+        """Name the accountant who receives the monthly package (§5 step 5, §28)."""
+        from backoffice.orchestrator import AccountantProfile
+
+        address = str(email or "").strip().lower()
+        if not _EMAIL.match(address) or len(address) > 254:
+            raise ServiceError(400, "That doesn't look like an email address.")
+        person = " ".join(str(name or "").split())[:120]
+        tool = " ".join(str(software or "").split())[:60] or "your accountant's software"
+        local, _, domain = address.partition("@")
+        self.repo.accountant = AccountantProfile(
+            id="acct-" + (_SLUG.sub("-", address).strip("-")[:40] or "x"), firm=person or domain,
+            person=person or local, email=address, software=tool)
+        now = self._now()
+        self.repo.connectors.pop("accountant", None)
+        self.repo.add_connector(ConnectorState(
+            id="accountant", name=person or domain, kind="accountant", account=address,
+            company_ids=tuple(self.repo.companies), healthy=True, covered_from=now, covered_until=now,
+            last_synced_at=now))
+        self.orchestrator.log("accountant", "accountant_set", subject_id="accountant",
+                              actor=f"owner:{self.repo.owner.email}")
+        self.orchestrator.run()
+        return {"ok": True, "accountant": {"email": address, "name": person or None, "software": tool},
+                "message": f"Done. I will send the closed months to {address}."}
+
     @property
     def repo(self):  # type: ignore[no-untyped-def]
         return self.orchestrator.repo
@@ -657,18 +736,26 @@ class BackOfficeService:
     # ----------------------------------------------------------------- Monthly report delivery
 
     def _report_settings(self) -> dict[str, Any]:
-        if getattr(self, "_report_cfg", None) is None:
-            acct = self.repo.accountant
-            self._report_cfg = {
-                "recipients": ([{"email": acct.email, "name": acct.person, "role": "Accountant"}] if acct else []),
-                "day": 3, "format": "zip", "includeDocuments": True,
-                "companies": list(self.repo.companies), "copyOwner": True,
-            }
-        return self._report_cfg
+        """The saved delivery settings, or the defaults while the owner has saved none.
+
+        Defaults are computed on each read (never stored by a read), so an
+        accountant or company added later is included, and reading never
+        changes the tenant's state.
+        """
+        saved = getattr(self, "_report_cfg", None)
+        if saved is not None:
+            return saved
+        acct = self.repo.accountant
+        return {
+            "recipients": ([{"email": acct.email, "name": acct.person, "role": "Accountant"}] if acct else []),
+            "day": 3, "format": "zip", "includeDocuments": True,
+            "companies": list(self.repo.companies), "copyOwner": True,
+        }
 
     def report_settings(self, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
         cfg = self._report_settings()
         if body:
+            cfg = dict(cfg)
             recipients = body.get("recipients", cfg["recipients"])
             if not isinstance(recipients, list) or len(recipients) > 20:
                 raise ServiceError(400, "Add up to 20 recipients.")
@@ -689,6 +776,7 @@ class BackOfficeService:
             cfg.update(recipients=clean, day=day, format=fmt, companies=companies,
                        includeDocuments=bool(body.get("includeDocuments", cfg["includeDocuments"])),
                        copyOwner=bool(body.get("copyOwner", cfg["copyOwner"])))
+            self._report_cfg = cfg
             self.orchestrator.log("closure", "report_settings_changed", values={"recipients": len(clean)})
         names = {c: e.name for c, e in self.repo.companies.items()}
         who = ", ".join(r["email"] for r in cfg["recipients"]) or "nobody yet"
@@ -705,15 +793,33 @@ class BackOfficeService:
     def api_keys(self) -> dict[str, Any]:
         return {"keys": [{k: v for k, v in rec.items() if k != "hash"} for rec in self._keys().values()]}
 
-    def api_key_create(self, body: Mapping[str, Any] | None) -> dict[str, Any]:
+    @staticmethod
+    def new_api_key() -> tuple[str, str, str]:
+        """A fresh accountant API key: ``(secret, prefix, sha256 fingerprint)``."""
         import hashlib
         import secrets
 
-        name = str((body or {}).get("name") or "Accounting system").strip()[:60]
         secret = "bo_live_" + secrets.token_urlsafe(24)
-        kid = f"key_{len(self._keys()) + 1:03d}"
-        self._keys()[kid] = {"id": kid, "name": name, "prefix": secret[:12], "createdAt": self._now().isoformat(),
-                             "hash": hashlib.sha256(secret.encode()).hexdigest(), "scope": "documents:read"}
+        return secret, secret[:12], hashlib.sha256(secret.encode()).hexdigest()
+
+    def api_key_create(self, body: Mapping[str, Any] | None, *, secret: str | None = None,
+                       fingerprint: tuple[str, str] | None = None) -> dict[str, Any]:
+        """Issue a key. ``secret`` fixes the key; ``fingerprint`` = (prefix, sha256) re-creates a
+        key whose secret is no longer known (an event-sourced tenant being rebuilt)."""
+        import hashlib
+
+        name = str((body or {}).get("name") or "Accounting system").strip()[:60]
+        if fingerprint is not None:
+            prefix, digest = fingerprint
+        else:
+            if secret is None:
+                secret, _, _ = self.new_api_key()
+            prefix, digest = secret[:12], hashlib.sha256(secret.encode()).hexdigest()
+        # A running number, so a revoked key's id is never given to a new key.
+        self._api_key_seq = getattr(self, "_api_key_seq", 0) + 1
+        kid = f"key_{self._api_key_seq:03d}"
+        self._keys()[kid] = {"id": kid, "name": name, "prefix": prefix, "createdAt": self._now().isoformat(),
+                             "hash": digest, "scope": "documents:read"}
         return {"ok": True, "id": kid, "key": secret,
                 "message": "Copy this key now. I only show it once; I store a fingerprint, not the key."}
 
@@ -1451,7 +1557,10 @@ class BackOfficeService:
         ]
         chain = repo.audit.verify(repo.tenant_id)
         names = [e.name for e in repo.entities]
-        company = names[0] if len(names) == 1 else ", ".join(names[:-1]) + f" and {names[-1]}"
+        if not names:
+            company = "Your business"
+        else:
+            company = names[0] if len(names) == 1 else ", ".join(names[:-1]) + f" and {names[-1]}"
         return {"companyName": company, "periodLabel": "the last 90 days", "headline": report.headline,
                 "lines": list(report.lines), "callToAction": report.call_to_action, "findings": findings,
                 "log": {"records": chain.checked, "intact": chain.ok, "head": chain.head_hash}}

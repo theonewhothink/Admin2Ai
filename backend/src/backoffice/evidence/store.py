@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import tempfile
 import threading
 from collections.abc import Callable, Mapping
@@ -257,6 +258,18 @@ class LocalObjectStore:
         except (FileNotFoundError, ValueError, KeyError):
             return None
 
+    def purge_tenant(self, tenant: str) -> int:
+        """Erase every object of ``tenant`` (account deletion, §52). Returns how many were removed.
+
+        Only for an owner-confirmed account deletion: originals are otherwise never removed.
+        """
+        directory = (self._root / validate_tenant(tenant)).resolve()
+        if directory.parent != self._root or not directory.is_dir():
+            return 0
+        removed = sum(1 for p in directory.rglob("*") if p.is_file() and not p.name.endswith(".meta.json"))
+        shutil.rmtree(directory)
+        return removed
+
 
 def _fsync_dir(directory: Path) -> None:
     """Make the new directory entry durable (best effort; not all platforms allow it)."""
@@ -410,6 +423,33 @@ class S3ObjectStore:
                 return False
             raise
         return True
+
+    def purge_tenant(self, tenant: str, *, bypass_governance: bool = False) -> int:
+        """Erase every version of every object of ``tenant`` (account deletion, §52).
+
+        With Object Lock in GOVERNANCE mode this needs ``bypass_governance`` and
+        the ``s3:BypassGovernanceRetention`` permission (the evidence-deletion
+        role in AWS); without them S3 refuses and :class:`StorageConfigError`
+        says so, so the erasure stays pending instead of being reported done.
+        """
+        prefix = f"{self.prefix}{validate_tenant(tenant)}/"
+        removed = 0
+        paginator = self.client.get_paginator("list_object_versions")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            targets = [{"Key": v["Key"], "VersionId": v["VersionId"]}
+                       for v in [*(page.get("Versions") or []), *(page.get("DeleteMarkers") or [])]]
+            for start in range(0, len(targets), 1000):
+                batch = targets[start:start + 1000]
+                params: dict[str, Any] = {"Bucket": self.bucket, "Delete": {"Objects": batch, "Quiet": True}}
+                if bypass_governance:
+                    params["BypassGovernanceRetention"] = True
+                result = self.client.delete_objects(**params)
+                errors = result.get("Errors") or []
+                if errors:
+                    codes = sorted({str(e.get("Code")) for e in errors})
+                    raise StorageConfigError(f"S3 refused to delete {len(errors)} object versions: {', '.join(codes)}")
+                removed += len(batch)
+        return removed
 
 
 def _s3_error_code(exc: Exception) -> str | None:

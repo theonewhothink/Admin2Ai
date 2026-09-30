@@ -21,22 +21,40 @@ from __future__ import annotations
 import re
 
 __all__ = [
+    "API_KEY_SETTING",
     "APP_ROLE",
+    "ERASURE_SETTING",
     "EVIDENCE_ADMIN_ROLE",
     "GROUP_ROLES",
+    "IDENTITY_SETTINGS",
+    "LOGIN_EMAIL_SETTING",
+    "RATE_SUBJECTS_SETTING",
     "READONLY_ROLE",
     "SCHEDULER_ROLE",
     "SCOPE_SQL",
+    "SESSION_SETTING",
+    "SETTING_SQL",
     "TENANT_SETTING",
     "USER_SETTING",
     "scope_params",
     "scope_sql",
+    "setting_params",
     "validate_id",
     "validate_tenant_id",
 ]
 
 TENANT_SETTING = "app.tenant_id"
 USER_SETTING = "app.user_id"
+# Sign-in lookups before a tenant is known (migration 0007). Each opens only
+# the rows matching the value the caller presents, and like the tenant scope
+# they are transaction-local.
+LOGIN_EMAIL_SETTING = "app.login_email"  # users row of the email being signed in
+SESSION_SETTING = "app.session_hash"  # sessions row of the token presented (its SHA-256)
+RATE_SUBJECTS_SETTING = "app.rate_subjects"  # login_attempts of these keyed hashes (comma-separated)
+API_KEY_SETTING = "app.api_key_hash"  # accountant_api_keys row of the key presented (its SHA-256)
+ERASURE_SETTING = "backoffice.tenant_erasure"  # the tenant being erased in this transaction (§52)
+IDENTITY_SETTINGS = (LOGIN_EMAIL_SETTING, SESSION_SETTING, RATE_SUBJECTS_SETTING, API_KEY_SETTING, ERASURE_SETTING)
+SETTING_SQL = "SELECT set_config(%s, %s, true)"
 
 APP_ROLE = "backoffice_app"  # api and worker: DML under RLS
 READONLY_ROLE = "backoffice_readonly"  # support and analytics: SELECT under RLS
@@ -80,3 +98,12 @@ def validate_id(value: object) -> str:
 def scope_params(tenant_id: str, user_id: str | None = None) -> tuple[str, str]:
     """Parameters for :data:`SCOPE_SQL`. Without a user, the user setting is cleared."""
     return validate_tenant_id(tenant_id), "" if user_id is None else validate_id(user_id)
+
+
+def setting_params(name: str, value: str) -> tuple[str, str]:
+    """Parameters for :data:`SETTING_SQL` (one of :data:`IDENTITY_SETTINGS` or :data:`USER_SETTING`)."""
+    if name not in (*IDENTITY_SETTINGS, USER_SETTING):
+        raise ValueError(f"{name!r} is not a scope setting")
+    if not isinstance(value, str) or len(value) > 8192 or "\x00" in value:
+        raise ValueError("scope setting values are short text")
+    return name, value

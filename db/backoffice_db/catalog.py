@@ -5,7 +5,8 @@ proves it against a real database, so a later migration that forgets row-level
 security, adds a float column or an unguarded history table fails CI:
 
 * every table has row-level security enabled AND forced, with a policy that
-  reads ``app.tenant_id`` (only the runner's ``schema_migrations`` is exempt);
+  reads ``app.tenant_id`` (only the runner's ``schema_migrations`` is exempt;
+  the sign-in tables in :data:`IDENTITY_TABLES` must read their own setting);
 * no column is binary floating point or ``money``; every money column is
   ``numeric(18,2)`` in a table that also has a ``char(3)`` currency column;
 * history tables refuse UPDATE, DELETE and TRUNCATE (trigger), and the
@@ -24,7 +25,7 @@ from dataclasses import dataclass
 from .executor import SqlExecutor
 from .tenancy import APP_ROLE, GROUP_ROLES
 
-__all__ = ["APPEND_ONLY_TABLES", "RLS_EXEMPT_TABLES", "CatalogProblem", "check_catalog"]
+__all__ = ["APPEND_ONLY_TABLES", "IDENTITY_TABLES", "RLS_EXEMPT_TABLES", "CatalogProblem", "check_catalog"]
 
 # Tables whose rows are history: never edited, never removed (evidence only
 # through an approved deletion request).
@@ -37,8 +38,19 @@ APPEND_ONLY_TABLES = (
     "tracked_item_transitions",
     "needs_you_answers",
     "audit_log",
+    "tenant_events",
 )
+# History tables added after 0004, with the migration that creates them: a
+# database migrated only up to an earlier version is not missing them.
+APPEND_ONLY_SINCE: dict[str, str] = {"tenant_events": "0007"}
 RLS_EXEMPT_TABLES = frozenset({"schema_migrations"})
+# Sign-in tables that belong to no tenant. They still need row-level security
+# enabled and forced, with a policy keyed on what the caller presents (the
+# setting named here) instead of app.tenant_id.
+IDENTITY_TABLES: dict[str, str] = {
+    "user_credentials": "app.user_id",
+    "login_attempts": "app.rate_subjects",
+}
 _MONEY_NAME = re.compile(r"^(?:amount|.+_amount|fee|difference|conversion_cost)$")
 
 # pg_trigger.tgtype bits
@@ -75,13 +87,12 @@ def _row_level_security(executor: SqlExecutor, schema: str) -> list[CatalogProbl
         SELECT c.relname AS table_name,
                c.relrowsecurity AS enabled,
                c.relforcerowsecurity AS forced,
-               EXISTS (
-                   SELECT 1 FROM pg_policy p
+               coalesce((
+                   SELECT string_agg(coalesce(pg_get_expr(p.polqual, p.polrelid), '')
+                                     || ' ' || coalesce(pg_get_expr(p.polwithcheck, p.polrelid), ''), ' ')
+                   FROM pg_policy p
                    WHERE p.polrelid = c.oid
-                     AND (coalesce(pg_get_expr(p.polqual, p.polrelid), '')
-                          || coalesce(pg_get_expr(p.polwithcheck, p.polrelid), ''))
-                         LIKE '%app.tenant_id%'
-               ) AS tenant_policy
+               ), '') AS policies
         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = '{schema}' AND c.relkind IN ('r', 'p')
         ORDER BY 1
@@ -94,8 +105,9 @@ def _row_level_security(executor: SqlExecutor, schema: str) -> list[CatalogProbl
             continue
         if r["enabled"] != "t" or r["forced"] != "t":
             problems.append(CatalogProblem(name, "row level security", "must be enabled and forced"))
-        if r["tenant_policy"] != "t":
-            problems.append(CatalogProblem(name, "row level security", "no policy reads app.tenant_id"))
+        setting = IDENTITY_TABLES.get(name, "app.tenant_id")
+        if setting not in str(r["policies"] or ""):
+            problems.append(CatalogProblem(name, "row level security", f"no policy reads {setting}"))
     return problems
 
 
@@ -157,7 +169,8 @@ def _append_only(executor: SqlExecutor, schema: str) -> list[CatalogProblem]:
     for table in APPEND_ONLY_TABLES:
         r = seen.get(table)
         if r is None:
-            problems.append(CatalogProblem(table, "append-only", "table is missing"))
+            if not _not_yet_migrated(executor, schema, APPEND_ONLY_SINCE.get(table)):
+                problems.append(CatalogProblem(table, "append-only", "table is missing"))
             continue
         types = [int(t) for t in (r["types"] or "").split(",") if t]
         row_before = [t for t in types if t & _BEFORE and t & _ROW]
@@ -171,6 +184,17 @@ def _append_only(executor: SqlExecutor, schema: str) -> list[CatalogProblem]:
                     CatalogProblem(table, "append-only", f"{APP_ROLE} must not have {privilege.upper()}")
                 )
     return problems
+
+
+def _not_yet_migrated(executor: SqlExecutor, schema: str, version: str | None) -> bool:
+    """True when the runner's bookkeeping shows ``version`` was not applied (a partial migration)."""
+    if version is None or not re.fullmatch(r"[0-9]{4}", version):
+        return False
+    present = executor.query(f"SELECT to_regclass('{schema}.schema_migrations') IS NOT NULL AS present")
+    if not present or present[0]["present"] != "t":
+        return False
+    rows = executor.query(f"SELECT count(*) AS n FROM {schema}.schema_migrations WHERE version = '{version}'")
+    return bool(rows) and rows[0]["n"] == "0"
 
 
 def _roles(executor: SqlExecutor, schema: str) -> list[CatalogProblem]:

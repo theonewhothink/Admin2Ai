@@ -41,7 +41,7 @@ Schema invariants (RLS everywhere, no floats, guarded history tables...)::
 
 from __future__ import annotations
 
-from .catalog import APPEND_ONLY_TABLES, RLS_EXEMPT_TABLES, CatalogProblem, check_catalog
+from .catalog import APPEND_ONLY_TABLES, IDENTITY_TABLES, RLS_EXEMPT_TABLES, CatalogProblem, check_catalog
 from .executor import ConnectionParams, PsqlError, PsqlExecutor, Row, SqlExecutor
 from .logins import MIN_PASSWORD_LENGTH, ensure_login, ensure_login_sql
 from .migrations import (
@@ -60,28 +60,41 @@ from .migrations import (
 )
 from .money import MAX_ABS_AMOUNT, db_amount, db_currency
 from .tenancy import (
+    API_KEY_SETTING,
     APP_ROLE,
+    ERASURE_SETTING,
     EVIDENCE_ADMIN_ROLE,
     GROUP_ROLES,
+    IDENTITY_SETTINGS,
+    LOGIN_EMAIL_SETTING,
+    RATE_SUBJECTS_SETTING,
     READONLY_ROLE,
     SCHEDULER_ROLE,
     SCOPE_SQL,
+    SESSION_SETTING,
+    SETTING_SQL,
     TENANT_SETTING,
     USER_SETTING,
     scope_params,
     scope_sql,
+    setting_params,
     validate_id,
     validate_tenant_id,
 )
 
 __all__ = [
     "APPEND_ONLY_TABLES",
+    "API_KEY_SETTING",
     "APP_ROLE",
     "AppliedMigration",
     "CatalogProblem",
     "ConnectionParams",
+    "ERASURE_SETTING",
     "EVIDENCE_ADMIN_ROLE",
     "GROUP_ROLES",
+    "IDENTITY_SETTINGS",
+    "IDENTITY_TABLES",
+    "LOGIN_EMAIL_SETTING",
     "MAX_ABS_AMOUNT",
     "MIN_PASSWORD_LENGTH",
     "MIGRATIONS_DIR",
@@ -93,11 +106,14 @@ __all__ = [
     "MigrationStatus",
     "PsqlError",
     "PsqlExecutor",
+    "RATE_SUBJECTS_SETTING",
     "READONLY_ROLE",
     "RLS_EXEMPT_TABLES",
     "Row",
     "SCHEDULER_ROLE",
     "SCOPE_SQL",
+    "SESSION_SETTING",
+    "SETTING_SQL",
     "SqlExecutor",
     "TENANT_SETTING",
     "USER_SETTING",
@@ -111,6 +127,7 @@ __all__ = [
     "migrate",
     "scope_params",
     "scope_sql",
+    "setting_params",
     "status",
     "validate_id",
     "validate_tenant_id",

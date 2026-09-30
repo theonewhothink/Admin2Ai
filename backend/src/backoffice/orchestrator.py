@@ -38,7 +38,8 @@ import hashlib
 import io
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -210,6 +211,22 @@ class Clock:
 
     def today(self) -> date:
         return self._now.astimezone(TZ).date()
+
+    @contextmanager
+    def peek(self, at: datetime) -> Iterator[datetime]:
+        """Read views as of ``at`` (never earlier than now), then put the clock back.
+
+        For read-only work in a live deployment: the owner sees today's date
+        and greeting, while the stored state keeps the time of its last change.
+        """
+        if at.tzinfo is None:
+            raise ValueError("the clock needs a timezone-aware time")
+        before = self._now
+        self._now = max(before, at)
+        try:
+            yield self._now
+        finally:
+            self._now = before
 
 
 class MemoryObjectStore:

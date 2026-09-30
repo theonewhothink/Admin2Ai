@@ -9,6 +9,10 @@ The system starts from Evidence, not from Invoice:
 from __future__ import annotations
 
 import hashlib
+import itertools
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
@@ -17,13 +21,49 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
+# Set only while an event-sourced tenant applies one event (backoffice.server):
+# ids and "now" then come from the event itself, so replaying the event log
+# rebuilds exactly the same state. Unset (the demo, tests, the browser) they
+# are random ids and the wall clock, as before.
+_ID_SOURCE: ContextVar[Callable[[str], str] | None] = ContextVar("backoffice_id_source", default=None)
+_NOW_SOURCE: ContextVar[Callable[[], datetime] | None] = ContextVar("backoffice_now_source", default=None)
+
 
 def new_id(prefix: str) -> str:
+    source = _ID_SOURCE.get()
+    if source is not None:
+        return source(prefix)
     return f"{prefix}_{uuid4().hex[:16]}"
 
 
 def utcnow() -> datetime:
+    source = _NOW_SOURCE.get()
+    if source is not None:
+        return source().astimezone(timezone.utc)
     return datetime.now(timezone.utc)
+
+
+@contextmanager
+def deterministic(seed: str, now: Callable[[], datetime]) -> Iterator[None]:
+    """Within this block, :func:`new_id` derives ids from ``seed`` and :func:`utcnow` reads ``now``.
+
+    Ids are ``prefix_`` + 16 hex digits of SHA-256(seed, n) for the n-th id made
+    in the block, so the same seed and the same sequence of calls give the same
+    ids in any process.
+    """
+    counter = itertools.count()
+
+    def make(prefix: str) -> str:
+        digest = hashlib.sha256(f"{seed}\x1f{next(counter)}".encode()).hexdigest()
+        return f"{prefix}_{digest[:16]}"
+
+    id_token = _ID_SOURCE.set(make)
+    now_token = _NOW_SOURCE.set(now)
+    try:
+        yield
+    finally:
+        _NOW_SOURCE.reset(now_token)
+        _ID_SOURCE.reset(id_token)
 
 
 class SourceKind(str, Enum):

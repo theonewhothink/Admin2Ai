@@ -55,6 +55,16 @@ _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 # Advisory lock id shared by every runner: 'backoffice.migrations' as a bigint.
 _LOCK_KEY = int.from_bytes(hashlib.sha256(b"backoffice.migrations").digest()[:8], "big", signed=True)
 
+# The api's readiness check (GET /readyz) compares what was applied with the
+# files it ships; the application role may read (only read) the bookkeeping.
+STATUS_GRANT = """DO $status_grant$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'backoffice_app') THEN
+        GRANT SELECT ON public.schema_migrations TO backoffice_app;
+    END IF;
+END
+$status_grant$;"""
+
 # Run under the same lock: concurrent CREATE TABLE IF NOT EXISTS can still collide.
 BOOKKEEPING_DDL = f"""
 SELECT pg_advisory_xact_lock({_LOCK_KEY});
@@ -66,6 +76,7 @@ CREATE TABLE IF NOT EXISTS public.schema_migrations (
     applied_by  text        NOT NULL DEFAULT current_user
 );
 REVOKE ALL ON public.schema_migrations FROM PUBLIC;
+{STATUS_GRANT}
 """
 
 
@@ -340,6 +351,7 @@ def bookkept_script(migration: Migration) -> str:
         f"SELECT pg_advisory_xact_lock({_LOCK_KEY});\n"
         "INSERT INTO public.schema_migrations (version, name, checksum) "
         f"VALUES ('{migration.version}', '{migration.name}', '{migration.checksum}');\n"
+        f"{STATUS_GRANT}\n"
         f"{migration.sql}\n"
     )
 

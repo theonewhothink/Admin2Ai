@@ -24,12 +24,12 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import urlencode
 
 from .vault import TokenVault
 
-__all__ = ["AuthorizationError", "OAuthApp", "OAuthAuthorizer", "PROVIDERS"]
+__all__ = ["AuthorizationError", "NonceStore", "OAuthApp", "OAuthAuthorizer", "PROVIDERS"]
 
 
 class AuthorizationError(Exception):
@@ -82,6 +82,18 @@ def _unb64(text: str) -> bytes:
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
 
 
+class NonceStore(Protocol):
+    """Shared single-use record of sign-ins in progress (several API processes, §47).
+
+    ``save`` notes a nonce until ``expires_at`` (epoch seconds); ``take``
+    returns True exactly once for a saved, unexpired nonce.
+    """
+
+    def save(self, tenant_id: str, nonce: str, expires_at: float) -> None: ...
+
+    def take(self, tenant_id: str, nonce: str) -> bool: ...
+
+
 class OAuthAuthorizer:
     def __init__(
         self,
@@ -93,6 +105,7 @@ class OAuthAuthorizer:
         http: Any = None,
         state_ttl_seconds: int = 600,
         clock: Any = time.time,
+        nonces: NonceStore | None = None,
     ) -> None:
         if len(state_key) < 32:
             raise ValueError("state_key must be at least 32 bytes")
@@ -103,17 +116,34 @@ class OAuthAuthorizer:
         self._http = http
         self._ttl = state_ttl_seconds
         self._clock = clock
+        # Without a shared nonce store the PKCE verifier stays in this process
+        # (one API process). With one, the verifier is derived from the nonce
+        # with the state key, so any process can finish the sign-in and the
+        # store only has to remember that the nonce was not used yet.
+        self._nonces = nonces
         self._verifiers: dict[str, str] = {}  # nonce -> PKCE verifier (server side, short-lived)
+
+    @property
+    def providers(self) -> tuple[str, ...]:
+        return tuple(sorted(self._apps))
+
+    def _derived_verifier(self, nonce: str) -> str:
+        return _b64(hmac.new(self._key, b"pkce:" + nonce.encode(), hashlib.sha256).digest())
 
     def begin(self, provider: str, tenant_id: str, connection_id: str, login_hint: str | None = None) -> str:
         app = self._apps.get(provider)
         if app is None:
             raise AuthorizationError(f"{provider} sign-in is not configured")
-        verifier = _b64(os.urandom(32))
-        challenge = _b64(hashlib.sha256(verifier.encode()).digest())
         nonce = _b64(os.urandom(16))
-        self._verifiers[nonce] = verifier
-        payload = {"p": provider, "t": tenant_id, "c": connection_id, "n": nonce, "e": int(self._clock()) + self._ttl}
+        expires = int(self._clock()) + self._ttl
+        if self._nonces is not None:
+            verifier = self._derived_verifier(nonce)
+            self._nonces.save(tenant_id, nonce, expires)
+        else:
+            verifier = _b64(os.urandom(32))
+            self._verifiers[nonce] = verifier
+        challenge = _b64(hashlib.sha256(verifier.encode()).digest())
+        payload = {"p": provider, "t": tenant_id, "c": connection_id, "n": nonce, "e": expires}
         body = _b64(json.dumps(payload, separators=(",", ":")).encode())
         state = f"{body}.{_b64(hmac.new(self._key, body.encode(), hashlib.sha256).digest())}"
         params = {
@@ -141,7 +171,10 @@ class OAuthAuthorizer:
     def complete(self, code: str, state: str) -> dict[str, str]:
         """Exchange ``code`` and seal the refresh token. Returns tenant, connection and provider."""
         payload = self._read_state(state)
-        verifier = self._verifiers.pop(payload["n"], None)
+        if self._nonces is not None:
+            verifier = self._derived_verifier(payload["n"]) if self._nonces.take(payload["t"], payload["n"]) else None
+        else:
+            verifier = self._verifiers.pop(payload["n"], None)
         if verifier is None:
             raise AuthorizationError("sign-in was already used")
         app = self._apps[payload["p"]]
@@ -163,4 +196,30 @@ class OAuthAuthorizer:
             raise AuthorizationError("the provider did not allow offline access")
         self._vault.store(payload["t"], payload["c"], payload["p"],
                           {"refresh_token": refresh, "scope": token.get("scope", "")})
-        return {"tenant_id": payload["t"], "connection_id": payload["c"], "provider": payload["p"]}
+        done = {"tenant_id": payload["t"], "connection_id": payload["c"], "provider": payload["p"]}
+        email = _id_token_email(token.get("id_token"))
+        if email:
+            done["email"] = email
+        return done
+
+
+def _id_token_email(id_token: Any) -> str | None:
+    """The mailbox address in an ID token received directly from the provider's token endpoint.
+
+    The token came over TLS from the token URL in exchange for our own code, so
+    its issuer is the provider (OpenID Connect Core §3.1.3.7 allows TLS
+    validation in place of the signature here). Only the address is used.
+    """
+    if not isinstance(id_token, str) or id_token.count(".") != 2:
+        return None
+    try:
+        claims = json.loads(_unb64(id_token.split(".")[1]))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(claims, dict):
+        return None
+    for name in ("email", "preferred_username", "upn"):
+        value = claims.get(name)
+        if isinstance(value, str) and "@" in value and len(value) <= 254 and " " not in value:
+            return value.strip().lower()
+    return None
