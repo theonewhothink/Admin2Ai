@@ -81,6 +81,10 @@ def handle(view: str, tenants: Sequence[BackOfficeService], body: Mapping[str, A
         return operations(tenants, limit=_limit((body or {}).get("limit")))
     if view == "readiness":
         return readiness()
+    if view == "acceptance":
+        from backoffice.acceptance import acceptance
+
+        return acceptance()
     raise KeyError(view)
 
 

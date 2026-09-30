@@ -2211,7 +2211,7 @@ class BackOfficeService:
              lambda b: self.accountant_rule(_field(b, "text"), str(b.get("scope") or "client"))),
             ("GET", r("/api/audit"), lambda b: self.audit()),
             ("GET", r("/api/pipeline"), lambda b: self.pipeline()),
-            ("GET", r("/api/internal/(overview|operations|readiness)"), lambda b, view: self.internal(view, b)),
+            ("GET", r("/api/internal/(overview|operations|readiness|acceptance)"), lambda b, view: self.internal(view, b)),
         )
 
 
