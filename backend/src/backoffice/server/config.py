@@ -71,6 +71,9 @@ class ServerConfig:
     s3_endpoint_url: str = ""
     evidence_kms_key_id: str = ""
     s3_bypass_governance: bool = False
+    s3_erasure_role_arn: str = ""  # the evidence-deletion role the sync worker assumes to finish erasures
+    s3_replica_bucket: str = ""  # the disaster-recovery copy of the evidence bucket (erased too)
+    s3_replica_region: str = ""
     object_dir: str = "/var/lib/backoffice/objects"
     gocardless_secret_id: str = field(default="", repr=False)
     gocardless_secret_key: str = field(default="", repr=False)
@@ -114,6 +117,9 @@ class ServerConfig:
             s3_endpoint_url=e.get("S3_ENDPOINT_URL", "").strip(),
             evidence_kms_key_id=e.get("EVIDENCE_KMS_KEY_ID", "").strip(),
             s3_bypass_governance=_flag(e, "S3_BYPASS_GOVERNANCE_ON_ERASURE"),
+            s3_erasure_role_arn=e.get("S3_ERASURE_ROLE_ARN", "").strip(),
+            s3_replica_bucket=e.get("S3_REPLICA_BUCKET", "").strip(),
+            s3_replica_region=e.get("S3_REPLICA_REGION", "").strip(),
             object_dir=e.get("BACKOFFICE_OBJECT_DIR", "").strip() or "/var/lib/backoffice/objects",
             gocardless_secret_id=e.get("GOCARDLESS_SECRET_ID", "").strip(),
             gocardless_secret_key=e.get("GOCARDLESS_SECRET_KEY", "").strip(),

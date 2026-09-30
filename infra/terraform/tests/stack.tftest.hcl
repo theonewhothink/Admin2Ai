@@ -76,6 +76,17 @@ mock_provider "aws" {
   }
 }
 
+# Distinct ARNs for the task roles whose trust relationships are asserted below.
+override_resource {
+  target = aws_iam_role.worker
+  values = { arn = "arn:aws:iam::123456789012:role/backoffice-production-worker-task" }
+}
+
+override_resource {
+  target = aws_iam_role.sync
+  values = { arn = "arn:aws:iam::123456789012:role/backoffice-production-sync-task" }
+}
+
 mock_provider "random" {
   mock_resource "random_password" {
     defaults = { result = "MockPasswordMockPasswordMockPassword0123456789abcdefABCDEF012345" }
@@ -247,6 +258,30 @@ run "production_defaults" {
   }
 
   assert {
+    condition = alltrue([
+      module.sync.environment["S3_ERASURE_ROLE_ARN"] == aws_iam_role.evidence_deletion.arn,
+      module.sync.environment["S3_REPLICA_BUCKET"] == aws_s3_bucket.evidence_replica[0].bucket,
+      module.sync.environment["S3_REPLICA_REGION"] == "eu-west-3",
+      module.api.environment["S3_ERASURE_ROLE_ARN"] == aws_iam_role.evidence_deletion.arn,
+    ])
+    error_message = "the sync worker finishes erasures as the deletion role, in both copies; the api leaves them to it"
+  }
+
+  assert {
+    condition = toset(flatten([
+      for p in data.aws_iam_policy_document.evidence_deletion_trust.statement[0].principals : p.identifiers
+    ])) == toset([aws_iam_role.worker.arn, aws_iam_role.sync.arn]) && aws_iam_role_policy.sync_erasure.name == "finish-account-erasures"
+    error_message = "the deletion role trusts the worker and the sync worker, and the sync worker may assume it"
+  }
+
+  assert {
+    condition = contains([
+      for s in data.aws_iam_policy_document.evidence_bucket.statement : s.sid if s.effect == "Deny"
+    ], "OnlyTheDeletionWorkflowBypassesRetention")
+    error_message = "only the deletion role may delete an original or bypass its retention"
+  }
+
+  assert {
     condition     = aws_sns_topic.alarms.kms_master_key_id == aws_kms_key.messaging.arn && length(aws_sns_topic_subscription.alarm_email) == 0
     error_message = "the alarm topic is KMS-encrypted and has no subscriber unless alarm_email is set"
   }
@@ -274,6 +309,11 @@ run "staging_can_be_smaller" {
   assert {
     condition     = length(aws_s3_bucket.evidence_replica) == 0 && length(aws_iam_role.replication) == 0
     error_message = "no replica when replication is off"
+  }
+
+  assert {
+    condition     = !contains(keys(module.sync.environment), "S3_REPLICA_BUCKET") && contains(keys(module.sync.environment), "S3_ERASURE_ROLE_ARN")
+    error_message = "without a replica, an erasure empties the evidence bucket only"
   }
 
   assert {

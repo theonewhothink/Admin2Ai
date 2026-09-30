@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -19,9 +21,10 @@ from _server_support import (
 )
 
 from backoffice.evidence.store import LocalObjectStore
-from backoffice.server.events import Event, chain_hash, state_digest
+from backoffice.server import events
+from backoffice.server.events import Event, EventError, canonical, chain_hash, state_digest
 from backoffice.server.runtime import ReplayDiverged, TenantManager
-from backoffice.server.store import MemoryStore, StoredEvent
+from backoffice.server.store import MemoryStore, StoredEvent, Tenant, User
 
 
 def _reads(h, token: str, paths: list[str]) -> dict[str, tuple[int, object]]:
@@ -232,3 +235,91 @@ def test_signup_events_replay_on_their_own(tmp_path: Path) -> None:
         assert rt.svc.repo.companies["padaria-lda"].tax_id == "516123459"
         assert rt.svc.repo.owner.email == "ana@example.pt"
     assert h.client.post("/api/auth/login", json={"email": "ana@example.pt", "password": PASSWORD}).status_code == 200
+
+
+# --------------------------------------------------------------------------- event and digest versions
+
+
+def _as_format_1(rows: list[StoredEvent]) -> list[StoredEvent]:
+    """The same log as the first release wrote it: event format 1, no digest version, re-chained."""
+    out: list[StoredEvent] = []
+    prev = rows[0].prev_hash
+    for row in rows:
+        payload = json.loads(row.body)
+        assert payload.pop("dv") == 1
+        payload["v"] = 1
+        body = canonical(payload)
+        out.append(StoredEvent(row.seq, row.at, row.kind, row.actor, body, prev, chain_hash(prev, body)))
+        prev = out[-1].hash
+    return out
+
+
+def test_events_record_the_digest_version_they_were_checked_with(tmp_path: Path) -> None:
+    h = harness(tmp_path)
+    account = signup(h.client)
+    tenant = account["tenant"]["id"]
+    h.client.post("/api/tasks", json={"title": "Call the bank"}, headers=bearer(account["token"]))
+    rows = h.store.events(tenant)
+    payloads = [json.loads(r.body) for r in rows]
+    assert {(p["v"], p["dv"]) for p in payloads} == {(2, events.DIGEST_VERSION)} == {(2, 1)}
+    assert all(Event.parse(r).digest_version == 1 for r in rows)
+    # A log in the first format (no "dv") is read as digest version 1 and replays unchanged.
+    old = MemoryStore()
+    old.create_account(user=User("usr_x", "x@x.pt", "X"), password_hash="scrypt$1$1$1$a$b",
+                       tenant=Tenant(tenant, "X"), roles=["owner"], events=_as_format_1(rows), at=rows[0].at)
+    h.clock.step = h.clock.step * 0
+    with TenantManager(old, h.objects, now=h.clock).open(tenant) as a, h.manager.open(tenant) as b:
+        assert state_digest(a.svc) == state_digest(b.svc)
+
+
+def test_a_log_recorded_with_digest_1_still_replays_after_digest_2(tmp_path: Path,
+                                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    h = harness(tmp_path)
+    account = signup(h.client)
+    token, tenant = account["token"], account["tenant"]["id"]
+    build_business(h, token)
+    recorded = len(h.store.events(tenant))
+    h.clock.step = h.clock.step * 0
+
+    # A later build covers more in its digest (here: the owner's name spelled out) and records it from now on.
+    def digest_v2(svc: object) -> str:
+        return hashlib.sha256(f"v2|{events.DIGESTS[1](svc)}|{svc.repo.owner.full_name}".encode()).hexdigest()
+
+    monkeypatch.setitem(events.DIGESTS, 2, digest_v2)
+    monkeypatch.setattr(events, "DIGEST_VERSION", 2)
+    with h.manager.open(tenant) as rt:
+        live = state_digest(rt.svc, 1)
+    upgraded = TenantManager(h.store, h.objects, now=h.clock, strict_reads=True)
+    with upgraded.open(tenant) as rt:  # every old event is compared with digest 1
+        assert state_digest(rt.svc, 1) == live
+    status, _ = upgraded.command(tenant, account["user"]["id"], "POST", "/api/tasks", {"title": "After the upgrade"})
+    assert status == 200
+    new = [Event.parse(r) for r in h.store.events(tenant)][recorded:]
+    assert [e.digest_version for e in new] == [2]
+
+    # Another process on the new build replays the mixed log: version-1 events with digest 1, the new one with 2.
+    third = TenantManager(h.store, h.objects, now=h.clock, strict_reads=True)
+    with third.open(tenant) as a, upgraded.open(tenant) as b:
+        assert state_digest(a.svc) == state_digest(b.svc)
+        assert events.DIGESTS[1](a.svc) != events.DIGESTS[2](a.svc)  # each event really used its own version
+
+    # A build that does not know digest 2 refuses that log instead of guessing.
+    monkeypatch.delitem(events.DIGESTS, 2)
+    monkeypatch.setattr(events, "DIGEST_VERSION", 1)
+    older = TenantManager(h.store, h.objects, now=h.clock)
+    with pytest.raises(ReplayDiverged) as err:
+        with older.open(tenant):
+            pass
+    assert err.value.seq == new[0].seq and "digest version 2" in err.value.reason
+
+
+def test_unknown_event_formats_are_refused() -> None:
+    body = canonical({"v": 3, "dv": 1, "seq": 1, "at": "2026-10-02T09:30:00+01:00", "kind": "tick", "actor": "system",
+                      "pre": None, "data": {}})
+    row = StoredEvent(1, datetime(2026, 10, 2, 8, 30, tzinfo=timezone.utc), "tick", "system", body, "0" * 64,
+                      chain_hash("0" * 64, body))
+    with pytest.raises(EventError):
+        Event.parse(row)
+    with pytest.raises(EventError):
+        Event.make(seq=1, at=row.at, kind="tick", actor="system", data={}, pre=None, prev_hash="0" * 64,
+                   digest_version=99)

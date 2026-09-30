@@ -23,6 +23,9 @@ backoffice.server.worker`` repeats it):
    "Gmail needs reconnecting" and sends one push notification (§47–48). A
    connection that has not synced for a day despite retries is shown the same
    way; the month can never close green while it is stale.
+5. **Erasures.** Accounts erased since the last pass still have their files:
+   the worker removes them, in AWS as the evidence-deletion role
+   (server/erasure.py), and marks each erasure record purged.
 
 The worker never sends email, moves money or approves anything.
 """
@@ -66,6 +69,7 @@ class PassReport:
     needs_owner: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     errors: int = 0
+    erasures: list[str] = field(default_factory=list)  # erased businesses whose files were purged
 
 
 @dataclass(frozen=True)
@@ -110,8 +114,10 @@ class SyncWorker:
         bank_batch: int = 500,
         backoff_base: timedelta = timedelta(minutes=1),
         backoff_max: timedelta = timedelta(hours=1),
+        purger: Any = None,
     ) -> None:
         self.manager = manager
+        self.purger = purger  # server/erasure.py: finishes account erasures (None: not this worker's job)
         self.store = manager.store
         self.vault = vault if vault is not None else manager.vault
         self.aggregator_factory = aggregator_factory
@@ -136,6 +142,7 @@ class SyncWorker:
 
     def run_once(self, should_stop: Callable[[], bool] | None = None) -> PassReport:
         report = PassReport()
+        self.complete_erasures(report)
         try:
             tenant_ids = self.store.tenant_ids()
         except StoreError:
@@ -159,6 +166,39 @@ class SyncWorker:
         log.info("sync_pass", extra={"tenants": report.tenants, "connections": len(report.synced),
                                      "messages": report.messages, "rows": report.rows})
         return report
+
+    def complete_erasures(self, report: PassReport) -> None:
+        """Remove the files of every erased business that still has them, then mark its record purged."""
+        if self.purger is None:
+            return
+        try:
+            pending = self.store.pending_erasures()
+        except StoreError:
+            log.warning("erasures_unavailable")
+            return
+        now = self.now()
+        for tenant_id in pending:
+            key = f"erasure/{tenant_id}"
+            retry = self._retry.get(key)
+            if retry is not None and retry[1] > now:
+                continue
+            self.manager.evict(tenant_id)
+            try:
+                removed = self.purger.purge(tenant_id)
+                self.store.mark_objects_purged(tenant_id, self.manager.now())
+            except StoreUnavailable:  # the database is away: the next pass tries again
+                log.warning("erasures_store_unavailable")
+                report.errors += 1
+                return
+            except Exception as exc:  # stays pending; tried again after a pause
+                failures = (retry[0] if retry else 0) + 1
+                self._retry[key] = (failures, now + min(self.backoff_max, self.backoff_base * (2 ** (failures - 1))))
+                log.warning("erasure_purge_failed", extra={"tenant": tenant_id, "exc_type": type(exc).__name__})
+                report.errors += 1
+                continue
+            self._retry.pop(key, None)
+            report.erasures.append(tenant_id)
+            log.info("erasure_completed", extra={"tenant": tenant_id, "rows": removed})
 
     def sync_tenant(self, tenant_id: str, report: PassReport | None = None) -> PassReport:
         report = report if report is not None else PassReport()

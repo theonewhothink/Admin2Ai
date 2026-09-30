@@ -6,8 +6,10 @@
 * :func:`erase_account` removes the business: its event log, sessions,
   phones, API keys and stored sign-ins (database), then its files (object
   store). A permanent erasure record, without personal data, says it
-  happened; if the file store refuses (an S3 Object Lock retention without
-  the bypass permission) the record stays "files pending" for an operator.
+  happened. In AWS only the evidence-deletion role may delete originals
+  (§25), and only the sync worker may take it: the record stays "files
+  pending" and the worker completes it (server/erasure.py). Elsewhere the
+  files go at once; if that fails, the worker tries again.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ import zipfile
 from datetime import datetime
 from typing import Any
 
+from .erasure import ErasurePurger
 from .events import Event, object_refs
 from .runtime import TenantManager
 
@@ -69,23 +72,23 @@ def export_account(manager: TenantManager, principal: Any) -> tuple[str, bytes]:
     return f"back-office-export-{now.date().isoformat()}.zip", buf.getvalue()
 
 
-def erase_account(manager: TenantManager, principal: Any, *, bypass_governance: bool = False) -> dict[str, Any]:
+def erase_account(manager: TenantManager, principal: Any, *, purger: ErasurePurger | None = None,
+                  bypass_governance: bool = False) -> dict[str, Any]:
     """Erase the principal's business. Returns what happened (for logs; the owner sees one sentence)."""
     tenant_id = principal.tenant.id
     now: datetime = manager.now()
     with manager.open(tenant_id):
         events = manager.store.erase_account(tenant_id, principal.user.id, now)
     manager.evict(tenant_id)
+    purger = purger or ErasurePurger(manager.objects, bypass_governance=bypass_governance)
     purged = False
-    try:
-        from backoffice.evidence.store import S3ObjectStore
-
-        if isinstance(manager.objects, S3ObjectStore):
-            manager.objects.purge_tenant(tenant_id, bypass_governance=bypass_governance)
-        else:
-            manager.objects.purge_tenant(tenant_id)
-        manager.store.mark_objects_purged(tenant_id, manager.now())
-        purged = True
-    except Exception:
-        log.exception("erase_files_pending", extra={"tenant": tenant_id})
+    if purger.uses_deletion_role:  # the sync worker assumes the deletion role and completes it
+        log.info("erase_files_queued", extra={"tenant": tenant_id})
+    else:
+        try:
+            purger.purge(tenant_id)
+            manager.store.mark_objects_purged(tenant_id, manager.now())
+            purged = True
+        except Exception:
+            log.exception("erase_files_pending", extra={"tenant": tenant_id})
     return {"tenant": tenant_id, "events": events, "filesPurged": purged}

@@ -1,7 +1,7 @@
 """The sync worker: ``python -m backoffice.server.worker [--once]`` (production only).
 
-Reads connected mailboxes and banks into every tenant and runs each tenant's
-day (see :mod:`backoffice.server.sync`). It uses the same settings as the API
+Reads connected mailboxes and banks into every tenant, runs each tenant's
+day and completes account erasures (see :mod:`backoffice.server.sync`). It uses the same settings as the API
 (``BACKOFFICE_MODE=production``, ``DATABASE_URL``, ``S3_BUCKET``, the vault key,
 OAuth apps, GoCardless keys, SMTP, Expo, Anthropic, document reading), plus:
 
@@ -9,6 +9,10 @@ OAuth apps, GoCardless keys, SMTP, Expo, Anthropic, document reading), plus:
 ``BACKOFFICE_SYNC_INTERVAL``   seconds between syncs of one mailbox (default 900); banks
                                sync at most every 6 hours (GoCardless allows 4 a day)
 ``BACKOFFICE_HISTORY_DAYS``    how far back a first sync reads (default 90, up to 365, §6)
+``S3_ERASURE_ROLE_ARN``        the evidence-deletion role it assumes to delete an erased
+                               business's files (AWS; its task role must be trusted)
+``S3_REPLICA_BUCKET``          the evidence bucket's disaster-recovery copy, erased too
+                               (``S3_REPLICA_REGION``)
 =============================  ==========================================================
 
 Its database login must be a member of ``backoffice_app`` and
@@ -42,6 +46,7 @@ def build_worker(config: ServerConfig, services: dict[str, Any] | None = None) -
     """The worker on the configured services (tests pass their own, like ``build_production_app``)."""
     from backoffice.connectors.authorize import app_from_env
 
+    from .erasure import purger_from_config
     from .http import build_manager, production_services
     from .sync import SyncWorker
 
@@ -53,7 +58,8 @@ def build_worker(config: ServerConfig, services: dict[str, Any] | None = None) -
     return SyncWorker(manager, vault=services.get("vault"), aggregator_factory=services.get("aggregator"),
                       oauth_apps=apps, http_client=services.get("http_client"),
                       imap_factory=services.get("imap_factory"),
-                      interval=timedelta(seconds=config.sync_interval_s), history_days=config.history_days)
+                      interval=timedelta(seconds=config.sync_interval_s), history_days=config.history_days,
+                      purger=services.get("purger") or purger_from_config(config, services["objects"]))
 
 
 def main(argv: Sequence[str] | None = None) -> int:

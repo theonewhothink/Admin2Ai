@@ -1,11 +1,13 @@
 # Least privilege (§52): each workload gets only what its code calls.
 #   api     read/write originals (never delete), enqueue ingest, publish events,
 #           seal and open owners' sign-ins (vault key)
-#   sync    read/write originals, the vault key (mailbox and bank sync)
+#   sync    read/write originals, the vault key (mailbox and bank sync); may
+#           assume the deletion role to finish an owner-confirmed account erasure
 #   worker  the same as api minus the vault, plus consume queues; may assume the deletion role
 #   ocr     no AWS permissions at all (receives bytes over HTTP from the worker)
 #   evidence-deletion  delete object versions and bypass GOVERNANCE retention,
-#           assumable only by the worker, used only after hard approval (§25)
+#           assumable only by the worker (after hard approval, §25) and the sync
+#           worker (files of an account the owner erased, §52)
 # Execution roles (image pull, logs, injected secrets) live in the ECS module.
 
 data "aws_iam_policy_document" "ecs_tasks_trust" {
@@ -111,6 +113,23 @@ resource "aws_iam_role_policy" "sync_common" {
   policy = data.aws_iam_policy_document.app_common.json
 }
 
+# Account erasure (§52): the sync worker deletes an erased business's files,
+# every version in both regions, only as the deletion role (the bucket policy
+# denies deletion to everyone else).
+data "aws_iam_policy_document" "sync_erasure" {
+  statement {
+    sid       = "FinishAccountErasures"
+    actions   = ["sts:AssumeRole"]
+    resources = [aws_iam_role.evidence_deletion.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "sync_erasure" {
+  name   = "finish-account-erasures"
+  role   = aws_iam_role.sync.id
+  policy = data.aws_iam_policy_document.sync_erasure.json
+}
+
 # Owners' sign-ins are sealed with envelope keys from the vault key; KMS
 # checks the encryption context (tenant, connection, provider) on every use.
 data "aws_iam_policy_document" "vault_key" {
@@ -179,7 +198,7 @@ data "aws_iam_policy_document" "evidence_deletion_trust" {
 
     principals {
       type        = "AWS"
-      identifiers = [aws_iam_role.worker.arn]
+      identifiers = [aws_iam_role.worker.arn, aws_iam_role.sync.arn]
     }
   }
 }

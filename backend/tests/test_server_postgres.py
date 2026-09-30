@@ -335,3 +335,37 @@ def test_listing_tenants_needs_the_scheduler_role(tmp_path: Path, database: dict
     h.clock.advance(days=1)
     report = SyncWorker(h.manager).run_once()
     assert report.ticks >= 1 and [e.kind for e in store.events(tenant)][-1] == "tick"
+
+
+def test_erasures_left_to_the_worker_are_listed_and_completed(tmp_path: Path, database: dict,
+                                                             store: PostgresStore) -> None:
+    from backoffice.evidence.store import LocalObjectStore
+    from backoffice.server.erasure import ErasurePurger
+    from backoffice.server.store import StoreError
+    from backoffice.server.sync import SyncWorker
+
+    class LeftToTheWorker(ErasurePurger):  # as in AWS: the api never deletes originals itself
+        uses_deletion_role = True
+
+    db: PsqlExecutor = database["db"]
+    objects = LocalObjectStore(tmp_path / "objects")
+    purger = LeftToTheWorker(objects)
+    h = harness(tmp_path, store=store, objects=objects, purger=purger)
+    account = signup(h.client, f"gone-{uuid.uuid4().hex[:6]}@example.pt")
+    tenant = account["tenant"]["id"]
+    objects.put_immutable(b"%PDF-1.7 an invoice", tenant, "application/pdf")
+    res = h.client.post("/api/account/delete", json={"confirm": "DELETE", "password": PASSWORD},
+                        headers=bearer(account["token"]))
+    assert res.status_code == 202
+    assert tenant in store.pending_erasures()  # as the scheduler (migration 0008), nothing else
+    plain = PostgresStore(str(database["plain_url"]), pool_size=1)
+    try:
+        with pytest.raises(StoreError):
+            plain.pending_erasures()
+    finally:
+        plain.close()
+    report = SyncWorker(h.manager, purger=purger).run_once()
+    assert tenant in report.erasures and tenant not in store.pending_erasures()
+    assert not (tmp_path / "objects" / tenant).exists()
+    record = db.query(f"SELECT objects_purged_at IS NOT NULL AS files FROM tenant_erasures WHERE tenant_id = '{tenant}'")
+    assert record == [{"files": "t"}]

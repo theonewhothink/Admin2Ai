@@ -430,6 +430,18 @@ class PostgresStore:
         except psycopg.errors.InsufficientPrivilege:
             raise StoreError(f"the database login is not a member of {self._db.SCHEDULER_ROLE}") from None
 
+    def pending_erasures(self) -> list[str]:
+        """Erased businesses whose files are still to purge, listed as the scheduler (migration 0008)."""
+        psycopg = _psycopg()
+        try:
+            with self._tx() as cur:
+                cur.execute(f"SET LOCAL ROLE {self._db.SCHEDULER_ROLE}")
+                cur.execute("SELECT tenant_id FROM tenant_erasures "
+                            "WHERE completed_at IS NOT NULL AND objects_purged_at IS NULL ORDER BY tenant_id")
+                return [str(r[0]) for r in cur.fetchall()]
+        except psycopg.errors.InsufficientPrivilege:
+            raise StoreError(f"the database login is not a member of {self._db.SCHEDULER_ROLE}") from None
+
     def mark_objects_purged(self, tenant_id: str, at: datetime) -> None:
         with self._tx(tenant=tenant_id) as cur:
             cur.execute("UPDATE tenant_erasures SET objects_purged_at = %s WHERE tenant_id = %s", (at, tenant_id))

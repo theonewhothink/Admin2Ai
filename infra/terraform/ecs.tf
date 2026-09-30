@@ -144,6 +144,17 @@ locals {
     BACKOFFICE_HISTORY_DAYS     = tostring(var.history_days)
   }
 
+  # Account erasure (§52): the api leaves an erased business's files to the sync
+  # worker, which assumes the deletion role (§25) to remove every version.
+  # Deletions are not replicated, so the disaster-recovery copy is emptied too.
+  erasure_environment = merge(
+    { S3_ERASURE_ROLE_ARN = aws_iam_role.evidence_deletion.arn },
+    var.enable_evidence_replication ? {
+      S3_REPLICA_BUCKET = aws_s3_bucket.evidence_replica[0].bucket
+      S3_REPLICA_REGION = var.dr_region
+    } : {},
+  )
+
   production_secrets = {
     BACKOFFICE_STATE_KEY               = aws_secretsmanager_secret.state_key.arn
     BACKOFFICE_GOOGLE_CLIENT_ID        = "${aws_secretsmanager_secret.connector["google-oauth-client"].arn}:client_id::"
@@ -214,7 +225,7 @@ module "api" {
   port    = 8000
 
   # Tasks are reachable only from the load balancer's security group.
-  environment   = merge(local.app_environment, local.production_environment, { FORWARDED_ALLOW_IPS = "*" })
+  environment   = merge(local.app_environment, local.production_environment, local.erasure_environment, { FORWARDED_ALLOW_IPS = "*" })
   secrets       = merge(local.app_secrets, local.production_secrets)
   secret_arns   = concat(local.app_secret_arns, local.production_secret_arns)
   task_role_arn = aws_iam_role.api.arn
@@ -268,8 +279,8 @@ module "worker" {
 }
 
 # One task: it reads every connected mailbox and bank on schedule (cursors and
-# backoff live in each business's event log and in memory), and runs each
-# business's day even when nobody signs in. A second copy would only repeat
+# backoff live in each business's event log and in memory), runs each
+# business's day even when nobody signs in, and finishes account erasures. A second copy would only repeat
 # the same reads (events are deduplicated), so it runs singly, on demand capacity.
 module "sync" {
   source = "./modules/ecs_service"
@@ -287,7 +298,7 @@ module "sync" {
   cpu     = var.sync_cpu
   memory  = var.sync_memory
 
-  environment   = merge(local.app_environment, local.production_environment)
+  environment   = merge(local.app_environment, local.production_environment, local.erasure_environment)
   secrets       = merge(local.app_secrets, local.production_secrets)
   secret_arns   = concat(local.app_secret_arns, local.production_secret_arns)
   task_role_arn = aws_iam_role.sync.arn

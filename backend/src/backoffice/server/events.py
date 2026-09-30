@@ -2,8 +2,15 @@
 
 Every change to a tenant is one event, stored as canonical JSON text::
 
-    {"v": 1, "seq": 7, "at": "2026-10-02T09:31:12.000123+01:00", "kind": "request",
+    {"v": 2, "dv": 1, "seq": 7, "at": "2026-10-02T09:31:12.000123+01:00", "kind": "request",
      "actor": "usr_...", "pre": "<state digest before>", "data": {...}}
+
+``v`` is the event format (1: without ``dv``, read as digest version 1; 2:
+with it) and ``dv`` the version of :func:`state_digest` that computed ``pre``.
+A replay compares each event with the digest function of *its* version, so
+changing what the digest covers means adding a version to :data:`DIGESTS` and
+raising :data:`DIGEST_VERSION`: existing logs keep replaying. An event whose
+format or digest version this build does not know is refused, never guessed.
 
 ``hash = SHA-256(prev_hash + "\\n" + body)``; the first event links to
 SHA-256("backoffice.events.v1:" + tenant id). The database recomputes and
@@ -46,11 +53,15 @@ __all__ = [
     "normalize",
     "restore_files",
     "sanitize_body",
+    "DIGESTS",
+    "DIGEST_VERSION",
     "state_digest",
 ]
 
-VERSION = 1
-GENESIS_PREFIX = "backoffice.events.v1:"
+VERSION = 2  # the event format new events are written in
+READABLE_VERSIONS = frozenset({1, 2})  # formats this build reads (1: no "dv", meaning digest version 1)
+DIGEST_VERSION = 1  # the state digest new events record (see DIGESTS)
+GENESIS_PREFIX = "backoffice.events.v1:"  # part of the chain (and of migration 0007): never changes
 FILE_FIELDS = ("dataBase64", "data_base64")
 SECRET_FIELDS = ("password",)
 REDACTED = "$redacted"
@@ -101,17 +112,21 @@ class Event:
     prev_hash: str
     hash: str
     body: str
+    digest_version: int = 1  # which state_digest computed ``pre``
 
     @classmethod
     def make(cls, *, seq: int, at: datetime, kind: str, actor: str, data: Mapping[str, Any], pre: str | None,
-             prev_hash: str) -> Event:
+             prev_hash: str, digest_version: int | None = None) -> Event:
         if at.tzinfo is None:
             raise EventError("event times carry their time zone")
-        payload = {"v": VERSION, "seq": seq, "at": at.isoformat(), "kind": kind, "actor": actor,
+        dv = DIGEST_VERSION if digest_version is None else digest_version
+        if dv not in DIGESTS:
+            raise EventError(f"unknown state digest version {dv}")
+        payload = {"v": VERSION, "dv": dv, "seq": seq, "at": at.isoformat(), "kind": kind, "actor": actor,
                    "pre": pre, "data": normalize(dict(data))}
         body = canonical(payload)
         return cls(seq=seq, at=at, kind=kind, actor=actor, data=payload["data"], pre=pre, prev_hash=prev_hash,
-                   hash=chain_hash(prev_hash, body), body=body)
+                   hash=chain_hash(prev_hash, body), body=body, digest_version=dv)
 
     @classmethod
     def parse(cls, row: StoredEvent) -> Event:
@@ -122,7 +137,10 @@ class Event:
             at = datetime.fromisoformat(payload["at"])
             if at.tzinfo is not None:
                 at = at.astimezone(TZ)  # the engine's own zone object, as when it was recorded
-            if payload["v"] != VERSION or payload["seq"] != row.seq or payload["kind"] != row.kind:
+            if payload["v"] not in READABLE_VERSIONS or payload["seq"] != row.seq or payload["kind"] != row.kind:
+                raise ValueError
+            dv = payload["dv"] if payload["v"] >= 2 else 1
+            if not isinstance(dv, int) or isinstance(dv, bool) or dv < 1:
                 raise ValueError
             data, pre, actor = payload["data"], payload["pre"], payload["actor"]
         except (ValueError, KeyError, TypeError) as exc:
@@ -130,7 +148,7 @@ class Event:
         if not isinstance(data, dict) or at.tzinfo is None:
             raise EventError(f"event {row.seq} is malformed")
         return cls(seq=row.seq, at=at, kind=row.kind, actor=str(actor), data=data, pre=pre,
-                   prev_hash=row.prev_hash, hash=row.hash, body=row.body)
+                   prev_hash=row.prev_hash, hash=row.hash, body=row.body, digest_version=dv)
 
     def stored(self) -> StoredEvent:
         return StoredEvent(seq=self.seq, at=self.at, kind=self.kind, actor=self.actor, body=self.body,
@@ -192,8 +210,20 @@ def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
 
-def state_digest(svc: Any) -> str:
-    """Fingerprint of everything a tenant's state holds, cheap enough to take before every change.
+def state_digest(svc: Any, version: int | None = None) -> str:
+    """Fingerprint of a tenant's state by digest ``version`` (default: the one new events record).
+
+    Raises :class:`EventError` for a version this build does not know (a log
+    written by a newer build is refused, never compared with the wrong digest).
+    """
+    digest = DIGESTS.get(DIGEST_VERSION if version is None else version)
+    if digest is None:
+        raise EventError(f"unknown state digest version {version}")
+    return digest(svc)
+
+
+def _digest_v1(svc: Any) -> str:
+    """Version 1: everything a tenant's state holds, cheap enough to take before every change.
 
     It covers the engine (audit chain head, which records every agent step
     with its time; items, documents, payments, questions, obligations,
@@ -251,3 +281,8 @@ def state_digest(svc: Any) -> str:
         "phones": sorted(repo.supplier_phones.items()),
     }
     return hashlib.sha256(canonical(summary).encode()).hexdigest()
+
+
+# Every digest version a stored event may name. Never change a version once events were recorded
+# with it: add the next one, raise DIGEST_VERSION, keep the old function for the old events.
+DIGESTS: dict[int, Callable[[Any], str]] = {1: _digest_v1}

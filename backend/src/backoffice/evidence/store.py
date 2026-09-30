@@ -424,17 +424,19 @@ class S3ObjectStore:
             raise
         return True
 
-    def purge_tenant(self, tenant: str, *, bypass_governance: bool = False) -> int:
+    def purge_tenant(self, tenant: str, *, bypass_governance: bool = False, client: Any = None) -> int:
         """Erase every version of every object of ``tenant`` (account deletion, §52).
 
         With Object Lock in GOVERNANCE mode this needs ``bypass_governance`` and
         the ``s3:BypassGovernanceRetention`` permission (the evidence-deletion
         role in AWS); without them S3 refuses and :class:`StorageConfigError`
         says so, so the erasure stays pending instead of being reported done.
+        ``client``: an S3 client with other credentials (the deletion role's).
         """
         prefix = f"{self.prefix}{validate_tenant(tenant)}/"
         removed = 0
-        paginator = self.client.get_paginator("list_object_versions")
+        s3 = client if client is not None else self.client
+        paginator = s3.get_paginator("list_object_versions")
         for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
             targets = [{"Key": v["Key"], "VersionId": v["VersionId"]}
                        for v in [*(page.get("Versions") or []), *(page.get("DeleteMarkers") or [])]]
@@ -443,7 +445,7 @@ class S3ObjectStore:
                 params: dict[str, Any] = {"Bucket": self.bucket, "Delete": {"Objects": batch, "Quiet": True}}
                 if bypass_governance:
                     params["BypassGovernanceRetention"] = True
-                result = self.client.delete_objects(**params)
+                result = s3.delete_objects(**params)
                 errors = result.get("Errors") or []
                 if errors:
                     codes = sorted({str(e.get("Code")) for e in errors})

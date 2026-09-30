@@ -40,6 +40,7 @@ from backoffice.internal import admin_only
 from .account import erase_account, export_account
 from .auth import COOKIE_NAME, CSRF_HEADER, CSRF_VALUE, SESSION_DAYS, AuthError, AuthService, Principal, permitted
 from .config import ServerConfig
+from .erasure import purger_from_config
 from .runtime import READ_ONLY_POSTS, ReplayDiverged, TenantManager, TenantNotFound
 from .store import Device, Store, StoreError, StoreUnavailable
 
@@ -321,6 +322,7 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
     now: Callable[[], datetime] = services.get("now") or (lambda: datetime.now(timezone.utc))
     manager = build_manager(config, services)
     auth = AuthService(store, manager, rate_key=config.state_key, admin_emails=config.admin_emails, now=now)
+    purger = services.get("purger") or purger_from_config(config, services["objects"])
     aggregator_factory = services.get("aggregator")
 
     app = FastAPI(title="Back Office", version="1.0.0", docs_url=None, redoc_url=None, openapi_url=None)
@@ -496,7 +498,7 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
         if body.get("confirm") != "DELETE":
             raise AuthError(400, "bad_request", "Type DELETE to confirm.")
         await run_in_threadpool(auth.reauthenticate, principal, body.get("password"), ip=_ip(request))
-        await run_in_threadpool(erase_account, manager, principal, bypass_governance=config.s3_bypass_governance)
+        await run_in_threadpool(erase_account, manager, principal, purger=purger)
         log.info("account_erased", extra={"tenant": principal.tenant.id})
         response = JSONResponse({"ok": True, "message": "Your account is being deleted. Your data is gone "
                                  "from the back office and your files are being removed."}, status_code=202)

@@ -48,6 +48,7 @@ from backoffice.domain.models import deterministic
 from backoffice.orchestrator import TZ
 from backoffice.service import BackOfficeService, ServiceError
 
+from . import events as _events
 from .events import (
     FILE_FIELDS,
     OBJECT,
@@ -418,7 +419,12 @@ class TenantManager:
             raise ReplayDiverged(rt.tenant_id, event.seq, "the log does not start with the tenant")
         if rt.svc is not None:
             rt.svc.repo.clock.advance_to(event.at)
-            digest = state_digest(rt.svc)
+            try:  # compared with the digest version the event was recorded with (events.DIGESTS)
+                digest = state_digest(rt.svc, event.digest_version)
+            except EventError:
+                raise ReplayDiverged(rt.tenant_id, event.seq,
+                                     f"recorded with state digest version {event.digest_version}, "
+                                     "which this build does not know") from None
             if event.pre != digest:
                 raise ReplayDiverged(rt.tenant_id, event.seq, "state before the event differs from when it was recorded")
         try:
@@ -441,14 +447,15 @@ class TenantManager:
                *, index: Sequence[IndexOp] = ()) -> tuple[int, dict[str, Any]]:
         """Append one event, then apply it live. Returns the apply's ``(status, body)``."""
         event: Event | None = None
+        version = _events.DIGEST_VERSION  # the digest this event records, and computes ``pre`` with
         for _ in range(5):
             at = self._event_time(rt)
             pre = None
             if rt.svc is not None:
                 rt.svc.repo.clock.advance_to(at)
-                pre = state_digest(rt.svc)
+                pre = state_digest(rt.svc, version)
             candidate = Event.make(seq=rt.seq + 1, at=at, kind=kind, actor=actor, data=data, pre=pre,
-                                   prev_hash=rt.head_hash)
+                                   prev_hash=rt.head_hash, digest_version=version)
             try:
                 self.store.append_events(rt.tenant_id, [candidate.stored()], index=index)
             except SeqConflict:
@@ -521,8 +528,10 @@ class TenantManager:
             at = self._event_time(rt)
             if rt.svc is not None:
                 rt.svc.repo.clock.advance_to(at)
-            event = Event.make(seq=rt.seq + 1, at=at, kind=kind, actor=actor, data=data, pre=rt.digest(),
-                               prev_hash=rt.head_hash)
+            version = _events.DIGEST_VERSION
+            pre = state_digest(rt.svc, version) if rt.svc is not None else None
+            event = Event.make(seq=rt.seq + 1, at=at, kind=kind, actor=actor, data=data, pre=pre,
+                               prev_hash=rt.head_hash, digest_version=version)
             status, body = self._apply(rt, event, env)
             if status >= 400:
                 raise ServiceError(status, body.get("message", "That did not work."))

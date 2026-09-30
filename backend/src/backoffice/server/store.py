@@ -156,6 +156,9 @@ class Store(Protocol):
     # every tenant (the sync worker's fan-out and the team's internal dashboard)
     def tenant_ids(self) -> list[str]: ...
 
+    # erased businesses whose files are still to purge (the sync worker completes them)
+    def pending_erasures(self) -> list[str]: ...
+
 
 # --------------------------------------------------------------------------- in memory
 
@@ -427,6 +430,12 @@ class MemoryStore:
         self._up()
         with self._lock:
             return sorted(self._d.tenants)
+
+    def pending_erasures(self) -> list[str]:
+        self._up()
+        with self._lock:
+            return sorted(t for t, e in self._d.erasures.items()
+                          if e.completed_at is not None and e.objects_purged_at is None)
 
     def mark_objects_purged(self, tenant_id: str, at: datetime) -> None:
         with self._lock:
