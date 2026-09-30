@@ -221,6 +221,9 @@ class DocumentType(str, Enum):
     DELIVERY_NOTE = "delivery_note"  # guia de remessa / guia de transporte
     ORDER_CONFIRMATION = "order_confirmation"
     SUPPLIER_STATEMENT = "supplier_statement"  # extrato de conta corrente
+    # A card terminal's or payment/sales platform's settlement statement: the sales, fees,
+    # refunds and disputes behind one payout into the bank (backoffice.settlements).
+    PAYOUT_REPORT = "payout_report"
     OTHER = "other"
 
 

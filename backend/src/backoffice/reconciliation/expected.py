@@ -11,14 +11,17 @@ Rules run in a fixed order, first hit wins:
 1. learned overrides (the owner or accountant said so once, §5, §40),
 2. nothing moved (zero amount),
 3. own accounts / own companies (IBAN, bank flag, or own company name),
-4. credit-card repayments,
-5. tax authorities named outright,
-6. bank fees the bank itself flags,
-7. loans (before fee wording: a loan instalment mentions interest, 'JUROS'),
-8. bank fees and interest by wording,
-9. other tax wording, then payroll,
-10. money in: refunds from suppliers, otherwise customer payments,
-11. money out: card purchases in a shop need a receipt, everything else an invoice.
+4. credit-card repayments (money out paying off a card),
+5. payouts (money in from a card terminal or a payment / sales platform: a net
+   settlement whose evidence is the provider's payout report, never customer
+   revenue on its own),
+6. tax authorities named outright,
+7. bank fees the bank itself flags,
+8. loans (before fee wording: a loan instalment mentions interest, 'JUROS'),
+9. bank fees and interest by wording,
+10. other tax wording, then payroll,
+11. money in: refunds from suppliers, otherwise customer payments,
+12. money out: card purchases in a shop need a receipt, everything else an invoice.
 
 Identity-based decisions (IBAN, bank flags, learned overrides, a resolved
 supplier) are GREEN; wording-based ones are AMBER (§57): they steer where to
@@ -49,9 +52,10 @@ from .bank import (
     NO_METADATA,
     BankMetadata,
     is_card_purchase,
-    is_card_settlement,
+    is_card_repayment,
     phrase_in,
 )
+from .payouts import payout_provider
 from .suppliers import SupplierMatch, SupplierResolver, normalize_descriptor
 
 __all__ = [
@@ -79,6 +83,7 @@ class EvidenceExpectation(str, Enum):
     PAYROLL = "payroll"
     LOAN_STATEMENT = "loan_statement"
     CARD_STATEMENT = "card_statement"
+    PAYOUT_REPORT = "payout_report"  # a provider's settlement statement for a payout (money in)
     BANK_EVIDENCE_SUFFICES = "bank_evidence_suffices"
     NONE_INTERNAL_TRANSFER = "none_internal_transfer"
 
@@ -92,6 +97,7 @@ class EvidenceProvider(str, Enum):
     GOVERNMENT = "government"
     PAYROLL = "payroll"
     BANK = "bank"
+    PAYMENT_PROVIDER = "payment_provider"  # the card terminal or platform's payout report
     NOBODY = "nobody"
 
 
@@ -104,6 +110,7 @@ _PROVIDERS: dict[EvidenceExpectation, EvidenceProvider] = {
     EvidenceExpectation.PAYROLL: EvidenceProvider.PAYROLL,
     EvidenceExpectation.LOAN_STATEMENT: EvidenceProvider.BANK,
     EvidenceExpectation.CARD_STATEMENT: EvidenceProvider.BANK,
+    EvidenceExpectation.PAYOUT_REPORT: EvidenceProvider.PAYMENT_PROVIDER,
     EvidenceExpectation.BANK_EVIDENCE_SUFFICES: EvidenceProvider.NOBODY,
     EvidenceExpectation.NONE_INTERNAL_TRANSFER: EvidenceProvider.NOBODY,
 }
@@ -127,6 +134,7 @@ ACCEPTED_DOCUMENT_TYPES: dict[EvidenceExpectation, frozenset[DocumentType]] = {
         {DocumentType.LOAN_STATEMENT, DocumentType.STATEMENT}
     ),
     EvidenceExpectation.CARD_STATEMENT: frozenset({DocumentType.STATEMENT}),
+    EvidenceExpectation.PAYOUT_REPORT: frozenset({DocumentType.PAYOUT_REPORT}),
     EvidenceExpectation.BANK_EVIDENCE_SUFFICES: frozenset(),
     EvidenceExpectation.NONE_INTERNAL_TRANSFER: frozenset(),
 }
@@ -301,6 +309,9 @@ _LEARNED_REASON: dict[EvidenceExpectation, str] = {
     EvidenceExpectation.PAYROLL: "You told me these are salaries.",
     EvidenceExpectation.LOAN_STATEMENT: "You told me these are loan payments.",
     EvidenceExpectation.CARD_STATEMENT: "You told me these pay off a card.",
+    EvidenceExpectation.PAYOUT_REPORT: (
+        "You told me these are payouts of your sales. Their payout report covers them."
+    ),
     EvidenceExpectation.BANK_EVIDENCE_SUFFICES: (
         "You told me the bank statement is enough for these."
     ),
@@ -356,6 +367,8 @@ class ExpectedEvidenceEngine:
             lambda: self._nothing_moved(tx),
             lambda: self._internal(tx),
             lambda: self._card_repayment(tx, meta),
+            # 'STRIPE PAYMENTS' / 'TPA 1234 SIBS' in: sales paid out net of fees, not a customer invoice.
+            lambda: self._payout(tx),
             # 'PAGAMENTO AO ESTADO IMPOSTO DO SELO' is tax, not a bank charge.
             lambda: self._tax(tx, tax == "strong"),
             lambda: self._bank_fee(tx, text, worded=False),
@@ -425,13 +438,26 @@ class ExpectedEvidenceEngine:
     def _card_repayment(
         self, tx: Transaction, meta: BankMetadata
     ) -> ExpectationDecision | None:
-        if not is_card_settlement(tx, meta):
+        if not is_card_repayment(tx, meta):
             return None
         quality = Quality.GREEN if meta.settles_card_last4 else Quality.AMBER
         return self._decide(
             tx, EvidenceExpectation.CARD_STATEMENT,
             "This pays off a card. The card statement covers it.", quality, "card_repayment",
         )  # fmt: skip
+
+    def _payout(self, tx: Transaction) -> ExpectationDecision | None:
+        """Money in from a card terminal or a payment or sales platform (wording: AMBER)."""
+        provider = payout_provider(tx)
+        if provider is None:
+            return None
+        reason = (
+            f"Payout of your sales from {provider.label}, after its {provider.fee_word}. "
+            "Its payout report covers it."
+        )
+        return self._decide(
+            tx, EvidenceExpectation.PAYOUT_REPORT, reason, Quality.AMBER, f"payout:{provider.key}"
+        )
 
     def _bank_fee(
         self, tx: Transaction, text: str, *, worded: bool

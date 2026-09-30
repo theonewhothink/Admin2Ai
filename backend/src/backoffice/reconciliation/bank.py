@@ -21,11 +21,13 @@ from backoffice.domain.models import Transaction, TransactionKind
 from ._text import currency_code, fold
 
 __all__ = [
+    "CARD_REPAYMENT_PHRASES",
     "CARD_SETTLEMENT_PHRASES",
     "BankMetadata",
     "FxDetails",
     "fx_from_text",
     "is_card_purchase",
+    "is_card_repayment",
     "is_card_settlement",
     "phrase_in",
 ]
@@ -201,11 +203,12 @@ def _parse_rate(raw: str) -> Decimal | None:
     return rate if rate > 0 else None
 
 
-# --------------------------------------------------------------------------- card settlements
+# --------------------------------------------------------------------------- card repayments
 
 # Statement wording for a debit that pays off a credit card (PT / ES / EN).
 # Bank-statement conventions, not regulation; extend as feeds are observed.
-CARD_SETTLEMENT_PHRASES: tuple[str, ...] = (
+# NOT a card-terminal sales payout (money in from an acquirer): see ``payouts``.
+CARD_REPAYMENT_PHRASES: tuple[str, ...] = (
     "LIQUIDACAO CARTAO",
     "LIQ CARTAO",
     "LIQUIDACAO DE CARTAO",
@@ -219,6 +222,7 @@ CARD_SETTLEMENT_PHRASES: tuple[str, ...] = (
     "CARD SETTLEMENT",
     "CARD REPAYMENT",
 )
+CARD_SETTLEMENT_PHRASES = CARD_REPAYMENT_PHRASES  # the older name; same meaning (paying off a card)
 
 
 def phrase_in(text: str, phrases: tuple[str, ...]) -> str | None:
@@ -238,8 +242,12 @@ def is_card_purchase(tx: Transaction) -> bool:
     return tx.kind == TransactionKind.CARD and bool(tx.card_last4)
 
 
-def is_card_settlement(tx: Transaction, meta: BankMetadata | None = None) -> bool:
-    """True when this debit pays off a credit card (declared, or by wording)."""
+def is_card_repayment(tx: Transaction, meta: BankMetadata | None = None) -> bool:
+    """True when this debit pays off a credit card (declared, or by wording).
+
+    Money out only. A card terminal or payment platform paying the business its
+    sales is a *payout* (money in), recognised by ``payouts.payout_provider``.
+    """
     if tx.amount >= 0:
         return False
     if meta is not None and meta.settles_card_last4:
@@ -247,4 +255,8 @@ def is_card_settlement(tx: Transaction, meta: BankMetadata | None = None) -> boo
     if is_card_purchase(tx):
         return False  # a purchase made with a card, not a repayment of one
     text = f"{tx.counterparty} {tx.description}"
-    return phrase_in(text, CARD_SETTLEMENT_PHRASES) is not None
+    return phrase_in(text, CARD_REPAYMENT_PHRASES) is not None
+
+
+# The older name, kept for callers: it has always meant repaying a credit card, never a sales payout.
+is_card_settlement = is_card_repayment

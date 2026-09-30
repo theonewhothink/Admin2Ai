@@ -1229,6 +1229,13 @@ class BackOfficeService:
                 continue
             if doc.matched_tx_ids:
                 continue
+            if doc.document.doc_type is DocumentType.PAYOUT_REPORT:
+                settlement = repo.settlements.get(doc.id)
+                who = settlement.report.provider.label if settlement else display_name(doc.document.supplier_name)
+                lines.append({"id": f"r_{doc.id}", "tone": "neutral",
+                              "text": f"The payout report from {who} arrived. I'm waiting for that payout to reach "
+                                      "your bank."})
+                continue
             lines.append({"id": f"r_{doc.id}", "tone": "neutral",
                           "text": f"The {display_name(doc.document.supplier_name)} {doc.label.split(' ')[0].lower()} "
                                   "arrived. I'm matching it with its payment."})

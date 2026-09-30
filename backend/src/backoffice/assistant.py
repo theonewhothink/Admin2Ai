@@ -917,7 +917,8 @@ class RuleBrain:
                 else:
                     parts.append(f"Biggest: {join_and(rows[:3])}.")
             named = [(k, w) for k, w in (("tax", "taxes"), ("bank_fee", "bank fees"), ("payroll", "salaries"),
-                                          ("loan", "loan repayments")) if m.by_kind.get(k)]
+                                          ("loan", "loan repayments"), ("platform_fee", "payment and platform fees"))
+                     if m.by_kind.get(k)]
             if not sup and not s.category and named and m.by_kind.get("cost"):
                 parts.append("That includes " + join_and([f"{self._m(m.by_kind[k])} in {w}" for k, w in named]) + ".")
             elif not sup and not s.category and len(named) == 1 and len(m.by_kind) == 1:
@@ -1022,7 +1023,10 @@ class RuleBrain:
             return f"I have no payment records {p.phrase}. {self._coverage_line()}"
         parts = []
         moved = [x for x in m.left_out if x.kind == "transfer"]
-        if not m.lines:
+        if not m.lines and m.waiting_payouts:
+            # Only payouts whose reports have not proven them: a net payout is never counted as sales.
+            parts.append(f"I can't count any sales{' for ' + who if who else ''} {p.phrase} yet.")
+        elif not m.lines:
             head = f"Nothing came in from customers{' for ' + who if who else ''} {p.phrase}, and no refunds."
             if len(moved) == 1:
                 x = moved[0]
@@ -1033,18 +1037,79 @@ class RuleBrain:
                 head += f" The only money in was {self._m(sum((x.amount for x in moved), Decimal(0)))} moved " \
                         "between your own accounts and companies."
             parts.append(head)
+        elif all(x.kind == "sales" for x in m.lines) and self._sales_totals(m) is not None:
+            providers = join_and(list(dict.fromkeys(x.provider for x in m.lines if x.provider)))
+            parts.append(f"{self._m(m.total)} came in{' for ' + who if who else ''} {p.phrase}, all of it sales "
+                         f"through {providers}.")
+            parts += self._sales_lines(m, intro=False)
+            if moved:
+                parts.append(f"I left out {self._m(sum((x.amount for x in moved), Decimal(0)))} moved between your "
+                             "own accounts and companies.")
         else:
             rows = [f"{label} {self._m(amount)}" for label, amount, _ in m.rows]
             head = f"{self._m(m.total)} came in{' for ' + who if who else ''} {p.phrase}"
             parts.append(f"{head}, across {m.count} payments: {join_and(rows[:3])}." if m.count > 1 else
                          f"{head}: {m.lines[0].merchant} on {self._day(m.lines[0].on)}.")
+            parts += self._sales_lines(m)
             if moved:
                 parts.append(f"I left out {self._m(sum((x.amount for x in moved), Decimal(0)))} moved between your "
                              "own accounts and companies.")
+        parts += self._waiting_payout_lines(m)
         if m.previous is not None and u.slots.compare:
             parts.append(self._comparison(m))
         parts += self._coverage_notes(m, p)
         return " ".join(parts)
+
+    def _sales_totals(self, m: Money) -> dict[str, Decimal] | None:
+        """Gross sales proven by payout reports, and what the providers kept from them."""
+        sales = [x for x in m.sales if x.currency == "EUR"]
+        if not sales:
+            return None
+        total = lambda attr: sum((getattr(x, attr) for x in sales), Decimal(0))  # noqa: E731
+        return {"sales": total("amount"), "fees": total("fees"), "refunds": total("refunds"),
+                "chargebacks": total("chargebacks"), "adjustments": total("adjustments"), "paid_out": total("paid_out")}
+
+    def _sales_lines(self, m: Money, *, intro: bool = True) -> list[str]:
+        """'That includes €1,000.00 in sales through Stripe. From that, €29.00 went in fees ...' (§20, §36)."""
+        t = self._sales_totals(m)
+        if t is None:
+            return []
+        providers = join_and(list(dict.fromkeys(x.provider for x in m.sales if x.provider)))
+        kept = []
+        words = sorted({x.fee_word for x in m.sales if x.fee_word}) or ["fees"]
+        fee_word = " and ".join(words)
+        if t["fees"]:
+            kept.append(f"{self._m(t['fees'])} went in {fee_word}" if t["fees"] > 0 else
+                        f"{self._m(-t['fees'])} in {fee_word} came back")
+        if t["refunds"]:
+            kept.append(f"{self._m(t['refunds'])} was refunded to customers")
+        if t["chargebacks"]:
+            kept.append(f"{self._m(t['chargebacks'])} was taken back in disputed card payments")
+        if t["adjustments"] < 0:
+            kept.append(f"{self._m(-t['adjustments'])} went in other deductions")
+        elif t["adjustments"] > 0:
+            kept.append(f"{self._m(t['adjustments'])} was added in other adjustments")
+        lines = [f"That includes {self._m(t['sales'])} in sales through {providers}."] if intro else []
+        if kept:
+            lines.append(f"From that, {join_and(kept)}, so {self._m(t['paid_out'])} reached your bank.")
+        else:
+            lines.append("All of it reached your bank.")
+        return lines
+
+    def _waiting_payout_lines(self, m: Money) -> list[str]:
+        """'Not counted yet: the €951.00 payout from Stripe on 18 September, report not received yet.'"""
+        waiting = m.waiting_payouts
+        if not waiting:
+            return []
+        if len(waiting) == 1:
+            x = waiting[0]
+            return [f"Not counted yet: the {self._m(x.amount)} payout from {x.provider} on {self._day(x.on)}, "
+                    f"{_PAYOUT_WAIT[x.status]}."]
+        total = self._m(sum((x.amount for x in waiting), Decimal(0)))
+        providers = join_and(list(dict.fromkeys(x.provider for x in waiting)))
+        why = "reports not received yet" if all(x.status == "report_missing" for x in waiting) else \
+            "until their payout reports arrive and add up"
+        return [f"Not counted yet: {len(waiting)} payouts from {providers} ({total} in all), {why}."]
 
     def _money_card(self, m: Money, p: Period, s: Slots) -> dict[str, Any]:
         scope = [self._companies(s.company_ids)] if s.company_ids else []
@@ -1058,6 +1123,11 @@ class RuleBrain:
             notes.append(f"Includes {self._m(m.by_kind['tax'])} in taxes.")
         if m.by_kind.get("bank_fee") and s.category != "bank_fees":
             notes.append(f"Includes {self._m(m.by_kind['bank_fee'])} in bank fees.")
+        if m.by_kind.get("platform_fee") and s.category != "platform_fees" and m.direction == "out":
+            notes.append(f"Includes {self._m(m.by_kind['platform_fee'])} in payment and platform fees.")
+        if m.direction == "in":
+            notes += self._sales_lines(m)
+            notes += self._waiting_payout_lines(m)
         moved = sum((x.amount for x in m.left_out), Decimal(0))
         if moved:
             notes.append(f"Left out {self._m(moved)} moved between your own accounts and companies.")
@@ -1082,18 +1152,28 @@ class RuleBrain:
 
     def payment_facts(self, x: Line) -> dict[str, Any]:
         """One payment for the model: plain facts, with the evidence id to cite."""
-        return {"date": x.on.isoformat(), "merchant": x.merchant, "amount_eur": float(x.amount),
-                "direction": x.direction, "company": self.repo.company_name(x.company_id),
-                "company_not_decided_yet": x.pending, "kind": x.kind, "category": x.category_label,
-                "invoice": self.ledger.payment_dict(x)["invoice"], "evidence_id": x.evidence_id,
-                "from_imported_bank_history": x.history}
+        facts = {"date": x.on.isoformat(), "merchant": x.merchant, "amount_eur": float(x.amount),
+                 "direction": x.direction, "company": self.repo.company_name(x.company_id),
+                 "company_not_decided_yet": x.pending, "kind": x.kind, "category": x.category_label,
+                 "invoice": self.ledger.payment_dict(x)["invoice"], "evidence_id": x.evidence_id,
+                 "from_imported_bank_history": x.history}
+        if x.kind == "payout":
+            facts["payout_report"] = {"settled": "matched", "report_disagrees": "does_not_match_the_bank",
+                                      "report_does_not_add_up": "does_not_add_up"}.get(x.status, "not_received_yet")
+            facts["note"] = "A net payout from a card terminal or sales platform, not customer revenue by itself."
+        if x.kind == "sales":
+            facts.update({"fees_eur": float(x.fees), "refunds_eur": float(x.refunds),
+                          "disputed_payments_eur": float(x.chargebacks), "adjustments_eur": float(x.adjustments),
+                          "paid_out_to_bank_eur": float(x.paid_out)})
+        return facts
 
     def money_facts(self, m: Money, p: Period) -> dict[str, Any]:
         """A spending or money-in result for the model (spending_summary)."""
         first, last = self.ledger.coverage()
         kinds = {"cost": "supplier_costs", "tax": "taxes", "bank_fee": "bank_fees", "payroll": "salaries",
                  "loan": "loan_repayments", "income": "customer_payments", "refund": "refunds",
-                 "interest": "bank_interest", "tax_refund": "tax_refunds"}
+                 "interest": "bank_interest", "tax_refund": "tax_refunds",
+                 "sales": "sales_through_card_terminals_and_platforms", "platform_fee": "payment_and_platform_fees"}
         out: dict[str, Any] = {
             "period": {"from": p.start.isoformat(), "to": p.end.isoformat(), "label": p.label},
             "records_cover": {"from": first.isoformat(), "to": last.isoformat()},
@@ -1113,6 +1193,18 @@ class RuleBrain:
             "payment_list": [self.payment_facts(x) for x in sorted(m.lines, key=lambda x: (x.on, x.id),
                                                                    reverse=True)[:40]],
         }
+        totals = self._sales_totals(m)
+        if totals is not None:
+            out["sales_from_payout_reports"] = {
+                "gross_sales_eur": float(totals["sales"]), "fees_and_commission_eur": float(totals["fees"]),
+                "refunded_to_customers_eur": float(totals["refunds"]),
+                "disputed_payments_eur": float(totals["chargebacks"]),
+                "other_adjustments_eur": float(totals["adjustments"]),
+                "paid_out_to_bank_eur": float(totals["paid_out"]),
+                "note": "Gross sales count as money in; the fees are costs; the net payout itself is not counted."}
+        if m.waiting_payouts:
+            out["payouts_not_counted_yet"] = [{**self.payment_facts(x), "provider": x.provider,
+                                               "why": _PAYOUT_WAIT_FACT[x.status]} for x in m.waiting_payouts]
         if m.previous is not None:
             out["previous_period"] = {"label": m.previous_label, "records_cover_period": m.previous.covered is not None,
                                       "total_eur": float(m.previous.total),
@@ -1273,9 +1365,17 @@ class RuleBrain:
         s = u.slots
         p = s.period
         items = self.ledger.missing(start=p.start if p else None, end=p.end if p else None, company_ids=s.company_ids)
+        payouts = self.ledger.missing_reports(start=p.start if p else None, end=p.end if p else None,
+                                              company_ids=s.company_ids)
         when = f" {p.phrase}" if p else ""
+        reports = [plan for _, plan in payouts[:3]]
+        if len(payouts) > 1:
+            reports.insert(0, f"{len(payouts)} payouts are waiting for payout reports that add up.")
+        report_chips = [{"label": self.ledger.payment_label(x), "id": x.evidence_id} for x, _ in payouts
+                        if x.evidence_id]
         if not items:
-            return _Answer(f"Every payment that needs an invoice has one{when}.")
+            return _Answer(" ".join([f"Every payment that needs an invoice has one{when}.", *reports]),
+                           evidence=report_chips)
         head = "One payment still has no invoice" if len(items) == 1 else \
             f"{count_phrase(len(items), 'payment').capitalize()} still have no invoice"
         plans = [plan for _, plan in items[:4]]
@@ -1284,7 +1384,7 @@ class RuleBrain:
         months = {(x.company_id, f"{x.on:%Y-%m}") for x, _ in items if x.company_id}
         chips += [{"label": f"{self.repo.company_name(c)} · {MONTH_NAMES[int(m[5:]) - 1]}", "id": f"month:{c}:{m}"}
                   for c, m in sorted(months)]
-        return _Answer(f"{head}{when}. " + " ".join(plans) + more, evidence=chips)
+        return _Answer(" ".join([f"{head}{when}. " + " ".join(plans) + more, *reports]), evidence=chips + report_chips)
 
     # -- intents: documents and reports --------------------------------------
 
@@ -1631,7 +1731,15 @@ class RuleBrain:
         return _Answer(FALLBACK_TEXT)
 
 
-_PAID_IN = {"tax": "taxes", "bank_fees": "bank fees", "payroll": "salaries", "loan": "loan repayments"}
+# Why a payout is not counted yet (§20): in a sentence, and for the model.
+_PAYOUT_WAIT = {"report_missing": "report not received yet",
+                "report_disagrees": "its report does not match what arrived in your bank",
+                "report_does_not_add_up": "its report does not add up"}
+_PAYOUT_WAIT_FACT = {"report_missing": "payout report not received yet",
+                     "report_disagrees": "its report does not match the bank",
+                     "report_does_not_add_up": "its report does not add up"}
+_PAID_IN = {"tax": "taxes", "bank_fees": "bank fees", "payroll": "salaries", "loan": "loan repayments",
+            "platform_fees": "payment and platform fees"}
 
 
 def _payee(merchant: str) -> str:
@@ -1685,9 +1793,13 @@ TOOLS: list[dict[str, Any]] = [
      "in (direction \"in\") over a period, from the bank records: total, breakdown, what was included and left "
      "out, and the payments behind it. Use it for ANY question about expenses, spending, costs, outgoings, "
      "income or money received. Transfers between the owner's own accounts and companies are left out; taxes "
-     "and bank fees are included and reported separately. Filters are optional: company_id, supplier (name), "
+     "and bank fees are included and reported separately. Payouts from card terminals and payment or sales "
+     "platforms (SIBS, Stripe, PayPal, Booking.com, Glovo, ...) are net settlements, never customer revenue: "
+     "once their payout report matched the bank, money in counts their gross sales and reports the fees, "
+     "refunds and disputed payments (sales_from_payout_reports); payouts without a report are listed in "
+     "payouts_not_counted_yet and are not counted. Filters are optional: company_id, supplier (name), "
      "category (tax, bank_fees, payroll, loan, rent, telecom, energy, software, travel, meals, office, "
-     "insurance, other). group_by: supplier, company, category or month. compare_previous adds the period of "
+     "insurance, platform_fees, other). group_by: supplier, company, category or month. compare_previous adds the period of "
      "the same length just before. Say which period the records cover when records_cover_period is false or "
      "notes mention it.",
      "input_schema": {"type": "object", "properties": {
@@ -1701,7 +1813,8 @@ TOOLS: list[dict[str, Any]] = [
          "amount": {"type": "number"}, "date_from": _DATE, "date_to": _DATE, "supplier": _S, "company_id": _S,
          "category": _S, "direction": {"type": "string", "enum": ["out", "in"]}}, "additionalProperties": False}},
     {"name": "missing_invoices", "description": "Payments that need an invoice or receipt and do not have one yet, "
-     "with what the operator is doing about each (for example the supplier was asked). All filters optional.",
+     "and payouts from card terminals and sales platforms still waiting for their payout report, with what the "
+     "operator is doing about each (for example the supplier was asked). All filters optional.",
      "input_schema": {"type": "object", "properties": {"company_id": _S, "date_from": _DATE, "date_to": _DATE},
                       "additionalProperties": False}},
     {"name": "vat_summary", "description": "VAT on purchase and sales documents dated in a period, and VAT paid "
@@ -1920,6 +2033,9 @@ def run_tool(op: Operator, name: str, args: dict[str, Any], cards: list[dict[str
         period = _tool_period(args, svc._today(), required=False)
         items = brain.ledger.missing(start=period.start if period else None, end=period.end if period else None,
                                      company_ids=_tool_companies(op, args.get("company_id")))
+        items += brain.ledger.missing_reports(start=period.start if period else None,
+                                              end=period.end if period else None,
+                                              company_ids=_tool_companies(op, args.get("company_id")))
         chips = [{"label": brain.ledger.payment_label(x), "id": x.evidence_id} for x, _ in items if x.evidence_id]
         if chips:
             cards.append({"type": "evidence", "items": chips[:8]})

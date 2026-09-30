@@ -29,6 +29,17 @@ fees, salaries and loan instalments. Answers name taxes and bank fees
 separately and say what was left out. Totals are in euros; a payment in
 another currency is left out of a total and mentioned.
 
+**Payouts** from card terminals and payment / sales platforms (SIBS, Stripe,
+PayPal, Booking.com, Glovo, ...) are net settlements, never customer revenue
+on their own. Once the provider's payout report has matched the bank payout
+to the cent (``backoffice.settlements``), the payout is shown as what it is:
+its gross sales (money in, kind ``sales``, carrying the fees, refunds,
+disputed payments and adjustments behind it) and the provider's fees or
+commission (a cost, kind ``platform_fee``, evidenced by the report and the
+provider's commission invoice when it matched). A payout whose report has not
+arrived (or disagrees with the bank) is not counted at all: answers list it as
+waiting for its report.
+
 Pure Python (runs in the browser build too).
 """
 
@@ -44,7 +55,7 @@ from typing import TYPE_CHECKING, Any
 
 from backoffice.domain.models import DocumentType, Transaction, TransactionKind
 from backoffice.learning import RuleSubject, counterparty_key, day_month, display_name, fold, format_money
-from backoffice.reconciliation import EvidenceExpectation, ExpectedEvidenceEngine
+from backoffice.reconciliation import EvidenceExpectation, ExpectedEvidenceEngine, payout_provider, provider_named
 
 if TYPE_CHECKING:  # pragma: no cover
     from backoffice.service import BackOfficeService
@@ -118,6 +129,11 @@ CATEGORIES: tuple[Category, ...] = (
     Category("insurance", "Insurance", ("insurance", "insurances", "seguro", "seguros", "premiums"),
              ("seguro", "seguros", "insurance", "apolice", "fidelidade", "allianz", "ageas", "tranquilidade",
               "generali", "zurich", "mapfre")),
+    # What card terminals and sales platforms keep from payouts: only from a matched payout report,
+    # never from wording (no evidence words).
+    Category("platform_fees", "Payment and platform fees", ("platform fees", "payment fees", "card fees",
+                                                           "processing fees", "payout fees", "platform commissions",
+                                                           "sales commissions")),
 )
 OTHER = Category("other", "Other costs", ())
 _BY_ID = {c.id: c for c in (*CATEGORIES, OTHER)}
@@ -135,11 +151,14 @@ _KIND: dict[EvidenceExpectation, str] = {
     EvidenceExpectation.NONE_INTERNAL_TRANSFER: "transfer",
     EvidenceExpectation.SALES_INVOICE: "income",
     EvidenceExpectation.REFUND_OR_CREDIT_NOTE: "refund",
+    EvidenceExpectation.PAYOUT_REPORT: "payout",  # a net settlement: shown through its report, never as income
 }
-_KIND_CATEGORY = {"tax": "tax", "bank_fee": "bank_fees", "payroll": "payroll", "loan": "loan"}
-COST_KINDS = frozenset({"cost", "tax", "bank_fee", "payroll", "loan"})
-IN_KINDS = frozenset({"income", "refund", "interest", "tax_refund"})
+_KIND_CATEGORY = {"tax": "tax", "bank_fee": "bank_fees", "payroll": "payroll", "loan": "loan",
+                  "platform_fee": "platform_fees"}
+COST_KINDS = frozenset({"cost", "tax", "bank_fee", "payroll", "loan", "platform_fee"})
+IN_KINDS = frozenset({"income", "refund", "interest", "tax_refund", "sales"})
 NOT_SPENDING = frozenset({"transfer", "card_repayment"})
+_ZERO = Decimal(0)
 _PURCHASE_DOCS = frozenset({DocumentType.INVOICE, DocumentType.INVOICE_RECEIPT, DocumentType.SIMPLIFIED_INVOICE,
                             DocumentType.RECEIPT, DocumentType.DEBIT_NOTE, DocumentType.CREDIT_NOTE})
 _TEXT_MIME = re.compile(r"^(?:text/|application/(?:xml|json)|message/)")
@@ -173,15 +192,26 @@ class Line:
     company_id: str | None  # None while the owner has not said (``pending``) or when personal
     pending: bool
     private: bool
-    kind: str  # cost | tax | bank_fee | payroll | loan | transfer | card_repayment | income | refund | interest
+    # cost | tax | bank_fee | payroll | loan | transfer | card_repayment | income | refund | interest |
+    # payout (a provider's net settlement, never counted itself) | sales | platform_fee (from its payout report)
+    kind: str
     category: str
-    evidence_id: str | None  # stored evidence of the bank line (tracked payments only)
+    evidence_id: str | None  # stored evidence of the bank line (tracked payments only), or of the payout report
     document_ids: tuple[str, ...]
     history: bool  # from the bank history imported at onboarding (§6), not tracked item by item
     needs_document: bool
     has_document: bool
     description: str = ""
     paid_in_cash: bool = False  # a receipt that says it was paid in cash: no bank line (§11)
+    # Sales from a payout report (kind "sales"): what the provider kept and what reached the bank.
+    fees: Decimal = _ZERO
+    refunds: Decimal = _ZERO
+    chargebacks: Decimal = _ZERO
+    adjustments: Decimal = _ZERO
+    paid_out: Decimal = _ZERO
+    provider: str = ""  # the payout provider in a sentence ("Stripe", "your card terminal")
+    fee_word: str = ""  # what that provider calls what it keeps: "fees" or "commission"
+    status: str = ""  # payouts: "settled" | "report_missing" | "report_disagrees" | "report_does_not_add_up"
 
     @property
     def category_label(self) -> str:
@@ -208,10 +238,17 @@ class Money:
     history_months: list[str]
     previous: Money | None = None
     previous_label: str = ""
+    # Money in only: payouts not counted because their payout report has not proven them yet.
+    waiting_payouts: list[Line] = field(default_factory=list)
 
     @property
     def count(self) -> int:
         return len(self.lines)
+
+    @property
+    def sales(self) -> list[Line]:
+        """Gross sales proven by payout reports (card terminals, payment and sales platforms)."""
+        return [x for x in self.lines if x.kind == "sales"]
 
 
 @dataclass
@@ -237,6 +274,11 @@ class Ledger:
         self.repo = service.repo
         self.today = service._today()
         self._supplier_text: dict[str, str] = {}
+        # Payout reports by the bank payout they were paired with (settled, or disagreeing with it).
+        self._payout_reports: dict[str, Any] = {}
+        for s in sorted(getattr(self.repo, "settlements", {}).values(), key=lambda s: s.document_id):
+            if s.transaction_id and (s.settled or s.transaction_id not in self._payout_reports):
+                self._payout_reports[s.transaction_id] = s
         self.lines = self._build()
 
     # -- building -------------------------------------------------------------
@@ -257,6 +299,7 @@ class Ledger:
             cash = self._cash_line(record)
             if cash is not None:
                 out.append(cash)
+        out += self._settled_payouts({x.id: x for x in out})
         out.sort(key=lambda x: (x.on, x.id))
         return out
 
@@ -287,6 +330,38 @@ class Ledger:
             description="Paid in cash", paid_in_cash=True,
         )
 
+    def _settled_payouts(self, by_id: dict[str, Line]) -> list[Line]:
+        """A payout its report proved, as what it is: gross sales in, the provider's fees out."""
+        repo = self.repo
+        out: list[Line] = []
+        for tx_id, s in sorted(self._payout_reports.items()):
+            payout = by_id.get(tx_id)
+            if payout is None or not s.settled:
+                continue
+            report = s.report
+            doc = repo.documents.get(s.document_id)
+            evidence = doc.evidence_ids[0] if doc is not None and doc.evidence_ids else payout.evidence_id
+            common: dict[str, Any] = {
+                "on": payout.on, "currency": report.currency, "supplier_id": None, "company_id": payout.company_id,
+                "pending": payout.pending, "private": payout.private, "evidence_id": evidence, "history": False,
+                "needs_document": False, "has_document": True, "provider": payout.provider,
+            }
+            ref = f" {report.payout_id}" if report.payout_id else ""
+            if report.gross_sales > 0:
+                out.append(Line(
+                    id=f"{tx_id}:sales", amount=report.gross_sales, direction="in",
+                    merchant=f"Sales through {payout.provider}", kind="sales", category="sales",
+                    document_ids=(s.document_id,), description=f"Payout{ref}", fees=report.fees,
+                    refunds=report.refunds, chargebacks=report.chargebacks, adjustments=report.adjustments,
+                    paid_out=report.net, fee_word=report.provider.fee_word, **common))
+            if report.fees > 0:
+                out.append(Line(
+                    id=f"{tx_id}:fees", amount=report.fees, direction="out", merchant=payout.merchant,
+                    kind="platform_fee", category="platform_fees",
+                    document_ids=(s.document_id, *s.commission_document_ids),
+                    description=f"{report.provider.fee_word.capitalize()} kept from the payout{ref}", **common))
+        return out
+
     def _line(self, tx: Transaction, rec: Any, decision: Any, resolver: Any, pending: set[str],
               accountant_ids: list[str]) -> Line:
         repo = self.repo
@@ -300,7 +375,21 @@ class Ledger:
             kind = {"bank_fee": "interest", "tax": "tax_refund", "cost": "income"}.get(kind, kind)
         own = next((e.name for e in repo.entities if tx.counterparty_iban and tx.counterparty_iban in e.own_ibans),
                    None)
-        if kind == "tax":
+        provider, status = "", ""
+        if kind == "payout":
+            settlement = self._payout_reports.get(tx.id)
+            found = payout_provider(tx) or provider_named(tx.counterparty, tx.description)
+            if settlement is not None and (found is None or found.is_card_terminal):
+                found = settlement.report.provider  # the acquirer the report names beats a bare 'TPA' line
+            provider = found.label if found else display_name(tx.counterparty)
+            merchant = found.title if found else provider
+            if settlement is None:
+                status = "report_missing"
+            elif settlement.settled:
+                status = "settled"
+            else:
+                status = "report_does_not_add_up" if settlement.problem == "does_not_add_up" else "report_disagrees"
+        elif kind == "tax":
             merchant = "Social Security" if re.search(r"\bseg(?:uranca)? social\b|\bigfss\b", folded) else "Tax office"
         elif kind == "transfer" and own:
             merchant = own
@@ -327,9 +416,10 @@ class Ledger:
             currency=tx.currency, merchant=merchant, supplier_id=supplier.id if supplier else None,
             company_id=company, pending=waiting, private=private, kind=kind, category=category,
             evidence_id=rec.evidence_id if rec is not None else None, document_ids=docs,
-            history=rec is None, needs_document=bool(decision.requires_document) and kind in COST_KINDS,
+            history=rec is None,
+            needs_document=bool(decision.requires_document) and (kind in COST_KINDS or kind == "payout"),
             has_document=bool(docs or (rec is not None and rec.proof_evidence_ids)),
-            description=tx.description,
+            description=tx.description, provider=provider, status=status,
         )
 
     def _history_company(self, tx: Transaction) -> str | None:
@@ -345,7 +435,7 @@ class Ledger:
     def _category(self, tx: Transaction, kind: str, supplier: Any, key: str, rec: Any, folded: str,
                   accountant_ids: list[str]) -> str:
         repo = self.repo
-        if kind in ("transfer", "card_repayment") or kind in IN_KINDS:
+        if kind in ("transfer", "card_repayment", "payout") or kind in IN_KINDS:
             return kind
         try:
             taught = repo.rulebook.evaluate(RuleSubject.from_transaction(tx, key=key), tenant_id=repo.tenant_id,
@@ -449,10 +539,16 @@ class Ledger:
         counted: list[Line] = []
         left_out: list[Line] = []
         pending: list[Line] = []
+        waiting: list[Line] = []
         private = other_currency = 0
         for x in base:
             if x.private:
                 private += 1
+                continue
+            if x.kind == "payout":
+                # A net settlement: counted through its report's sales and fees, or not at all yet.
+                if x.status != "settled" and (not company_ids or x.company_id in company_ids or x.pending):
+                    waiting.append(x)
                 continue
             if x.kind in NOT_SPENDING:
                 if not company_ids or x.company_id in company_ids:
@@ -479,7 +575,7 @@ class Ledger:
         result = Money(start=start, end=end, direction=direction, lines=counted, total=total, group_by=group,
                        rows=self._rows(counted, group), by_kind=dict(by_kind), left_out=left_out, pending=pending,
                        private_count=private, other_currency=other_currency, covered=covered,
-                       history_months=self._history_months(counted))
+                       history_months=self._history_months(counted), waiting_payouts=waiting)
         if compare is not None:
             p_start, p_end, p_label = compare
             result.previous = self.money(p_start, p_end, direction=direction, company_ids=company_ids,
@@ -555,6 +651,20 @@ class Ledger:
             out.append((x, self.svc.orchestrator.missing.plan(rec)))
         return out
 
+    def missing_reports(self, *, start: date | None = None, end: date | None = None,
+                        company_ids: Sequence[str] = ()) -> list[tuple[Line, str]]:
+        """Payouts still without a payout report that proves them, with the plan for each (§20, §22)."""
+        repo = self.repo
+        out = []
+        for x in self.select(start=start, end=end, direction="in"):
+            rec = repo.transactions.get(x.id)
+            if rec is None or x.kind != "payout" or x.private or x.status == "settled":
+                continue
+            if repo.items[rec.item_id].is_done or (company_ids and x.company_id not in company_ids):
+                continue
+            out.append((x, self.svc.orchestrator.missing.plan(rec)))
+        return out
+
     # -- presentation ---------------------------------------------------------
 
     def payment_label(self, x: Line) -> str:
@@ -564,6 +674,10 @@ class Ledger:
     def payment_dict(self, x: Line) -> dict[str, Any]:
         if x.history:
             invoice = "history"
+        elif x.kind == "payout":
+            invoice = "matched" if x.status == "settled" else "missing"  # its payout report
+        elif x.kind in ("sales", "platform_fee"):
+            invoice = "matched"  # read from the payout report that matched the bank
         elif not x.needs_document:
             invoice = "not needed"
         elif x.kind == "tax":

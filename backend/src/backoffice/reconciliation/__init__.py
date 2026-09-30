@@ -32,6 +32,14 @@ Suppliers — descriptor normalization and learned aliases:
     resolver.resolve("PAYPAL *ADOBE").key      # supplier id, or 'adobe' when unknown
     resolver.learn("PAYPAL *ADOBESYSTEM", supplier.id)
 
+Payouts (§20, §21) — money in from a card terminal or a payment / sales platform
+is a net settlement, never customer revenue by itself; it expects the provider's
+payout report (``EvidenceExpectation.PAYOUT_REPORT``), which
+:mod:`backoffice.settlements` parses and reconciles. ``is_card_repayment``
+(older name ``is_card_settlement``) is the opposite: paying off a credit card.
+
+    payout_provider(tx)                # PayoutProvider or None ('STRIPE PAYMENTS', 'TPA 1234 SIBS')
+
 Scoring (§54) — explainable candidate scores:
 
     score = score_match([tx], [doc], MatchContext(suppliers=resolver))
@@ -59,6 +67,7 @@ from .bank import (
     FxDetails,
     fx_from_text,
     is_card_purchase,
+    is_card_repayment,
     is_card_settlement,
 )
 from .engine import (
@@ -82,6 +91,16 @@ from .expected import (
     LearnedExpectation,
 )
 from .fx import EcbConfig, EcbFxRates, FxRateSource, FxRateUnavailable, StaticFxRates
+from .payouts import (
+    CARD_TERMINAL,
+    PAYOUT_PROVIDERS,
+    PayoutProvider,
+    ProviderKind,
+    compatible_providers,
+    payout_provider,
+    provider_by_key,
+    provider_named,
+)
 from .history import (
     Cadence,
     InMemoryPaymentHistory,
@@ -121,6 +140,15 @@ from .suppliers import (
 __all__ = [
     "ACCEPTED_DOCUMENT_TYPES",
     "CARD_LAST4_FIELD",
+    "CARD_TERMINAL",
+    "PAYOUT_PROVIDERS",
+    "PayoutProvider",
+    "ProviderKind",
+    "compatible_providers",
+    "is_card_repayment",
+    "payout_provider",
+    "provider_by_key",
+    "provider_named",
     "AliasMemory",
     "Allocation",
     "Alternative",

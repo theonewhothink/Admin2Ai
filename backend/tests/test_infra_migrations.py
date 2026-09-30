@@ -24,6 +24,7 @@ from backoffice.domain.models import (  # noqa: E402
     SourceKind,
     TransactionKind,
 )
+from backoffice.reconciliation import MatchKind  # noqa: E402
 from backoffice_db import (  # noqa: E402
     MIGRATIONS_DIR,
     Migration,
@@ -79,6 +80,7 @@ def _domain_values(name: str) -> set[str]:
         ("transaction_kind", TransactionKind),
         ("obligation_kind", ObligationKind),
         ("item_stage", Stage),
+        ("match_kind", MatchKind),
     ],
 )
 def test_sql_enumerations_mirror_the_domain_model(domain: str, enum: type[Enum]) -> None:
