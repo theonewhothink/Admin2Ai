@@ -42,6 +42,9 @@ STATIC_PATHS = (
     "/api/accountant/clients",
     "/api/audit",
     "/api/pipeline",
+    "/api/internal/overview",
+    "/api/internal/operations",
+    "/api/internal/readiness",
 )
 
 

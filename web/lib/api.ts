@@ -14,6 +14,7 @@
 import { unstable_rethrow } from "next/navigation";
 import * as sample from "./data";
 import { browserEngine, engineRequest } from "./engine";
+import type { InternalOperations, InternalOverview } from "./internal-types";
 import type {
   AccountantClientDetail,
   AccountantClientRow,
@@ -316,6 +317,33 @@ function isPipeline(v: unknown): Pipeline | null {
 export async function getPipeline(): Promise<Pipeline | null> {
   if (!browserEngine && !hasApi) return null;
   return request<Pipeline | null>("/api/pipeline", { method: "GET" }, isPipeline, () => null);
+}
+
+/* ---------- Internal dashboard, "Admin OS" (engine or backend only; never sample data) ---------- */
+
+function isOverview(v: unknown): InternalOverview | null {
+  return isRecord(v) && Array.isArray(v.golden) && isRecord(v.health) && Array.isArray(v.fixes) && Array.isArray(v.tenants)
+    ? (v as unknown as InternalOverview)
+    : null;
+}
+
+function isOperations(v: unknown): InternalOperations | null {
+  return isRecord(v) && Array.isArray(v.activity) && isRecord(v.audit) && Array.isArray(v.audit.entries)
+    ? (v as unknown as InternalOperations)
+    : null;
+}
+
+/** The team's Command Center figures. Null when there is no engine or backend to ask. */
+export async function getInternalOverview(): Promise<InternalOverview | null> {
+  if (!browserEngine && !hasApi) return null;
+  return request<InternalOverview | null>("/api/internal/overview", { method: "GET" }, isOverview, () => null);
+}
+
+/** Recent activity and the newest `limit` audit records (the engine's default when omitted). */
+export async function getInternalOperations(limit?: number): Promise<InternalOperations | null> {
+  if (!browserEngine && !hasApi) return null;
+  const path = `/api/internal/operations${limit ? `?limit=${encodeURIComponent(String(limit))}` : ""}`;
+  return request<InternalOperations | null>(path, { method: "GET" }, isOperations, () => null);
 }
 
 /* ---------- Audit and accountant (sample data unless the browser engine runs) ---------- */

@@ -637,6 +637,12 @@ class BackOfficeService:
 
         return build_pipeline(self)
 
+    def internal(self, view: str, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """The team's internal dashboard (backoffice/internal.py); admin-only once sign-in exists."""
+        from backoffice import internal
+
+        return internal.handle(view, [self], body)
+
     def chat_tools(self) -> dict[str, Any]:
         """What the browser chat needs to run Claude itself: instructions, tools, today and the model."""
         from backoffice.assistant import SYSTEM, TOOLS, ClaudeBrain
@@ -1661,6 +1667,7 @@ class BackOfficeService:
              lambda b: self.accountant_rule(_field(b, "text"), str(b.get("scope") or "client"))),
             ("GET", r("/api/audit"), lambda b: self.audit()),
             ("GET", r("/api/pipeline"), lambda b: self.pipeline()),
+            ("GET", r("/api/internal/(overview|operations|readiness)"), lambda b, view: self.internal(view, b)),
         )
 
 

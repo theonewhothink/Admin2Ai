@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useEffect, useId, useRef, useState } from "react";
 import { Icon, type IconName } from "@/components/Icon";
 import { browserEngine, resetEngine } from "@/lib/engine";
+import { canOpenInternal, viewerRole } from "@/lib/internal-access";
 import { resetAnswered } from "@/lib/resolved-store";
 import type { Owner } from "@/lib/types";
 import styles from "./shell.module.css";
@@ -83,6 +84,14 @@ export function ProfileMenu({ owner, sampleData }: { owner: Owner; sampleData: b
               </Link>
             </li>
           ))}
+          {canOpenInternal(viewerRole()) ? (
+            <li>
+              <Link href="/internal" className={styles.menuItem} onClick={close}>
+                <Icon name="shield" size={18} />
+                Internal dashboard
+              </Link>
+            </li>
+          ) : null}
         </ul>
         <div className={styles.menuGroupLabel}>Preview</div>
         <ul className={styles.menuList}>
