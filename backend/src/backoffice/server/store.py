@@ -31,8 +31,9 @@ __all__ = [
     "User",
 ]
 
-# An employee (backoffice.staff) may only upload receipts and read their own open card payments (auth.py).
-ROLES = ("owner", "accountant", "admin", "employee")
+# An employee (backoffice.staff) may only upload receipts and read their own open card payments (auth.py);
+# a manager (backoffice.managers) only their outlets' questions, documents, payments and receipts.
+ROLES = ("owner", "accountant", "admin", "employee", "manager")
 
 
 class StoreError(Exception):
@@ -171,6 +172,8 @@ class Store(Protocol):
 
     # accountants limited to some companies, and clients invited by their accountant (§28, §29, §51)
     def membership_companies(self, tenant_id: str, user_id: str) -> tuple[str, ...] | None: ...
+    # an outlet manager: (their one company, the cost centers they run); None when not a manager (0013)
+    def manager_scope(self, tenant_id: str, user_id: str) -> tuple[str, tuple[str, ...]] | None: ...
     def create_invitation(self, invitation: Invitation) -> None: ...
     def invitation(self, token_hash: str) -> Invitation | None: ...
     def mark_invitation_sent(self, invitation: Invitation, at: datetime) -> None: ...
@@ -219,6 +222,8 @@ class _Data:
     erasures: dict[str, _Erasure] = field(default_factory=dict)
     # (tenant, user) -> the companies an accountant membership is limited to (absent = every company)
     membership_companies: dict[tuple[str, str], tuple[str, ...]] = field(default_factory=dict)
+    # (tenant, user) -> (company, cost centers) of a manager membership
+    manager_scopes: dict[tuple[str, str], tuple[str, tuple[str, ...]]] = field(default_factory=dict)
     invitations: dict[str, Invitation] = field(default_factory=dict)  # token hash -> invitation
 
 
@@ -294,14 +299,24 @@ class MemoryStore:
                 return None
             return user, tenant, roles
 
-    def add_membership(self, tenant_id: str, user_id: str, role: str, companies: Sequence[str] = ()) -> None:
+    def add_membership(self, tenant_id: str, user_id: str, role: str, companies: Sequence[str] = (),
+                       cost_centers: Sequence[str] = ()) -> None:
         """Give ``user_id`` a role in ``tenant_id`` (tests; invitations use :meth:`accept_invitation`).
 
-        ``companies`` limits an accountant membership to those companies of the business.
+        ``companies`` limits an accountant membership to those companies of the business. A manager
+        membership needs exactly one company and one or more of its ``cost_centers`` (outlets).
         """
         with self._lock:
             if role not in ROLES or tenant_id not in self._d.tenants or user_id not in self._d.users:
                 raise StoreError("unknown tenant, user or role")
+            if role == "manager":
+                if len(tuple(dict.fromkeys(companies))) != 1 or not cost_centers:
+                    raise StoreError("a manager membership is one company and one or more of its cost centers")
+                self._d.memberships.add((tenant_id, user_id, role))
+                self._d.manager_scopes[(tenant_id, user_id)] = (companies[0], tuple(dict.fromkeys(cost_centers)))
+                return
+            if cost_centers:
+                raise StoreError("only a manager membership is limited to cost centers")
             if companies and role != "accountant":
                 raise StoreError("only an accountant membership is limited to companies")
             self._d.memberships.add((tenant_id, user_id, role))
@@ -318,6 +333,14 @@ class MemoryStore:
             if (tenant_id, user_id, "accountant") not in self._d.memberships:
                 return None
             return self._d.membership_companies.get((tenant_id, user_id)) or None
+
+    def manager_scope(self, tenant_id: str, user_id: str) -> tuple[str, tuple[str, ...]] | None:
+        """(company, cost centers) of a manager membership; None when the person is not a manager there."""
+        self._up()
+        with self._lock:
+            if (tenant_id, user_id, "manager") not in self._d.memberships:
+                return None
+            return self._d.manager_scopes.get((tenant_id, user_id))
 
     # ----------------------------------------------------------------- client invitations (§29)
 
@@ -521,6 +544,7 @@ class MemoryStore:
             self._d.memberships = {m for m in self._d.memberships if m[0] != tenant_id}
             self._d.membership_companies = {k: v for k, v in self._d.membership_companies.items()
                                             if k[0] != tenant_id}
+            self._d.manager_scopes = {k: v for k, v in self._d.manager_scopes.items() if k[0] != tenant_id}
             self._d.invitations = {h: (replace(i, accepted_tenant_id=None) if i.accepted_tenant_id == tenant_id
                                        else i)
                                    for h, i in self._d.invitations.items() if i.inviter_tenant_id != tenant_id}

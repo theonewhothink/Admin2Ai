@@ -470,6 +470,7 @@ class ObligationKind(str, Enum):
     DEBT_COLLECTION = "debt_collection"
     BANK_REQUEST = "bank_request"
     PAYMENT_DEADLINE = "payment_deadline"
+    VAT_RETURN = "vat_return"  # a periodic VAT return its country's calendar sets (Spain's modelo 303)
 
 
 class Obligation(BaseModel):

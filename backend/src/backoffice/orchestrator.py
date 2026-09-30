@@ -106,18 +106,17 @@ from backoffice.closure import (
     satisfy,
 )
 from backoffice.closure.month import EXPECTED_INVOICE
+from backoffice.closure.obligations import VerificationCondition
 from backoffice.countries.foreign import IssuerProfile, detect_issuer, read_foreign_text
 from backoffice.deposits import customer_name, deposit_wording, is_advance_invoice, read_terms, says_held_back
 from backoffice.countries.foreign import vat_rates as foreign_vat_rates
-from backoffice.countries.pt import (
-    PACK,
-    PTQRCode,
-    QRCodeError,
-    RateDataUnavailable,
-    extract_text_fields,
-    looks_like_pt_qr,
-    parse_qr,
-    qr_to_observations,
+from backoffice.countries import (
+    CompanyPack,
+    CountryPackError,
+    FiscalQRError,
+    FiscalQRResult,
+    company_countries,
+    company_pack,
 )
 from backoffice.domain.cost_centers import (
     CostCenter,
@@ -610,8 +609,10 @@ class DocumentRecord:
     # It never proves a company payment; the transfer that pays the employee back closes it.
     claim_id: str | None = None
     # Who issued it and from which country (checklist P7): a foreign issuer is checked by rules that
-    # hold anywhere, never by Portuguese ones. None, or a Portuguese issuer: the Portuguese rules.
+    # hold anywhere, never by the company's own country's. None, or a domestic issuer: the home rules.
     issuer: IssuerProfile | None = None
+    # The country of the company it is for (§49): its pack read it and checks its VAT.
+    country: str = "PT"
     # Deposits, staged payments and amounts held back (checklist X8, I2, I4, I5).
     advance: bool = False  # an advance or deposit invoice ("Fatura de adiantamento")
     terms: Any = None  # deposits.Terms: the deposits it takes off, the amount due now, the part held back
@@ -625,6 +626,12 @@ class DocumentRecord:
     billing_name: str | None = None
     billing_address: str | None = None
     payslip: Payslip | None = None  # a payslip: the salary it proves (checklist J3)
+    # Sensitive (checklist X32): "medical", "legal", "hr" (its wording or kind) or "owner" (the owner said so).
+    # Never sent to an external AI, never shown to employees or outlet managers, every read of it logged.
+    sensitive: str | None = None
+    sensitive_by: str = ""  # "wording" | "owner"
+    # The outlet (cost center) a manager sent it for (their own upload is theirs to see).
+    uploaded_for: str | None = None
 
     @property
     def id(self) -> str:
@@ -649,6 +656,17 @@ class DocumentRecord:
             number = f" of {day.day} {_MONTH_NAMES[day.month - 1]}" if day else ""
         amount = f" · {format_money(doc.gross_amount, doc.currency)}" if doc.gross_amount is not None else ""
         return f"{kind}{number}{amount}"
+
+
+@dataclass(frozen=True)
+class AccessEntry:
+    """One read of a sensitive document's original (§52): who, when, which document, and how."""
+
+    at: datetime
+    document_id: str
+    who: str  # an email address, "owner" in the demo, or "accounting software (API key)"
+    role: str  # "owner" | "accountant" | "admin" | "api"
+    how: str = "opened the original"
 
 
 @dataclass
@@ -1226,13 +1244,19 @@ class Repository:
         # ("owner" | "accountant"), and the requests written for missing payslips (payment id -> outbox id).
         self.payroll_employees: dict[str, str] = {}
         self.payroll_by: dict[str, str] = {}
+        # Every read of a sensitive document's original (who, when, which document), for the owner (§52).
+        self.document_access: list[AccessEntry] = []
         self.payslip_requests: dict[str, str] = {}
 
     # ----------------------------------------------------------------- set-up
 
     def add_company(self, *, id: str, name: str, legal_name: str, tax_id: str, ibans: Sequence[str] = (),
-                    address: str | None = None, sector: str | None = None) -> LegalEntity:
-        entity = LegalEntity(id=id, tenant_id=self.tenant_id, name=name, country="PT", tax_id=tax_id,
+                    address: str | None = None, sector: str | None = None, country: str = "PT") -> LegalEntity:
+        """One of the owner's companies, in its own country (§49): every document, VAT amount and letter of
+        the company is read and checked by that country's pack. Raises UnknownCountryError for a country
+        without a pack that can run a company."""
+        code = company_pack(country).country_code
+        entity = LegalEntity(id=id, tenant_id=self.tenant_id, name=name, country=code, tax_id=tax_id,
                              own_ibans=list(ibans))
         self.companies[id] = entity
         self.legal_names[id] = legal_name
@@ -1270,6 +1294,22 @@ class Repository:
     def company_name(self, company_id: str | None) -> str | None:
         entity = self.companies.get(company_id or "")
         return entity.name if entity else None
+
+    def company_country(self, company_id: str | None) -> str:
+        """The company's country (its pack reads its documents); the business's first one when unknown."""
+        entity = self.companies.get(company_id or "")
+        return entity.country if entity is not None else self.primary_country()
+
+    def primary_country(self) -> str:
+        """The country of the business's first company (Portugal before any company is added)."""
+        return next((e.country for e in self.companies.values()), "PT")
+
+    def countries(self) -> tuple[str, ...]:
+        """The countries of the business's companies, first company's first (Portugal when there is none)."""
+        return tuple(dict.fromkeys(e.country for e in self.companies.values())) or ("PT",)
+
+    def pack_for(self, company_id: str | None) -> CompanyPack:
+        return company_pack(self.company_country(company_id))
 
     def ownership(self) -> OwnershipBook:
         return OwnershipBook(
@@ -1490,7 +1530,7 @@ class _Extracted:
     doc_type: DocumentType
     supplier_name: str | None
     evidence_ids: list[str]
-    qr: PTQRCode | None = None
+    qr: FiscalQRResult | None = None  # the home country's fiscal QR code, read (§13 Stage 0)
     buyer_is_final_consumer: bool = False
     parsers: list[str] = field(default_factory=list)
     invoice_number: str | None = None
@@ -1502,6 +1542,7 @@ class _Extracted:
     issuer: IssuerProfile | None = None
     billing_name: str | None = None  # the customer name printed on it (H2)
     billing_address: str | None = None  # the billing address printed on it (H3)
+    home: str = "PT"  # the country of the company it is for: its pack read it (§49)
 
 
 class DiscoveryAgent(_Agent):
@@ -1685,18 +1726,19 @@ class RetrievalAgent(_Agent):
             email_evidence_id=record.email_evidence_id, shared=record.shared)
 
 
-_QR_START = re.compile(r"A:\d{9}\*B:")
 _MONEY_WITH_CURRENCY = re.compile(r"(?:€|EUR)\s?-?\d[\d.,\u00a0 ]*\d|-?\d[\d.,\u00a0 ]*\d\s?(?:€|EUR)")
 
 
 class DocumentAgent(_Agent):
-    """Stage 0 extraction: UBL e-invoices, Portuguese fiscal QR codes and text fields (§13, §19),
-    plus the readings of uploaded PDFs and photos (§13-17).
+    """Stage 0 extraction: UBL e-invoices, fiscal QR codes and text fields (§13, §19), plus the readings
+    of uploaded PDFs and photos (§13-17), each through the pack of the company's own country (§49).
 
-    The issuer's country is decided first (checklist P7): a document from abroad is read with the
-    international labels and its own conventions (day order, currency, VAT number), never as if it
-    were Portuguese because the company is. A document one of the business's own companies issued
-    (its own sales invoice) keeps the Portuguese reading.
+    Which of the business's companies a document is for decides its home country (the only one when
+    all companies share one; else the company it names, its issuer's company for its own sale). The
+    issuer's country is decided next (checklist P7): a document from another country than the home
+    one is read with the international labels and its own conventions (day order, currency, VAT
+    number), never as if it were domestic because the company is. A document one of the business's
+    own companies issued (its own sales invoice) keeps its company's reading.
     """
 
     name = "document"
@@ -1704,6 +1746,36 @@ class DocumentAgent(_Agent):
     def own_tax_ids(self) -> list[str]:
         """The business's own tax numbers with their country ("PT516123459"): on a purchase, the customer."""
         return [qualified_tax_id(e.tax_id, e.country) or e.tax_id for e in self.repo.entities]
+
+    def named_countries(self, text: str) -> set[str]:
+        """The countries of the business's companies whose tax number the text prints."""
+        return {e.country for e in self.repo.entities if e.tax_id and _names_own_tax_id(text, e.tax_id)}
+
+    def home_country(self, texts: Sequence[str], *, own_issuer: str | None = None,
+                     fiscal: Sequence[tuple[str, str]] = (), numbers: Sequence[str] = ()) -> str:
+        """The country of the company a document is for (its pack reads it).
+
+        One country for the whole business: that one (a Portuguese business reads everything as
+        before). Several: the issuing company's for its own sale; else the country of the
+        companies the document names by tax number, when they agree; else the issuer's country
+        when one of the companies is there (a domestic purchase); else the first company's.
+        """
+        countries = self.repo.countries()
+        if len(countries) == 1:
+            return countries[0]
+        if own_issuer is not None:
+            company = self.repo.company_for_tax_id(own_issuer)
+            return self.repo.company_country(company)
+        joined = "\n".join(texts)
+        named = self.named_countries(joined)
+        if len(named) == 1:
+            return named.pop()
+        primary = self.repo.primary_country()
+        guess = detect_issuer(joined, own_tax_ids=self.own_tax_ids(), fiscal_qr=fiscal[0][0] if fiscal else False,
+                              structured_tax_ids=numbers, home=primary)
+        if guess.country in countries:
+            return guess.country
+        return primary
 
     def stage0_fields(self, text: str, source: str, method: ExtractionMethod,
                       hint: dict[str, str] | None = None) -> dict[str, list[FieldObservation]]:
@@ -1718,24 +1790,26 @@ class DocumentAgent(_Agent):
         return {} if extracted is None else {k: list(v) for k, v in extracted.observations.items()}
 
     def text_extractor(self, hint: Mapping[str, str] | None = None) -> Any:
-        """Reads fields from an OCR engine's text (the router labels them with the engine): Portuguese
-        fields, or the international labels when the text comes from abroad."""
+        """Reads fields from an OCR engine's text (the router labels them with the engine): the home
+        country's fields, or the international labels when the text comes from abroad."""
         own = self.own_tax_ids()
 
         def extract(text: str, source: str, method: ExtractionMethod) -> dict[CriticalField, list[FieldObservation]]:
             issuer = (hint or {}).get("issuer") or self.own_issuer([_Part(source, "text", text=text, method=method)])
             found: dict[CriticalField, list[FieldObservation]] = {}
+            payloads, rest = _split_qr(text)
+            home = self.home_country([rest], own_issuer=issuer, fiscal=payloads)
             if issuer is None:  # not the business's own sale: who issued it, and from which country (P7)
-                payloads, rest = _split_qr(text)
-                profile = detect_issuer(rest, own_tax_ids=own, fiscal_qr=bool(payloads))
+                profile = detect_issuer(rest, own_tax_ids=own, fiscal_qr=payloads[0][0] if payloads else False,
+                                        home=home)
                 if profile.reads_foreign:
                     for name, obs in read_foreign_text(rest, source, method=method, issuer=profile,
                                                        own_tax_ids=own).observations.items():
                         found.setdefault(name, []).extend(obs)
                     return found
             customers, suppliers = self._roles(issuer)
-            for obs in extract_text_fields(text, source, method=method, known_customer_tax_ids=customers,
-                                           known_supplier_tax_ids=suppliers).observations:
+            for obs in company_pack(home).read_text(text, source, method=method, known_customer_tax_ids=customers,
+                                                    known_supplier_tax_ids=suppliers).observations:
                 found.setdefault(obs.field, []).append(obs)
             currency = _text_currency(text, source, method)
             if currency is not None:
@@ -1780,23 +1854,25 @@ class DocumentAgent(_Agent):
                 structured += [str(o.value) for o in part.observations.get(CriticalField.SUPPLIER_TAX_ID.value, ())
                                if o.method in (ExtractionMethod.QR, ExtractionMethod.STRUCTURED_XML)]
             payloads, rest = _split_qr(part.text)
-            for payload in payloads:
-                try:
-                    structured.append(parse_qr(payload).issuer_nif)
-                except QRCodeError:
-                    continue
-            neutral = extract_text_fields(rest, part.evidence_id, method=part.method)
-            worded += [str(o.value) for o in neutral.observations if o.field is CriticalField.SUPPLIER_TAX_ID]
+            for country, payload in payloads:
+                found = _fiscal_qr(country, payload, part.evidence_id)
+                if found is not None and found.issuer_tax_id:
+                    structured.append(found.issuer_tax_id)
+            for country in self.repo.countries():  # each company's own labels
+                neutral = company_pack(country).read_text(rest, part.evidence_id, method=part.method)
+                worded += [str(o.value) for o in neutral.observations if o.field is CriticalField.SUPPLIER_TAX_ID]
         for value in structured or worded:
             mine = next((t for t in own if same_tax_id(t, value)), None)
             if mine is not None:
                 return mine
         return None
 
-    def issuer_of(self, parts: Sequence[_Part], structured: Mapping[int, Any]) -> IssuerProfile:
-        """Who issued the document, from all its readable parts together (a fiscal QR code means Portugal)."""
+    def _signals(self, parts: Sequence[_Part], structured: Mapping[int, Any]
+                 ) -> tuple[list[str], list[tuple[str, str]], list[str]]:
+        """(texts without fiscal QR payloads, the fiscal QR payloads with their country, the supplier tax
+        numbers structured copies give), from all of a document's readable parts together."""
         texts: list[str] = []
-        fiscal_qr = False
+        fiscal: list[tuple[str, str]] = []
         numbers: list[str] = []
         for i, part in enumerate(parts):
             if part.kind in ("ubl", "html"):
@@ -1805,12 +1881,18 @@ class DocumentAgent(_Agent):
                     numbers += [str(o.value) for o in result.fields.get(CriticalField.SUPPLIER_TAX_ID, ())]
                 continue
             payloads, rest = _split_qr(part.text)
-            fiscal_qr = fiscal_qr or bool(payloads)
+            fiscal += payloads
             texts.append(rest)
             if part.kind == "read":
                 texts.append(part.reading_text)
-        return detect_issuer("\n".join(texts), own_tax_ids=self.own_tax_ids(), fiscal_qr=fiscal_qr,
-                             structured_tax_ids=numbers)
+        return texts, fiscal, numbers
+
+    def issuer_of(self, parts: Sequence[_Part], structured: Mapping[int, Any], home: str) -> IssuerProfile:
+        """Who issued the document, from all its readable parts together (a fiscal QR code names its country),
+        relative to the home country of the company it is for."""
+        texts, fiscal, numbers = self._signals(parts, structured)
+        return detect_issuer("\n".join(texts), own_tax_ids=self.own_tax_ids(),
+                             fiscal_qr=fiscal[0][0] if fiscal else False, structured_tax_ids=numbers, home=home)
 
     def read(self, parts: Sequence[_Part]) -> _Extracted | None:
         observations: dict[str, list[FieldObservation]] = {}
@@ -1818,7 +1900,7 @@ class DocumentAgent(_Agent):
         kinds: dict[str, DocumentType] = {}
         receipt_fallback = False  # text with fields but no word naming its kind: read as a receipt
         supplier_name: str | None = None
-        qr: PTQRCode | None = None
+        qr: FiscalQRResult | None = None
         final_consumer = False
         parsers: list[str] = []
         structured: dict[int, Any] = {}  # e-invoices (one result each) and HTML data (a tuple of results each)
@@ -1832,10 +1914,15 @@ class DocumentAgent(_Agent):
                 structured[i] = _html_structured(part.data, part.evidence_id)
         own_issuer = self.own_issuer(parts)
         customers, suppliers = self._roles(own_issuer)
+        # Which company it is for decides its home country, whose pack reads it (§49): never another's.
+        signals = self._signals(parts, structured)
+        home = self.home_country(signals[0], own_issuer=own_issuer, fiscal=signals[1], numbers=signals[2])
+        pack = company_pack(home)
+        code = home.lower()
         # Who issued it and from which country (checklist P7). The business's own sale is its own
-        # company's document: read the Portuguese way, with its roles, never as a purchase from abroad.
-        issuer = None if own_issuer is not None else self.issuer_of(parts, structured)
-        # From abroad (or in English/Spanish with no country to go by): its own labels and conventions.
+        # company's document: read its company's way, with its roles, never as a purchase from abroad.
+        issuer = None if own_issuer is not None else self.issuer_of(parts, structured, home)
+        # From abroad (or in another language with no country to go by): its own labels and conventions.
         abroad = issuer is not None and issuer.reads_foreign
         own = self.own_tax_ids() if abroad else []
         stated: list[Decimal] = []
@@ -1885,20 +1972,22 @@ class DocumentAgent(_Agent):
                     kinds.setdefault("reading", part.doc_type)
             text = part.text
             qr_payloads, rest = _split_qr(text)
-            for payload in qr_payloads:
-                try:
-                    code = parse_qr(payload)
-                except QRCodeError:
+            for country, payload in qr_payloads:
+                if country != home:
+                    continue  # another country's code: it named the issuer's country, it is not read as ours
+                found = _fiscal_qr(country, payload, part.evidence_id)
+                if found is None:
                     continue
-                qr = qr or code
-                parsers.append("pt_fiscal_qr")
-                final_consumer = final_consumer or code.buyer_is_final_consumer
-                for obs in qr_to_observations(code, part.evidence_id):
+                qr = qr or found
+                parsers.append(f"{code}_fiscal_qr")
+                final_consumer = final_consumer or found.buyer_is_final_consumer
+                for obs in found.observations:
                     add(obs.field, obs)
                 add(CriticalField.CURRENCY, FieldObservation(
-                    value=code.currency, source=part.evidence_id, method=ExtractionMethod.QR, confidence=0.95,
+                    value=found.currency, source=part.evidence_id, method=ExtractionMethod.QR, confidence=0.95,
                     location="qr:amounts are in euro"))
-                kinds.setdefault("qr", code.doc_type)
+                if found.native_doc_type:  # a code that says which kind of document it is on
+                    kinds.setdefault("qr", found.doc_type)
             method = part.method
             if abroad:
                 assert issuer is not None
@@ -1912,11 +2001,11 @@ class DocumentAgent(_Agent):
                 stated += foreign.stated_rates
                 read_any = bool(foreign.observations)
             else:
-                fields = extract_text_fields(rest, part.evidence_id, method=method, known_customer_tax_ids=customers,
-                                             known_supplier_tax_ids=suppliers)
+                fields = pack.read_text(rest, part.evidence_id, method=method, known_customer_tax_ids=customers,
+                                        known_supplier_tax_ids=suppliers)
                 if fields.observations:
-                    parsers.append({"text": "pt_text_fields", "read": "pt_text_fields:pdf_text"}.get(
-                        part.kind, "pt_text_fields:email_body"))
+                    parsers.append({"text": f"{code}_text_fields", "read": f"{code}_text_fields:pdf_text"}.get(
+                        part.kind, f"{code}_text_fields:email_body"))
                 final_consumer = final_consumer or fields.buyer_is_final_consumer
                 for obs in fields.observations:
                     add(obs.field, obs)
@@ -1930,9 +2019,9 @@ class DocumentAgent(_Agent):
                 if currency is not None:
                     add(CriticalField.CURRENCY, currency)
                 read_any = bool(fields.observations)
-            supplier_name = supplier_name or part.supplier_name or _first_line(rest, foreign=abroad)
+            supplier_name = supplier_name or part.supplier_name or _first_line(rest, foreign=abroad, pack=pack)
             if read_any:
-                named = _text_doc_type(rest, foreign=abroad)
+                named = _doc_kind(rest, pack, foreign=abroad)
                 if named is not None:
                     kinds.setdefault("text", named)
                 receipt_fallback = True
@@ -1940,8 +2029,8 @@ class DocumentAgent(_Agent):
                 texts.append(rest)
                 reference = reference or _referenced_invoice(rest)
             if part.kind == "read" and part.observations:
-                supplier_name = supplier_name or _first_line(part.reading_text, foreign=abroad)
-                named = _text_doc_type(part.reading_text, foreign=abroad)
+                supplier_name = supplier_name or _first_line(part.reading_text, foreign=abroad, pack=pack)
+                named = _doc_kind(part.reading_text, pack, foreign=abroad)
                 if named is not None:
                     kinds.setdefault("reading_text", named)
                 receipt_fallback = True
@@ -1980,7 +2069,7 @@ class DocumentAgent(_Agent):
             buyer_is_final_consumer=final_consumer, parsers=[*parsers, *(["supplier_statement"] if statement else [])],
             invoice_number=str(number) if number is not None else None,
             issuer_tax_id=own_issuer, referenced_number=reference, paid_in_cash=_says_paid_in_cash(joined),
-            text=joined[:_TEXT_KEPT], statement=statement, issuer=issuer,
+            text=joined[:_TEXT_KEPT], statement=statement, issuer=issuer, home=home,
         )
 
 
@@ -2002,13 +2091,14 @@ class VerificationAgent(_Agent):
                evidence_ids: Sequence[str] = (),
                owner: Mapping[str, FieldObservation] | None = None, bank_currency: str | None = None,
                issuer: IssuerProfile | None = None, bank: BankCharge | None = None,
-               log: bool = True) -> DocumentAssessment:
+               log: bool = True, country: str | None = None) -> DocumentAssessment:
         """Every field graded with the observations behind it (§18). A value the owner confirmed
         replaces the readings that disagree with it (they stay on the record, §55).
 
         A document from abroad (``issuer``) is checked by rules that hold anywhere, with its own
         country's VAT rates, and ``bank`` (the matching payment, in the document's currency) as the
-        independent source (checklist P7). Portuguese documents keep the Portuguese rules.
+        independent source (checklist P7). A domestic document is checked with the VAT rates of its
+        company's country (``country``, else the issuer profile's home), through that country's pack.
         """
         observations = _with_owner(observations, owner or {})
         issue = _first_value(observations, CriticalField.ISSUE_DATE)
@@ -2020,9 +2110,10 @@ class VerificationAgent(_Agent):
             response: dict[str, Any] = {"quality": assessment.quality.value, "with_bank_amount": bank is not None,
                                         "issuer_country": issuer.country}
         else:
+            pack = company_pack(country or (issuer.home if issuer is not None else self.repo.primary_country()))
             try:
-                rates = PACK.vat_rates(issue) if isinstance(issue, date) else PACK.vat_rates(self.repo.today())
-            except RateDataUnavailable:
+                rates = pack.vat_rates(issue) if isinstance(issue, date) else pack.vat_rates(self.repo.today())
+            except CountryPackError:
                 rates = ()
             assessment = assess_document(observations, rates, bank_amount, doc_type=doc_type,
                                          bank_currency=bank_currency)
@@ -2446,8 +2537,9 @@ class PayrollAgent(_Agent):
         record = DocumentRecord(document=document, evidence_ids=evidence, origin=origin, received_at=at,
                                 item_id=item.id, observations={}, reasons=payslip.reasons(), sender=sender,
                                 message_text=message_text, recipients=recipients, text=text[:_TEXT_KEPT],
-                                payslip=payslip)
+                                payslip=payslip, country=repo.company_country(company))
         repo.documents[doc_id] = record
+        self.o._classify_sensitive(record, text)  # a payslip always: pay and staff information
         if payslip.employee_iban:
             repo.payroll_employees[normalize_iban(payslip.employee_iban)] = payslip.employee
         self.o.advance(item, Stage.ACQUIRED, evidence, agent="discovery", note="Payslip received.")
@@ -2692,6 +2784,7 @@ class SettlementAgent(_Agent):
             document=document, evidence_ids=[evidence.id], origin=origin, received_at=at, item_id=item.id,
             observations={name: list(obs) for name, obs in found.observations.items()},
             reasons=() if found.adds_up else (found.mismatch_sentence(),), checks=self._checks(found),
+            country=repo.company_country(company),
         )
         repo.documents[doc_id] = record
         settlement = SettlementRecord(document_id=doc_id, report=found,
@@ -2968,7 +3061,7 @@ class SettlementAgent(_Agent):
             value=fees, source=report_evidence[0], method=ExtractionMethod.API, confidence=0.95, location=where))
         assessment = self.o.verification.assess(doc.observations, doc.document.doc_type, subject_id=doc.id,
                                                 evidence_ids=[*doc.evidence_ids, *report_evidence],
-                                                owner=doc.owner_values, issuer=doc.issuer)
+                                                owner=doc.owner_values, issuer=doc.issuer, country=doc.country)
         self.o._apply_assessment(doc, assessment)
         tx_ids = [s.transaction_id for s in chosen if s.transaction_id]
         doc.matched_tx_ids = list(tx_ids)
@@ -3043,6 +3136,7 @@ _OBLIGATION_ARRIVED: dict[ObligationKind, str] = {
     ObligationKind.DEBT_COLLECTION: "Read a debt collection letter.",
     ObligationKind.PAYMENT_DEADLINE: "Read a letter about a payment due.",
     ObligationKind.FILING: "Read a letter about a return to file.",
+    ObligationKind.VAT_RETURN: "Read a letter about the VAT return.",
 }
 _RENEWED_THING = {ObligationKind.INSURANCE_RENEWAL: "policy", ObligationKind.LICENSE_RENEWAL: "licence",
                   ObligationKind.CONTRACT_RENEWAL: "contract"}
@@ -3066,6 +3160,57 @@ class ObligationAgent(_Agent):
 
     name = "obligation"
 
+    # ------------------------------------------------------------------ each company's country (§49)
+
+    def vocabulary(self) -> dict[str, tuple[str, ...]] | None:
+        """The letter wording of the business's companies' countries (their packs), added to the core's
+        English and Portuguese; None when their packs add nothing (a Portuguese business)."""
+        merged: dict[str, tuple[str, ...]] = {}
+        for country in self.repo.countries():
+            for name, phrases in company_pack(country).obligation_vocabulary().items():
+                merged[name] = tuple(dict.fromkeys((*merged.get(name, ()), *phrases)))
+        return merged or None
+
+    def calendar(self, now: datetime) -> list[ObligationRecord]:
+        """Obligations a company's country sets by the calendar, with no letter (Spain's quarterly VAT return,
+        modelo 303): each once per company and period, from its own country's pack. Nothing for a country
+        whose deadlines arrive by letter (Portugal)."""
+        repo = self.repo
+        today = now.astimezone(TZ).date()
+        made: list[ObligationRecord] = []
+        for company_id, entity in sorted(repo.companies.items()):
+            for periodic in company_pack(entity.country).periodic_obligations(company_id, today):
+                oid = "obl_" + hashlib.sha256(periodic.key.encode("utf-8")).hexdigest()[:16]
+                if oid in repo.obligations:
+                    continue
+                body = json.dumps({"kind": "calendar", "country": entity.country, "obligation": periodic.kind,
+                                   "period": periodic.period, "company": company_id,
+                                   "due_on": periodic.due_on.isoformat(), "title": periodic.title},
+                                  sort_keys=True).encode()
+                reg = repo.registry.register(body, tenant_id=repo.tenant_id, source_kind=SourceKind.GOVERNMENT,
+                                             format=EvidenceFormat.JSON, mime_type="application/json",
+                                             retrieved_at=now, metadata={"kind": "country_calendar"})
+                condition = VerificationCondition(proof=proof_for(ObligationKind(periodic.kind)), by=periodic.due_on,
+                                                  since=today)
+                obligation = Obligation(
+                    id=oid, tenant_id=repo.tenant_id, entity_id=company_id, kind=ObligationKind(periodic.kind),
+                    title=periodic.title, due_on=periodic.due_on, responsible=periodic.responsible,
+                    consequence=periodic.consequence, required_evidence=periodic.required_evidence,
+                    verification_condition=condition.encode())
+                record = ObligationRecord(
+                    obligation=obligation, evidence_id=reg.evidence.id, title=periodic.title,
+                    reasons=(*periodic.reasons, f"Due {day_month(periodic.due_on, today)}"),
+                    reference=None, issuer=Issuer.TAX_AUTHORITY.value, received_on=today)
+                repo.obligations[oid] = record
+                self.log("calendar_obligation", subject_id=oid, evidence_ids=[reg.evidence.id],
+                         values={"kind": periodic.kind, "period": periodic.period, "due_on": periodic.due_on,
+                                 "entity_id": company_id, "country": entity.country})
+                self.o.activity(now, "collected", f"Added the deadline for the {periodic.title[0].lower()}"
+                                f"{periodic.title[1:]}: {day_month(periodic.due_on, today)}.", company_id,
+                                evidence_ids=[reg.evidence.id])
+                made.append(record)
+        return made
+
     # ------------------------------------------------------------------ letters that ask for something
 
     def detect(self, text: str, evidence_id: str, *, received_on: date,
@@ -3073,7 +3218,7 @@ class ObligationAgent(_Agent):
         """The obligation a letter or message creates; a pending one when it names none of your companies."""
         finding = detect_obligation(
             text, tenant_id=self.repo.tenant_id, received_on=received_on, sender=sender,
-            entities=self.repo.entities,
+            entities=self.repo.entities, vocabulary=self.vocabulary(),
         )
         if finding is None:
             return None
@@ -3107,10 +3252,13 @@ class ObligationAgent(_Agent):
             consequence=finding.consequence, required_evidence=finding.required_evidence,
             verification_condition=finding.condition.encode())
         obligation = base.model_copy(update={"id": oid})
+        # A periodic VAT return is one per company and deadline: a letter about it is the one on file.
+        periodic = obligation.kind is ObligationKind.VAT_RETURN
         same = next((o for o in sorted(repo.obligations.values(), key=lambda o: o.obligation.id)
                      if not o.done and o.obligation.entity_id == obligation.entity_id
                      and o.obligation.kind is obligation.kind and o.obligation.due_on == obligation.due_on
-                     and o.obligation.amount == obligation.amount and o.reference == finding.reference), None)
+                     and (periodic or (o.obligation.amount == obligation.amount
+                                       and o.reference == finding.reference))), None)
         if same is not None:
             self.log("obligation_already_known", subject_id=same.obligation.id,
                      evidence_ids=[evidence_id, same.evidence_id])
@@ -3179,7 +3327,8 @@ class ObligationAgent(_Agent):
         """A letter or message saying something asked for was done ("Recebemos os seus documentos", "A sua
         licença foi renovada até ..."). It closes an obligation only when it fits exactly one open one of
         that kind, for that company, from the same sender, with the same reference (§3); else nothing."""
-        finding = detect_confirmation(text, received_on=received_on, sender=sender, entities=self.repo.entities)
+        finding = detect_confirmation(text, received_on=received_on, sender=sender, entities=self.repo.entities,
+                                      vocabulary=self.vocabulary())
         if finding is None:
             return None
         domain = email_domain(sender) if "@" in sender else None
@@ -3372,9 +3521,9 @@ def _names_tax_id(text: str, tax_id: str) -> bool:
 
 
 def _reads_as_accounting_document(text: str) -> bool:
-    """A fiscal document rather than a letter: a Portuguese fiscal QR code, or a numbered invoice, receipt
-    or note title ("Fatura n.º FT 2026/183", "Invoice 2026/77"). Its payment proves it (§20)."""
-    if _QR_START.search(text or ""):
+    """A fiscal document rather than a letter: a fiscal QR code (Portugal's, Spain's), or a numbered invoice,
+    receipt or note title ("Fatura n.º FT 2026/183", "Invoice 2026/77"). Its payment proves it (§20)."""
+    if _split_qr(text or "")[0]:
         return True
     from backoffice.learning import fold
 
@@ -6888,7 +7037,7 @@ class Orchestrator:
         or one that names none of your companies (one question). True when the text was taken as such, so
         it is not also read as an invoice; a fiscal document (QR code) always goes on to be read."""
         received = at.astimezone(TZ).date()
-        fiscal = bool(_QR_START.search(text))
+        fiscal = bool(_split_qr(text)[0])
         confirmed = self.obligations.confirm_from(text, evidence_id, received_on=received, sender=sender)
         if confirmed is not None:
             report.obligation_ids.append(confirmed.obligation.id)
@@ -6959,12 +7108,16 @@ class Orchestrator:
         if outcome is None:
             from backoffice.reading import ReadRequest  # server only: the browser demo has no reader
 
+            from backoffice.sensitivity import classify
+
             data = repo.registry.open(repo.tenant_id, evidence.id)
             hint: dict[str, str] = {}  # Stage 0 tells the OCR reading whether this is your own sales invoice
             request = ReadRequest(
                 tenant_id=repo.tenant_id, evidence_id=evidence.id, data=data, mime_type=evidence.mime_type,
                 stage0_fields=lambda text, method: self.documents.stage0_fields(text, evidence.id, method, hint),
                 extractor=self.documents.text_extractor(hint),
+                # A sensitive document never goes to an external AI, even when external AI is on (§52, §53).
+                sensitive=lambda text: classify(text, evidence.filename) is not None,
             )
             try:
                 outcome = repo.reader.read(request)
@@ -7147,7 +7300,8 @@ class Orchestrator:
         # own country's rules; None, or a Portuguese issuer, keeps the Portuguese ones.
         profile = extracted.issuer
         assessment = self.verification.assess(extracted.observations, extracted.doc_type,
-                                              evidence_ids=extracted.evidence_ids, issuer=profile)
+                                              evidence_ids=extracted.evidence_ids, issuer=profile,
+                                              country=extracted.home)
         values, quality, reasons = _settled_values(assessment), assessment.quality, assessment.reasons
         # The business's own sales invoice (§20 "money in"): issued by one of its companies.
         issuer = extracted.issuer_tax_id or next(
@@ -7200,9 +7354,10 @@ class Orchestrator:
             paid_in_cash=extracted.paid_in_cash and not sales and document.doc_type in _CASH_DOCUMENTS,
             referenced_number=extracted.referenced_number if document.doc_type is DocumentType.CREDIT_NOTE else None,
             recipients=recipients, issuer=profile, billing_name=extracted.billing_name,
-            billing_address=extracted.billing_address,
+            billing_address=extracted.billing_address, country=extracted.home,
         )
         self.repo.documents[doc_id] = record
+        self._classify_sensitive(record, extracted.text, message_text, self._filename(extracted.evidence_ids))
         evidence = extracted.evidence_ids
         self.advance(item, Stage.ACQUIRED, evidence, agent="discovery", note="Document received.")
         self.advance(item, Stage.UNDERSTOOD, evidence, agent="document", note="Details read.")
@@ -7306,7 +7461,7 @@ class Orchestrator:
         record.evidence_ids = [*record.evidence_ids, *new]
         assessment = self.verification.assess(record.observations, record.document.doc_type, subject_id=record.id,
                                               evidence_ids=record.evidence_ids, owner=record.owner_values,
-                                              issuer=record.issuer)
+                                              issuer=record.issuer, country=record.country)
         # What the first copy did not say and the new one does (an invoice first read from an email's words,
         # then its PDF): the gaps are filled from the checked values; nothing already known is replaced.
         settled = _settled_values(assessment)
@@ -7373,7 +7528,7 @@ class Orchestrator:
     def _conflict_question(self, record: DocumentRecord) -> tuple[str, tuple[CheckOption, ...], tuple[str, ...]]:
         assessment = self.verification.assess(record.observations, record.document.doc_type,
                                               subject_id=record.id, evidence_ids=record.evidence_ids,
-                                              owner=record.owner_values, issuer=record.issuer)
+                                              owner=record.owner_values, issuer=record.issuer, country=record.country)
         red = [name for name in _CONFLICT_ORDER
                if name in assessment.fields and assessment.fields[name].quality is Quality.RED]
         red += sorted(n for n, a in assessment.fields.items() if a.quality is Quality.RED and n not in red)
@@ -7793,6 +7948,7 @@ class Orchestrator:
         now = self.repo.clock.advance_to(at) if at else self.repo.clock.now()
         report = RunReport()
         self.staff.learn(now)  # cardholders the bank's card details name (employee cards)
+        self.obligations.calendar(now)  # deadlines a company's country sets by the calendar (Spain's modelo 303)
         for _ in range(self.MAX_PASSES):
             report.passes += 1
             moved = self._entities(now)
@@ -8704,7 +8860,7 @@ class Orchestrator:
                 charge = replace(charge, amount=charge.amount + credit)
             assessment = self.verification.assess(
                 doc.observations, doc.document.doc_type, subject_id=doc.id, evidence_ids=evidence,
-                owner=doc.owner_values, issuer=doc.issuer, bank=charge)
+                owner=doc.owner_values, issuer=doc.issuer, bank=charge, country=doc.country)
         else:
             same = rec.tx.currency.strip().upper() == doc.document.currency.strip().upper()
             # Another currency without the bank's conversion line: stated, never compared as if equal.
@@ -8761,7 +8917,8 @@ class Orchestrator:
                         -PAYMENT_LEAD_DAYS <= (charge.booked_on - doc.issue_date).days <= PAYMENT_LAG_DAYS):
                     continue
                 assessment = self.verification.assess(record.observations, doc.doc_type, owner=record.owner_values,
-                                                      issuer=record.issuer, bank=charge, log=False)
+                                                      issuer=record.issuer, bank=charge, log=False,
+                                                      country=record.country)
                 if assessment.quality is Quality.GREEN:
                     agreeing.append(rec.id)
             if len(agreeing) == 1:
@@ -8963,8 +9120,61 @@ class Orchestrator:
         return AnswerOutcome(ok=True, message=f"Done. The {who} payment is now {self._allocation_words(allocation)}.",
                              learned=learned, resolved_ids=resolved)
 
+    # ----------------------------------------------------------------- sensitive documents (checklist X32)
+
+    def _filename(self, evidence_ids: Sequence[str]) -> str:
+        for evidence_id in evidence_ids:
+            try:
+                name = self.repo.evidence(evidence_id).filename
+            except Exception:  # noqa: BLE001 - a missing name is no name
+                continue
+            if name:
+                return str(name)
+        return ""
+
+    def _classify_sensitive(self, record: DocumentRecord, *texts: str) -> None:
+        """Mark a new document sensitive when its own words (or its kind: a payslip) say so (§52)."""
+        from backoffice.sensitivity import classify
+
+        category = classify(*texts, doc_type=record.document.doc_type)
+        if category is None:
+            return
+        record.sensitive, record.sensitive_by = category, "wording"
+        self.log("document", "mark_sensitive", subject_id=record.id, evidence_ids=record.evidence_ids,
+                 values={"category": category, "by": "wording"})
+
+    def mark_sensitive(self, document_id: str, sensitive: bool) -> DocumentRecord:
+        """The owner marks a document sensitive, or not (§52). KeyError for an unknown document."""
+        record = self.repo.documents[document_id]
+        before = record.sensitive
+        record.sensitive = ("owner" if before is None else before) if sensitive else None
+        record.sensitive_by = "owner"
+        self.log("owner", "mark_sensitive", subject_id=document_id, evidence_ids=record.evidence_ids,
+                 values={"sensitive": bool(sensitive), "category": record.sensitive or "", "before": before or ""},
+                 actor=OWNER_ACTOR)
+        return record
+
+    def sensitive_documents(self) -> dict[str, DocumentRecord]:
+        return {d.id: d for d in self.repo.documents.values() if d.sensitive}
+
+    def record_access(self, document_ids: Sequence[str], *, who: str, role: str, at: datetime,
+                      how: str = "opened the original") -> list[AccessEntry]:
+        """Log reads of sensitive documents' originals (who, when, which document), for the owner (§52)."""
+        entries = []
+        for document_id in dict.fromkeys(document_ids):
+            record = self.repo.documents.get(document_id)
+            if record is None or not record.sensitive:
+                continue
+            entry = AccessEntry(at=at, document_id=document_id, who=who, role=role, how=how)
+            self.repo.document_access.append(entry)
+            self.log("access", "document_opened", subject_id=document_id, evidence_ids=record.evidence_ids,
+                     values={"who": who, "role": role, "how": how})
+            entries.append(entry)
+        return entries
+
     def allocate_by_owner(self, subject_id: str, *, cost_center_id: str | None = None, general: bool = False,
-                          split: Any = None, remember: bool = False, recharge: bool | None = None) -> AnswerOutcome:
+                          split: Any = None, remember: bool = False, recharge: bool | None = None,
+                          answered_by: str | None = None) -> AnswerOutcome:
         """The owner puts one payment or document on a cost center, on general costs, or splits it.
 
         ``recharge``: True when the client it is for pays it back (a reimbursable or pass-through cost),
@@ -9011,14 +9221,15 @@ class Orchestrator:
         if recharge is not None:
             said["recharge"] = recharge  # the owner's own word that the client pays it back (§55)
         body = json.dumps({"kind": "cost_center", **said,
-                           "split": split, "answered_by": repo.owner.email, "answered_at": now.isoformat()},
+                           "split": split, "answered_by": answered_by or repo.owner.email,
+                           "answered_at": now.isoformat()},
                           sort_keys=True, default=str).encode()
         reg = repo.registry.register(body, tenant_id=repo.tenant_id, source_kind=SourceKind.UPLOAD,
                                      format=EvidenceFormat.JSON, mime_type="application/json", retrieved_at=now,
                                      metadata={"kind": "owner_answer"})
         answer_ev = reg.evidence.id
-        self.log("owner", "allocate_cost_center", subject_id=subject_id, evidence_ids=[answer_ev], actor=OWNER_ACTOR,
-                 values={"option_id": option_id})
+        self.log("owner", "allocate_cost_center", subject_id=subject_id, evidence_ids=[answer_ev],
+                 actor=f"manager:{answered_by}" if answered_by else OWNER_ACTOR, values={"option_id": option_id})
         allocation = allocation.model_copy(update={"evidence_ids": (*allocation.evidence_ids, answer_ev)})
         if recharge is not None:
             labels = join_and([c.label for c in centers if c.id in allocation.cost_center_ids])
@@ -9230,7 +9441,7 @@ class Orchestrator:
                 location="owner answer: " + option.label)
         assessment = self.verification.assess(record.observations, record.document.doc_type, subject_id=record.id,
                                               evidence_ids=[*record.evidence_ids, answer_ev],
-                                              owner=record.owner_values, issuer=record.issuer)
+                                              owner=record.owner_values, issuer=record.issuer, country=record.country)
         self._apply_assessment(record, assessment)
         self.activity(now, "answered", f"You told me which values on the {who} invoice are right.", needs.company_id,
                       amount=record.document.gross_amount, currency=record.document.currency,
@@ -9316,7 +9527,7 @@ class Orchestrator:
         if record.owner_values:
             assessment = self.verification.assess(record.observations, record.document.doc_type, subject_id=record.id,
                                                   evidence_ids=[*record.evidence_ids, answer_ev],
-                                                  owner=record.owner_values, issuer=record.issuer)
+                                                  owner=record.owner_values, issuer=record.issuer, country=record.country)
             self._apply_assessment(record, assessment)
         record.document = record.document.model_copy(update={"entity_id": company})
         record.owner_confirmed = answer_ev
@@ -9528,16 +9739,42 @@ def _reached(item: TrackedItem, stage: Stage) -> bool:
     return any(s in ORDER and ORDER.index(s) >= target for s in stages)
 
 
-def _split_qr(text: str) -> tuple[list[str], str]:
-    """Fiscal QR payloads found in a text (decoded QR codes), and the text without them."""
-    payloads, rest = [], []
+def _company_packs() -> tuple[CompanyPack, ...]:
+    """Every pack a company can run on (Portugal, Spain): their fiscal QR codes are recognised on any document,
+    so a code from another country names the issuer's country and is never read as text."""
+    return tuple(company_pack(c) for c in company_countries())
+
+
+def _split_qr(text: str) -> tuple[list[tuple[str, str]], str]:
+    """Fiscal QR payloads found in a text (decoded QR codes) with their country, and the text without them."""
+    packs = _company_packs()
+    payloads: list[tuple[str, str]] = []
+    rest: list[str] = []
     for line in (text or "").splitlines():
-        m = _QR_START.search(line)
-        if m and looks_like_pt_qr(line[m.start():].strip()):
-            payloads.append(line[m.start():].strip())
+        found = next(((p.country_code, payload) for p in packs if (payload := p.find_fiscal_qr(line))), None)
+        if found is not None:
+            payloads.append(found)
         else:
             rest.append(line)
     return payloads, "\n".join(rest)
+
+
+def _fiscal_qr(country: str, payload: str, evidence_id: str) -> FiscalQRResult | None:
+    """A fiscal QR payload read by its own country's pack; None when it cannot be read (never guessed, §19)."""
+    try:
+        return company_pack(country).parse_fiscal_qr(payload, evidence_id)
+    except (FiscalQRError, CountryPackError):
+        return None
+
+
+def _names_own_tax_id(text: str, tax_id: str) -> bool:
+    """'NIF: 516 123 459', 'PT516123459', 'CIF: B-1234567-4', 'ESB12345674' all name that tax number."""
+    compact = re.sub(r"[^0-9A-Za-z]", "", tax_id or "").upper()
+    if len(compact) < 8:
+        return False
+    body = r"[ .\-]?".join(re.escape(c) for c in compact)
+    return re.search(rf"(?<![0-9A-Za-z.]){body}(?![0-9A-Za-z]|[.]\d)", text or "", re.I) is not None or \
+        re.search(rf"(?<![0-9A-Za-z])[A-Z]{{2}}[ \-]?{body}(?![0-9A-Za-z]|[.]\d)", text or "", re.I) is not None
 
 
 def _text_currency(text: str, source: str, method: ExtractionMethod) -> FieldObservation | None:
@@ -9594,6 +9831,16 @@ _KIND_ANYWHERE = tuple(
 # Spanish names of a credit note ("Factura rectificativa" would otherwise read as an invoice): checked first
 # on a document from abroad (checklist P7).
 _FOREIGN_CREDIT_NOTE = re.compile(r"(?<![a-z])(?:factura\s+rectificativa|nota\s+de\s+abono)(?![a-z])")
+
+
+def _doc_kind(text: str, pack: CompanyPack, *, foreign: bool = False) -> DocumentType | None:
+    """The kind a document's own words give it: a domestic one in its country's own names first
+    ("Factura rectificativa"), then the core's Portuguese and English names."""
+    if not foreign:
+        named = pack.document_kind(text)
+        if named is not None:
+            return named
+    return _text_doc_type(text, foreign=foreign)
 
 
 def _text_doc_type(text: str, *, foreign: bool = False) -> DocumentType | None:
@@ -9679,8 +9926,10 @@ _TITLE_WORDS = ("nif", "fatura", "invoice", "data", "atcud")
 _FOREIGN_TITLE_WORDS = (*_TITLE_WORDS, "tax invoice", "factura", "receipt", "recibo", "bill to", "page", "vat ")
 
 
-def _first_line(text: str, *, foreign: bool = False) -> str | None:
-    words = _FOREIGN_TITLE_WORDS if foreign else _TITLE_WORDS
+def _first_line(text: str, *, foreign: bool = False, pack: CompanyPack | None = None) -> str | None:
+    """The first line that is not a title or a label: the supplier's name. A domestic document skips its
+    own country's title words (``pack``), one from abroad the international ones."""
+    words = _FOREIGN_TITLE_WORDS if foreign else (tuple(pack.title_words) if pack is not None else _TITLE_WORDS)
     for line in (text or "").splitlines():
         line = line.strip()
         if line and not line.lower().startswith(words):
@@ -9748,40 +9997,16 @@ def _invoice_lines(parts: Sequence[_Part]) -> tuple[Any, ...]:
 
 
 def _qr_vat_parts(text: str) -> tuple[VatPart, ...]:
-    """A Portuguese fiscal QR's amounts by VAT rate (rates in percent; exempt at 0%, non-taxable without a rate)."""
+    """A fiscal QR's amounts by VAT rate, as its country's pack reads them (rates in percent; exempt at 0%,
+    non-taxable without a rate). Empty when the code gives no breakdown (Spain's give only the total)."""
     if not text:
         return ()
-    from backoffice.countries.pt.vat import rate_for
-
     payloads, _ = _split_qr(text)
-    for payload in payloads:
-        try:
-            code = parse_qr(payload)
-        except QRCodeError:
+    for country, payload in payloads:
+        found = _fiscal_qr(country, payload, "")
+        if found is None:
             continue
-        merged: dict[Decimal | None, tuple[Decimal, Decimal]] = {}
-
-        def add(rate: Decimal | None, net: Decimal, vat: Decimal) -> None:
-            old = merged.get(rate, (_ZERO, _ZERO))
-            merged[rate] = (old[0] + net, old[1] + vat)
-
-        for block in code.tax_blocks:
-            if block.exempt_base:
-                add(Decimal(0), block.exempt_base, _ZERO)
-            for bucket, base, vat in block.rate_pairs():
-                try:
-                    fraction = rate_for(block.region, bucket, code.issue_date)
-                except (ValueError, KeyError):
-                    fraction = None
-                pct = None
-                if fraction is not None:
-                    pct = fraction * 100
-                    pct = pct.quantize(Decimal(1)) if pct == pct.to_integral_value() else pct.normalize()
-                add(pct, base, vat)
-        for extra in (code.non_taxable, code.stamp_duty):
-            if extra:
-                add(None, extra, _ZERO)
-        return tuple(VatPart(rate=rate, net=net, vat=vat) for rate, (net, vat) in merged.items())
+        return tuple(found.vat_parts)
     return ()
 
 

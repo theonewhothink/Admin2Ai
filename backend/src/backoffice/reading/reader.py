@@ -14,6 +14,10 @@ the orchestrator's Document agent needs:
    or disputed, within the tenant's budget (§17).
 3. **External AI** runs only when switched on (``external_ai``); otherwise
    the commercial role is removed before routing, so nothing can leave.
+   Even when it is on, a sensitive document (``ReadRequest.sensitive``:
+   medical, legal, pay or staff wording in its own text or what a local
+   engine read from it) never leaves: every external engine is guarded and
+   answers "kept on our servers" without sending anything (§52, §53).
 
 Nothing here decides quality: readings are returned with their engine as
 source and method OCR/VLM, and the Verification agent grades them (§18, §57).
@@ -88,6 +92,9 @@ class ReadRequest:
     stage0_fields: Stage0Fields | None = None
     extractor: FieldExtractor | None = None
     required_fields: Collection[CriticalField] | None = None
+    # True when a text read from the file (its own text, or a local engine's reading) shows it is
+    # sensitive (backoffice.sensitivity): then no external engine sees it, whatever the settings.
+    sensitive: Callable[[str], bool] | None = None
 
 
 @dataclass(frozen=True)
@@ -221,6 +228,15 @@ class DocumentReader:
             if registry.find(COMMERCIAL) is not None or any(
                     registry.find(n).capabilities.external for n in registry.names()):
                 extra.append(ReadStep("external_ai", StepState.OFF, "BACKOFFICE_EXTERNAL_AI is off"))
+        elif request.sensitive is not None:
+            if request.sensitive(stage0.text):
+                # Sensitive by its own text: no external engine runs at all (§52, §53).
+                config = replace(config, roles=replace(config.roles, **{
+                    role: None for role in ("primary", "complex_layout", "long_document", "commercial")
+                    if _is_external(registry, getattr(config.roles, role), role)}))
+                extra.append(ReadStep("external_ai", StepState.OFF, "sensitive document: kept on our servers"))
+            else:
+                registry = _guarded(registry, request.sensitive, stage0.text)
         router = OCRRouter(registry, request.extractor, config=config, budget=self._budget)
         page = PageImage(data=request.data, mime_type=mime, page_count=stage0.page_count)
         routing = RoutingRequest(
@@ -251,6 +267,73 @@ class DocumentReader:
             "steps": [*extra, *_steps(result)],
             "cost": result.total_cost,
         }
+
+
+# --------------------------------------------------------------------------- sensitive documents stay here
+
+
+def _is_external(registry: Any, name: str | None, role: str) -> bool:
+    from backoffice.ocr import COMMERCIAL
+
+    if name is None:
+        return False
+    engine = registry.find(name)
+    return role == "commercial" or name == COMMERCIAL or (engine is not None and engine.capabilities.external)
+
+
+class _KeptHere:
+    """An external engine that first checks what our own engines read: a sensitive document is answered
+    "kept on our servers" and nothing is sent (§52, §53)."""
+
+    def __init__(self, inner: Any, sensitive: Callable[[str], bool], known_text: str) -> None:
+        self._inner = inner
+        self._sensitive = sensitive
+        self._known = known_text
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    @property
+    def name(self) -> str:
+        return self._inner.name
+
+    @property
+    def version(self) -> str:
+        return self._inner.version
+
+    @property
+    def cost_per_page(self) -> Decimal:
+        return self._inner.cost_per_page
+
+    @property
+    def capabilities(self) -> Any:
+        return self._inner.capabilities
+
+    @property
+    def method(self) -> Any:
+        return self._inner.method
+
+    async def recognize(self, pages: Any, hints: Any = None) -> Any:
+        from backoffice.ocr import OCRResult
+
+        seen = [self._known, getattr(hints, "prior_text", None) or ""]
+        seen += [p.text for p in getattr(hints, "prior_pages", ()) or ()]
+        if self._sensitive("\n".join(t for t in seen if t)):
+            return OCRResult(engine=self._inner.name, model_version=self._inner.version, method=self._inner.method,
+                             pages=(), warnings=("sensitive document: kept on our servers",))
+        return await self._inner.recognize(pages, hints)
+
+
+def _guarded(registry: Any, sensitive: Callable[[str], bool], known_text: str) -> Any:
+    """The registry with every external engine guarded by :class:`_KeptHere`."""
+    from backoffice.ocr import COMMERCIAL, EngineRegistry
+
+    out = EngineRegistry()
+    for name in registry.names():
+        engine = registry.find(name)
+        external = name == COMMERCIAL or bool(getattr(engine.capabilities, "external", False))
+        out.register(_KeptHere(engine, sensitive, known_text) if external else engine, name=name)
+    return out
 
 
 # --------------------------------------------------------------------------- outcome helpers

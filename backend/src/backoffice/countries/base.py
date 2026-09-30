@@ -159,6 +159,12 @@ class FiscalQRResult:
     Callers must not close anything on an unusable result (§3).
     ``notes`` are technical remarks for logs and audit, never owner copy;
     use ``CountryPackError.owner_message`` style text for the owner.
+
+    ``native_doc_type`` is empty when the code does not say which kind of document it is on (the
+    Spanish Verifactu code names only the issuer, number, date and total): the document's own
+    words decide then. ``issuer_tax_id``, ``buyer_is_final_consumer``, ``currency`` and
+    ``vat_parts`` (amounts by VAT rate, :class:`~backoffice.domain.models.VatPart`) are what the
+    core reads besides the observations.
     """
 
     country: str
@@ -169,6 +175,40 @@ class FiscalQRResult:
     usable: bool
     notes: tuple[str, ...]
     payload: Any  # the country-specific typed object
+    issuer_tax_id: str | None = None
+    buyer_is_final_consumer: bool = False
+    currency: str = "EUR"
+    vat_parts: tuple[Any, ...] = ()
+
+
+@dataclass(frozen=True)
+class TextReading:
+    """What a pack's text reader found in one text (country-neutral shape).
+
+    ``unassigned_tax_ids`` are valid tax numbers whose role (supplier or customer) the text
+    does not say; ``buyer_is_final_consumer`` is True when the buyer is the country's generic
+    "no tax number" consumer.
+    """
+
+    observations: tuple[NamedObservation, ...]
+    unassigned_tax_ids: tuple[str, ...] = ()
+    buyer_is_final_consumer: bool = False
+
+
+@dataclass(frozen=True)
+class PeriodicObligation:
+    """An obligation a country's calendar sets for a company, with no letter needed (e.g. a quarterly
+    VAT return). ``key`` is stable per company and period, so the same obligation is created once."""
+
+    key: str
+    kind: str  # an ObligationKind value
+    title: str
+    period: str  # "2026-Q3"
+    due_on: date
+    responsible: str
+    consequence: str
+    required_evidence: str
+    reasons: tuple[str, ...] = ()
 
 
 class CountryPackError(Exception):
@@ -262,6 +302,70 @@ class CountryPack(Protocol):
         ...
 
 
+@runtime_checkable
+class CompanyPack(CountryPack, Protocol):
+    """A pack complete enough to run a company's back office (§49): the core reads every document,
+    checks every VAT amount and words every obligation of a company through its own country's pack.
+
+    ``language`` is the pack's document language ("pt", "es"): a document in another language with
+    no issuer country is read as one from abroad. ``title_words`` start lines that are never the
+    supplier's name. ``obligation_vocabulary`` adds the country's letter wording (folded phrases by
+    category, see :mod:`backoffice.closure.obligations`) to the core's English and Portuguese.
+    """
+
+    language: str
+    title_words: tuple[str, ...]
+
+    def read_text(
+        self,
+        text: str,
+        source: str,
+        *,
+        method: ExtractionMethod = ExtractionMethod.OCR,
+        known_customer_tax_ids: Collection[str] = (),
+        known_supplier_tax_ids: Collection[str] = (),
+    ) -> Any:
+        """A :class:`TextReading` (or an object with the same three attributes)."""
+        ...
+
+    def find_fiscal_qr(self, line: str) -> str | None:
+        """The fiscal QR payload a decoded-QR text line carries, or None."""
+        ...
+
+    def document_kind(self, text: str) -> DocumentType | None:
+        """The kind the document's own words name ("Factura rectificativa"); None to use the core's."""
+        ...
+
+    def obligation_vocabulary(self) -> Mapping[str, tuple[str, ...]]: ...
+
+    def periodic_obligations(self, company_id: str, today: date) -> tuple[PeriodicObligation, ...]: ...
+
+    def is_private_person(self, tax_id: str | None) -> bool:
+        """True when the tax number belongs to a private person (for the accountant's rent flag)."""
+        ...
+
+
+def company_pack(country: str) -> CompanyPack:
+    """The pack a company of ``country`` runs on; UnknownCountryError when there is none, or it is
+    not complete enough to run a company (only a validator)."""
+    pack = get_pack(country)
+    if not isinstance(pack, CompanyPack):
+        raise UnknownCountryError(f"the {pack.country_code} pack cannot run a company yet")
+    return pack
+
+
+def company_countries() -> tuple[str, ...]:
+    """Countries a company can be set up in (their packs run a company), sorted."""
+    out = []
+    for code in available_countries():
+        try:
+            company_pack(code)
+        except UnknownCountryError:
+            continue
+        out.append(code)
+    return tuple(out)
+
+
 # --------------------------------------------------------------------------- #
 # Registry
 # --------------------------------------------------------------------------- #
@@ -269,6 +373,7 @@ class CountryPack(Protocol):
 # Built-in packs, imported on first use. Each module exposes its instance as
 # ``PACK`` and registers it on import.
 _BUILTIN_PACKS: dict[str, str] = {
+    "ES": "backoffice.countries.es",
     "PT": "backoffice.countries.pt",
 }
 

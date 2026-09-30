@@ -217,6 +217,7 @@ def pre_read(svc: Any, reader: Any, uploads: Sequence[tuple[bytes, str | None, s
     if reader is None:
         return {}
     from backoffice.reading import ReadRequest
+    from backoffice.sensitivity import classify
 
     repo = svc.repo
     documents = svc.orchestrator.documents
@@ -230,6 +231,8 @@ def pre_read(svc: Any, reader: Any, uploads: Sequence[tuple[bytes, str | None, s
                 tenant_id=repo.tenant_id, evidence_id=evidence_id, data=blob, mime_type=mime,
                 stage0_fields=lambda text, method, _id=evidence_id: documents.stage0_fields(text, _id, method),
                 extractor=documents.text_extractor(),
+                # A sensitive document never goes to an external AI, even when external AI is on (§52, §53).
+                sensitive=lambda text, _name=filename: classify(text, _name) is not None,
             )
             try:
                 outcome = reader.read(request)

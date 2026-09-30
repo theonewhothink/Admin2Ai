@@ -39,7 +39,7 @@ def test_get_pack_is_case_insensitive_and_returns_one_instance():
     assert "PT" in available_countries()
 
 
-@pytest.mark.parametrize("code", ["ES", "PRT", "", "P1", None])
+@pytest.mark.parametrize("code", ["FR", "PRT", "", "P1", None])  # Spain has a pack now (countries/es)
 def test_unknown_countries(code):
     with pytest.raises(UnknownCountryError):
         get_pack(code)

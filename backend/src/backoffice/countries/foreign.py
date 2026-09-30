@@ -1,6 +1,6 @@
-"""Documents from suppliers outside Portugal (checklist P7, X31).
+"""Documents from suppliers outside the company's own country (checklist P7, X31).
 
-Portugal is the only country pack, but a Portuguese company still buys from
+A company runs on its own country's pack (Portugal, Spain), but a Portuguese company still buys from
 Ireland (Meta, Google), the Netherlands (Booking.com), the United States
 (AWS, GitHub, OpenAI), the United Kingdom or Spain. Their invoices follow
 their own country's conventions: no AT fiscal QR code, no ATCUD, no NIF,
@@ -49,6 +49,7 @@ from backoffice.verification.normalize import iban_is_valid
 __all__ = [
     "EU_MEMBERS",
     "FOREIGN_LABELS",
+    "HOME_LANGUAGE",
     "ForeignFields",
     "IssuerProfile",
     "TaxNumber",
@@ -505,8 +506,8 @@ def find_tax_numbers(text: str) -> list[TaxNumber]:
 
 # --------------------------------------------------------------------------- the issuer's country
 
-# Country names printed in addresses (folded). Portugal is left out of detection:
-# on a purchase invoice it is usually the customer's address.
+# Country names printed in addresses (folded). The company's own country is left out of
+# detection (``home``): on a purchase invoice it is usually the customer's address.
 _COUNTRY_WORDS: Mapping[str, tuple[str, ...]] = MappingProxyType({
     "GB": ("united kingdom", "great britain", "northern ireland", "england", "scotland", "wales"),
     "US": ("united states of america", "united states"),
@@ -577,13 +578,19 @@ def document_language(text: str) -> str | None:
     return leaders[0] if best and len(leaders) == 1 else None
 
 
+# The language a company's own country writes its documents in.
+HOME_LANGUAGE: Mapping[str, str] = MappingProxyType({"PT": "pt", "ES": "es"})
+
+
 @dataclass(frozen=True)
 class IssuerProfile:
     """Which country issued a document, and why (plain words), with what the rest of the core needs.
 
-    ``country`` is None when nothing says, or the signals disagree: callers
-    then keep their Portuguese rules. ``stated_rates`` are the VAT rates the
-    document prints ("VAT (21%)"), filled in by the text reader.
+    ``home`` is the country of the company the document is for (its pack reads domestic
+    documents); a document is foreign when its issuer's country is another one. ``country`` is
+    None when nothing says, or the signals disagree: callers then keep the home country's rules.
+    ``stated_rates`` are the VAT rates the document prints ("VAT (21%)"), filled in by the text
+    reader.
     """
 
     country: str | None = None
@@ -592,10 +599,11 @@ class IssuerProfile:
     reverse_charge: bool = False
     language: str | None = None
     stated_rates: tuple[Decimal, ...] = ()
+    home: str = "PT"
 
     @property
     def is_foreign(self) -> bool:
-        return self.country is not None and self.country != "PT"
+        return self.country is not None and self.country != self.home
 
     @property
     def in_eu(self) -> bool:
@@ -603,8 +611,10 @@ class IssuerProfile:
 
     @property
     def reads_foreign(self) -> bool:
-        """Read with the international labels: a foreign issuer, or an unknown one writing English or Spanish."""
-        return self.is_foreign or (self.country is None and self.language in ("en", "es"))
+        """Read with the international labels: a foreign issuer, or an unknown one writing another language
+        than the home country's (English or Spanish for a Portuguese company)."""
+        return self.is_foreign or (self.country is None and self.language is not None
+                                   and self.language != HOME_LANGUAGE.get(self.home))
 
     @property
     def has_valid_vat_number(self) -> bool:
@@ -647,25 +657,35 @@ def _named_countries(text: str) -> set[str]:
     return found
 
 
+_FISCAL_QR_BASIS: Mapping[str, str] = MappingProxyType({
+    "PT": "a Portuguese fiscal QR code", "ES": "a Spanish invoice QR code (Verifactu or TicketBAI)",
+})
+
+
 def detect_issuer(
     text: str,
     *,
     own_tax_ids: Collection[str] = (),
-    fiscal_qr: bool = False,
+    fiscal_qr: bool | str = False,
     structured_tax_ids: Iterable[str] = (),
+    home: str = "PT",
 ) -> IssuerProfile:
     """The issuing country of a document, strongest signal first (module docstring).
 
     ``own_tax_ids`` are the business's own numbers, *with* their country
     ("PT516123459"): on a purchase invoice they name the customer, never the
     issuer. ``structured_tax_ids`` are supplier numbers from a structured copy
-    (an e-invoice), which count like printed ones.
+    (an e-invoice), which count like printed ones. ``fiscal_qr`` is the country
+    of a fiscal QR code on the document (True: Portugal's). ``home`` is the
+    country of the company the document is for: its name in an address is
+    usually the customer's, so it is left out of the address signal.
     """
     language = document_language(text)
     reverse = mentions_reverse_charge(text)
-    base = IssuerProfile(reverse_charge=reverse, language=language)
+    base = IssuerProfile(reverse_charge=reverse, language=language, home=home)
     if fiscal_qr:
-        return replace(base, country="PT", basis=("a Portuguese fiscal QR code",))
+        country = "PT" if fiscal_qr is True else str(fiscal_qr)
+        return replace(base, country=country, basis=(_FISCAL_QR_BASIS.get(country, "a fiscal QR code"),))
     numbers = find_tax_numbers(text)
     for raw in structured_tax_ids:
         tn = check_tax_number(raw)
@@ -679,7 +699,7 @@ def detect_issuer(
         return replace(base, country=countries[0], basis=(f"{what} {number.printed}",), tax_number=number)
     if len(countries) > 1:
         return replace(base, basis=("tax numbers from more than one country",))
-    named = _named_countries(text) - {"PT"}
+    named = _named_countries(text) - {home}
     if len(named) == 1:
         country = named.pop()
         return replace(base, country=country, basis=("the country in its address",))

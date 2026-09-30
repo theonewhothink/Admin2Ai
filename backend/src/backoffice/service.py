@@ -174,6 +174,12 @@ class BackOfficeService:
         self.real_sources = False
         # What each synced connection remembers between runs (connectors.base.ConnectorState as JSON).
         self.sync_states: dict[str, dict[str, Any]] = {}
+        # Sensitive documents' originals read during the current request (§52): the production server records
+        # them as an event with who read them (server/runtime.py); a service used directly (the demo) records
+        # them at once, as read by ``viewer``.
+        self._opened: list[str] = []
+        self.inline_access_log = True
+        self.viewer: tuple[str, str] = ("owner", "owner")
 
     @classmethod
     def demo(cls) -> BackOfficeService:
@@ -209,14 +215,21 @@ class BackOfficeService:
         return svc
 
     def add_company(self, name: Any, tax_id: Any, legal_name: Any = None, address: Any = None,
-                    sector: Any = None) -> dict[str, Any]:
-        """Add one of the owner's companies. A Portuguese NIF is checked with the country pack.
+                    sector: Any = None, country: Any = None) -> dict[str, Any]:
+        """Add one of the owner's companies, in its own country (Portugal unless ``country`` says otherwise,
+        e.g. "ES"). Its tax number is checked by that country's pack (§49): a NIF in Portugal, a NIF, NIE or
+        CIF in Spain; every later document, VAT amount and letter of the company goes through that pack.
 
         ``address`` (its postal address) and ``sector`` (its line of business, in plain words) are optional:
         they help tell which company an invoice is for (H3) and which purchases are clearly personal (X23).
         """
-        from backoffice.countries.pt.nif import validate_nif
+        from backoffice.countries import UnknownCountryError, company_pack
 
+        try:
+            pack = company_pack(str(country or "PT"))
+        except UnknownCountryError:
+            raise ServiceError(400, "I can't set up a company in that country yet. Portugal and Spain are "
+                                    "supported.") from None
         name = " ".join(str(name or "").split())
         if not name:
             raise ServiceError(400, "What is the company called?")
@@ -227,11 +240,11 @@ class BackOfficeService:
             raise ServiceError(400, "That legal name is too long.")
         nif = ""
         if tax_id not in (None, ""):
-            check = validate_nif(str(tax_id))
+            check = pack.validate_tax_id(str(tax_id))
             if not check.valid or not check.normalized:
-                raise ServiceError(400, check.message or "That NIF doesn't look right. Please check it.")
+                raise ServiceError(400, check.message or "That tax number doesn't look right. Please check it.")
             nif = check.normalized
-            if any(e.tax_id == nif for e in self.repo.companies.values()):
+            if any(e.tax_id == nif and e.country == pack.country_code for e in self.repo.companies.values()):
                 raise ServiceError(409, "That company is already here.")
         base = _SLUG.sub("-", name.lower()).strip("-")[:40] or "company"
         company_id, n = base, 2
@@ -239,7 +252,7 @@ class BackOfficeService:
             company_id, n = f"{base}-{n}", n + 1
         self.repo.add_company(id=company_id, name=name, legal_name=legal, tax_id=nif,
                               address=" ".join(str(address or "").split())[:200] or None,
-                              sector=" ".join(str(sector or "").split())[:80] or None)
+                              sector=" ".join(str(sector or "").split())[:80] or None, country=pack.country_code)
         self.orchestrator.milestone("company_added")
         self.orchestrator.setup_step("company", entity_id=company_id)
         # Sources that read for every company (mailboxes) now cover this one too; the business's
@@ -248,8 +261,11 @@ class BackOfficeService:
             if c.kind == "email" and company_id not in c.company_ids:
                 c.company_ids = (*c.company_ids, company_id)
         self._sync_accountant_connectors()
-        self.orchestrator.log("entity", "company_added", subject_id=company_id,
-                              values={"tax_id": nif or None}, actor=f"owner:{self.repo.owner.email}")
+        added: dict[str, Any] = {"tax_id": nif or None}
+        if pack.country_code != "PT":  # recorded only for another country: Portuguese entries stay as they were
+            added["country"] = pack.country_code
+        self.orchestrator.log("entity", "company_added", subject_id=company_id, values=added,
+                              actor=f"owner:{self.repo.owner.email}")
         self.orchestrator.run()
         return {"ok": True, "company": self.company(company_id), "message": f"Done. {name} is set up."}
 
@@ -1807,7 +1823,8 @@ class BackOfficeService:
                     tone = "good"
             out.append({
                 "id": company_id, "name": entity.name, "legalName": self.repo.legal_names.get(company_id, entity.name),
-                "taxId": entity.tax_id, "tone": tone, "statusLabel": status.company_status, "detail": detail,
+                "taxId": entity.tax_id, "country": entity.country,
+                "tone": tone, "statusLabel": status.company_status, "detail": detail,
                 "currentMonth": str(month), "months": sorted(months, reverse=True),
                 "pendingItemIds": [n.id for n in self._open_needs(company_id)],
             })
@@ -2922,7 +2939,9 @@ class BackOfficeService:
                    "note": f"{done} of {total} items are ready for {software}. The rest will follow when they close."})
         rules = [{"id": r.id, "label": r.label, "scope": "client" if r.entity_ids or r.tenant_id else "all"}
                  for r in self.orchestrator.accountant_rules(company_id)]
+        country = repo.companies[company_id].country
         return {**row, "taxId": repo.companies[company_id].tax_id, "software": software,
+                "country": country, "countryName": COUNTRY_NAMES.get(country, country),
                 "period": {"key": str(month), "from": month.first_day.isoformat(),
                            "to": month.last_day.isoformat()},
                 "accountant": {"name": accountant.person, "firm": accountant.firm, "email": accountant.email}
@@ -3063,7 +3082,8 @@ class BackOfficeService:
         for doc_id, (record, item_id) in records.items():
             doc = record.document
             if doc.doc_type is DocumentType.INVOICE_RECEIPT and doc.vat_amount == 0 and \
-                    doc.supplier_tax_id and doc.supplier_tax_id[:1] in "123":
+                    record.country == repo.companies[company_id].country and \
+                    self.repo.pack_for(company_id).is_private_person(doc.supplier_tax_id):
                 flags.append(({"id": f"t_{doc_id}",
                                "title": f"Rent paid to a private landlord · {format_money(doc.gross_amount or 0)}",
                                "detail": "No withholding shown on the receipt. Whether it applies is your call."},
@@ -3142,6 +3162,87 @@ class BackOfficeService:
                "application/xml": ".xml", "text/html": ".html"}.get(ev.mime_type or "", ".bin")
         return f"{ev.id}{ext}"
 
+    # ----------------------------------------------------------------- sensitive documents (§52, checklist X32)
+
+    def note_opened(self, document_ids: Sequence[str]) -> None:
+        """A sensitive document's original is being read in this request (for the access log)."""
+        self._opened.extend(d for d in document_ids if d not in self._opened)
+
+    def take_opened(self) -> list[str]:
+        """The sensitive documents whose originals the last request read (and forget them)."""
+        opened, self._opened = list(self._opened), []
+        return opened
+
+    def record_access(self, document_ids: Sequence[str], *, who: str, role: str,
+                      how: str = "opened the original") -> dict[str, Any]:
+        """Log reads of sensitive documents' originals (the production server's ``documents.opened`` event)."""
+        entries = self.orchestrator.record_access(document_ids, who=who, role=role, at=self._now(), how=how)
+        return {"ok": True, "recorded": len(entries)}
+
+    def access_log(self) -> dict[str, Any]:
+        """``GET /api/documents/access-log``: every read of a sensitive document's original, newest first, and
+        the documents that are sensitive (the owner only)."""
+        repo = self.repo
+        role_words = {"owner": "Owner", "admin": "Owner", "accountant": "Accountant", "api": "Accounting software"}
+        entries = []
+        for e in sorted(repo.document_access, key=lambda e: e.at, reverse=True):
+            record = repo.documents.get(e.document_id)
+            entries.append({"at": e.at.isoformat(), "documentId": e.document_id,
+                            "document": record.label if record is not None else e.document_id, "who": e.who,
+                            "role": e.role, "roleLabel": role_words.get(e.role, e.role.title()), "how": e.how})
+        from backoffice.sensitivity import CATEGORY_WORDS
+
+        sensitive = [{"id": d.id, "label": d.label, "companyId": d.document.entity_id or "",
+                      "reason": CATEGORY_WORDS.get(d.sensitive or "", ""), "markedBy": d.sensitive_by or "wording"}
+                     for d in sorted(repo.documents.values(), key=lambda d: d.id) if d.sensitive]
+        return {"entries": entries, "sensitiveDocuments": sensitive}
+
+    def document_sensitive(self, document_id: str, body: Mapping[str, Any] | None) -> dict[str, Any]:
+        """``POST /api/documents/<id>/sensitive`` ``{sensitive: true|false}``: the owner marks a document."""
+        value = (body or {}).get("sensitive", True)
+        if not isinstance(value, bool):
+            raise ServiceError(400, "Say true or false.")
+        try:
+            record = self.orchestrator.mark_sensitive(document_id, value)
+        except KeyError:
+            raise ServiceError(404, "I can't find that document.") from None
+        message = ("Done. Only you and the company's accountant can see it now, and I note every time its original "
+                   "is opened." if value else "Done. It is no longer marked sensitive.")
+        return {"ok": True, "message": message,
+                "document": {"id": record.id, "sensitive": bool(record.sensitive)}}
+
+    def _opened_evidence(self, evidence_id: str) -> None:
+        self.note_opened([d.id for d in self.repo.documents.values() if d.sensitive and evidence_id in d.evidence_ids])
+
+    # ----------------------------------------------------------------- an outlet manager (checklist X37)
+
+    def dispatch_manager(self, method: str, path: str, body_json: Any,
+                         cost_centers: Collection[str]) -> tuple[int, dict[str, Any]]:
+        """Route one request from an outlet manager (production ``manager`` role): their outlets' questions,
+        documents, payments, spending and receipts, nothing else (backoffice.managers)."""
+        from backoffice.managers import ManagerViews
+
+        views = ManagerViews(self, cost_centers)
+        who = self.viewer[0] if self.viewer and self.viewer[1] == "manager" else ""
+        r = re.compile
+        seg = r"([^/]+)"
+        routes = (
+            ("GET", r("/api/manager/outlets"), lambda b: views.outlets()),
+            ("GET", r("/api/needs-you"), lambda b: views.needs_you()),
+            ("POST", r(f"/api/needs-you/{seg}/answer"),
+             lambda b, i: views.answer(i, _field(b, "option_id", "optionId"), bool(b.get("remember", False)),
+                                       b.get("split"))),
+            ("GET", r("/api/documents"), lambda b: views.documents(b)),
+            ("GET", r(f"/api/documents/{seg}/file"), lambda b, d: views.document_file(d)),
+            ("GET", r(f"/api/documents/{seg}"), lambda b, d: views.document(d)),
+            ("GET", r(f"/api/transactions/{seg}"), lambda b, t: views.transaction(t)),
+            ("GET", r(f"/api/cost-centers/{seg}"), lambda b, c: views.cost_center(c, b)),
+            ("GET", r(f"/api/cost-centers/{seg}/statement"), lambda b, c: views.statement(c, b)),
+            ("POST", r("/api/manager/receipts"), lambda b: views.receipt(b, by=who)),
+        )
+        return self._route(method, path, body_json, routes,
+                           refuse=(403, {"error": "forbidden", "message": "You don't have access to that."}))
+
     def evidence_file(self, evidence_id: str, *, companies: Collection[str] | None = None,
                       company_id: str | None = None) -> dict[str, Any]:
         """One original, as stored (§55): ``{filename, contentType, data}`` (base64).
@@ -3160,6 +3261,7 @@ class BackOfficeService:
             data = repo.registry.open(repo.tenant_id, evidence_id)
         except (ObjectNotFound, IntegrityError, ValueError):
             raise ServiceError(404, "I can't find that evidence.") from None
+        self._opened_evidence(evidence_id)
         return {"filename": self._evidence_filename(ev), "contentType": ev.mime_type or "application/octet-stream",
                 "data": base64.b64encode(data).decode()}
 
@@ -3410,6 +3512,16 @@ class BackOfficeService:
         method = (method or "GET").upper()
         raw_path, _, query = (path or "/").partition("?")
         path = unquote(raw_path).rstrip("/") or "/"
+        self._opened = []
+        try:
+            return self._route_one(method, path, query, body_json, routes, refuse)
+        finally:
+            if self.inline_access_log and self._opened:
+                who, role = self.viewer
+                self.record_access(self.take_opened(), who=who, role=role)
+
+    def _route_one(self, method: str, path: str, query: str, body_json: Any, routes: Sequence[Any],
+                   refuse: tuple[int, dict[str, Any]] | None) -> tuple[int, dict[str, Any]]:
         try:
             body = _body(body_json)
             if not body and query:
@@ -3488,6 +3600,9 @@ class BackOfficeService:
             ("GET", r(f"/api/reports/{seg}/file"), lambda b, rid: self.report_file(rid)),
             ("GET", r("/api/documents"), lambda b: self.documents_list(b)),
             ("POST", r("/api/documents/export"), lambda b: self.documents_export(b)),
+            # Sensitive documents (§52): who opened their originals; the owner marks one (or not).
+            ("GET", r("/api/documents/access-log"), lambda b: self.access_log()),
+            ("POST", r(f"/api/documents/{seg}/sensitive"), lambda b, did: self.document_sensitive(did, b)),
             ("GET", r(f"/api/documents/{seg}/file"), lambda b, did: self.document_download(did)),
             ("GET", r(f"/api/documents/{seg}"), lambda b, did: self.document_detail(did)),
             ("GET", r(f"/api/transactions/{seg}"), lambda b, tid: self.transaction(tid)),
@@ -3561,7 +3676,9 @@ def _article(word: str) -> str:
 
 
 REVERSE_CHARGE_FLAG = "Possible reverse charge: VAT to be declared by you"
-FOREIGN_VAT_FLAG = "Foreign VAT charged — may be reclaimable abroad, not deductible in Portugal"
+# Named by the country of the company the document is for (§49): Portugal's, Spain's...
+_FOREIGN_VAT_FLAG = "Foreign VAT charged — may be reclaimable abroad, not deductible in {country}"
+FOREIGN_VAT_FLAG = _FOREIGN_VAT_FLAG.format(country="Portugal")
 
 
 def _foreign_vat_flag(record: DocumentRecord) -> dict[str, str] | None:
@@ -3570,11 +3687,14 @@ def _foreign_vat_flag(record: DocumentRecord) -> dict[str, str] | None:
     VAT charged by a foreign supplier cannot be deducted in Portugal (it may be reclaimed in the
     supplier's country). No VAT charged by an EU supplier with a valid VAT number, an invoice saying
     the VAT is reverse-charged, or a supplier outside the EU: the business may have to declare the
-    VAT itself. Which applies (goods or services, B2B or not) is the accountant's call.
+    VAT itself. Which applies (goods or services, B2B or not) is the accountant's call. "Foreign" is
+    relative to the country of the company the document is for (a Spanish invoice to a Spanish
+    company is domestic; to a Portuguese one, foreign).
     """
     issuer = record.issuer
     if issuer is None or not issuer.is_foreign:
         return None
+    home = COUNTRY_NAMES.get(issuer.home, issuer.home)
     doc = record.document
     who = display_name(doc.supplier_name)
     where = COUNTRY_NAMES.get(issuer.country or "", issuer.country or "abroad")
@@ -3586,7 +3706,7 @@ def _foreign_vat_flag(record: DocumentRecord) -> dict[str, str] | None:
         if valid and doc.net_amount and check_rate(doc.net_amount, doc.vat_amount, valid).fit is not RateFit.MATCHES:
             rate = (doc.vat_amount / doc.net_amount).quantize(Decimal("0.001"))
             detail += f" {percent(rate)} is not a VAT rate used in {where}."
-        return {"id": f"t_foreign_vat_{doc.id}", "title": FOREIGN_VAT_FLAG, "detail": detail}
+        return {"id": f"t_foreign_vat_{doc.id}", "title": _FOREIGN_VAT_FLAG.format(country=home), "detail": detail}
     if not issuer.reverse_charge_candidate:
         return None
     if issuer.reverse_charge:

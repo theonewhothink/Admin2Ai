@@ -19,6 +19,18 @@ open card payments (``GET /api/employee/card-payments``) and uploads receipts
 (``POST /api/employee/receipts``, JSON or multipart); the server, never the
 request, says who they are. Everything else is refused (server/auth.py).
 
+Outlet managers (backoffice.managers): a ``manager`` membership is limited to
+some cost centers (outlets) of one company. They read and answer their outlets'
+Needs You items and read their documents, payments and spending through the
+same paths the owner uses (filtered by the engine,
+``BackOfficeService.dispatch_manager``), read ``GET /api/manager/outlets`` and
+send receipts for an outlet (``POST /api/manager/receipts``, JSON or
+multipart). Everything else is refused (server/auth.py MANAGER_ROUTES).
+
+Sensitive documents (backoffice.sensitivity): every read of a sensitive
+document's original is recorded with who read it (an event in the tenant's
+log); the owner reads the access log at ``GET /api/documents/access-log``.
+
 Hardening: security headers on every response (HSTS, nosniff, a CSP that
 allows nothing, no framing, no referrer, no caching of API data), CORS only for
 BACKOFFICE_ALLOWED_ORIGINS (with credentials), request size limits, one JSON
@@ -66,7 +78,7 @@ log = logging.getLogger("backoffice.http")
 
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 UPLOAD_PATHS = frozenset({"/api/evidence", "/api/evidence/upload", "/api/receipts", "/api/share",
-                          "/api/employee/receipts", "/api/expense-claims"})
+                          "/api/employee/receipts", "/api/expense-claims", "/api/manager/receipts"})
 # base64 in JSON grows a file by a third; a little room for the other fields.
 UPLOAD_LIMIT = MAX_UPLOAD_BYTES * 4 // 3 + 1024 * 1024
 PUBLIC_API = frozenset({"/api/auth/signup", "/api/auth/login", "/api/oauth/callback",
@@ -88,7 +100,8 @@ _ROUTE_WORDS = frozenset(
     "connections stale reconnect clients rules audit pipeline auth signup login logout me account delete "
     "onboarding company oauth start callback bank devices v1 healthz readyz internal overview operations "
     "readiness acceptance cost-centers allocate obligations transactions expected-invoices not-coming statement "
-    "invitations accept employee employees card-payments expense-claims profile mailboxes seen".split())
+    "invitations accept employee employees card-payments expense-claims profile mailboxes seen manager outlets "
+    "sensitive access-log".split())
 # One client company of any business: /api/accountant/clients/<tenant id>~<company id>[/…] (§28, §29).
 _CLIENT_REF = re.compile(r"/api/accountant/clients/(?P<tenant>[A-Za-z0-9][A-Za-z0-9_.-]{0,127})~(?P<company>[^/~]+)"
                          r"(?P<rest>/.*)?")
@@ -540,7 +553,9 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
         principal, refresh = await _signed_in(request, owner=True)
         body = await _json(request)
         if not str(body.get("taxId") or "").strip():
-            raise AuthError(400, "bad_request", "I need the company's NIF. It has 9 digits.")
+            spain = str(body.get("country") or "").strip().upper() == "ES"
+            raise AuthError(400, "bad_request", "I need the company's NIF or CIF. It has 9 characters." if spain
+                            else "I need the company's NIF. It has 9 digits.")
         status, out = await run_in_threadpool(manager.add_company, principal.tenant.id, principal.user.id, body)
         return _reply(status, out, refresh=(refresh, _token(request)[0]))
 
@@ -736,6 +751,8 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
         ok = await run_in_threadpool(manager.read, tenant_id, lambda svc: svc.api_authorize(secret))
         return (tenant_id, secret) if ok else None
 
+    _API_VIEWER = ("accounting software (API key)", "api")
+
     @app.get("/api/v1/documents")
     @_guarded
     async def v1_documents(request: Request) -> Response:
@@ -752,7 +769,9 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
         found = await _key_tenant(request)
         if found is None:
             return _error(401, "unauthorized", "This key is not valid.")
-        f = await run_in_threadpool(manager.read, found[0], lambda svc: svc.assistant.document_file(document_id))
+        f = await run_in_threadpool(functools.partial(manager.read, found[0],
+                                                      lambda svc: svc.assistant.document_file(document_id),
+                                                      viewer=_API_VIEWER))
         if f is None:
             return _error(404, "not_found", "I can't find that document.")
         return Response(f[2], media_type=f[1], headers={"Content-Disposition": f'attachment; filename="{f[0]}"'})
@@ -770,7 +789,8 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
                                             date_to=svc._date_arg(q, "to"))
 
         try:
-            name, data, _ = await run_in_threadpool(manager.read, found[0], build)
+            name, data, _ = await run_in_threadpool(functools.partial(manager.read, found[0], build,
+                                                                      viewer=_API_VIEWER))
         except Exception:
             return _error(400, "bad_request", "Use dates like 2026-09-30.")
         return Response(data, media_type="application/zip",
@@ -837,6 +857,31 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
                                               "/api/employee/receipts", body)
         return _reply(status, out, refresh=(refresh, _token(request)[0]))
 
+    @app.post("/api/manager/receipts")
+    @_guarded
+    async def manager_receipts(request: Request) -> Response:
+        """A receipt an outlet manager sends for one of their outlets (``costCenterId`` when they run several)."""
+        from backoffice.api.app import _multipart
+
+        principal, refresh = await _signed_in(request)
+        if not principal.manager_only:
+            raise AuthError(403, "forbidden", FORBIDDEN)
+        data = await request.body()
+        content_type = request.headers.get("content-type", "")
+        if content_type.startswith("multipart/form-data"):
+            fields, file_part = _multipart(data, content_type)
+            if file_part is None:
+                return _error(400, "bad_request", "There was nothing to save.")
+            body: dict[str, Any] = {**fields, "filename": file_part["filename"],
+                                    "contentType": file_part["content_type"],
+                                    "dataBase64": base64.b64encode(file_part["data"]).decode("ascii")}
+        else:
+            body = await _json(request)
+        status, out = await run_in_threadpool(functools.partial(
+            manager.command, principal.tenant.id, principal.user.id, "POST", "/api/manager/receipts", body,
+            manager=principal.cost_centers or frozenset(), manager_email=principal.user.email))
+        return _reply(status, out, refresh=(refresh, _token(request)[0]))
+
     # ----------------------------------------------------------------- the team's dashboard (admins only)
 
     def _internal(principal: Principal, target: str, query: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -883,7 +928,8 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
         limit = _client_access(principal, tenant_id, company_id)
         local = f"/api/accountant/clients/{company_id}{rest}"
         if method == "GET":
-            return manager.view(tenant_id, "GET", local + query, None, companies=limit, prefix=f"{tenant_id}~")
+            return manager.view(tenant_id, "GET", local + query, None, companies=limit, prefix=f"{tenant_id}~",
+                                viewer=(principal.user.email, "accountant"))
         if rest == "/rules":
             text = body.get("text")
             scope = "client" if limit is not None else str(body.get("scope") or "client")
@@ -917,7 +963,8 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
         tenant = principal.tenant.id
         allowed = principal.companies or frozenset()
         if target == "/api/documents/export":
-            return manager.view(tenant, "POST", target, body, companies=allowed)
+            return manager.view(tenant, "POST", target, body, companies=allowed,
+                                viewer=(principal.user.email, "accountant"))
         own = _CLIENT_RULES.fullmatch(target)
         if target == "/api/accountant/rules" or own:
             company = own.group(1) if own else str(body.get("companyId") or "")
@@ -1081,19 +1128,33 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
                 return _error(403, "forbidden", FORBIDDEN)
             status, out = await run_in_threadpool(functools.partial(
                 manager.view, tenant, "GET", target + query, None, employee=principal.user.email))
+        elif principal.manager_only:
+            # An outlet manager: their outlets only (backoffice.managers); auth.py allowed the path.
+            outlets = principal.cost_centers or frozenset()
+            if request.method == "GET":
+                status, out = await run_in_threadpool(functools.partial(
+                    manager.view, tenant, "GET", target + query, None, manager=outlets,
+                    viewer=(principal.user.email, "manager")))
+            else:
+                body = await _json(request)
+                status, out = await run_in_threadpool(functools.partial(
+                    manager.command, tenant, actor, "POST", target, body, manager=outlets,
+                    manager_email=principal.user.email))
         elif request.method == "GET" and target == "/api/accountant/clients" and \
                 (home := await run_in_threadpool(_accountant_home, principal)) is not None:
             status, out = home
         elif request.method == "GET":
             # An accountant limited to some companies reads only those companies (§28, §52).
             status, out = await run_in_threadpool(functools.partial(
-                manager.view, tenant, "GET", target + query, None, companies=principal.companies))
+                manager.view, tenant, "GET", target + query, None, companies=principal.companies,
+                viewer=(principal.user.email, principal.role)))
         else:
             body = await _json(request)
             if principal.limited:
                 status, out = await run_in_threadpool(_limited_post, principal, target, body)
             elif target in READ_ONLY_POSTS:
-                status, out = await run_in_threadpool(manager.view, tenant, "POST", target, body)
+                status, out = await run_in_threadpool(functools.partial(
+                    manager.view, tenant, "POST", target, body, viewer=(principal.user.email, principal.role)))
             elif target == "/api/chat":
                 status, out = await run_in_threadpool(manager.chat, tenant, actor, body)
             elif target == "/api/chat/tool":
