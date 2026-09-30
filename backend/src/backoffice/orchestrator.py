@@ -9,7 +9,12 @@ log (§55).
 Pipeline for one piece of evidence::
 
     Discovery      what arrived (email, e-invoice, fiscal QR text, bank rows, letter)
-    Retrieval      invoice links in emails, followed through registered portal adapters (§9, §10)
+    Retrieval      invoice links in emails and shared from the phone, followed through the repository's link
+                   source (§9, §10): the demo's portal adapters, or on the production server what was fetched
+                   before the event was recorded (server/links.py). Files and rendered pages are kept with their
+                   provenance; a sign-in wall is the owner's to pass; an unsafe link is never opened; a link that
+                   no longer works starts the missing-evidence path. An invoice written in the email itself (plain
+                   text, HTML, schema.org data) is read as a document when nothing attached or linked gives one
     Document       structured extraction: UBL, Portuguese fiscal QR + text fields (§13, §19); uploaded
                    PDFs and photos through the repository's document reader (backoffice.reading:
                    text layer, QR, then the OCR chain), when one is configured (§13-17). The issuer's
@@ -40,7 +45,8 @@ Pipeline for one piece of evidence::
                    your companies is one question
     Missing        a plan for every payment still without its document; supplier chasing (§22); money back
                    without its credit note is asked for the same way; a supplier's usual invoice that is
-                   overdue past its learned rhythm is raised once, asked for, and closed when it arrives (§23)
+                   overdue past its learned rhythm is raised once, asked for, and closed when it arrives (§23);
+                   the invoice behind a link that no longer works is looked for, then asked for at once
     Refunds        a refund closes on the credit note it matches, and that credit note's invoice is shown with
                    it; another amount is one question; money back to a customer needs your own credit note
     Accountant     routine accountant questions answered from evidence (§28)
@@ -153,7 +159,20 @@ from backoffice.evidence import (
     parse_key,
     sha256_hex,
 )
+from backoffice.evidence.email import EmailParseError, parse_eml
+from backoffice.evidence.html_signals import html_to_text
+from backoffice.evidence.links import (
+    BLOCKED_MESSAGE,
+    FetchResult,
+    LinkOutcome,
+    authentication_message,
+    register_fetch,
+    sign_in_message,
+)
+from backoffice.evidence.retrieval import LinkSource, PortalLinks, email_invoice_links
 from backoffice.extraction import StructuredFormatError, XMLSyntaxError, parse_einvoice
+from backoffice.extraction.fields import StructuredDataError
+from backoffice.extraction.htmldata import extract_html_structured
 from backoffice.extraction.invoicelines import InvoiceDetails, read_invoice_details
 from backoffice.fraud import (
     ApproverKind,
@@ -220,12 +239,14 @@ from backoffice.mailer import is_simulated
 from backoffice.missing import (
     ChaseFacts,
     ChaseMessage,
+    LinkChaseFacts,
     RecurringChaseFacts,
     StatementItem,
     activity_line,
     choose_language,
     clean_invoice_number,
     compose_correction_request,
+    compose_link_request,
     compose_recurring_request,
     compose_request,
     recurring_activity_line,
@@ -299,6 +320,7 @@ __all__ = [
     "ActivityEntry",
     "AnswerOutcome",
     "BankRow",
+    "BrokenLinkRecord",
     "ChaseRecord",
     "CheckOption",
     "Clock",
@@ -307,6 +329,7 @@ __all__ = [
     "DocumentRecord",
     "ExpectedInvoiceRecord",
     "IngestReport",
+    "LinkRecord",
     "MemoryObjectStore",
     "NeedsYouRecord",
     "ObligationRecord",
@@ -327,6 +350,7 @@ TZ = timezone(timedelta(hours=1), "WEST")
 SYSTEM = "system"
 OWNER_ACTOR = "owner"
 CHASE_AFTER_DAYS = 3  # a payment this old without its invoice is worth a polite request (§22, §23)
+LINK_GIVE_UP_AFTER = timedelta(days=3)  # an invoice link whose site has not answered for this long: another way
 ANSWER_SECONDS = 40  # owner time recorded for one tap on a Needs-You item (§59)
 MESSAGE_ID_DOMAIN = "backoffice.example"  # right-hand side of the Message-IDs of the emails we write
 
@@ -880,10 +904,77 @@ class ChaseRecord:
     line: str  # the Activity line once it is sent
     outbox_id: str = ""
     sent_at: datetime | None = None
+    link_id: str | None = None  # asked because the invoice link in the supplier's email no longer works
 
     @property
     def sent(self) -> bool:
         return self.sent_at is not None
+
+
+@dataclass
+class LinkRecord:
+    """One invoice link from an email or shared from the phone, and what following it gave (§9).
+
+    ``status``: "waiting" (not opened yet, or the site did not answer: tried again later), "retrieved"
+    (the file behind it, or the page itself, is stored as evidence with its provenance), "sign_in" (the
+    supplier's site asks the owner to sign in or for a code), "blocked" (it did not look safe: never
+    opened) or "broken" (it no longer works: the invoice is looked for and asked for another way, §22).
+    """
+
+    url: str
+    status: str
+    first_seen: datetime
+    email_evidence_id: str | None = None  # the email it came in; None when it was shared from the phone
+    shared: bool = False
+    supplier_id: str | None = None
+    supplier_name: str = ""
+    evidence_ids: tuple[str, ...] = ()  # what it gave that is read as documents
+    snapshot_ids: tuple[str, ...] = ()  # screenshots of rendered pages (kept, never read)
+    message: str = ""  # what the owner is told, in plain words
+    reason: str = ""  # internal code from the fetch ("http_404", "login_required", ...), never shown
+    tries: int = 0
+
+
+@dataclass
+class BrokenLinkRecord:
+    """An invoice link that no longer works (§9 → §22): the invoice is looked for, then asked for.
+
+    Closed only by the invoice arriving, never by the request; the request counts as asked only once a
+    transport accepted it (like every email the back office writes).
+    """
+
+    id: str
+    url: str
+    supplier_id: str | None
+    supplier_name: str
+    since: date  # the day the email (or the shared link) arrived
+    at: datetime
+    email_evidence_id: str | None = None
+    shared: bool = False
+    status: str = "missing"  # "missing" | "requested" | "received"
+    tx_id: str | None = None  # the payment the request asks about, when there is one
+    company_id: str | None = None
+    message: ChaseMessage | None = None  # a request not tied to a payment (none was found)
+    outbox_id: str = ""
+    written_at: datetime | None = None
+    sent_at: datetime | None = None
+    document_id: str | None = None  # the invoice that arrived since
+    searched: tuple[str, ...] = ()  # where I looked, in plain words
+    note: str = ""  # why nothing was asked yet, in plain words
+
+    @property
+    def where(self) -> str:
+        return "The link you shared" if self.shared else f"The link in {_possessive(self.supplier_name)} email"
+
+    @property
+    def asked_line(self) -> str:
+        """'The link in Vodafone's email no longer works, so I asked Vodafone for the invoice.'"""
+        return f"{self.where} no longer works, so I asked {self.supplier_name} for the invoice."
+
+    @property
+    def waiting_line(self) -> str:
+        return (f"{self.where} no longer works, so I wrote to {self.supplier_name} asking for the invoice. "
+                "It is waiting to be sent.")
 
 
 @dataclass
@@ -1067,6 +1158,11 @@ class Repository:
         self.history_transactions: list[Transaction] = []
         self.portal: dict[str, PortalDocument] = {}
         self.pending_links: list[str] = []
+        # What is behind an invoice link (§9, §10): the demo's portal adapters, or on the production server
+        # what was fetched before the event was recorded (server/links.py). Never the network directly.
+        self.links: LinkSource = PortalLinks(self.portal, clock=self.clock.now)
+        self.links_seen: dict[str, LinkRecord] = {}  # every invoice link followed, by URL
+        self.broken_links: dict[str, BrokenLinkRecord] = {}  # links that no longer work, by their own id
         self.closed_months: dict[tuple[str, str], date] = {}
         self.recovered_tx_ids: set[str] = set()
         # Reads uploaded PDFs and photos (backoffice.reading.DocumentReader, set by the server from its
@@ -1368,26 +1464,126 @@ class DiscoveryAgent(_Agent):
 
 
 class RetrievalAgent(_Agent):
-    """Follows invoice links through registered portal adapters (§9, §10). Never guesses a URL."""
+    """Follows invoice links through the repository's link source (§9, §10). Never guesses a URL.
+
+    The source is the demo's portal adapters, or on the production server what was fetched before the
+    event was recorded (a replay never opens a link). What comes back is stored with its provenance
+    (original and final URL, redirects, retrieval time; the page itself when no file is behind it). A
+    sign-in wall becomes the owner's sign-in state; an unsafe link is never opened; a link that no longer
+    works starts the missing-evidence path (§22); a site that did not answer is tried again later.
+    """
 
     name = "retrieval"
 
-    def follow(self, url: str, *, supplier_hint: str | None, at: datetime, context: Mapping[str, Any]) -> str | None:
-        page = self.repo.portal.get(url)
-        if page is None:
-            if url not in self.repo.pending_links:
-                self.repo.pending_links.append(url)
+    def follow(self, url: str, *, supplier: Supplier | None, at: datetime, context: Mapping[str, Any],
+               source_kind: SourceKind = SourceKind.EMAIL, email_evidence_id: str | None = None,
+               shared: bool = False) -> LinkRecord:
+        repo = self.repo
+        record = repo.links_seen.get(url)
+        if record is None:
+            record = LinkRecord(url=url, status="waiting", first_seen=at, email_evidence_id=email_evidence_id,
+                                shared=shared)
+        if supplier is not None:
+            record.supplier_id, record.supplier_name = supplier.id, display_name(supplier.name)
+        result = repo.links.fetch(url, supplier_name=supplier.name if supplier else None)
+        if result is None:
+            if record.status != "waiting":
+                return record  # followed before (read again): what it gave is already on file
+            if url not in repo.pending_links:
+                repo.pending_links.append(url)
             self.log("link_pending", values={"url": url})
-            return None
+            repo.links_seen.setdefault(url, record)
+            return record
+        repo.links_seen[url] = record
+        record.tries += 1
+        record.supplier_name = record.supplier_name or display_name(result.supplier, fallback="The supplier")
+        busy = result.outcome is LinkOutcome.UNAVAILABLE and result.retryable
+        gave_up = busy and at - record.first_seen >= LINK_GIVE_UP_AFTER  # down for days: another way
+        if url in repo.pending_links and (not busy or gave_up):
+            repo.pending_links.remove(url)
+        if gave_up:
+            self._broken(record, result, at)
+        elif result.portal is not None:
+            self._from_portal(record, result, at, context)
+        elif result.content is not None and result.format is not None:
+            self._retrieved(record, result, source_kind, context)
+        elif result.outcome in (LinkOutcome.LOGIN_REQUIRED, LinkOutcome.MFA_REQUIRED):
+            self._needs_sign_in(record, result, at)
+        elif result.outcome is LinkOutcome.BLOCKED_UNSAFE:
+            record.status, record.reason, record.message = "blocked", result.reason or "unsafe", BLOCKED_MESSAGE
+            self.log("link_blocked", values={"url": url, "reason": record.reason})
+        elif result.expired:
+            self._broken(record, result, at)
+        else:  # a timeout, an outage, a busy site: tried again later
+            record.status, record.reason = "waiting", result.reason or "unavailable"
+            if url not in repo.pending_links:
+                repo.pending_links.append(url)
+            self.log("link_retry_later", values={"url": url, "reason": record.reason})
+        return record
+
+    def _from_portal(self, record: LinkRecord, result: FetchResult, at: datetime, context: Mapping[str, Any]) -> None:
+        """A supplier portal adapter (§10) handed the document over."""
+        assert result.content is not None and result.format is not None
         reg = self.repo.registry.register(
-            page.data, tenant_id=self.repo.tenant_id, source_kind=SourceKind.SUPPLIER_PORTAL,
-            format=EvidenceFormat.UBL if page.content_type.endswith("xml") else EvidenceFormat.TEXT,
-            mime_type=page.content_type, filename=page.filename, original_url=url, retrieved_at=at,
-            metadata={"portal": page.portal}, context=dict(context),
+            result.content, tenant_id=self.repo.tenant_id, source_kind=SourceKind.SUPPLIER_PORTAL,
+            format=result.format, mime_type=result.record.content_type or "application/octet-stream",
+            filename=result.filename, original_url=record.url, retrieved_at=at, metadata={"portal": result.portal},
+            context=dict(context),
         )
+        record.status, record.evidence_ids = "retrieved", (reg.evidence.id,)
         self.log("retrieve", subject_id=reg.evidence.id, evidence_ids=[reg.evidence.id],
-                 values={"url": url, "portal": page.portal, "supplier": supplier_hint or ""})
-        return reg.evidence.id
+                 values={"url": record.url, "portal": result.portal, "supplier": result.supplier or ""})
+
+    def _retrieved(self, record: LinkRecord, result: FetchResult, source_kind: SourceKind,
+                   context: Mapping[str, Any]) -> None:
+        """The file behind the link, or the page itself when there is none (§9 steps 6-10)."""
+        regs = register_fetch(result, self.repo.registry, tenant_id=self.repo.tenant_id, source_kind=source_kind,
+                              context=context)
+        shot = sha256_hex(result.snapshot_png) if result.snapshot_png else None
+        record.evidence_ids = tuple(dict.fromkeys(r.evidence.id for r in regs if r.evidence.sha256 != shot))
+        record.snapshot_ids = tuple(r.evidence.id for r in regs if r.evidence.sha256 == shot)
+        record.status, record.reason = "retrieved", result.outcome.value
+        fetched = result.record
+        self.log("retrieve", subject_id=record.evidence_ids[0] if record.evidence_ids else None,
+                 evidence_ids=[*record.evidence_ids, *record.snapshot_ids],
+                 values={"url": fetched.original_url, "final_url": fetched.final_url, "outcome": result.outcome.value,
+                         "redirects": max(0, len(fetched.redirect_chain) - 1), "retrieved_at": fetched.retrieved_at,
+                         "supplier": record.supplier_name},
+                 response={"status": fetched.status_code, "sha256": fetched.sha256, "via_browser": result.via_browser})
+
+    def _needs_sign_in(self, record: LinkRecord, result: FetchResult, at: datetime) -> None:
+        """§9: the supplier's site wants the owner to sign in (or a code): the owner is told, once."""
+        who = record.supplier_name or "The supplier"
+        mfa = result.outcome is LinkOutcome.MFA_REQUIRED
+        message = authentication_message(who) if mfa else sign_in_message(who)
+        first = record.status != "sign_in"
+        record.status, record.reason, record.message = "sign_in", result.outcome.value, message
+        self.log("link_needs_sign_in", values={"url": record.url, "outcome": result.outcome.value, "supplier": who})
+        if first:
+            where = "The link you shared" if record.shared else "The invoice link in its email"
+            self.o.activity(at, "checked", f"{message} {where} opens a sign-in page, so I could not get the "
+                            "invoice from it yet.", self.o.supplier_company(record.supplier_id))
+
+    def _broken(self, record: LinkRecord, result: FetchResult, at: datetime) -> None:
+        """It no longer works (gone, 404/410): look for the invoice, then ask for it (§22)."""
+        record.status, record.reason = "broken", result.reason or "unavailable"
+        self.log("link_broken", values={"url": record.url, "reason": record.reason, "supplier": record.supplier_name})
+        link_id = "lnk_" + hashlib.sha256(record.url.encode("utf-8")).hexdigest()[:16]
+        if link_id in self.repo.broken_links:
+            return
+        since = at.astimezone(TZ).date()
+        if record.email_evidence_id:  # the day the supplier's email was sent (else when it arrived)
+            try:
+                email = self.repo.evidence(record.email_evidence_id)
+                sent = email.metadata.get("date")
+                since = (datetime.fromisoformat(sent) if isinstance(sent, str) else email.retrieved_at
+                         ).astimezone(TZ).date()
+            except Exception:  # noqa: BLE001 - the arrival day is enough
+                pass
+        self.repo.broken_links[link_id] = BrokenLinkRecord(
+            id=link_id, url=record.url, supplier_id=record.supplier_id,
+            supplier_name=record.supplier_name or "the supplier", since=since, at=at,
+            email_evidence_id=record.email_evidence_id, shared=record.shared)
 
 
 _QR_START = re.compile(r"A:\d{9}\*B:")
@@ -1477,6 +1673,10 @@ class DocumentAgent(_Agent):
                     continue
                 structured += [str(o.value) for o in result.fields.get(CriticalField.SUPPLIER_TAX_ID, ())]
                 continue
+            if part.kind == "html":
+                for found in _html_structured(part.data, part.evidence_id):
+                    structured += [str(o.value) for o in found.fields.get(CriticalField.SUPPLIER_TAX_ID, ())]
+                continue
             if part.kind == "read":
                 structured += [str(o.value) for o in part.observations.get(CriticalField.SUPPLIER_TAX_ID.value, ())
                                if o.method in (ExtractionMethod.QR, ExtractionMethod.STRUCTURED_XML)]
@@ -1500,9 +1700,9 @@ class DocumentAgent(_Agent):
         fiscal_qr = False
         numbers: list[str] = []
         for i, part in enumerate(parts):
-            if part.kind == "ubl":
-                result = structured.get(i)
-                if result is not None:
+            if part.kind in ("ubl", "html"):
+                found = structured.get(i)
+                for result in found if isinstance(found, tuple) else (found,) if found is not None else ():
                     numbers += [str(o.value) for o in result.fields.get(CriticalField.SUPPLIER_TAX_ID, ())]
                 continue
             payloads, rest = _split_qr(part.text)
@@ -1522,13 +1722,15 @@ class DocumentAgent(_Agent):
         qr: PTQRCode | None = None
         final_consumer = False
         parsers: list[str] = []
-        structured: dict[int, Any] = {}
+        structured: dict[int, Any] = {}  # e-invoices (one result each) and HTML data (a tuple of results each)
         for i, part in enumerate(parts):
             if part.kind == "ubl":
                 try:
                     structured[i] = parse_einvoice(part.data, source=part.evidence_id)
                 except (StructuredFormatError, XMLSyntaxError):
                     continue
+            elif part.kind == "html":
+                structured[i] = _html_structured(part.data, part.evidence_id)
         own_issuer = self.own_issuer(parts)
         customers, suppliers = self._roles(own_issuer)
         # Who issued it and from which country (checklist P7). The business's own sale is its own
@@ -1558,6 +1760,16 @@ class DocumentAgent(_Agent):
                     kinds.setdefault("ubl", result.doc_type)
                 supplier_name = supplier_name or result.extras.get("supplier_name")
                 reference = reference or result.extras.get("invoice_reference")
+                continue
+            if part.kind == "html":  # schema.org Invoice / Order data in an HTML email or page (§13 Stage 0)
+                for result in structured.get(i, ()):
+                    parsers.append(result.kind)
+                    for f, found in result.fields.items():
+                        for obs in found:
+                            add(f, obs)
+                    supplier_name = supplier_name or result.extras.get("supplier_name")
+                    if result.kind.endswith("_invoice"):
+                        kinds.setdefault("html", DocumentType.INVOICE)
                 continue
             if part.kind == "read":
                 for name, found in sorted(part.observations.items()):
@@ -1615,7 +1827,7 @@ class DocumentAgent(_Agent):
                 if currency is not None:
                     add(CriticalField.CURRENCY, currency)
                 read_any = bool(fields.observations)
-            supplier_name = supplier_name or _first_line(rest, foreign=abroad)
+            supplier_name = supplier_name or part.supplier_name or _first_line(rest, foreign=abroad)
             if read_any:
                 named = _text_doc_type(rest, foreign=abroad)
                 if named is not None:
@@ -1643,7 +1855,7 @@ class DocumentAgent(_Agent):
                 return None
             supplier_name = _statement_issuer(joined)
         number = _first_value(observations, CriticalField.INVOICE_NUMBER)
-        doc_type = next((kinds[k] for k in ("qr", "ubl", "text", "reading", "reading_text") if k in kinds),
+        doc_type = next((kinds[k] for k in ("qr", "ubl", "text", "html", "reading", "reading_text") if k in kinds),
                         DocumentType.RECEIPT if receipt_fallback else DocumentType.INVOICE)
         if statement is None and "qr" not in kinds and "ubl" not in kinds and joined.strip():
             if doc_type is DocumentType.SUPPLIER_STATEMENT:
@@ -2822,6 +3034,9 @@ class MissingEvidenceAgent(_Agent):
         if staff is not None:
             return staff
         chase = self.repo.chases.get(rec.id)
+        link = self.repo.broken_links.get(chase.link_id or "") if chase is not None else None
+        if chase is not None and link is not None:  # the invoice link in its email no longer works
+            return link.asked_line if chase.sent else link.waiting_line
         if chase is not None and chase.sent:
             return (f"I asked {who} for the invoice for the {amount} payment on {when}. "
                     "Suppliers usually reply within a few days.")
@@ -2900,30 +3115,168 @@ class MissingEvidenceAgent(_Agent):
             if supplier is None or not supplier.contact_email:
                 continue
             company = self.repo.companies[rec.tx.entity_id]
-            decision = authorize(ActionKind.SUPPLIER_INVOICE_REQUEST, self.repo.policy, ActionContext(
-                tenant_id=self.repo.tenant_id, entity_id=company.id, subject_id=rec.id))
-            self.log("authorize_chase", subject_id=rec.id, evidence_ids=[rec.evidence_id],
+            if any(b.status == "requested" and b.tx_id is None and b.supplier_id == supplier.id
+                   and b.company_id == company.id for b in self.repo.broken_links.values()):
+                continue  # already asked for the invoice behind a link that no longer works: not twice
+            if self._write_chase(rec, supplier, company, now) is not None:
+                written.append(rec.id)
+        return written
+
+    def _write_chase(self, rec: TxRecord, supplier: Supplier, company: LegalEntity, now: datetime, *,
+                     link: BrokenLinkRecord | None = None) -> ChaseRecord | None:
+        """Write the request for one payment's invoice when the policy allows it (§22, §25); None otherwise."""
+        decision = authorize(ActionKind.SUPPLIER_INVOICE_REQUEST, self.repo.policy, ActionContext(
+            tenant_id=self.repo.tenant_id, entity_id=company.id, subject_id=rec.id))
+        self.log("authorize_chase", subject_id=rec.id, evidence_ids=[rec.evidence_id],
+                 response={"allowed": decision.allowed_now, "reason": decision.reason_plain})
+        if not decision.allowed_now:
+            return None
+        # A supplier's statement may name the invoice this payment is missing: the request then asks for it.
+        facts = ChaseFacts.build(rec.tx, supplier, company, invoice_number=self.o.statements.number_for(rec))
+        message = compose_request(facts, token=thread_token(self.repo.tenant_id, rec.id),
+                                  today=now.astimezone(TZ).date(), message_id_domain=MESSAGE_ID_DOMAIN)
+        out = self.o.write_email("supplier_request", rec.id, company.id, message.to, message.subject, message.body,
+                                 now, headers=(("Message-ID", message.message_id),))
+        chase = ChaseRecord(tx_id=rec.id, supplier_id=supplier.id, company_id=company.id, message=message,
+                            written_at=now, line=link.asked_line if link is not None else activity_line(facts),
+                            outbox_id=out.id, link_id=link.id if link is not None else None)
+        self.repo.chases[rec.id] = chase
+        values = {"to": message.to, "subject": message.subject, "outbox_id": out.id}
+        if link is not None:
+            values["broken_link"] = link.id
+        self.log("write_request", subject_id=rec.id, evidence_ids=[rec.evidence_id], values=values)
+        return chase
+
+    # ------------------------------------------------------------------ invoice links that no longer work (§9, §22)
+
+    def chase_broken_links(self, now: datetime) -> list[str]:
+        """An invoice link that no longer works: look for the invoice first, then ask the supplier for it.
+
+        With a payment to that supplier still without its invoice, the request asks for that payment's
+        invoice (the usual request, written at once rather than after a few days); without one, it asks for
+        the invoice from the supplier's email. Either way it goes out through the same send path and counts
+        as asked only once a transport accepted it. The item closes only when the invoice arrives (§3).
+        Returns the links a request was written for now.
+        """
+        repo = self.repo
+        written: list[str] = []
+        for record in sorted(repo.broken_links.values(), key=lambda r: r.id):
+            if record.status == "received":
+                continue
+            found = self._invoice_since(record)
+            if found is not None:
+                record.status, record.document_id = "received", found.id
+                self.log("broken_link_resolved", subject_id=record.id, evidence_ids=found.evidence_ids,
+                         values={"document": found.id})
+                continue
+            if record.status != "missing":
+                continue
+            record.searched = ("I looked through your email and the documents you sent me: the invoice is not there.",)
+            supplier = repo.suppliers.get(record.supplier_id or "")
+            if supplier is None or not supplier.contact_email:
+                record.note = f"I don't have an email address for {record.supplier_name}, so I can't ask for it."
+                continue
+            rec = self._payment_for(record, supplier)
+            if rec is not None:
+                if rec.id in repo.chases:  # already asked about that payment: that request covers it
+                    record.status, record.tx_id, record.company_id = "requested", rec.id, rec.company_id
+                    continue
+                company = repo.companies.get(rec.tx.entity_id or "")
+                if company is None:
+                    record.note = "I'm waiting to know which of your companies the payment is for before I ask."
+                    continue
+                chase = self._write_chase(rec, supplier, company, now, link=record)
+                if chase is None:
+                    record.note = "Asking suppliers for invoices is not switched on, so I have not asked."
+                    continue
+                record.status, record.tx_id, record.company_id = "requested", rec.id, company.id
+                record.outbox_id, record.written_at = chase.outbox_id, now
+                written.append(record.id)
+                continue
+            company = repo.companies.get(self.o.supplier_company(supplier.id) or "")
+            if company is None:
+                record.note = "I'm waiting for the payment to know which of your companies the invoice is for."
+                continue
+            decision = authorize(ActionKind.SUPPLIER_INVOICE_REQUEST, repo.policy, ActionContext(
+                tenant_id=repo.tenant_id, entity_id=company.id, subject_id=record.id))
+            self.log("authorize_chase", subject_id=record.id,
                      response={"allowed": decision.allowed_now, "reason": decision.reason_plain})
             if not decision.allowed_now:
+                record.note = "Asking suppliers for invoices is not switched on, so I have not asked."
                 continue
-            # A supplier's statement may name the invoice this payment is missing: the request then asks for it.
-            facts = ChaseFacts.build(rec.tx, supplier, company, invoice_number=self.o.statements.number_for(rec))
-            message = compose_request(facts, token=thread_token(self.repo.tenant_id, rec.id), today=today,
-                                      message_id_domain=MESSAGE_ID_DOMAIN)
-            out = self.o.write_email("supplier_request", rec.id, company.id, message.to, message.subject, message.body,
+            facts = LinkChaseFacts.build(supplier, company, emailed_on=record.since)
+            message = compose_link_request(facts, token=thread_token(repo.tenant_id, record.id),
+                                           today=now.astimezone(TZ).date(), message_id_domain=MESSAGE_ID_DOMAIN)
+            out = self.o.write_email("link_request", record.id, company.id, message.to, message.subject, message.body,
                                      now, headers=(("Message-ID", message.message_id),))
-            self.repo.chases[rec.id] = ChaseRecord(tx_id=rec.id, supplier_id=supplier.id, company_id=company.id,
-                                                   message=message, written_at=now, line=activity_line(facts),
-                                                   outbox_id=out.id)
-            self.log("write_request", subject_id=rec.id, evidence_ids=[rec.evidence_id],
+            record.status, record.company_id, record.message = "requested", company.id, message
+            record.outbox_id, record.written_at = out.id, now
+            self.log("write_request", subject_id=record.id,
                      values={"to": message.to, "subject": message.subject, "outbox_id": out.id})
-            written.append(rec.id)
+            written.append(record.id)
         return written
+
+    def _invoice_since(self, record: BrokenLinkRecord) -> DocumentRecord | None:
+        """The invoice that link was for, when it is on file: from that supplier, arrived around the link or since
+        (the same email's attachment or words, another channel, the supplier's reply), or its payment's."""
+        if record.tx_id:
+            rec = self.repo.transactions.get(record.tx_id)
+            if rec is not None and rec.document_ids:
+                return self.repo.documents.get(rec.document_ids[0])
+        if record.email_evidence_id:  # the same email gave it (its attachment or its own words)
+            registry, tenant = self.repo.registry, self.repo.tenant_id
+            for d in sorted(self.repo.documents.values(), key=lambda d: d.id):
+                if d.sales or d.supporting:
+                    continue
+                if record.email_evidence_id in d.evidence_ids or any(
+                        s.context.get("parent_evidence_id") == record.email_evidence_id
+                        for e in d.evidence_ids for s in registry.sightings(tenant, e)):
+                    return d
+        if not record.supplier_id:
+            return None
+        earliest = record.since - timedelta(days=3)
+        found = [d for d in self.repo.documents.values()
+                 if d.supplier_id == record.supplier_id and not d.sales and not d.supporting
+                 and d.document.doc_type in PURCHASE_INVOICE_TYPES and _arrived_on(d) >= earliest]
+        return min(found, key=lambda d: (d.received_at, d.id)) if found else None
+
+    def _payment_for(self, record: BrokenLinkRecord, supplier: Supplier) -> TxRecord | None:
+        """A payment to that supplier, around the day of its email, still without its invoice."""
+        resolver = self.repo.resolver()
+        near: list[tuple[int, str, TxRecord]] = []
+        for rec in self.repo.transactions.values():
+            if rec.tx.amount >= 0 or rec.private or rec.document_ids or rec.likely_document_ids:
+                continue
+            if self.repo.items[rec.item_id].is_done:
+                continue
+            if rec.decision is not None and not rec.decision.requires_document:
+                continue
+            days = abs((rec.tx.booked_on - record.since).days)
+            if days > 45:
+                continue
+            match = resolver.resolve_transaction(rec.tx)
+            if match.supplier is not None and match.supplier.id == supplier.id:
+                near.append((days, rec.id, rec))
+        return min(near, key=lambda n: (n[0], n[1]))[2] if near else None
+
+    def sent_link_request(self, record: BrokenLinkRecord, at: datetime) -> None:
+        """A transport accepted the request for the invoice behind a link that no longer works."""
+        record.sent_at = at
+        self.repo.closure_log.append(ClosureActivity(
+            kind=ClosureKind.SUPPLIER_CHASED, at=at, entity_id=record.company_id or "",
+            subject_id=record.supplier_id or record.id, period=Month.of(record.since)))
+        self.o.activity(at, "chased", record.asked_line, record.company_id,
+                        evidence_ids=[record.email_evidence_id] if record.email_evidence_id else [])
+        self.log("request_invoice", subject_id=record.id,
+                 values={"to": record.message.to if record.message else "", "url": record.url},
+                 response={"message_id": record.message.message_id if record.message else None})
 
     def sent(self, chase: ChaseRecord, at: datetime) -> None:
         """A transport accepted the request: now the supplier has been asked (§22, month summary)."""
         rec = self.repo.transactions[chase.tx_id]
         chase.sent_at = at
+        if chase.link_id and chase.link_id in self.repo.broken_links:
+            self.repo.broken_links[chase.link_id].sent_at = at
         self.repo.closure_log.append(ClosureActivity(
             kind=ClosureKind.SUPPLIER_CHASED, at=at, entity_id=chase.company_id, subject_id=chase.supplier_id,
             period=Month.of(rec.tx.booked_on)))
@@ -5886,6 +6239,8 @@ class Orchestrator:
                  response={"simulated": is_simulated(transport)})
         if message.kind == "supplier_request" and message.subject_id in self.repo.chases:
             self.missing.sent(self.repo.chases[message.subject_id], at)
+        elif message.kind == "link_request" and message.subject_id in self.repo.broken_links:
+            self.missing.sent_link_request(self.repo.broken_links[message.subject_id], at)
         elif message.kind == "expected_invoice_request" and message.subject_id in self.repo.expected_invoices:
             self.missing.sent_expected(self.repo.expected_invoices[message.subject_id], at)
         elif message.kind == "accountant_answer" and message.subject_id in self.repo.accountant_questions:
@@ -5919,7 +6274,12 @@ class Orchestrator:
                 what = ("the credit note for the {} refund" if rec.tx.amount > 0 else
                         "the invoice for the {} payment").format(format_money(abs(rec.tx.amount), rec.tx.currency))
                 text = f"Wrote to {who} asking for {what}. It is waiting to be sent."
+                if (link := self.repo.broken_links.get(chase.link_id or "")) is not None:
+                    text = link.waiting_line
                 evidence = [rec.evidence_id]
+            elif message.kind == "link_request" and (link := self.repo.broken_links.get(message.subject_id)):
+                text = link.waiting_line
+                evidence = [link.email_evidence_id] if link.email_evidence_id else []
             elif message.kind == "expected_invoice_request" and (
                     expected := self.repo.expected_invoices.get(message.subject_id)):
                 text = (f"Wrote to {expected.supplier_name} asking for its usual invoice for {expected.period.name}. "
@@ -5982,15 +6342,76 @@ class Orchestrator:
         outcome = self.discovery.share(payload)
         report = self._process_outcome(outcome, at=at, origin="share")
         report.pending_links = []
+        followed: list[LinkRecord] = []
         for url in outcome.pending_links:
-            ev = self.retrieval.follow(url, supplier_hint=None, at=at, context={"shared": True})
-            if ev is None:
-                report.pending_links.append(url)
-                continue
-            report.evidence_ids.append(ev)
-            self._document_from_parts(self._parts_for(ev), at=at, origin="link", retrieved=True, report=report)
+            link = self.retrieval.follow(url, supplier=self._link_supplier(url), at=at, context={"shared": True},
+                                         source_kind=SourceKind.MOBILE_SHARE, shared=True)
+            followed.append(link)
+            self._read_link(link, at=at, report=report)
+        message = _shared_link_message(followed)
+        if message:
+            report.message = message
         self.run(at)
         return report
+
+    def follow_waiting(self, urls: Sequence[str], at: datetime | None = None) -> IngestReport:
+        """Follow links that were waiting (never opened, or the site did not answer), once more (§9).
+
+        The production server opens them before recording the event (server/links.py); here they are
+        read through that recording like any link, with the email they came in as their context.
+        """
+        at = self.repo.clock.advance_to(at) if at else self.repo.clock.now()
+        report = IngestReport(route="link", message="Got it.")
+        for url in dict.fromkeys(urls):
+            if url not in self.repo.pending_links:
+                continue  # settled meanwhile
+            seen = self.repo.links_seen.get(url)
+            email = self._email_context(seen.email_evidence_id) if seen and seen.email_evidence_id else None
+            shared = bool(seen and seen.shared)
+            supplier = email.supplier if email is not None else self._link_supplier(url)
+            if shared:
+                context: dict[str, Any] = {"shared": True}
+            elif seen is not None and seen.email_evidence_id:
+                context = {"email_evidence_id": seen.email_evidence_id}
+            else:
+                context = {}
+            link = self.retrieval.follow(url, supplier=supplier, at=at, context=context,
+                                         source_kind=SourceKind.MOBILE_SHARE if shared else SourceKind.EMAIL,
+                                         email_evidence_id=seen.email_evidence_id if seen else None, shared=shared)
+            if link.status == "waiting":
+                report.pending_links.append(url)
+                continue
+            self._read_link(link, at=at, report=report, email=email)
+        self.run(at)
+        return report
+
+    def _link_supplier(self, url: str) -> Supplier | None:
+        from urllib.parse import urlsplit
+
+        try:
+            host = urlsplit(url).hostname
+        except ValueError:
+            return None
+        return self.repo.supplier_for_domain(host) if host else None
+
+    def supplier_company(self, supplier_id: str | None) -> str | None:
+        """The company a supplier's invoices usually go to: the only one it has served, else None."""
+        if not supplier_id:
+            return None
+        companies = {d.document.entity_id for d in self.repo.documents.values()
+                     if d.supplier_id == supplier_id and d.document.entity_id}
+        supplier = self.repo.suppliers.get(supplier_id)
+        if supplier is not None:
+            resolver = self.repo.resolver()
+            companies |= {r.tx.entity_id for r in self.repo.transactions.values()
+                          if r.tx.entity_id and r.tx.amount < 0 and not r.private
+                          and (m := resolver.resolve_transaction(r.tx)).supplier is not None
+                          and m.supplier.id == supplier_id}
+        if len(companies) == 1:
+            return next(iter(companies))
+        if not companies and len(self.repo.companies) == 1:
+            return next(iter(self.repo.companies))
+        return None
 
     def receive_upload(self, request: UploadRequest) -> tuple[UploadReceipt, IngestReport | None]:
         at = self.repo.clock.now()
@@ -6111,12 +6532,26 @@ class Orchestrator:
         return "Got it. I stored it, but I couldn't find invoice details in it."
 
     def _parts_for(self, evidence_id: str) -> list[_Part]:
-        """The readable parts of one piece of evidence: text/XML directly; PDFs and photos through the reader."""
+        """The readable parts of one piece of evidence: text/XML directly; PDFs and photos through the reader;
+        an HTML page (a receipt behind a link) by its schema.org data and its visible text."""
         evidence = self.repo.evidence(evidence_id)
         if evidence.format in _READABLE_FILES:
             return self._read_file(evidence)
+        if evidence.format is EvidenceFormat.HTML:
+            return self._html_parts(evidence_id)
         part = self._part_for(evidence_id)
         return [part] if part is not None else []
+
+    def _html_parts(self, evidence_id: str) -> list[_Part]:
+        try:
+            data = self.repo.registry.open(self.repo.tenant_id, evidence_id)
+        except (ObjectNotFound, IntegrityError):
+            return []
+        parts = [_Part(evidence_id, "html", data=data)] if _html_structured(data, evidence_id) else []
+        text = html_to_text(data.decode("utf-8", errors="replace"))
+        if text.strip():
+            parts.append(_Part(evidence_id, "text", text=text))
+        return parts
 
     def _read_file(self, evidence: Evidence) -> list[_Part]:
         """Stage 0 and the OCR chain for a PDF or photo (§13-17); nothing when no reader is configured."""
@@ -6172,18 +6607,17 @@ class Orchestrator:
     def _process_email(self, result: EmailIngestResult, *, at: datetime, origin: str, report: IngestReport) -> None:
         parsed = result.parsed
         message_id = result.message.evidence.id
-        sender = parsed.sender.address if parsed.sender else None
-        text = f"{parsed.subject}\n{parsed.text_body}"
+        email = self._email_facts(parsed, message_id)
+        sender, text, body_part, recipients = email.sender, email.text, email.body, email.recipients
         accountant = self.repo.accountant_by_email(sender)
         if accountant is not None:
-            questions = self.accountant.receive(parsed.text_body, message_id, at, accountant,
+            questions = self.accountant.receive(body_part.text if body_part else "", message_id, at, accountant,
                                                 subject=parsed.subject, message_id=parsed.thread.message_id)
             report.question_ids += [q.id for q in questions]
             return
         # An employee answering my request for a card receipt (backoffice.staff): matched by its thread.
         reply = self.staff.reply_to(parsed, message_id, at)
         first_document = len(report.document_ids)
-        body_part = _Part(message_id, "email_body", text=parsed.text_body) if parsed.text_body.strip() else None
         groups: list[list[_Part]] = []
         hint = f"{parsed.sender_domain or ''} {parsed.subject}"  # names the provider when the report does not
         for f in result.files:
@@ -6194,39 +6628,108 @@ class Orchestrator:
                 groups.append(file_parts)
             else:
                 report.stored_only = True
-        supplier = self.repo.supplier_for_domain(parsed.sender_domain)
-        recipients = tuple(dict.fromkeys(a.address.lower() for a in (*parsed.to, *parsed.cc) if a.address))
-        for link in parsed.invoice_links:
-            ev = self.retrieval.follow(link.url, supplier_hint=supplier.name if supplier else None, at=at,
-                                       context={"email_evidence_id": message_id})
-            if ev is None:
-                report.pending_links.append(link.url)
-                continue
-            report.evidence_ids.append(ev)
-            self._document_from_parts(self._parts_for(ev), at=at, origin="link", retrieved=True,
-                                      report=report, sender=sender, message_text=text, body=body_part,
-                                      recipients=recipients)
+        supplier = email.supplier
+        made = 0  # documents this email gave from its files and links
+        for url in email_invoice_links(parsed):
+            link = self.retrieval.follow(url, supplier=supplier, at=at, context={"email_evidence_id": message_id},
+                                         source_kind=SourceKind.EMAIL, email_evidence_id=message_id)
+            made += self._read_link(link, at=at, report=report, email=email)
         writer = _sender_line(parsed.sender)
         for file_parts in groups:
             letter = _letter_text(file_parts)
             if letter and self._read_letter(letter, file_parts[0].evidence_id, at=at, report=report, sender=writer):
                 continue
-            self._document_from_parts(file_parts, at=at, origin=origin, retrieved=False, report=report,
-                                      sender=sender, message_text=text, body=body_part, recipients=recipients)
-        if not result.files and not parsed.invoice_links and not parsed.bulk and parsed.text_body.strip():
+            made += self._document_from_parts(file_parts, at=at, origin=origin, retrieved=False, report=report,
+                                              sender=sender, message_text=text, body=body_part,
+                                              recipients=recipients) is not None
+        letter = False
+        if not result.files and not parsed.invoice_links and not parsed.bulk and body_part is not None:
             # A message with nothing attached: its own words may be the letter (a bank asking for
             # documents, an insurer's renewal notice, a confirmation that something was done).
-            self._read_letter(text, message_id, at=at, report=report, sender=writer)
+            letter = self._read_letter(text, message_id, at=at, report=report, sender=writer)
+        if not letter and not made and not _has_attachments(result):
+            # No file and no link gave a document: the invoice may be written in the email itself (B4).
+            self._body_invoice(parsed, email, at=at, origin=origin, report=report)
         for nested in result.attached_emails:
             self._process_email(nested, at=at, origin=origin, report=report)
         if reply is not None:
             self.staff.replied(reply, report.document_ids[first_document:], at)
 
+    def _email_facts(self, parsed: Any, message_id: str) -> _EmailFacts:
+        """Who sent an email, its readable words (the HTML body turned into text when it has no plain one)."""
+        sender = parsed.sender.address if parsed.sender else None
+        words = parsed.text_body if parsed.text_body.strip() else html_to_text(parsed.html_body)
+        body = _Part(message_id, "email_body", text=words) if words.strip() else None
+        recipients = tuple(dict.fromkeys(a.address.lower() for a in (*parsed.to, *parsed.cc) if a.address))
+        return _EmailFacts(message_id=message_id, sender=sender, text=f"{parsed.subject}\n{words}", body=body,
+                           recipients=recipients, supplier=self.repo.supplier_for_domain(parsed.sender_domain),
+                           parsed=parsed)
+
+    def _email_context(self, evidence_id: str) -> _EmailFacts | None:
+        """The facts of an email on file (for a link from it followed later)."""
+        try:
+            parsed = parse_eml(self.repo.registry.open(self.repo.tenant_id, evidence_id))
+        except (EmailParseError, ObjectNotFound, IntegrityError, KeyError, ValueError):
+            return None
+        return self._email_facts(parsed, evidence_id)
+
+    def _read_link(self, link: LinkRecord, *, at: datetime, report: IngestReport,
+                   email: _EmailFacts | None = None) -> int:
+        """Read what a followed link gave (§9 step 10): each file, or the page itself. Returns documents made."""
+        if link.status == "waiting":
+            report.pending_links.append(link.url)
+            return 0
+        if link.status != "retrieved":
+            return 0
+        made = 0
+        for evidence_id in link.evidence_ids:
+            report.evidence_ids.append(evidence_id)
+            parts = self._parts_for(evidence_id)
+            if not parts:
+                report.stored_only = True
+                continue
+            made += self._document_from_parts(
+                parts, at=at, origin="link", retrieved=True, report=report,
+                sender=email.sender if email else None, message_text=email.text if email else "",
+                body=email.body if email else None, recipients=email.recipients if email else (),
+                shared_link=link.shared) is not None
+        return made
+
+    def _body_invoice(self, parsed: Any, email: _EmailFacts, *, at: datetime, origin: str,
+                      report: IngestReport) -> DocumentRecord | None:
+        """An invoice or e-receipt written in the email itself, with nothing attached (B4).
+
+        Only a complete one becomes a document, with the email as its evidence: its supplier, number,
+        date and total, read by the same text readers as any document (Portuguese fiscal fields, the
+        international labels) and, when the HTML carries it, schema.org data (JSON-LD or microdata).
+        A body that merely mentions an invoice does not.
+        """
+        if email.body is None:
+            return None
+        parts: list[_Part] = []
+        if parsed.html_body:
+            html = parsed.html_body.encode("utf-8", errors="replace")
+            if _html_structured(html, email.message_id):
+                parts.append(_Part(email.message_id, "html", data=html))
+        who = email.supplier.name if email.supplier is not None else _sender_name(parsed)
+        parts.append(replace(email.body, supplier_name=who))
+        extracted = self.documents.read(parts)
+        if extracted is None or not _complete_invoice(extracted, structured=len(parts) > 1, bulk=parsed.bulk,
+                                                      known_supplier=email.supplier is not None):
+            return None
+        self.documents.log("body_invoice", subject_id=email.message_id, evidence_ids=[email.message_id],
+                           values={"parsers": list(dict.fromkeys(extracted.parsers))})
+        return self._document_from_parts(parts, at=at, origin=origin, retrieved=False, report=report,
+                                         sender=email.sender, message_text=email.text, recipients=email.recipients,
+                                         known_supplier=email.supplier)
+
     # ----------------------------------------------------------------- documents
 
     def _document_from_parts(self, parts: list[_Part], *, at: datetime, origin: str, retrieved: bool,
                              report: IngestReport, sender: str | None = None, message_text: str = "",
-                             body: _Part | None = None, recipients: tuple[str, ...] = ()) -> DocumentRecord | None:
+                             body: _Part | None = None, recipients: tuple[str, ...] = (),
+                             shared_link: bool = False, known_supplier: Supplier | None = None
+                             ) -> DocumentRecord | None:
         extracted = self.documents.read(parts)
         if extracted is None:
             report.stored_only = True
@@ -6259,7 +6762,9 @@ class Orchestrator:
             supplier = self.repo.supplier_for_tax_id(supplier_tax_id)
         else:
             supplier = self.repo.supplier_for_tax_id(values.get("supplier_tax_id"))
-        existing = self._duplicate_of(values, extracted.doc_type)
+        if supplier is None and not sales and not supplier_tax_id and known_supplier is not None:
+            supplier = known_supplier  # names no tax number: the known supplier whose address sent it
+        existing = self._duplicate_of(values, extracted.doc_type, supplier.id if supplier else None)
         if existing is not None:
             return self._merge_duplicate(existing, extracted, report)
         doc_id = "doc_" + extracted.evidence_ids[0][3:19]
@@ -6335,7 +6840,8 @@ class Orchestrator:
                           f"{kind}{number} from {source}.", company, amount=document.gross_amount,
                           currency=document.currency, evidence_ids=evidence)
         elif retrieved:
-            self.activity(at, "recovered", f"Recovered the {who} invoice from a link in your email.", company,
+            where = "the link you shared" if shared_link else "a link in your email"
+            self.activity(at, "recovered", f"Recovered the {who} invoice from {where}.", company,
                           amount=document.gross_amount, currency=document.currency, evidence_ids=evidence)
         else:
             self.activity(at, "collected", f"Collected the {who} {kind} from {source}.", company,
@@ -6361,20 +6867,28 @@ class Orchestrator:
                 report.message = f"Got it. I need one answer from you: {needs.prompt}"
         return record
 
-    def _duplicate_of(self, values: Mapping[str, Any], doc_type: DocumentType) -> DocumentRecord | None:
+    def _duplicate_of(self, values: Mapping[str, Any], doc_type: DocumentType,
+                      supplier_id: str | None = None) -> DocumentRecord | None:
         """The same document again: same supplier, same number and the same kind of document.
 
+        The supplier is its tax number; when one of the two names none (an invoice written in an email's
+        body from a known supplier), it is that known supplier (``supplier_id``).
         A different kind is never a copy (verification.duplicates): a credit note that carries
         its invoice's number, or a pro-forma numbered like the invoice, is a document of its own.
         """
         number = _text(values.get("invoice_number"))
         tax_id = _text(values.get("supplier_tax_id"))
-        if not number or not tax_id:
+        if not number or not (tax_id or supplier_id):
             return None
         for rec in self.repo.documents.values():
             doc = rec.document
-            if doc.invoice_number and _same_number(doc.invoice_number, number) and \
-                    same_tax_id(doc.supplier_tax_id, tax_id) and same_document_kind(doc.doc_type, doc_type):
+            if not (doc.invoice_number and _same_number(doc.invoice_number, number)
+                    and same_document_kind(doc.doc_type, doc_type)):
+                continue
+            if tax_id and doc.supplier_tax_id:
+                if same_tax_id(doc.supplier_tax_id, tax_id):
+                    return rec
+            elif supplier_id and rec.supplier_id == supplier_id:
                 return rec
         return None
 
@@ -6392,8 +6906,15 @@ class Orchestrator:
         assessment = self.verification.assess(record.observations, record.document.doc_type, subject_id=record.id,
                                               evidence_ids=record.evidence_ids, owner=record.owner_values,
                                               issuer=record.issuer)
+        # What the first copy did not say and the new one does (an invoice first read from an email's words,
+        # then its PDF): the gaps are filled from the checked values; nothing already known is replaced.
+        settled = _settled_values(assessment)
+        gaps = {name: value for name, read in _GAP_FIELDS
+                if getattr(record.document, name) is None and (value := read(settled.get(name))) is not None}
+        if "supplier_tax_id" in gaps and record.issuer is not None and record.issuer.is_foreign:
+            gaps["supplier_tax_id"] = qualified_tax_id(gaps["supplier_tax_id"], record.issuer.country)
         record.document = record.document.model_copy(update={"quality": assessment.quality,
-                                                             "evidence_ids": record.evidence_ids})
+                                                             "evidence_ids": record.evidence_ids, **gaps})
         record.reasons = assessment.reasons
         record.checks = assessment.verified_fields
         self.documents.log("merge_duplicate", subject_id=record.id, evidence_ids=new)
@@ -6899,7 +7420,8 @@ class Orchestrator:
         self.staged.ask(now)  # a deposit, a part payment or a deposit given back that is not proven: one question
         report.expected = self.missing.check_recurring(now)  # usual invoices that are overdue (§23)
         self.statements.review(now)  # suppliers' account statements: nothing at all without one
-        report.chased = self.missing.chase_all(now)
+        linked = self.missing.chase_broken_links(now)  # invoice links that no longer work: nothing without one
+        report.chased = [*(r for b in linked if (r := self.repo.broken_links[b].tx_id)), *self.missing.chase_all(now)]
         self.missing.chase_expected(now)
         self.staff.follow_up(now)  # receipts asked from cardholders, reminders, expense claims to approve
         self.accountant.answer_all(now)
@@ -8449,6 +8971,85 @@ def _letter_text(parts: Sequence[_Part]) -> str:
     return ""
 
 
+# --------------------------------------------------------------------------- emails, bodies and links (§8, §9)
+
+
+@dataclass(frozen=True)
+class _EmailFacts:
+    """What the agents need from one email: who sent it, its words (HTML turned into text when there is no
+    plain body), who it went to, and the supplier its sender's domain belongs to."""
+
+    message_id: str
+    sender: str | None
+    text: str  # subject and words, for letters and fraud wording checks
+    body: _Part | None
+    recipients: tuple[str, ...]
+    supplier: Supplier | None
+    parsed: Any
+
+
+def _has_attachments(result: EmailIngestResult) -> bool:
+    """A file sent with the email (an inline logo is not), or an email attached to it."""
+    return bool(result.attached_emails) or any(
+        not (f.inline and f.evidence.format in (EvidenceFormat.IMAGE, EvidenceFormat.SCREENSHOT))
+        for f in result.files)
+
+
+def _html_structured(html: bytes, source: str) -> tuple[Any, ...]:
+    """schema.org Invoice / Order data in an HTML body or page (JSON-LD or microdata); () when there is none."""
+    try:
+        return tuple(r for r in extract_html_structured(html, source=source) if r.fields)
+    except (StructuredDataError, ValueError, RecursionError):
+        return ()
+
+
+def _complete_invoice(extracted: _Extracted, *, structured: bool, bulk: bool, known_supplier: bool) -> bool:
+    """An email body is a document only when it carries the whole invoice (B4): who issued it, its number,
+    a date and its total. A body that only mentions an invoice ("attached", "available online") is not."""
+    obs = extracted.observations
+
+    def has(f: CriticalField) -> bool:
+        return bool(obs.get(f.value))
+
+    if extracted.statement is not None or extracted.doc_type in SUPPORTING_DOCUMENT_TYPES:
+        return False
+    if not (has(CriticalField.INVOICE_NUMBER) and has(CriticalField.GROSS_AMOUNT)
+            and (has(CriticalField.ISSUE_DATE) or has(CriticalField.DUE_DATE))):
+        return False
+    fiscal = extracted.qr is not None
+    if bulk and not (structured or fiscal):
+        return False  # a newsletter quoting prices is not an invoice
+    return fiscal or has(CriticalField.SUPPLIER_TAX_ID) or known_supplier or (
+        structured and bool(extracted.supplier_name))
+
+
+def _sender_name(parsed: Any) -> str | None:
+    """'Vodafone Business' from 'Vodafone Business <faturacao@vodafone.pt>', else the domain's name."""
+    from backoffice.evidence.domains import display_name_for_host
+
+    sender = parsed.sender
+    name = " ".join((getattr(sender, "name", "") or "").replace("<", " ").replace(">", " ").split())
+    if name and "@" not in name:
+        return name
+    domain = parsed.sender_domain
+    return display_name_for_host(domain) if domain else None
+
+
+def _possessive(name: str) -> str:
+    return f"{name}'" if name.endswith("s") else f"{name}'s"
+
+
+def _shared_link_message(followed: Sequence[LinkRecord]) -> str | None:
+    """The one thing the owner needs to hear about the links they shared, if anything (§12, §69)."""
+    for status, reason in (("sign_in", LinkOutcome.MFA_REQUIRED.value), ("sign_in", None), ("blocked", None)):
+        for link in followed:
+            if link.status == status and (reason is None or link.reason == reason) and link.message:
+                return link.message
+    if any(link.status == "broken" for link in followed):
+        return "Got it. This link no longer works. I'm looking for the invoice another way."
+    return None
+
+
 def _option_value(f: CriticalField, raw: Any) -> Any:
     """A value as the owner confirms it: amounts and dates typed, numbers and references as printed."""
     from backoffice.extraction.values import typed_value
@@ -8543,6 +9144,14 @@ def _dec(value: Any) -> Decimal | None:
     if isinstance(value, int) and not isinstance(value, bool):
         return Decimal(value)
     return None
+
+
+# Fields a later copy of the same document may fill when the first copy left them empty (never the IBAN:
+# bank details are checked by the fraud agent when a document is first read, never slipped in afterwards).
+_GAP_FIELDS: tuple[tuple[str, Any], ...] = (
+    ("supplier_tax_id", _text), ("issue_date", _date), ("due_date", _date),
+    ("net_amount", _dec), ("vat_amount", _dec), ("gross_amount", _dec),
+)
 
 
 def _slug(text: str) -> str:

@@ -62,6 +62,8 @@ x-production-env: &production-env
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
   # Reading PDFs and photos: PDF text and QR codes locally; a PP-OCRv6 sidecar when set.
   BACKOFFICE_DOCUMENT_READING: ${BACKOFFICE_DOCUMENT_READING:-on}
+  # Invoice links opened before each change is recorded (§9); off: they wait unopened.
+  BACKOFFICE_LINK_FETCHING: ${BACKOFFICE_LINK_FETCHING:-on}
   BACKOFFICE_OCR_URL: ${BACKOFFICE_OCR_URL:-}
   BACKOFFICE_EXTERNAL_AI: ${BACKOFFICE_EXTERNAL_AI:-off}
   BACKOFFICE_SYNC_INTERVAL: ${BACKOFFICE_SYNC_INTERVAL:-900}

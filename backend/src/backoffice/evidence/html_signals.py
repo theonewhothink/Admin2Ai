@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from html import unescape
 from html.parser import HTMLParser
 
-__all__ = ["MAX_ANCHORS", "Anchor", "HtmlSignals", "analyze_html", "normalize_space"]
+__all__ = ["MAX_ANCHORS", "Anchor", "HtmlSignals", "analyze_html", "html_to_text", "normalize_space"]
 
 _WS = re.compile(r"\s+")
 _VOID = frozenset(
@@ -284,3 +284,78 @@ def analyze_html(html: str, *, max_text: int = 200_000, max_anchors: int = MAX_A
     except Exception:  # noqa: BLE001 - malformed markup must not stop ingestion
         pass
     return collector.finish()
+
+
+# --------------------------------------------------------------------------- text of an HTML body
+
+# Elements that start a new line in what a reader sees ("Total: 12,30 €" stays on its own line).
+_BLOCK = frozenset(
+    {"address", "article", "aside", "blockquote", "br", "caption", "dd", "div", "dl", "dt", "fieldset",
+     "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "li",
+     "main", "nav", "ol", "p", "pre", "section", "table", "tbody", "tfoot", "thead", "tr", "ul"}
+)  # fmt: skip
+_CELL = frozenset({"td", "th"})
+_BLANK_LINES = re.compile(r"\n{3,}")
+_INLINE_WS = re.compile(r"[^\S\n]+")
+
+
+class _TextCollector(HTMLParser):
+    """Visible text with line breaks where the page breaks lines; scripts, styles and comments dropped."""
+
+    def __init__(self, max_chars: int) -> None:
+        super().__init__(convert_charrefs=True)
+        self._max = max_chars
+        self._out: list[str] = []
+        self._size = 0
+        self._skip = 0
+
+    def _emit(self, text: str) -> None:
+        if self._size < self._max:
+            self._out.append(text)
+            self._size += len(text)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in _SKIP_TEXT or tag in ("head", "title", "noscript"):
+            self._skip += 1
+        elif tag in _BLOCK:
+            self._emit("\n")
+        elif tag in _CELL:
+            self._emit(" ")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in _BLOCK:
+            self._emit("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if (tag in _SKIP_TEXT or tag in ("head", "title", "noscript")) and self._skip:
+            self._skip -= 1
+        elif tag in _BLOCK:
+            self._emit("\n")
+        elif tag in _CELL:
+            self._emit(" ")
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip:
+            self._emit(data)
+
+    def text(self) -> str:
+        joined = "".join(self._out)[: self._max]
+        lines = (_INLINE_WS.sub(" ", line).strip() for line in joined.split("\n"))
+        return _BLANK_LINES.sub("\n\n", "\n".join(lines)).strip()
+
+
+def html_to_text(html: str, *, max_chars: int = 200_000) -> str:
+    """The text a person reads in an HTML email or page, one line per visual line (§8).
+
+    Stdlib tokenizer only: nothing is fetched or executed, scripts, styles,
+    the head and comments are dropped, and the output is bounded. Never raises.
+    """
+    if not html:
+        return ""
+    collector = _TextCollector(max_chars)
+    try:
+        collector.feed(html)
+        collector.close()
+    except Exception:  # noqa: BLE001 - malformed markup must not stop ingestion
+        pass
+    return collector.text()

@@ -315,9 +315,12 @@ def _default_services(config: ServerConfig) -> dict[str, Any]:
 
             return GoCardlessBankAccountData(config.gocardless_secret_id, config.gocardless_secret_key,
                                              base_url=config.gocardless_api_url or GOCARDLESS_API)
+    from .links import link_fetcher_from_env
+
     return {"store": store, "objects": objects, "vault": vault, "authorizer": authorizer,
             "mailer": mailer_from_env(), "brain_factory": brain_factory, "notifier": notifier,
-            "aggregator": aggregator, "reader": reader_from_env(), "now": now}
+            "aggregator": aggregator, "reader": reader_from_env(), "link_fetcher": link_fetcher_from_env(),
+            "now": now}
 
 
 def production_services(config: ServerConfig, overrides: Mapping[str, Any]) -> dict[str, Any]:
@@ -326,13 +329,15 @@ def production_services(config: ServerConfig, overrides: Mapping[str, Any]) -> d
 
 
 def build_manager(config: ServerConfig, services: Mapping[str, Any]) -> TenantManager:
-    """The tenant manager the API and the sync worker share (same store, vault, reader, mailer, push)."""
+    """The tenant manager the API and the sync worker share (same store, vault, reader, link fetcher, mailer,
+    push)."""
     now: Callable[[], datetime] = services.get("now") or (lambda: datetime.now(timezone.utc))
     return TenantManager(
         services["store"], services["objects"], now=now, vault=services.get("vault"),
         authorizer=services.get("authorizer"), mailer=services.get("mailer"),
         brain_factory=services.get("brain_factory"), notifier=services.get("notifier"),
-        reader=services.get("reader"), cache_size=config.tenant_cache_size,
+        reader=services.get("reader"), link_fetcher=services.get("link_fetcher"),
+        cache_size=config.tenant_cache_size,
         strict_reads=bool(services.get("strict_reads", config.strict_reads)))
 
 

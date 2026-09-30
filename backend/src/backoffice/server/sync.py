@@ -16,14 +16,23 @@ backoffice.server.worker`` repeats it):
    The last batch carries the connector's new state (cursor, coverage, gaps),
    so a replay rebuilds exactly what the owner saw and the next sync continues
    where this one ended.
-4. **Failures.** A network problem or provider outage is retried with
+   A reply that points at an invoice sent earlier in its thread ("see the
+   invoice I sent on the 3rd") brings the thread's earlier messages with it,
+   fetched through the connector (Gmail threads, Microsoft conversations)
+   before the event is recorded, so the earlier attachment is read even when
+   it arrived before the history window. Invoice links in the messages are
+   opened before recording too (server/links.py).
+4. **Links that wait.** Invoice links not opened yet (the site did not
+   answer, or they arrived before links were opened) are opened again, with
+   backoff, and recorded as ``links.fetched``.
+5. **Failures.** A network problem or provider outage is retried with
    exponential backoff (respecting ``Retry-After``) and records nothing. A
    refused sign-in or an expired bank consent only the owner can fix: the
    connection is marked as needing them (``sync.failed``), which shows
    "Gmail needs reconnecting" and sends one push notification (§47–48). A
    connection that has not synced for a day despite retries is shown the same
    way; the month can never close green while it is stale.
-5. **Erasures.** Accounts erased since the last pass still have their files:
+6. **Erasures.** Accounts erased since the last pass still have their files:
    the worker removes them, in AWS as the evidence-deletion role
    (server/erasure.py), and marks each erasure record purged.
 
@@ -32,6 +41,7 @@ The worker never sends email, moves money or approves anything.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -41,7 +51,7 @@ from typing import Any
 from .runtime import ReplayDiverged, TenantManager, TenantNotFound
 from .store import StoreError, StoreUnavailable
 
-__all__ = ["BANK_MIN_INTERVAL", "PassReport", "STALE_AFTER", "SyncWorker", "transaction_row"]
+__all__ = ["BANK_MIN_INTERVAL", "LINKS_PER_PASS", "PassReport", "STALE_AFTER", "SyncWorker", "transaction_row"]
 
 log = logging.getLogger("backoffice.server.sync")
 
@@ -49,6 +59,11 @@ log = logging.getLogger("backoffice.server.sync")
 BANK_MIN_INTERVAL = timedelta(hours=6)
 # A connection that has not synced for this long, despite retries, is shown to the owner (§47).
 STALE_AFTER = timedelta(hours=24)
+LINKS_PER_PASS = 10  # waiting invoice links opened per tenant and pass
+# A link whose site did not answer is tried again after 15 minutes, then less and less often (at most every
+# 6 hours); after 3 days without an answer the engine gets the invoice another way (orchestrator).
+LINK_BACKOFF_BASE = timedelta(minutes=15)
+LINK_BACKOFF_MAX = timedelta(hours=6)
 _KINDS = {"google": "gmail", "microsoft": "microsoft", "imap": "imap", "open_banking": "open_banking"}
 
 
@@ -70,6 +85,8 @@ class PassReport:
     skipped: list[str] = field(default_factory=list)
     errors: int = 0
     erasures: list[str] = field(default_factory=list)  # erased businesses whose files were purged
+    thread_messages: int = 0  # earlier messages of a thread fetched because a reply pointed at them
+    links: int = 0  # waiting invoice links opened and settled
 
 
 @dataclass(frozen=True)
@@ -209,7 +226,33 @@ class SyncWorker:
                 report.ticks += 1
         for connection in self.manager.read(tenant_id, lambda svc: _connections(tenant_id, svc), what="sync plan"):
             self._sync(connection, report)
+        self._follow_links(tenant_id, report)
         return report
+
+    # ----------------------------------------------------------------- links that wait (§9)
+
+    def _follow_links(self, tenant_id: str, report: PassReport) -> None:
+        """Open invoice links that are waiting, with backoff per link; what came back is one event."""
+        if self.manager.link_fetcher is None:
+            return
+        now = self.now()
+        waiting = self.manager.read(tenant_id, lambda svc: svc.links_waiting(), what="links plan")
+        due = [u for u in waiting if (r := self._retry.get(f"link/{tenant_id}/{u}")) is None or r[1] <= now]
+        due = due[:LINKS_PER_PASS]
+        if not due:
+            return
+        status, body = self.manager.follow_links(tenant_id, due)
+        if status == 404:
+            raise _Gone(tenant_id)
+        still = set(body.get("waiting") or ()) if status == 200 else set(due)
+        for url in due:
+            key = f"link/{tenant_id}/{url}"
+            if url in still:
+                failures = self._retry.get(key, (0, now))[0] + 1
+                self._retry[key] = (failures, now + min(LINK_BACKOFF_MAX, LINK_BACKOFF_BASE * (2 ** (failures - 1))))
+            else:
+                self._retry.pop(key, None)
+                report.links += 1
 
     # ----------------------------------------------------------------- one connection
 
@@ -259,6 +302,7 @@ class SyncWorker:
 
     def _sync_mail(self, c: _Connection, connector: Any, state: Any, now: datetime, report: PassReport) -> Any:
         batch: list[bytes] = []
+        seen: set[str] = set()  # messages in this sync (by SHA-256): a thread's messages are sent once
 
         def flush(final_state: Any = None) -> None:
             if not batch and final_state is None:
@@ -270,6 +314,13 @@ class SyncWorker:
             batch.clear()
 
         def sink(item: Any) -> None:
+            digest = hashlib.sha256(item.raw).hexdigest()
+            if digest in seen:
+                return  # already in this sync, as the earlier message of a thread
+            seen.add(digest)
+            earlier = self._earlier_in_thread(c, connector, item, seen)
+            report.thread_messages += len(earlier)
+            batch.extend(earlier)  # the earlier message first, then the reply that points at it
             batch.append(item.raw)
             if len(batch) >= self.mail_batch:
                 flush()
@@ -277,6 +328,47 @@ class SyncWorker:
         outcome = connector.sync(state, sink, now=now)
         flush(outcome.state.model_dump(mode="json") if outcome.ok else None)  # a failure keeps what arrived
         return outcome
+
+    def _earlier_in_thread(self, c: _Connection, connector: Any, item: Any, seen: set[str]) -> list[bytes]:
+        """A reply pointing at an invoice sent earlier in its thread ("see the invoice I sent on the 3rd"):
+        the thread's earlier messages the business does not have yet, fetched through the connector now,
+        before the event is recorded (§8 "previous attachments"), even from before the history window."""
+        fetch = getattr(connector, "thread_messages", None)
+        if fetch is None or not getattr(item, "thread_id", None):
+            return []
+        from backoffice.connectors.base import ConnectorError
+        from backoffice.evidence.email import EmailParseError, parse_eml
+        from backoffice.evidence.retrieval import refers_to_earlier_invoice
+
+        try:
+            if not refers_to_earlier_invoice(parse_eml(item.raw)):
+                return []
+        except EmailParseError:
+            return []
+        try:
+            messages = fetch(item.thread_id)
+        except ConnectorError as exc:  # the reply itself still arrives; the thread is tried with the next reply
+            log.warning("thread_fetch_failed", extra={"tenant": c.tenant_id, "reason": exc.code})
+            return []
+        earlier: list[tuple[str, bytes]] = []
+        for message in messages:
+            if message.provider_id == item.provider_id or message.raw == item.raw:
+                continue
+            if item.received_at and message.received_at and message.received_at > item.received_at:
+                continue  # only what came before the reply
+            digest = hashlib.sha256(message.raw).hexdigest()
+            if digest not in seen:
+                seen.add(digest)
+                earlier.append((digest, message.raw))
+        if not earlier:
+            return []
+
+        def known(svc: Any) -> set[str]:
+            index = svc.repo.registry.index
+            return {d for d, _ in earlier if index.find_by_sha256(c.tenant_id, d) is not None}
+
+        have = self.manager.read(c.tenant_id, known, what="thread plan")
+        return [raw for digest, raw in earlier if digest not in have]
 
     def _sync_bank(self, c: _Connection, connector: Any, state: Any, now: datetime, report: PassReport) -> Any:
         batch: list[dict[str, Any]] = []

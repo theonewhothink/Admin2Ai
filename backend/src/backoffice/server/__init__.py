@@ -10,6 +10,7 @@ tenant into a multi-tenant service:
 * :mod:`.events`    the append-only, hash-chained tenant event log and state digests;
 * :mod:`.runtime`   event-sourced tenants: record, apply, replay, cache, locks, read guard;
 * :mod:`.reads`     documents read before an event is recorded; replays use the recorded reading;
+* :mod:`.links`     invoice links opened before an event is recorded; replays use what came back;
 * :mod:`.sync`      the sync worker: mailboxes and banks into events, each tenant's day;
 * :mod:`.worker`    ``python -m backoffice.server.worker``;
 * :mod:`.auth`      sign-up, sign-in, sessions, CSRF guard, roles, rate limits;

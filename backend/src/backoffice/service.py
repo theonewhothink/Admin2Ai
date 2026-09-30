@@ -916,6 +916,16 @@ class BackOfficeService:
             self.orchestrator.run()
         return {"ok": True, "rows": len(known)}
 
+    def follow_links(self, urls: Sequence[str]) -> dict[str, Any]:
+        """Invoice links that were waiting, followed again (production: opened before the event was recorded)."""
+        report = self.orchestrator.follow_waiting(list(urls))
+        return {"ok": True, "documents": list(dict.fromkeys(report.document_ids)),
+                "waiting": list(report.pending_links)}
+
+    def links_waiting(self) -> list[str]:
+        """Invoice links not opened yet, or whose site did not answer: the sync worker tries them again."""
+        return list(self.repo.pending_links)
+
     def sync_failed(self, connection_id: str, state: Mapping[str, Any], *, reconnect: bool) -> dict[str, Any]:
         """A sync failed. Only the owner can fix a refused sign-in: the connection needs reconnecting (§47–48)."""
         c = self.repo.connectors.get(connection_id)

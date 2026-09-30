@@ -45,6 +45,7 @@ __all__ = [
     "ChaseThread",
     "InboundEmail",
     "Language",
+    "LinkChaseFacts",
     "MatchMethod",
     "RecurringChaseFacts",
     "ReminderDecision",
@@ -57,6 +58,7 @@ __all__ = [
     "choose_language",
     "clean_invoice_number",
     "compose_correction_request",
+    "compose_link_request",
     "compose_recurring_request",
     "compose_reminder",
     "compose_request",
@@ -248,7 +250,7 @@ def _guard(*texts: str) -> None:
             raise ValueError("a supplier message may not contain internal identifiers")
 
 
-def _our_details(facts: ChaseFacts | RecurringChaseFacts) -> str:
+def _our_details(facts: ChaseFacts | RecurringChaseFacts | LinkChaseFacts) -> str:
     is_pt = facts.company_country.strip().upper() == "PT"
     tax_id = (normalize_tax_id(facts.company_tax_id) if is_pt else None) or facts.company_tax_id.strip()
     label = "NIF" if is_pt else ("NIF/VAT" if facts.language is Language.PT else "VAT number")
@@ -757,3 +759,60 @@ def compose_recurring_request(facts: RecurringChaseFacts, *, token: str, today: 
 def recurring_activity_line(facts: RecurringChaseFacts) -> str:
     """'Asked Vodafone for its usual invoice for October.'"""
     return f"Asked {facts.supplier_name} for its usual invoice for {_EN_MONTHS[facts.period_month - 1]}."
+
+
+# --------------------------------------------------------------------------- a link that no longer works (§9, §22)
+
+
+@dataclass(frozen=True)
+class LinkChaseFacts:
+    """The invoice link in a supplier's email no longer works and no payment names the invoice yet: the
+    request quotes only the day of that email. Nothing else (never the link) reaches the supplier."""
+
+    supplier_name: str
+    supplier_email: str
+    emailed_on: date  # the day of the supplier's email with the link
+    company_name: str
+    company_tax_id: str
+    company_country: str = "PT"
+    language: Language = Language.EN
+
+    def __post_init__(self) -> None:
+        if not _PLAIN_ADDRESS.fullmatch(self.supplier_email):
+            raise ValueError("supplier email must be one plain address")
+
+    @classmethod
+    def build(cls, supplier: Supplier, company: LegalEntity, *, emailed_on: date,
+              language: Language | None = None) -> LinkChaseFacts:
+        if not supplier.contact_email:
+            raise ValueError("the supplier has no contact email")
+        return cls(
+            supplier_name=display_name(supplier.name), supplier_email=supplier.contact_email, emailed_on=emailed_on,
+            company_name=company.name.strip(), company_tax_id=company.tax_id, company_country=company.country,
+            language=language or choose_language(supplier, supplier.contact_email),
+        )
+
+
+def compose_link_request(facts: LinkChaseFacts, *, token: str, today: date, message_id_domain: str) -> ChaseMessage:
+    """'The link to the invoice in your email of 12 September no longer works. Could you please send us the
+    invoice as an attachment?'"""
+    ours = _our_details(facts)
+    if facts.language is Language.PT:
+        when = day_month_pt(facts.emailed_on, today)
+        subject = f"Fatura do vosso email de {when}"
+        body = (
+            f"Olá,\n\nA ligação para a fatura no vosso email de {when} já não funciona. Poderiam, por favor, "
+            f"enviar-nos a fatura em anexo? Agradecemos desde já.\n\n{ours}\n\n"
+            f"Com os melhores cumprimentos,\n{facts.company_name}"
+        )
+    else:
+        when = day_month(facts.emailed_on, today)
+        subject = f"Invoice from your email of {when}"
+        body = (
+            f"Hello,\n\nThe link to the invoice in your email of {when} no longer works. Could you please send us "
+            f"the invoice as an attachment? Thank you.\n\n{ours}\n\nKind regards,\n{facts.company_name}"
+        )
+    subject = f"{subject} (Ref. {token})"
+    _guard(subject, body)
+    return ChaseMessage(to=facts.supplier_email, subject=subject, body=body, language=facts.language, token=token,
+                        message_id=_message_id(token, 0, today, message_id_domain))

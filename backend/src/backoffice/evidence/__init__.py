@@ -23,6 +23,11 @@ Links (``links``)
                                     total deadline, pinned connections, SessionCookie for stored logins
     register_fetch(result, registry, tenant_id=) -> [Registration]  original first; ZIP/.eml contents follow
     BrowserSession Protocol; PlaywrightBrowserSession (lazy, isolated worker process)
+Following links, one interface everywhere (``retrieval``)
+    LinkSource Protocol: fetch(url, supplier_name=) -> FetchResult | None (None: not opened, it waits)
+    PortalLinks(pages)              the demo's portal adapters; the server records LinkFetcher results
+    email_invoice_links(parsed)     the links of one email the engine follows (the server fetches them first)
+    refers_to_earlier_invoice(parsed)  a reply pointing at an invoice sent earlier in its thread
 Share extension (``share``)
     ShareIntake(registry, fetcher=).accept(tenant_id, SharePayload) -> ShareOutcome
     ShareIntake.ingest_file(tenant_id, bytes, ...) -> ShareOutcome   file routing for other callers
@@ -73,7 +78,7 @@ from .email import (
     parse_gmail_raw,
     score_link,
 )
-from .html_signals import Anchor, HtmlSignals, analyze_html
+from .html_signals import Anchor, HtmlSignals, analyze_html, html_to_text
 from .links import (
     BLOCKED_MESSAGE,
     BrowserDownload,
@@ -100,6 +105,7 @@ from .links import (
     register_fetch,
     sign_in_message,
 )
+from .retrieval import LinkSource, NoLinks, PortalLinks, email_invoice_links, refers_to_earlier_invoice
 from .share import GOT_IT, ShareIntake, ShareKind, ShareOutcome, SharePayload, ShareRoute, route_for
 from .sniff import Sniffed, sniff, zip_directory_shape
 from .store import (
@@ -174,16 +180,19 @@ __all__ = [
     "LinkCandidate",
     "LinkFetcher",
     "LinkOutcome",
+    "LinkSource",
     "LocalObjectStore",
     "LookalikeChecker",
     "LookalikeFinding",
     "LookalikeKind",
     "MailPart",
+    "NoLinks",
     "ObjectNotFound",
     "ObjectStore",
     "ParsedEmail",
     "PlaywrightBrowserSession",
     "PlaywrightConfig",
+    "PortalLinks",
     "ReceiptStore",
     "RedirectHop",
     "Registration",
@@ -215,6 +224,8 @@ __all__ = [
     "UrlSafetyConfig",
     "ZipLimits",
     "analyze_html",
+    "email_invoice_links",
+    "html_to_text",
     "authentication_message",
     "check_json_metadata",
     "decode_gmail_raw",
@@ -228,6 +239,7 @@ __all__ = [
     "parse_eml",
     "parse_gmail_raw",
     "parse_key",
+    "refers_to_earlier_invoice",
     "register_fetch",
     "register_members",
     "registrable_domain",

@@ -23,6 +23,7 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -259,6 +260,26 @@ class GmailConnector:
         item = self.fetch_raw(message_id)
         if item is not None:
             sink(item)
+
+    def thread_messages(self, thread_id: str) -> list[MailItem]:
+        """Every message of one thread (``threads.get``), oldest first, each as ``format=raw``.
+
+        A reply may point at an invoice sent earlier in the same thread, even before the history
+        window (§8 "previous attachments"). Drafts and chats are skipped; spam and trash unless opted in.
+        """
+        response = self._http.request("GET", f"{self.base_url}/threads/{quote(thread_id, safe='')}",
+                                      params={"format": "minimal"}, allow=(404,))
+        if response.status_code == 404:
+            return []
+        items: list[MailItem] = []
+        for message in object_list(json_object(response, "gmail"), "messages", "gmail"):
+            labels = message.get("labelIds") or []
+            if isinstance(labels, list) and not self._wanted(labels):
+                continue
+            item = self.fetch_raw(required_str(message, "id", "gmail"))
+            if item is not None:
+                items.append(item)
+        return items
 
     # ----------------------------------------------------------------- push
 

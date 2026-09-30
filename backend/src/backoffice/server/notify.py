@@ -1,10 +1,12 @@
 """Push notifications to the owner's phone, through Expo, for the few things that need them (§42).
 
-Only three things ever notify:
+Only four things ever notify:
 
 * a new hard approval: a payment on hold because the bank details changed
   or the invoice needs checking (§25, §26);
 * a connection that needs reconnecting (§47, §48);
+* a supplier's site that needs the owner to sign in (or a code) before the
+  invoice behind its link can be fetched (§9: "Supplier X needs authentication.");
 * a month that closed.
 
 Nothing else: "invoice processed" is quiet success. Messages are computed
@@ -51,6 +53,7 @@ class Facts:
     approvals: frozenset[str]
     stale: frozenset[str]
     closed: frozenset[tuple[str, str]]
+    sign_ins: frozenset[str] = frozenset()  # invoice links whose site asks the owner to sign in
 
 
 def facts(svc: Any) -> Facts:
@@ -59,6 +62,7 @@ def facts(svc: Any) -> Facts:
         approvals=frozenset(n.id for n in repo.open_needs() if n.kind == "approval"),
         stale=frozenset(c.id for c in repo.connectors.values() if not c.healthy),
         closed=frozenset(repo.closed_months),
+        sign_ins=frozenset(url for url, link in getattr(repo, "links_seen", {}).items() if link.status == "sign_in"),
     )
 
 
@@ -85,6 +89,10 @@ def messages_for(svc: Any, before: Facts, after: Facts) -> list[PushMessage]:
         if connector is not None:
             out.append(PushMessage("Connection needs you", f"{connector.name} needs reconnecting.",
                                    "/settings#connections"))
+    for url in sorted(after.sign_ins - before.sign_ins):
+        link = repo.links_seen.get(url)
+        if link is not None and link.message:
+            out.append(PushMessage("Sign-in needed", link.message, "/activity"))
     by_month: dict[str, list[str]] = {}
     for company_id, month in sorted(after.closed - before.closed):
         by_month.setdefault(month, []).append(repo.company_name(company_id) or company_id)

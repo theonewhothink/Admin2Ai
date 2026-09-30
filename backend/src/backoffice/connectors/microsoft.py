@@ -279,6 +279,27 @@ class MicrosoftMailConnector:
         response = self._http.request("GET", f"{self.base_url}/me/messages/{message_id}/$value", allow=(404,))
         return None if response.status_code == 404 else response.content
 
+    def thread_messages(self, conversation_id: str) -> list[MailItem]:
+        """Every message of one conversation, each as MIME, oldest first (drafts skipped).
+
+        A reply may point at an invoice sent earlier in the same conversation, even before the history
+        window (§8 "previous attachments").
+        """
+        escaped = conversation_id.replace("'", "''")
+        url = f"{self.base_url}/me/messages"
+        params: dict[str, Any] | None = {"$select": _SELECT, "$filter": f"conversationId eq '{escaped}'",
+                                         "$top": self.config.page_size}
+        found: list[dict[str, Any]] = []
+        for _ in range(self.config.max_pages):
+            page = self._http.get_json(url, params=params)
+            found += object_list(page, "value", "graph")
+            url, params = self._follow(page.get("@odata.nextLink")), None
+            if not url:
+                break
+        items: list[MailItem] = []
+        self._deliver_all(sorted(found, key=lambda m: str(m.get("receivedDateTime") or "")), None, items.append)
+        return items
+
     def list_attachments(self, message_id: str) -> list[GraphAttachment]:
         url = f"{self.base_url}/me/messages/{message_id}/attachments"
         found: list[GraphAttachment] = []

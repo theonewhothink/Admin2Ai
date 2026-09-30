@@ -24,8 +24,10 @@ Side effects (email, push notifications, stored secrets) happen only live:
 a replay has a vault that stores nothing and a mailer that sends nothing.
 Nothing external runs while an event applies: PDFs and photos are read (OCR,
 Claude vision) before the event is recorded and the event keeps the full
-reading (server/reads.py); the chat model's tool calls are events of their
-own; OAuth and bank calls happen in the HTTP handlers and the sync worker.
+reading (server/reads.py); invoice links are opened before the event is
+recorded and the event keeps what came back, the bytes in the object store
+(server/links.py); the chat model's tool calls are events of their own; OAuth
+and bank calls happen in the HTTP handlers and the sync worker.
 
 Reads are checked: a read that changes a tenant's state digest is logged and
 the tenant is dropped from the cache (rebuilt from its log on the next
@@ -60,6 +62,7 @@ from .events import (
     sanitize_body,
     state_digest,
 )
+from .links import INGEST_PATHS, RecordedLinks, links_in_files, links_in_share, pre_fetch
 from .reads import RecordedReader, pre_read
 from .store import IndexOp, SeqConflict, Store, StoreUnavailable
 
@@ -265,6 +268,7 @@ class TenantManager:
         brain_factory: Callable[[BackOfficeService], Any] | None = None,
         notifier: Any = None,
         reader: Any = None,
+        link_fetcher: Any = None,
         cache_size: int = 200,
         strict_reads: bool = False,
     ) -> None:
@@ -279,6 +283,9 @@ class TenantManager:
         # The live document reader (backoffice.reading.reader_from_env). It only ever runs before an
         # event is recorded (server/reads.py); applies read through the recorded outcomes.
         self.reader = reader
+        # The live link fetcher (backoffice.evidence.links.LinkFetcher). Like the reader it only ever runs
+        # before an event is recorded (server/links.py); applies follow links through the recorded results.
+        self.link_fetcher = link_fetcher
         self.cache_size = cache_size
         # Reads must never change a tenant. In tests a read that does raises; in production it is
         # logged and the tenant is rebuilt from its log on the next request.
@@ -534,6 +541,9 @@ class TenantManager:
         # the outcomes recorded in the event (server/reads.py).
         facts = event.data.get("env") if isinstance(event.data.get("env"), Mapping) else {}
         svc.repo.reader = RecordedReader.from_event(event.data.get("reads")) if facts.get("reader") else None
+        # Links are never opened while an event applies: live and on replay, the engine follows them through
+        # what was fetched before the event was recorded (server/links.py); anything else waits.
+        svc.repo.links = RecordedLinks(event.data.get("links"), lambda ref: self.get_file(rt.tenant_id, ref, env))
         clock = svc.repo.clock
         with deterministic(f"{rt.tenant_id}:{event.seq}", clock.now):
             clock.advance_to(event.at)
@@ -685,10 +695,49 @@ class TenantManager:
                 index.append(IndexOp("remove_api_key", revoke.group(1)))
             data: dict[str, Any] = {"method": method, "path": path, "body": clean,
                                     "env": self._facts(authorize=authorize is not None)}
-            reads = pre_read(rt.service, self.reader, _uploads(clean, env))
+            uploads = _uploads(clean, env)
+            if method == "POST" and path in INGEST_PATHS:
+                # Links in what arrives (a shared link, an email's invoice links) are opened now, before the
+                # event: the event keeps what came back, and applying it never opens anything.
+                urls = [*links_in_files(tenant_id, uploads), *(links_in_share(body) if path == "/api/share" else [])]
+                links, fetched = self._fetch_links(rt, urls, env)
+                if links:
+                    data["links"] = links
+                uploads += fetched
+            reads = pre_read(rt.service, self.reader, uploads)
             if reads:
                 data["reads"] = reads
             return self.record(rt, "request", data, actor, env, index=index)
+
+    def _fetch_links(self, rt: TenantRuntime, urls: Sequence[str], env: Env
+                     ) -> tuple[dict[str, Any], list[tuple[bytes, str | None, str | None]]]:
+        """Open links with the live fetcher before an event is recorded (server/links.py). A link the tenant
+        already followed to the end (retrieved, refused as unsafe, no longer working) is not opened again."""
+        if self.link_fetcher is None or not urls:
+            return {}, []
+        seen = rt.service.repo.links_seen
+
+        def settled(url: str) -> bool:
+            record = seen.get(url)
+            return record is not None and record.status in ("retrieved", "blocked", "broken")
+
+        return pre_fetch(self.link_fetcher, urls, lambda data: self.put_file(rt.tenant_id, data, env), skip=settled)
+
+    def follow_links(self, tenant_id: str, urls: Sequence[str]) -> tuple[int, dict[str, Any]]:
+        """Open links that are waiting (never opened, or the site did not answer) and record what came back
+        as one event (``links.fetched``); the engine then reads them like any link (the sync worker's job)."""
+        with self.open(tenant_id) as rt:
+            pending = set(rt.service.repo.pending_links)
+            waiting = [u for u in dict.fromkeys(urls) if u in pending]
+            env = self.live_env()
+            links, fetched = self._fetch_links(rt, waiting, env)
+            if not links:
+                return 200, {"ok": True, "documents": [], "waiting": waiting}
+            data: dict[str, Any] = {"urls": list(links), "links": links, "env": self._facts()}
+            reads = pre_read(rt.service, self.reader, fetched)
+            if reads:
+                data["reads"] = reads
+            return self.record(rt, "links.fetched", data, "system:links", env)
 
     def _authorize_url(self, rt: TenantRuntime, path: str, body: Mapping[str, Any]) -> str | None:
         """The Google/Microsoft consent URL, obtained before the event is recorded: for a new mailbox
@@ -786,7 +835,12 @@ class TenantManager:
             refs = [self.put_file(tenant_id, raw, env) for raw in messages]
             data: dict[str, Any] = {"connectionId": connection_id, "messages": [{OBJECT: ref} for ref in refs],
                                     "state": dict(state) if state is not None else None, "env": self._facts()}
-            reads = pre_read(rt.service, self.reader, [(raw, "message.eml", "message/rfc822") for raw in messages])
+            files: list[tuple[bytes, str | None, str | None]] = [(raw, "message.eml", "message/rfc822")
+                                                                  for raw in messages]
+            links, fetched = self._fetch_links(rt, links_in_files(tenant_id, files), env)  # §9: before the event
+            if links:
+                data["links"] = links
+            reads = pre_read(rt.service, self.reader, [*files, *fetched])
             if reads:
                 data["reads"] = reads
             return self.record(rt, "sync.mail", data, "system:sync", env)
@@ -962,6 +1016,11 @@ def _sync_failed(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) ->
                                        reconnect=bool(d.get("reconnect")))
 
 
+def _links_fetched(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
+    """Waiting links, opened before this event was recorded: read through the recording (never opened here)."""
+    return 200, rt.service.follow_links([str(u) for u in event.data.get("urls") or []])
+
+
 def _tick(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
     rt.service.orchestrator.run()
     return 200, {"ok": True}
@@ -990,6 +1049,7 @@ _HANDLERS: dict[str, Handler] = {
     "sync.mail": _sync_mail,
     "sync.bank": _sync_bank,
     "sync.failed": _sync_failed,
+    "links.fetched": _links_fetched,
     "tick": _tick,
     "outbox.send": _outbox_send,
     "void": _void,
