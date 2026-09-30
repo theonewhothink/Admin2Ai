@@ -470,6 +470,13 @@ class ObligationKind(str, Enum):
     DEBT_COLLECTION = "debt_collection"
     BANK_REQUEST = "bank_request"
     PAYMENT_DEADLINE = "payment_deadline"
+    # Municipal tourist tax (taxa turística): the monthly payment to the municipality, or its declaration.
+    TOURIST_TAX = "tourist_tax"
+    TOURIST_TAX_DECLARATION = "tourist_tax_declaration"
+    # Grants and subsidies (IFAP, PEPAC, Portugal 2030 ...): documents to send by a deadline, and a grant
+    # payment announced (approved or made) that is to arrive in the bank.
+    GRANT_DOCUMENTS = "grant_documents"
+    GRANT_PAYMENT = "grant_payment"
 
 
 class Obligation(BaseModel):

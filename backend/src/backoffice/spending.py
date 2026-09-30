@@ -26,8 +26,24 @@ own accounts or companies is *not* spending, and neither is paying off a card
 
 **Spending** is money out that is a real cost: supplier purchases, taxes, bank
 fees, salaries and loan instalments. Answers name taxes and bank fees
-separately and say what was left out. Totals are in euros; a payment in
-another currency is left out of a total and mentioned.
+separately and say what was left out. Totals are in euros.
+
+**Other currencies** (checklist I11): a card payment in dollars or pounds that the bank charged in euros
+(its line says "USD 125,00 TAXA 0,9215") is counted at the euros actually charged, never at a guessed
+rate, and answers say which payments were converted (``Line.original_amount``). A payment booked in
+another currency (a US dollar account) has no euro amount: it is never in a euro total; answers list it
+separately, in its own currency, money in included (a customer paying in dollars into a dollar account).
+
+**Grants and subsidies** (checklist X30): money in from IFAP, PEPAC, Portugal 2030 ... is kind ``grant``:
+money in, named apart, never a sale. The municipal tourist tax (X26) is a tax paid to the municipality.
+
+**Disputed card payments** (checklist I7): money a card network takes back when a customer disputes a
+card payment (kind ``chargeback``), and money won back (kind ``chargeback_won``), are neither a cost nor
+income: left out of both, and said.
+
+**Security deposits** (checklist X9): a refundable security deposit a customer paid is theirs, held for
+them (kind ``deposit_held``): never income, left out and said. What goes back is left out like any deposit
+given back; a part kept becomes income only once an invoice for it or the owner's confirmation says so.
 
 **Recharged costs and client money** (backoffice.recharges): the part of a payment bought for a client
 to pay back (a reimbursable cost, a disbursement, media bought for them, a pass-through licence) is not
@@ -75,7 +91,13 @@ from typing import TYPE_CHECKING, Any
 
 from backoffice.domain.models import DocumentType, Transaction, TransactionKind
 from backoffice.learning import RuleSubject, counterparty_key, day_month, display_name, fold, format_money
-from backoffice.reconciliation import EvidenceExpectation, ExpectedEvidenceEngine, payout_provider, provider_named
+from backoffice.reconciliation import (
+    EvidenceExpectation,
+    ExpectedEvidenceEngine,
+    fx_from_text,
+    payout_provider,
+    provider_named,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from backoffice.service import BackOfficeService
@@ -176,9 +198,11 @@ _KIND: dict[EvidenceExpectation, str] = {
 _KIND_CATEGORY = {"tax": "tax", "bank_fee": "bank_fees", "payroll": "payroll", "loan": "loan",
                   "platform_fee": "platform_fees"}
 COST_KINDS = frozenset({"cost", "tax", "bank_fee", "payroll", "loan", "platform_fee"})
-IN_KINDS = frozenset({"income", "refund", "interest", "tax_refund", "sales", "deposit"})
+IN_KINDS = frozenset({"income", "refund", "interest", "tax_refund", "sales", "deposit", "grant"})
 NOT_SPENDING = frozenset({"transfer", "card_repayment", "reimbursement"})
 GIVEN_BACK = frozenset({"deposit_returned", "deposit_refund"})  # a deposit and the money that gave it back
+DISPUTED = frozenset({"chargeback", "chargeback_won"})  # a disputed card payment taken back, or won back (I7)
+HELD_FOR = frozenset({"deposit_held"})  # a security deposit held for a customer (X9)
 _ZERO = Decimal(0)
 _PURCHASE_DOCS = frozenset({DocumentType.INVOICE, DocumentType.INVOICE_RECEIPT, DocumentType.SIMPLIFIED_INVOICE,
                             DocumentType.RECEIPT, DocumentType.DEBIT_NOTE, DocumentType.CREDIT_NOTE})
@@ -239,10 +263,17 @@ class Line:
     # ("waiting" | "approved" | "paid"); a reimbursement: who was paid back.
     employee: str = ""
     claim_status: str = ""
+    # A payment in another currency the bank charged (or paid in) in euros: what it was in that currency (I11).
+    original_amount: Decimal | None = None
+    original_currency: str = ""
 
     @property
     def category_label(self) -> str:
         return category_label(self.category)
+
+    @property
+    def converted(self) -> bool:
+        return self.original_amount is not None and bool(self.original_currency)
 
 
 @dataclass
@@ -275,6 +306,17 @@ class Money:
     given_back: list[Line] = field(default_factory=list)
     # Staff expense claims waiting for the owner's OK (not counted yet).
     claims_waiting: list[Line] = field(default_factory=list)
+    # Disputed card payments taken back or won back (I7), and security deposits held for customers (X9): never
+    # counted, always said.
+    disputed: list[Line] = field(default_factory=list)
+    held_for: list[Line] = field(default_factory=list)
+    # Payments with no euro amount (booked in another currency): never in a euro total, listed apart (I11).
+    other_currency_lines: list[Line] = field(default_factory=list)
+
+    @property
+    def converted(self) -> list[Line]:
+        """Counted payments in another currency, at the euros the bank actually charged (or paid in)."""
+        return [x for x in self.lines if x.converted]
 
     @property
     def count(self) -> int:
@@ -401,6 +443,9 @@ class Ledger:
             if dep is None or dep.direction != "in" or x.direction != "in":
                 out.append(x)
                 continue
+            if getattr(dep, "security", False):
+                out += self._security_parts(x, dep)
+                continue
             waiting = dep.status == "held" and dep.advance_document_id is None  # not on any invoice yet
             kept = replace(x, kind="deposit" if waiting else "income", category="deposit" if waiting else x.category)
             if dep.returned <= 0:
@@ -411,6 +456,25 @@ class Ledger:
             if dep.available > 0:
                 out.append(replace(kept, amount=dep.available))
         return out
+
+    @staticmethod
+    def _security_parts(x: Line, dep: Any) -> list[Line]:
+        """A security deposit (X9): what is still held for the customer (never income), what went back (neither
+        income nor a cost), and what was kept, as income, once an invoice or the owner's OK says so."""
+        parts: list[Line] = []
+        if dep.returned > 0:
+            parts.append(replace(x, id=f"{x.id}:given_back", amount=dep.returned, kind="deposit_returned",
+                                 category="deposit_returned", needs_document=False))
+        rest = dep.amount - dep.returned
+        if rest > 0:
+            kept = dep.status in ("applied", "kept")
+            parts.append(replace(x, id=f"{x.id}:kept" if kept else f"{x.id}:held", amount=rest,
+                                 kind="income" if kept else "deposit_held",
+                                 category="income" if kept else "deposit_held", needs_document=False,
+                                 description="Kept from a security deposit" if kept else "Security deposit held"))
+        if parts:  # the whole payment keeps its own id on one of its parts (so it is still found)
+            parts[-1] = replace(parts[-1], id=x.id)
+        return parts
 
     def _cash_line(self, record: Any) -> Line | None:
         """A purchase paid in cash: its receipt is its only evidence (§11). Counted once the receipt
@@ -505,6 +569,10 @@ class Ledger:
             kind = "cost"  # "the bank statement is enough" taught for something that is not a bank charge
         if tx.amount > 0:
             kind = {"bank_fee": "interest", "tax": "tax_refund", "cost": "income"}.get(kind, kind)
+        if decision.rule == "grant" and tx.amount > 0:
+            kind = "grant"  # a grant or subsidy: money in, never a sale (X30)
+        elif decision.rule in DISPUTED:
+            kind = decision.rule  # a disputed card payment: neither a cost nor income (I7)
         claims = list(getattr(rec, "claim_ids", None) or []) if rec is not None else []
         if claims:
             kind = "reimbursement"  # pays an employee back: the receipts they paid are the cost (counted once)
@@ -524,8 +592,18 @@ class Ledger:
                 status = "settled"
             else:
                 status = "report_does_not_add_up" if settlement.problem == "does_not_add_up" else "report_disagrees"
+        elif kind == "tax" and decision.rule == "tourist_tax":
+            merchant = "Tourist tax"  # paid to the municipality (X26)
         elif kind == "tax":
             merchant = "Social Security" if re.search(r"\bseg(?:uranca)? social\b|\bigfss\b", folded) else "Tax office"
+        elif kind == "grant":
+            from backoffice.closure.obligations import grant_agency
+
+            merchant = grant_agency(f"{tx.counterparty} {tx.description}") or display_name(tx.counterparty)
+        elif kind in DISPUTED:
+            chargebacks = getattr(repo, "chargebacks", {})
+            cb = chargebacks.get(tx.id)
+            merchant = cb.provider if cb is not None and cb.provider else display_name(tx.counterparty)
         elif kind == "transfer" and own:
             merchant = own
         elif kind in ("bank_fee", "interest") and repo.accounts.get(tx.account_id) is not None:
@@ -550,6 +628,8 @@ class Ledger:
         category = self._category(tx, kind, supplier, match.key, rec, folded,
                                   repo.accountant_ids_for(rule_company), rule_company)
         docs = tuple(rec.document_ids) if rec is not None else ()
+        # Charged (or paid in) in euros for an amount in another currency: the bank's conversion line (I11).
+        fx = fx_from_text(f"{tx.counterparty} {tx.description}", tx.currency) if tx.currency == CURRENCY else None
         employee = ""
         if claims:
             first = repo.expense_claims.get(claims[0])
@@ -565,6 +645,8 @@ class Ledger:
             needs_document=bool(decision.requires_document) and (kind in COST_KINDS or kind == "payout"),
             has_document=bool(docs or (rec is not None and rec.proof_evidence_ids)),
             description=tx.description, provider=provider, status=status,
+            original_amount=fx.original_amount if fx is not None else None,
+            original_currency=fx.original_currency if fx is not None else "",
         )
 
     def _history_company(self, tx: Transaction) -> str | None:
@@ -580,7 +662,7 @@ class Ledger:
     def _category(self, tx: Transaction, kind: str, supplier: Any, key: str, rec: Any, folded: str,
                   accountant_ids: list[str], company: str | None = None) -> str:
         repo = self.repo
-        if kind in ("transfer", "card_repayment", "payout", "reimbursement") or kind in IN_KINDS:
+        if kind in ("transfer", "card_repayment", "payout", "reimbursement") or kind in IN_KINDS or kind in DISPUTED:
             return kind
         try:
             taught = repo.rulebook.evaluate(RuleSubject.from_transaction(tx, key=key, entity_id=company),
@@ -688,10 +770,18 @@ class Ledger:
         clients: list[Line] = []
         given_back: list[Line] = []
         claims_waiting: list[Line] = []
+        disputed: list[Line] = []
+        held_for: list[Line] = []
+        foreign: list[Line] = []
         private = other_currency = 0
         for x in base:
             if x.private:
                 private += 1
+                continue
+            if x.kind in DISPUTED or x.kind in HELD_FOR:
+                # A disputed card payment taken back or won back, a security deposit held: never counted.
+                if not company_ids or x.company_id in company_ids:
+                    (disputed if x.kind in DISPUTED else held_for).append(x)
                 continue
             if x.kind in GIVEN_BACK:
                 # A deposit that went back, and the money that gave it back: neither income nor a cost.
@@ -727,7 +817,8 @@ class Ledger:
                     pending.append(x)
                 continue
             if x.currency != CURRENCY:
-                other_currency += 1
+                other_currency += 1  # no euro amount: listed apart, in its own currency (I11)
+                foreign.append(x)
                 continue
             counted.append(x)
         total = sum((x.amount for x in counted), Decimal(0))
@@ -742,7 +833,8 @@ class Ledger:
                        history_months=self._history_months(counted), waiting_payouts=waiting,
                        recharged=[x for x in clients if x.kind == "recharge"],
                        paid_back=[x for x in clients if x.kind != "recharge"], given_back=given_back,
-                       claims_waiting=claims_waiting)
+                       claims_waiting=claims_waiting, disputed=disputed, held_for=held_for,
+                       other_currency_lines=foreign)
         if compare is not None:
             p_start, p_end, p_label = compare
             result.previous = self.money(p_start, p_end, direction=direction, company_ids=company_ids,
@@ -853,6 +945,8 @@ class Ledger:
             invoice = "matched"  # read from the payout report that matched the bank
         elif x.kind == "deposit":
             invoice = "matched" if x.has_document else "missing"  # your invoice for the work will take it off
+        elif x.kind == "grant":
+            invoice = "proof" if x.has_document else "missing"  # the grant letter, never an invoice (X30)
         elif not x.needs_document:
             invoice = "not needed"
         elif x.kind == "tax":

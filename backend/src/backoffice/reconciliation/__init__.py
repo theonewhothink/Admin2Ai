@@ -90,7 +90,7 @@ from .expected import (
     InMemoryExpectationOverrides,
     LearnedExpectation,
 )
-from .fx import EcbConfig, EcbFxRates, FxRateSource, FxRateUnavailable, StaticFxRates
+from .fx import DatedFxRates, EcbConfig, EcbFxRates, FxRateSource, FxRateUnavailable, StaticFxRates
 from .payouts import (
     CARD_TERMINAL,
     PAYOUT_PROVIDERS,
@@ -157,6 +157,7 @@ __all__ = [
     "BankMetadata",
     "Cadence",
     "CandidateScore",
+    "DatedFxRates",
     "EcbConfig",
     "EcbFxRates",
     "EvidenceExpectation",

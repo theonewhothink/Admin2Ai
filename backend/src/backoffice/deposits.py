@@ -17,6 +17,9 @@ customer or supplier, a reference), or when the owner confirms it with one tap (
   customer ("Retenção de garantia (5%): 500,00 €", "Retention 5%: €500.00, released on 30/06/2027").
   Withholding tax ("retenção na fonte", IRS) is never taken for an amount held back.
 * :func:`customer_name`: the customer printed on the business's own invoice ("Cliente: ...").
+* :func:`security_deposit_wording`: a refundable security deposit ("CAUÇÃO", "SECURITY DEPOSIT", "DEPÓSITO DE
+  GARANTIA", "DAMAGE DEPOSIT") a customer pays and gets back (checklist X9): money held for them, never
+  income for the work. :func:`mentions_security_deposit` finds it named on an invoice ("a deduzir da caução").
 
 The wording tables are conventions (unverified against live feeds): extend them as data is seen.
 Pure Python (runs in the browser build too).
@@ -35,12 +38,15 @@ __all__ = [
     "Deduction",
     "DepositWords",
     "HeldBack",
+    "SecurityWords",
     "Terms",
     "customer_name",
     "deposit_wording",
     "is_advance_invoice",
+    "mentions_security_deposit",
     "read_terms",
     "says_held_back",
+    "security_deposit_wording",
 ]
 
 _ZERO = Decimal("0")
@@ -56,6 +62,14 @@ _DEPOSIT = re.compile(
 _DEPOSIT_OUT = re.compile(
     r"(?<![a-z])(?:sinal|adiantamentos?|adiant|deposit|deposits|down\s*payment|advance\s+payment|prepayment"
     r"|pre-payment|pagamento\s+antecipado|pago\s+antecipadamente)(?![a-z])")
+# A refundable security deposit (checklist X9): the customer's money, held until it goes back (car rental,
+# equipment hire, a flat let for the holidays). Never a deposit for the work.
+_SECURITY = re.compile(
+    r"(?<![a-z])(?:caucao|caucoes|caucionamento|security\s+deposits?|damage\s+deposits?|refundable\s+deposits?"
+    r"|deposito\s+(?:de\s+)?(?:garantia|caucao)|depositos\s+de\s+garantia|garantia\s+(?:de\s+)?aluguer)(?![a-z])")
+# Money out that says it gives such a deposit back.
+_GIVING_BACK = re.compile(r"(?<![a-z])(?:devolucao|devol|devolvida|devolvido|restituicao|reembolso|return|returned"
+                          r"|refund|refunded)(?![a-z])")
 # Money the owner put in the bank themselves: never a customer's deposit.
 _CASH_IN = re.compile(r"(?<![a-z])(?:numerario|cash\s+deposit|atm|deposito\s+(?:em\s+)?(?:numerario|dinheiro|cheque))"
                       r"(?![a-z])")
@@ -199,6 +213,33 @@ def deposit_wording(*texts: str | None, outgoing: bool = False) -> DepositWords 
     if not said and reference is None:
         return None
     return DepositWords(reference=reference, said=said)
+
+
+@dataclass(frozen=True)
+class SecurityWords:
+    """A bank line about a refundable security deposit, in plain words."""
+
+    giving_back: bool  # it says it gives such a deposit back ("DEVOLUCAO CAUCAO")
+
+    @property
+    def why(self) -> str:
+        if self.giving_back:
+            return "The bank line says it gives a security deposit back."
+        return "The bank line says it is a security deposit."
+
+
+def security_deposit_wording(*texts: str | None) -> SecurityWords | None:
+    """A refundable security deposit ("CAUCAO VIATURA AA-12-BB", "SECURITY DEPOSIT APT 3"), or None."""
+    folded = fold(" ".join(t for t in texts if t))
+    if not folded.strip() or not _SECURITY.search(folded):
+        return None
+    return SecurityWords(giving_back=bool(_GIVING_BACK.search(folded)))
+
+
+def mentions_security_deposit(text: str | None) -> bool:
+    """A document that names a security deposit ("Valor retido da caução: 50,00 €", "Deducted from the security
+    deposit")."""
+    return bool(_SECURITY.search(fold(text or "")))
 
 
 def says_held_back(*texts: str | None) -> bool:

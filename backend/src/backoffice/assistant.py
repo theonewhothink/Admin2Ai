@@ -1040,12 +1040,12 @@ class RuleBrain:
                 parts.append(f"I left out {self._m(cards)} paying off cards: their purchases are counted one by one.")
         parts += self._recharge_lines(m)
         parts += self._given_back_lines(m)
+        parts += self._disputed_lines(m)
         parts += self._staff_claim_lines(m)
         parts += self._pending_lines(m, s)
         if m.private_count:
             parts.append(f"I left out {count_phrase(m.private_count, 'payment')} you marked as not for your companies.")
-        if m.other_currency:
-            parts.append(f"I left out {count_phrase(m.other_currency, 'payment')} in other currencies.")
+        parts += self._currency_lines(m)
         if m.previous is not None and s.compare:
             parts.append(self._comparison(m))
         if s.average and m.lines:
@@ -1157,14 +1157,18 @@ class RuleBrain:
             parts.append(f"{head}, across {m.count} payments: {join_and(rows[:3])}." if m.count > 1 else
                          f"{head}: {m.lines[0].merchant} on {self._day(m.lines[0].on)}.")
             parts += self._deposit_lines(m)
+            parts += self._grant_lines(m)
             parts += self._sales_lines(m)
             if moved:
                 parts.append(f"I left out {self._m(sum((x.amount for x in moved), Decimal(0)))} moved between your "
                              "own accounts and companies.")
         parts += self._paid_back_lines(m)
         parts += self._given_back_lines(m)
+        parts += self._held_for_lines(m)
+        parts += self._disputed_lines(m)
         parts += self._held_back_lines(m, u.slots.company_ids)
         parts += self._waiting_payout_lines(m)
+        parts += self._currency_lines(m)
         if m.previous is not None and u.slots.compare:
             parts.append(self._comparison(m))
         parts += self._coverage_notes(m, p)
@@ -1187,8 +1191,14 @@ class RuleBrain:
         return out[:3]
 
     def _deposit_lines(self, m: Money) -> list[str]:
-        """Deposits not invoiced yet are money in, but not yet income for the work (checklist X8)."""
+        """Deposits not invoiced yet are money in, but not yet income for the work (checklist X8); the part of a
+        security deposit kept, with an invoice or the owner's OK, is income (X9)."""
         held = m.by_kind.get("deposit", Decimal(0))
+        kept = [x for x in m.lines if x.description == "Kept from a security deposit"]
+        if kept and not held:
+            total = self._m(sum((x.amount for x in kept), Decimal(0)))
+            what = "a security deposit" if len(kept) == 1 else "security deposits"
+            return [f"That includes {total} kept from {what}."]
         if not held:
             return []
         if held == m.total:
@@ -1196,6 +1206,98 @@ class RuleBrain:
             return ["All of it is deposits for work not invoiced yet." if several else
                     "It is a deposit for work not invoiced yet."]
         return [f"That includes {self._m(held)} in deposits for work not invoiced yet."]
+
+    def _grant_lines(self, m: Money) -> list[str]:
+        """'That includes €4,500.00 in grants and subsidies (IFAP), not sales.' (checklist X30)."""
+        grants = [x for x in m.lines if x.kind == "grant"]
+        if not grants:
+            return []
+        total = sum((x.amount for x in grants), Decimal(0))
+        who = join_and(list(dict.fromkeys(x.merchant for x in grants)))
+        if total == m.total:
+            return [f"It is {'a grant or subsidy' if len(grants) == 1 else 'grants and subsidies'} ({who}), not "
+                    f"{'a sale' if len(grants) == 1 else 'sales'}."]
+        return [f"That includes {self._m(total)} in grants and subsidies ({who}), not sales."]
+
+    def _held_for_lines(self, m: Money) -> list[str]:
+        """'I left out the €300.00 security deposit from João Lima: it is held for them, not income.' (X9)."""
+        if not m.held_for:
+            return []
+        if len(m.held_for) == 1:
+            x = m.held_for[0]
+            return [f"I left out the {self._m(x.amount)} security deposit from {x.merchant}: it is held for them, "
+                    "not income."]
+        total = self._m(sum((x.amount for x in m.held_for), Decimal(0)))
+        return [f"I left out {total} in security deposits held for customers: they are not income."]
+
+    def _disputed_lines(self, m: Money) -> list[str]:
+        """Disputed card payments taken back or won back (I7): neither a cost nor income, and said."""
+        taken = [x for x in m.disputed if x.kind == "chargeback"]
+        won = [x for x in m.disputed if x.kind == "chargeback_won"]
+        out = []
+        if taken and m.direction == "out":
+            if len(taken) == 1:
+                x = taken[0]
+                out.append(f"I left out the {self._m(x.amount)} {x.merchant} took back on {self._day(x.on)} for a "
+                           "disputed card payment: it is not a cost.")
+            else:
+                total = self._m(sum((x.amount for x in taken), Decimal(0)))
+                out.append(f"I left out {total} taken back for {len(taken)} disputed card payments: they are not "
+                           "costs.")
+        if won and m.direction == "in":
+            if len(won) == 1:
+                x = won[0]
+                out.append(f"I left out the {self._m(x.amount)} that came back on {self._day(x.on)} for a disputed "
+                           "card payment you won: it is not new income.")
+            else:
+                total = self._m(sum((x.amount for x in won), Decimal(0)))
+                out.append(f"I left out {total} that came back for {len(won)} disputed card payments you won: it is "
+                           "not new income.")
+        return out
+
+    def _currency_lines(self, m: Money) -> list[str]:
+        """Payments in another currency (I11): counted at the euros the bank actually charged (or paid in), and
+        said; those with no euro amount listed apart, in their own currency, never in a euro total."""
+        from backoffice.fraud.engine import CURRENCY_NAMES
+
+        out = []
+        moved = "charged" if m.direction == "out" else "paid in"
+        converted = m.converted
+        if len(converted) == 1:
+            x = converted[0]
+            original = format_money(x.original_amount or Decimal(0), x.original_currency)
+            out.append(f"The {x.merchant} payment on {self._day(x.on)} was {original}: I counted the "
+                       f"{self._m(x.amount)} your bank {moved} in euros.")
+        elif converted:
+            each = [f"{x.merchant} {format_money(x.original_amount or Decimal(0), x.original_currency)} "
+                    f"({self._m(x.amount)})" for x in sorted(converted, key=lambda x: (x.on, x.id))]
+            more = f" and {len(each) - 4} more" if len(each) > 4 else ""
+            out.append(f"{len(converted)} payments were in other currencies: I counted what your bank {moved} in "
+                       f"euros, {', '.join(each[:4]) if more else join_and(each)}{more}.")
+        foreign = m.other_currency_lines
+        if not foreign:
+            return out
+        if len(foreign) == 1:
+            x = foreign[0]
+            money = format_money(x.amount, x.currency)
+            name = CURRENCY_NAMES.get(x.currency, x.currency)
+            if m.direction == "in":
+                out.append(f"Also received in {name}, not in the euro total: {money} from {x.merchant} on "
+                           f"{self._day(x.on)}.")
+            else:
+                out.append(f"Not in the euro total: {money} to {x.merchant} on {self._day(x.on)}, paid in {name} "
+                           "with no euro amount.")
+            return out
+        totals: dict[str, list[Decimal]] = {}
+        for x in foreign:
+            totals.setdefault(x.currency, []).append(x.amount)
+        each = [f"{format_money(sum(v, Decimal(0)), cur)} in {count_phrase(len(v), 'payment')}"
+                for cur, v in sorted(totals.items())]
+        if m.direction == "in":
+            out.append(f"Also received in other currencies, not in the euro total: {join_and(each)}.")
+        else:
+            out.append(f"Not in the euro total, paid in other currencies with no euro amount: {join_and(each)}.")
+        return out
 
     def _given_back_lines(self, m: Money) -> list[str]:
         """'I left out the €1,000.00 deposit from Maria Silva: it went back to them.' (never income, never a cost)."""
@@ -1402,9 +1504,13 @@ class RuleBrain:
             notes.append(f"Includes {self._m(m.by_kind['platform_fee'])} in payment and platform fees.")
         if m.direction == "in":
             notes += self._deposit_lines(m)
+            notes += self._grant_lines(m)
             notes += self._sales_lines(m)
             notes += self._waiting_payout_lines(m)
+            notes += self._held_for_lines(m)
         notes += self._given_back_lines(m)
+        notes += self._disputed_lines(m)
+        notes += self._currency_lines(m)
         moved = sum((x.amount for x in m.left_out if x.kind != "reimbursement"), Decimal(0))
         if moved:
             notes.append(f"Left out {self._m(moved)} moved between your own accounts and companies.")
@@ -1453,7 +1559,7 @@ class RuleBrain:
                  "loan": "loan_repayments", "income": "customer_payments", "refund": "refunds",
                  "interest": "bank_interest", "tax_refund": "tax_refunds",
                  "sales": "sales_through_card_terminals_and_platforms", "platform_fee": "payment_and_platform_fees",
-                 "deposit": "deposits_for_work_not_invoiced_yet"}
+                 "deposit": "deposits_for_work_not_invoiced_yet", "grant": "grants_and_subsidies"}
         out: dict[str, Any] = {
             "period": {"from": p.start.isoformat(), "to": p.end.isoformat(), "label": p.label},
             "records_cover": {"from": first.isoformat(), "to": last.isoformat()},
@@ -1475,6 +1581,20 @@ class RuleBrain:
         }
         if m.given_back:  # a deposit that went back when a booking was cancelled: neither income nor a cost (X8)
             out["left_out"]["deposits_given_back_eur"] = float(sum((x.amount for x in m.given_back), Decimal(0)))
+        if m.held_for:  # security deposits held for customers: theirs, not income (X9)
+            out["left_out"]["security_deposits_held_for_customers_eur"] = float(
+                sum((x.amount for x in m.held_for), Decimal(0)))
+        if m.disputed:  # disputed card payments taken back or won back: neither a cost nor income (I7)
+            out["left_out"]["disputed_card_payments_eur"] = float(sum((x.amount for x in m.disputed), Decimal(0)))
+        if m.converted:  # in another currency, counted at the euros the bank actually charged or paid in (I11)
+            out["converted_at_the_euros_the_bank_booked"] = [
+                {**self.payment_facts(x), "original_amount": float(x.original_amount or 0),
+                 "original_currency": x.original_currency} for x in m.converted]
+        if m.other_currency_lines:  # no euro amount: listed in their own currency, never in a euro total (I11)
+            out["other_currency_payments_not_in_the_total"] = [
+                {"date": x.on.isoformat(), "merchant": x.merchant, "amount": float(x.amount), "currency": x.currency,
+                 "direction": x.direction, "company": self.repo.company_name(x.company_id),
+                 "evidence_id": x.evidence_id} for x in m.other_currency_lines]
         totals = self._sales_totals(m)
         if totals is not None:
             out["sales_from_payout_reports"] = {

@@ -498,6 +498,8 @@ _JARGON: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("token", re.compile(r"\btokens?\b|\btokeni[sz]\w*", _I)),
     ("ledger", re.compile(r"\bledgers?\b", _I)),
     ("accrual", re.compile(r"\baccruals?\b", _I)),
+    # Disputed card payments (checklist I7): the owner reads "a disputed card payment taken back".
+    ("chargeback", re.compile(r"\bcharge[\s-]?backs?\b", _I)),
     # Deposits and staged invoices (checklist X8): the owner reads "held back by the customer" and "still to come".
     ("receivable", re.compile(r"\breceivables?\b", _I)),
     ("retention", re.compile(r"\bretentions?\b", _I)),

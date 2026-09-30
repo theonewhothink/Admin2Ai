@@ -28,6 +28,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     import httpx
 
 __all__ = [
+    "DatedFxRates",
     "EcbConfig",
     "EcbFxRates",
     "FxRateSource",
@@ -68,6 +69,43 @@ def divide(numerator: Decimal, denominator: Decimal) -> Decimal:
     with localcontext() as ctx:
         ctx.prec = 28
         return numerator / denominator
+
+
+class DatedFxRates:
+    """Reference rates from a fixed table {(base, quote, day): rate}, like the ECB's: a day without a rate
+    (a weekend, a holiday) takes the latest one up to ``lookback_days`` before it; inverses are derived.
+
+    Useful for tests, and for a table of reference rates loaded once (no network).
+    """
+
+    def __init__(self, rates: Mapping[tuple[str, str, date], Decimal], lookback_days: int = 7) -> None:
+        table: dict[tuple[str, str], dict[date, Decimal]] = {}
+        for (base, quote, day), value in rates.items():
+            if isinstance(value, float) or not isinstance(value, Decimal) or value <= 0:
+                raise ValueError("rates must be positive Decimals")
+            table.setdefault((checked_code(base), checked_code(quote)), {})[day] = value
+        self._rates = table
+        self.lookback_days = lookback_days
+
+    def _on(self, base: str, quote: str, on: date) -> Decimal | None:
+        days = self._rates.get((base, quote))
+        if not days:
+            return None
+        for back in range(self.lookback_days + 1):
+            found = days.get(on - timedelta(days=back))
+            if found is not None:
+                return found
+        return None
+
+    def rate(self, base: str, quote: str, on: date) -> Decimal | None:
+        base, quote = checked_code(base), checked_code(quote)
+        if base == quote:
+            return _ONE
+        direct = self._on(base, quote, on)
+        if direct is not None:
+            return direct
+        inverse = self._on(quote, base, on)
+        return divide(_ONE, inverse) if inverse is not None else None
 
 
 class StaticFxRates:

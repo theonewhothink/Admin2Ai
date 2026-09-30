@@ -41,7 +41,8 @@ from backoffice.closure import (
 from backoffice.closure import needs_accountant as closure_needs_accountant
 from backoffice.domain.cost_centers import CostCenter, CostCenterIdentifiers, SplitError, to_cents
 from backoffice.domain.lifecycle import Stage
-from backoffice.domain.models import DocumentType, SourceKind
+from backoffice.domain.models import DocumentType, ObligationKind, SourceKind
+from backoffice.fx_differences import accountant_flag as fx_accountant_flag
 from backoffice.countries.foreign import vat_rates as foreign_vat_rates
 from backoffice.evidence import IntegrityError, ObjectNotFound, SharePayload, UploadRequest
 from backoffice.fraud import SignalKind, mask_iban, normalize_iban
@@ -79,10 +80,13 @@ _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _SLUG = re.compile(r"[^a-z0-9]+")
 # Needs-You questions shown as one plain choice with the engine's own prompt and options (§37).
 _PLAIN_QUESTIONS = ("company", "cash", "obligation", "refund", "obligation_company", "statement", "recharge",
-                    "part", "deposit", "deposit_refund",
+                    "part", "deposit", "deposit_refund", "deposit_kept", "chargeback",
                     "receipt", "expense_claim")
+# Open payments proven without a document: their plan still shows in the month (I7, X9).
+_PLANNED_RULES = frozenset({"chargeback", "chargeback_won", "security_deposit"})
 _ISSUER_NAMES = {"tax_authority": "Tax office", "social_security": "Social Security", "bank": "Your bank",
-                 "landlord": "Your landlord", "insurer": "Your insurer"}
+                 "landlord": "Your landlord", "insurer": "Your insurer", "municipality": "Your municipality",
+                 "grant_agency": "Grant agency"}
 _STAGE_WORDS = {Stage.DISCOVERED: "Found", Stage.ACQUIRED: "Received", Stage.UNDERSTOOD: "Read",
                 Stage.VERIFIED: "Checked", Stage.MATCHED: "Matched", Stage.ACTED: "Done", Stage.CONFIRMED: "Confirmed",
                 Stage.CLOSED: "Closed", Stage.NEEDS_OWNER: "Waiting for you", Stage.CONFLICT: "Details disagree",
@@ -451,8 +455,8 @@ class BackOfficeService:
             reference = f"reference {record.reference}. " if record.reference else ""
             tone = "risk" if due.overdue else ("attention" if due.days_left <= 5 else "neutral")
             if record.payable:
-                note = f"{amount}{reference}I will check the payment when it goes out.".replace(" · reference",
-                                                                                         ", reference")
+                step = self.orchestrator.obligations.payment_step(record)
+                note = f"{amount}{reference}{step}".replace(" · reference", ", reference")
             else:
                 note = self.orchestrator.obligations.next_step(record)
                 tone = "neutral" if record.informational else tone
@@ -1366,6 +1370,11 @@ class BackOfficeService:
         deposit = repo.deposits.get(rec.id)
         if deposit is not None:
             out["deposit"] = {"status": deposit.status, "text": self.orchestrator.staged.deposit_text(deposit)}
+        disputed = self.orchestrator.chargebacks.text(rec)  # a disputed card payment (I7)
+        if disputed is not None:
+            out["disputed"] = {"status": repo.chargebacks[rec.id].status, "text": disputed}
+            if not item.is_done:
+                out["nextStep"] = disputed
         return out
 
     def _parts(self, **subject: str) -> list[dict[str, Any]]:
@@ -1878,7 +1887,7 @@ class BackOfficeService:
                                   f"{format_money(abs(rec.tx.amount), rec.tx.currency)} belongs to."})
         for n in self._open_needs(company_id):
             if n.kind not in ("company", "cash", "obligation", "refund", "part", "deposit", "deposit_refund",
-                              "receipt", "expense_claim") or \
+                              "deposit_kept", "chargeback", "receipt", "expense_claim") or \
                     repo.item_month(repo.items[n.item_id]) != month:
                 continue
             lines.append({"id": f"r_{n.id}", "tone": "attention", "href": f"/needs-you#{n.id}", "linkLabel": "Answer",
@@ -1891,7 +1900,7 @@ class BackOfficeService:
                 if rec.hold_reason:  # matched, but a large first purchase needs more before it closes
                     lines.append({"id": f"r_{rec.id}", "text": rec.hold_reason, "tone": "attention"})
                 continue
-            if rec.decision is not None and rec.decision.requires_document:
+            if rec.decision is not None and (rec.decision.requires_document or rec.decision.rule in _PLANNED_RULES):
                 lines.append({"id": f"r_{rec.id}", "text": self.orchestrator.missing.plan(rec), "tone": "neutral"})
         for expected in sorted(repo.expected_invoices.values(), key=lambda e: (e.due_on, e.id)):
             # A supplier's usual invoice that has not arrived (§23): missing until it does.
@@ -1970,14 +1979,25 @@ class BackOfficeService:
                     "reasons": [r.replace(": ", " ", 1) for r in rec.match_why],
                 })
             elif rec.proof_evidence_ids:
-                out.append({"id": f"m_{rec.id}", "supplier": "Tax office", "description": "Tax payment",
+                supplier, description = self._letter_payment_words(rec)
+                out.append({"id": f"m_{rec.id}", "supplier": supplier, "description": description,
                             "amount": _num(abs(rec.tx.amount)), "currency": rec.tx.currency,
                             "date": rec.tx.booked_on.isoformat(), "reasons": self._tax_reasons(rec)})
+            elif self.orchestrator.chargebacks.settled(rec) is not None:
+                # A disputed card payment taken back or won back, linked to what proves it (I7).
+                cb = repo.chargebacks[rec.id]
+                out.append({"id": f"m_{rec.id}", "supplier": self.orchestrator.chargebacks.merchant(rec),
+                            "description": "Disputed card payment won back" if cb.direction == "in" else
+                            "Disputed card payment taken back",
+                            "amount": _num(abs(rec.tx.amount)), "currency": rec.tx.currency,
+                            "date": rec.tx.booked_on.isoformat(),
+                            "reasons": [r.replace(": ", " ", 1) for r in rec.match_why]})
             elif self.orchestrator.staged.settled_without_document(rec) is not None:
                 # A deposit given back when a booking was cancelled, and the money that gave it back (X8).
                 dep = repo.deposits.get(rec.deposit_refund_of or rec.id)
+                noun = dep.noun.capitalize() if dep else "Deposit"
                 out.append({"id": f"m_{rec.id}", "supplier": dep.party if dep else display_name(rec.tx.counterparty),
-                            "description": "Deposit given back" if rec.deposit_refund_of else "Deposit",
+                            "description": f"{noun} given back" if rec.deposit_refund_of else noun,
                             "amount": _num(abs(rec.tx.amount)), "currency": rec.tx.currency,
                             "date": rec.tx.booked_on.isoformat(),
                             "reasons": [r.replace(": ", " ", 1) for r in rec.match_why]})
@@ -2605,7 +2625,8 @@ class BackOfficeService:
                         "obligation": "payment to confirm", "refund": "refund to confirm",
                         "obligation_company": "which company", "statement": "statement to check",
                         "recharge": "paid back by the client?", "part": "payment to confirm",
-                        "deposit": "deposit to confirm", "deposit_refund": "deposit given back?"}[n.kind]
+                        "deposit": "deposit to confirm", "deposit_refund": "deposit given back?",
+                        "deposit_kept": "security deposit kept?", "chargeback": "disputed card payment"}[n.kind]
                 evidence.append({"label": f"{item['merchant']} · {what}", "id": f"needs:{n.id}"})
             elif n.kind == "cost_center":
                 rec = self.repo.transactions[n.subject_id]
@@ -2654,11 +2675,19 @@ class BackOfficeService:
             evidence += [{"label": step["label"], "id": step["evidenceIds"][0]} for step in chain
                          if step["evidenceIds"] and step["id"] != rec.id and step["id"] not in rec.document_ids]
         elif rec.proof_evidence_ids:
-            ob = next((o for o in self.repo.obligations.values() if rec.evidence_id in o.satisfied_by), None)
+            ob = self.orchestrator.obligations.proven_by(rec)
             reference = f", reference {ob.reference}" if ob is not None and ob.reference else ""
-            answer = (f"The {format_money(amount)} payment on {when} went to the tax office. It pays the tax letter"
-                      f"{reference}, so nothing is missing.")
-            evidence.insert(0, {"label": "Tax letter", "id": rec.proof_evidence_ids[0]})
+            letter = self.orchestrator.obligations.letter_word(ob)
+            if ob is not None and ob.obligation.kind is ObligationKind.GRANT_PAYMENT:
+                answer = (f"The {format_money(amount)} on {when} came from {who}. It is the grant the grant letter "
+                          "announced, so nothing is missing.")
+            elif ob is not None and ob.obligation.kind is ObligationKind.TOURIST_TAX:
+                answer = (f"The {format_money(amount)} payment on {when} went to the municipality. It pays the tourist "
+                          f"tax letter{reference}, so nothing is missing.")
+            else:
+                answer = (f"The {format_money(amount)} payment on {when} went to the tax office. It pays the tax letter"
+                          f"{reference}, so nothing is missing.")
+            evidence.insert(0, {"label": letter, "id": rec.proof_evidence_ids[0]})
         elif rec.decision is not None and not rec.decision.requires_document:
             answer = f"The {format_money(amount)} payment on {when} went to {who}. {rec.decision.reason}"
         else:
@@ -2973,7 +3002,8 @@ class BackOfficeService:
                 records = [repo.documents[d] for d in rec.document_ids if d in repo.documents]
                 labels[rec.evidence_id] = self._tx_evidence(rec)["label"]
                 for p in rec.proof_evidence_ids:
-                    labels.setdefault(p, "Tax letter")
+                    labels.setdefault(p, self.orchestrator.obligations.letter_word(
+                        self.orchestrator.obligations.proven_by(rec)))
                 evidence_ids = [rec.evidence_id, *rec.proof_evidence_ids]
                 kwargs: dict[str, Any] = {"transaction": rec.tx, "documents": [d.document for d in records],
                                           "why": self._recon_why(rec)}
@@ -3009,7 +3039,8 @@ class BackOfficeService:
     def _recon_status(self, status: str, rec: TxRecord) -> tuple[str, str]:
         """Label and tone of one payment in the accountant's reconciliation list."""
         if status == "closed" and not rec.document_ids and rec.proof_evidence_ids:
-            return "Matched to the tax letter", "good"
+            letter = self.orchestrator.obligations.letter_word(self.orchestrator.obligations.proven_by(rec))
+            return f"Matched to the {letter.lower()}", "good"
         if status == "open":
             if rec.document_ids:
                 return "Document found, being checked", "neutral"
@@ -3026,6 +3057,8 @@ class BackOfficeService:
             return [r.replace(": ", " ", 1) for r in rec.match_why]
         if rec.proof_evidence_ids:
             return self._tax_reasons(rec)
+        if rec.id in self.repo.chargebacks and rec.match_why:  # a disputed card payment and what it is linked to
+            return [r.replace(": ", " ", 1) for r in rec.match_why]
         if rec.decision is not None and not rec.decision.requires_document:
             return [rec.decision.reason]
         if rec.likely_document_ids:
@@ -3034,10 +3067,26 @@ class BackOfficeService:
             return [self.orchestrator.missing.plan(rec)]  # what I'm doing to find it
         return []
 
+    def _letter_payment_words(self, rec: TxRecord) -> tuple[str, str]:
+        """(who, what) for a payment a letter proves: the tax office, the municipality's tourist tax, a grant."""
+        ob = self.orchestrator.obligations.proven_by(rec)
+        kind = ob.obligation.kind if ob is not None else None
+        if kind is ObligationKind.GRANT_PAYMENT:
+            return (ob.agency if ob is not None and ob.agency else display_name(rec.tx.counterparty)), "Grant received"
+        if kind is ObligationKind.TOURIST_TAX:
+            return "Municipality", "Tourist tax"
+        return "Tax office", "Tax payment"
+
     def _tax_reasons(self, rec: TxRecord) -> list[str]:
-        ob = next((o for o in self.repo.obligations.values() if rec.evidence_id in o.satisfied_by), None)
+        ob = self.orchestrator.obligations.proven_by(rec)
         amount = format_money(abs(rec.tx.amount), rec.tx.currency)
-        reasons = [f"Tax letter asks for {amount}", f"Bank payment {amount}"]
+        if ob is not None and ob.obligation.kind is ObligationKind.GRANT_PAYMENT:
+            reasons = [f"Grant letter announces {amount}", f"Money received {amount}"]
+            if ob.agency:
+                reasons.append(f"From {ob.agency}, as the letter says")
+            return reasons
+        letter = self.orchestrator.obligations.letter_word(ob)
+        reasons = [f"{letter} asks for {amount}", f"Bank payment {amount}"]
         if ob is not None and ob.reference:
             reasons.append(f"Reference {ob.reference} matches")
         if ob is not None and rec.tx.booked_on <= ob.obligation.due_on:
@@ -3080,6 +3129,9 @@ class BackOfficeService:
             foreign = _foreign_vat_flag(record)  # reverse charge, or VAT charged abroad (checklist X31)
             if foreign is not None:
                 flags.append((foreign, item_id))
+            exchange = fx_accountant_flag(self.orchestrator, doc_id)  # paid at another rate than its date's (I11)
+            if exchange is not None:
+                flags.append((exchange, item_id))
         for rec in sorted(repo.transactions.values(), key=lambda r: (r.tx.booked_on, r.id)):
             note = rec.company_note
             if note is None or company_id not in note or (month is not None and Month.of(rec.tx.booked_on) != month):

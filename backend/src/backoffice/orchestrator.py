@@ -106,8 +106,18 @@ from backoffice.closure import (
     satisfy,
 )
 from backoffice.closure.month import EXPECTED_INVOICE
+from backoffice.closure.obligations import grant_agency
+from backoffice.fx_differences import record_exchange_differences
 from backoffice.countries.foreign import IssuerProfile, detect_issuer, read_foreign_text
-from backoffice.deposits import customer_name, deposit_wording, is_advance_invoice, read_terms, says_held_back
+from backoffice.deposits import (
+    customer_name,
+    deposit_wording,
+    is_advance_invoice,
+    mentions_security_deposit,
+    read_terms,
+    says_held_back,
+    security_deposit_wording,
+)
 from backoffice.countries.foreign import vat_rates as foreign_vat_rates
 from backoffice.countries.pt import (
     PACK,
@@ -665,6 +675,7 @@ class TxRecord:
     assignment: EntityAssignment | None = None
     private: bool = False  # the owner said: personal / not one of my companies
     proof_evidence_ids: list[str] = field(default_factory=list)  # e.g. the tax letter a payment proves
+    proof_note: str = ""  # why that letter proves it, when it is not a tax letter ("The grant letter's ...")
     missing_since: date | None = None
     # Documents kept with the payment that do not prove it (a pro-forma, a receipt where an invoice is needed).
     supporting_document_ids: list[str] = field(default_factory=list)
@@ -762,6 +773,7 @@ class ObligationRecord:
     confirmed_by: tuple[str, ...] = ()  # the owner's confirmation (and any file with it), as evidence
     declined_tx_ids: list[str] = field(default_factory=list)  # payments the owner said do not pay it
     how: str = ""  # plain words once done: "Paid on 2 November." / "Renewed on 20 October."
+    agency: str | None = None  # a grant letter: the agency it names ("IFAP"), as a bank line would name it too
 
     @property
     def proof(self) -> ProofKind:
@@ -889,6 +901,13 @@ class DepositRecord:
     applied_to: str | None = None  # the final invoice that takes it off (document id)
     refunds: dict[str, Decimal] = field(default_factory=dict)
     not_for_document_ids: list[str] = field(default_factory=list)  # invoices the owner said it is not part of
+    # A refundable security deposit (checklist X9): held for the customer, never income for the work. It closes
+    # when it goes back; a part kept (damage, charges) becomes income only with an invoice for it or the owner's
+    # confirmation (``kept`` and ``kept_answer``, status "kept").
+    security: bool = False
+    kept: Decimal = _ZERO
+    kept_answer: str | None = None  # evidence id of the owner's answer that they kept it
+    kept_later_at: Decimal | None = None  # what had gone back when the owner said the rest goes back later
 
     @property
     def returned(self) -> Decimal:
@@ -896,8 +915,13 @@ class DepositRecord:
 
     @property
     def available(self) -> Decimal:
-        """What of it can still be taken off an invoice: all of it, less what went back."""
-        return self.amount - self.returned
+        """What of it can still be taken off an invoice (or is still held): all of it, less what went back or
+        was kept."""
+        return self.amount - self.returned - self.kept
+
+    @property
+    def noun(self) -> str:
+        return "security deposit" if self.security else "deposit"
 
 
 @dataclass
@@ -1135,7 +1159,10 @@ _DOC_LABELS = {
 # Documents a purchase paid in cash can be evidenced by (§11: the owner photographs the receipt).
 _CASH_DOCUMENTS = frozenset({DocumentType.RECEIPT, *PURCHASE_INVOICE_TYPES})
 # Questions about deposits, part payments and deposits given back (checklist X8), answered by the staged agent.
-_STAGED_QUESTIONS = ("part", "deposit", "deposit_refund")
+_STAGED_QUESTIONS = ("part", "deposit", "deposit_refund", "deposit_kept")
+# Bank lines proven by something other than an invoice: a grant by its letter (X30), a chargeback by the sale
+# it takes back or the chargeback it reverses (I7). Never matched to documents.
+_OWN_PROOF_RULES = frozenset({"grant", "chargeback", "chargeback_won"})
 # Documents paid after they are issued, so a due date on them can pass unpaid (F8). An invoice-receipt or a
 # simplified invoice from a till is paid when it is issued.
 _PAYABLE_LATER = frozenset({DocumentType.INVOICE, DocumentType.DEBIT_NOTE})
@@ -1227,6 +1254,13 @@ class Repository:
         self.payroll_employees: dict[str, str] = {}
         self.payroll_by: dict[str, str] = {}
         self.payslip_requests: dict[str, str] = {}
+        # Disputed card payments on the bank statement, by their payment id (backoffice.chargebacks, I7).
+        self.chargebacks: dict[str, Any] = {}
+        # Reference exchange rates (reconciliation.FxRateSource) for exchange differences (backoffice.fx_differences,
+        # I11): set by the server from its configuration; None in the browser demo, where nothing is fetched and no
+        # difference is ever guessed. The differences found, by the document they are about.
+        self.fx_rates: Any = None
+        self.fx_differences: dict[str, Any] = {}
 
     # ----------------------------------------------------------------- set-up
 
@@ -2141,7 +2175,8 @@ class ReconciliationAgent(_Agent):
         engine = self.engine()
         for rec in records:
             decision = engine.classify(rec.tx)
-            decision = self._customer_refund(rec, decision) or decision
+            # Money back to a customer or depositor; a card payment a customer disputed (I7).
+            decision = self._customer_refund(rec, decision) or self.o.chargebacks.decision(rec, decision) or decision
             rec.decision = decision
             self.log("expect", subject_id=rec.id, evidence_ids=[rec.evidence_id],
                      values={"expectation": decision.expectation.value, "rule": decision.rule},
@@ -2209,6 +2244,10 @@ class ReconciliationAgent(_Agent):
                and not repo.items[r.item_id].is_done
                and r.decision.expectation is not EvidenceExpectation.PAYOUT_REPORT
                and not (r.decision.expectation is EvidenceExpectation.PAYROLL and r.decision.quality is Quality.GREEN)
+               # A grant (its letter), a chargeback (the sale it takes back) and a security deposit held for a
+               # customer (its return) are never proven by an invoice (checklist X30, I7, X9).
+               and r.decision.rule not in _OWN_PROOF_RULES
+               and not (r.id in repo.deposits and repo.deposits[r.id].security)
                and (r.decision.requires_document or r.decision.quality is not Quality.GREEN)]
         docs = [d for d in repo.documents.values()
                 if not d.on_hold and d.document.quality is not Quality.RED
@@ -3043,11 +3082,16 @@ _OBLIGATION_ARRIVED: dict[ObligationKind, str] = {
     ObligationKind.DEBT_COLLECTION: "Read a debt collection letter.",
     ObligationKind.PAYMENT_DEADLINE: "Read a letter about a payment due.",
     ObligationKind.FILING: "Read a letter about a return to file.",
+    ObligationKind.TOURIST_TAX: "Read a letter about the tourist tax to pay.",
+    ObligationKind.TOURIST_TAX_DECLARATION: "Read a letter about the tourist tax declaration.",
+    ObligationKind.GRANT_DOCUMENTS: "Read a letter about your grant: documents to send.",
+    ObligationKind.GRANT_PAYMENT: "Read a letter about a grant payment to receive.",
 }
 _RENEWED_THING = {ObligationKind.INSURANCE_RENEWAL: "policy", ObligationKind.LICENSE_RENEWAL: "licence",
                   ObligationKind.CONTRACT_RENEWAL: "contract"}
 _PAYMENT_LETTER = {ObligationKind.RENT: "rent letter", ObligationKind.DEBT_COLLECTION: "debt collection letter",
-                   ObligationKind.PAYMENT_DEADLINE: "payment letter", ObligationKind.TAX_DEADLINE: "tax letter"}
+                   ObligationKind.PAYMENT_DEADLINE: "payment letter", ObligationKind.TAX_DEADLINE: "tax letter",
+                   ObligationKind.TOURIST_TAX: "tourist tax letter", ObligationKind.GRANT_PAYMENT: "grant letter"}
 # Payments that never pay a letter: money moved between your own accounts, a card paid off.
 _NOT_A_LETTER_PAYMENT = frozenset({EvidenceExpectation.NONE_INTERNAL_TRANSFER, EvidenceExpectation.CARD_STATEMENT})
 
@@ -3120,7 +3164,7 @@ class ObligationAgent(_Agent):
             obligation=obligation, evidence_id=evidence_id, title=finding.title, reasons=tuple(finding.reasons),
             reference=finding.reference, issuer=finding.issuer.value, received_on=received_on, sender=sender,
             payee_supplier_id=payee_supplier, payee_ibans=ibans, payee_key=key,
-            informational=finding.renews_on_its_own)
+            informational=finding.renews_on_its_own, agency=getattr(finding, "agency", None))
         repo.obligations[oid] = record
         values: dict[str, Any] = {"kind": obligation.kind.value, "due_on": obligation.due_on,
                                   "amount": obligation.amount, "entity_id": obligation.entity_id}
@@ -3216,8 +3260,10 @@ class ObligationAgent(_Agent):
         for ob in sorted(self.repo.obligations.values(), key=lambda o: o.obligation.id):
             if ob.done or not ob.payable:
                 continue
-            if ob.obligation.kind is ObligationKind.TAX_DEADLINE:
+            if ob.obligation.kind in (ObligationKind.TAX_DEADLINE, ObligationKind.TOURIST_TAX):
                 proven += self._prove_tax(ob)
+            elif ob.obligation.kind is ObligationKind.GRANT_PAYMENT:
+                proven += self._prove_grant(ob)
             else:
                 self._prove_payment(ob)
         return proven
@@ -3229,9 +3275,13 @@ class ObligationAgent(_Agent):
                             reference=r.tx.reference)
 
     def _prove_tax(self, ob: ObligationRecord) -> list[TxRecord]:
+        """Tax payments, and the tourist tax paid to the municipality (only by a payment its bank line calls
+        tourist tax: never an ordinary tax payment of the same amount, X26)."""
+        tourist = ob.obligation.kind is ObligationKind.TOURIST_TAX
         facts = [self._payment_fact(r) for r in self.repo.transactions.values()
                  if r.company_id == ob.obligation.entity_id and r.tx.amount < 0 and r.decision is not None
-                 and r.decision.expectation.value == "tax_notice_or_proof"]
+                 and r.decision.expectation.value == "tax_notice_or_proof"
+                 and (r.decision.rule == "tourist_tax") == tourist]
         if not facts:
             return []
         result = satisfy(ob.obligation, sorted(facts, key=lambda f: f.evidence_id))
@@ -3247,8 +3297,91 @@ class ObligationAgent(_Agent):
         for rec in self.repo.transactions.values():
             if rec.evidence_id in result.evidence_ids:
                 rec.proof_evidence_ids = [ob.evidence_id]
+                if tourist:
+                    rec.proof_note = "The payment matches the tourist tax letter's amount and reference."
                 proven.append(rec)
         return proven
+
+    # ------------------------------------------------------------------ grants (checklist X30)
+
+    def grant_from(self, ob: ObligationRecord, rec: TxRecord) -> bool:
+        """The bank line shows the money came from whoever wrote the grant letter: the agency it names, the
+        letter's reference, the account it prints, or the sender's own name."""
+        tx = rec.tx
+        text = f"{tx.counterparty} {tx.description} {tx.reference or ''}"
+        if ob.agency and grant_agency(text) == ob.agency:
+            return True
+        if ob.reference and ob.reference in normalize_reference(text):
+            return True
+        if ob.payee_ibans and tx.counterparty_iban and normalize_iban(tx.counterparty_iban) in ob.payee_ibans:
+            return True
+        return bool(ob.payee_key and counterparty_key(tx.counterparty) == ob.payee_key)
+
+    def _prove_grant(self, ob: ObligationRecord) -> list[TxRecord]:
+        """A grant payment announced by a letter is done only when the money arrives: the amount the letter
+        gives, from the agency that wrote it. The right amount from someone the bank line does not identify
+        is one plain question, never a guess. The payment is proven by the letter, recorded as a grant."""
+        repo = self.repo
+        candidates = sorted((r for r in repo.transactions.values()
+                             if r.company_id == ob.obligation.entity_id and r.tx.amount > 0 and not r.private
+                             and r.decision is not None and r.decision.expectation not in _NOT_A_LETTER_PAYMENT
+                             and not r.document_ids and not r.proof_evidence_ids and r.id not in ob.declined_tx_ids
+                             and not repo.items[r.item_id].is_done),
+                            key=lambda r: (r.tx.booked_on, r.id))
+        identified = [r for r in candidates if self.grant_from(ob, r)]
+        if identified:
+            result = satisfy(ob.obligation, [self._payment_fact(r) for r in identified])
+            self.log("satisfy", subject_id=ob.obligation.id, evidence_ids=[ob.evidence_id, *result.evidence_ids],
+                     response={"satisfied": result.satisfied, "quality": result.quality.value},
+                     validations=list(result.reasons))
+            if result.satisfied and result.quality is Quality.GREEN:
+                proven = [r for r in identified if r.evidence_id in result.evidence_ids]
+                self.grant_received(ob, proven, result)
+                return proven
+        if any(n.status == "open" and n.kind == "obligation" and n.options
+               and n.options[0].values.get("obligation") == ob.obligation.id for n in repo.needs.values()):
+            return []
+        named = {r.id for r in identified}
+        for rec in candidates:
+            if rec.id in named or rec.tx.entity_id is None or rec.decision is None or rec.decision.rule != "grant":
+                continue
+            if satisfy(ob.obligation, [self._payment_fact(rec)]).satisfied:
+                self.o.ask_about_obligation_payment(ob, rec)
+                return []
+        return []
+
+    def grant_received(self, ob: ObligationRecord, recs: Sequence[TxRecord], result: Any, *,
+                       answer_ev: str | None = None) -> None:
+        """The grant arrived: the letter is done, and it is the proof of the money received (a grant, not a sale)."""
+        last = max(r.tx.booked_on for r in recs)
+        how = f"Received on {day_month(last)}." + (" You confirmed it." if answer_ev else "")
+        self._done(ob, result, how=how, extra=(answer_ev,) if answer_ev else ())
+        for rec in recs:
+            rec.proof_evidence_ids = [ob.evidence_id, *([answer_ev] if answer_ev else [])]
+            rec.proof_note = "The grant letter's amount matches the money received."
+            if rec.decision is None or rec.decision.rule != "grant":  # the letter says what it is: a grant
+                rec.decision = ExpectationDecision(
+                    rec.tx.id, EvidenceExpectation.TAX_NOTICE_OR_PROOF,
+                    "A grant or subsidy. The letter about it covers it: it is not a sale.", Quality.GREEN, "grant")
+            self.log("grant_received", subject_id=rec.id, evidence_ids=[rec.evidence_id, *rec.proof_evidence_ids],
+                     values={"obligation": ob.obligation.id, "amount": abs(rec.tx.amount), "agency": ob.agency})
+
+    def proven_by(self, rec: TxRecord) -> ObligationRecord | None:
+        """The letter a payment proves (a tax, tourist tax or grant letter), if any."""
+        return next((o for o in sorted(self.repo.obligations.values(), key=lambda o: o.obligation.id)
+                     if rec.evidence_id in o.satisfied_by), None)
+
+    def letter_word(self, ob: ObligationRecord | None) -> str:
+        """'Tax letter', 'Tourist tax letter', 'Grant letter'."""
+        kind = ob.obligation.kind if ob is not None else ObligationKind.TAX_DEADLINE
+        return {ObligationKind.TOURIST_TAX: "Tourist tax letter",
+                ObligationKind.GRANT_PAYMENT: "Grant letter"}.get(kind, "Tax letter")
+
+    def payment_step(self, ob: ObligationRecord) -> str:
+        """What I do about a letter that is done by a payment."""
+        if ob.obligation.kind is ObligationKind.GRANT_PAYMENT:
+            return "I will check that the money arrives in your bank."
+        return "I will check the payment when it goes out."
 
     def _candidates(self, ob: ObligationRecord) -> list[TxRecord]:
         return sorted((r for r in self.repo.transactions.values()
@@ -3329,13 +3462,19 @@ class ObligationAgent(_Agent):
         if ob.informational:
             return "It renews on its own. Nothing to do unless you want to change or end it."
         if ob.payable:
-            return "I will check the payment when it goes out."
+            return self.payment_step(ob)
         if ob.proof is ProofKind.SUBMISSION:
             who = "Your accountant files this. " if ob.obligation.responsible == "accountant" else ""
+            if kind is ObligationKind.TOURIST_TAX_DECLARATION:
+                return ("I close it when the municipality confirms the declaration, or when you tell me it is "
+                        "submitted.")
             return f"{who}I close it when the filing receipt arrives."
         if ob.proof is ProofKind.RENEWAL:
             return (f"I close it when the renewed {_RENEWED_THING.get(kind, 'contract')} arrives, or when you tell me "
                     "you are not renewing.")
+        if kind is ObligationKind.GRANT_DOCUMENTS:
+            return ("When you have sent the documents, forward me the agency's confirmation or tell me they are "
+                    "sent.")
         return "When you have sent what they ask for, forward me their confirmation or tell me it is done."
 
     def payment_letter(self, ob: ObligationRecord) -> str:
@@ -3406,6 +3545,9 @@ class MissingEvidenceAgent(_Agent):
                     "answers may settle it.")
         if rec.decision is not None and rec.decision.expectation is EvidenceExpectation.PAYOUT_REPORT:
             return self.o.settlement.plan(rec, amount, when)
+        disputed = self.o.chargebacks.plan(rec) if rec.id in self.repo.chargebacks else None
+        if disputed is not None:  # a disputed card payment (I7): linked to its sale, not to an invoice
+            return disputed
         staged = None if rec.supporting_document_ids or rec.id in self.repo.chases else self.o.staged.plan(rec)
         if staged is not None:  # a deposit waiting for its invoice, or money that may give one back (X8)
             return staged
@@ -3435,6 +3577,16 @@ class MissingEvidenceAgent(_Agent):
                     "so I'm still looking for the invoice.")
         if rec.decision is not None and rec.decision.provider.value == "owner":
             return f"The {amount} payment to {who} on {when} is waiting for its receipt. I will match it when it arrives."
+        if rec.decision is not None and rec.decision.rule == "grant":  # checklist X30
+            payer = display_name(rec.tx.counterparty)
+            if any(n.subject_id == rec.id and n.status == "open" and n.kind == "obligation"
+                   for n in self.repo.needs.values()):
+                return f"The {amount} from {payer} on {when} may be the grant in a letter. I asked you about it."
+            return (f"The {amount} from {payer} on {when} is a grant or subsidy, not a sale. Forward me the letter "
+                    "about it (the approval or the payment notice) and I will close it.")
+        if rec.decision is not None and rec.decision.rule == "tourist_tax":  # checklist X26
+            return (f"The {amount} tourist tax payment on {when} is waiting for the municipality's notice or "
+                    "payment proof.")
         if rec.decision is not None and rec.decision.provider.value == "government":
             return f"The {amount} tax payment on {when} is waiting for the tax notice or payment proof."
         return f"I'm looking for the document for the {amount} payment to {who} on {when}."
@@ -4758,6 +4910,8 @@ class StagedPaymentsAgent(_Agent):
         repo = self.repo
         money = format_money(dep.amount, dep.currency)
         when = day_month(dep.received_on, repo.today())
+        if dep.security:
+            return self._security_text(dep, money, when)
         base = (f"Deposit of {money} from {dep.party} on {when}" if dep.direction == "in" else
                 f"Deposit of {money} paid to {dep.party} on {when}")
         center = self.cost_center(dep)
@@ -4776,6 +4930,23 @@ class StagedPaymentsAgent(_Agent):
             return f"{base}, on advance invoice {self.number(advance)}. The final invoice will take it off."
         whose = "your" if dep.direction == "in" else "its"
         return f"{base}. It is kept as a deposit until {whose} invoice takes it off."
+
+    def _security_text(self, dep: DepositRecord, money: str, when: str) -> str:
+        """Where a security deposit stands: held for the customer, given back, or partly kept (X9)."""
+        base = f"Security deposit of {money} from {dep.party} on {when}"
+        back = format_money(dep.returned, dep.currency)
+        went = f"{back} went back to them; " if dep.returned else ""
+        final = self.repo.documents.get(dep.applied_to or "")
+        if dep.status == "applied" and final is not None:
+            kept = format_money(dep.available, dep.currency)
+            return f"{base}. {went}{kept} was kept for {self.invoice_words(final)}."
+        if dep.status == "kept":
+            return f"{base}. {went}{format_money(dep.kept, dep.currency)} was kept, as you confirmed."
+        if dep.status == "refunded":
+            return f"{base}, given back in full."
+        if dep.returned:
+            return f"{base}. {went}{format_money(dep.available, dep.currency)} is still held for them."
+        return f"{base}, held for them. It is theirs until it goes back or you keep part of it."
 
     def waiting_sentence(self, record: DocumentRecord) -> str:
         """Why an invoice paid in parts is still open, in plain words."""
@@ -4840,6 +5011,7 @@ class StagedPaymentsAgent(_Agent):
         moved += self._apply_stated(now)
         moved += self._release_held(now)
         moved += self._refund_deposits(now)
+        moved += self._keep_security(now)
         return moved
 
     def _register_deposits(self, now: datetime) -> int:
@@ -4868,13 +5040,18 @@ class StagedPaymentsAgent(_Agent):
             elif rec.document_ids or repo.items[rec.item_id].is_done:
                 continue
             words = None
+            security = None
             if advance is None:
                 wanted = EvidenceExpectation.SALES_INVOICE if rec.tx.amount > 0 else EvidenceExpectation.INVOICE
                 if rec.decision.expectation is not wanted:
                     continue
-                words = deposit_wording(rec.tx.counterparty, rec.tx.description, rec.tx.reference,
-                                        outgoing=rec.tx.amount < 0)
-                if words is None:
+                if rec.tx.amount > 0:  # a customer's refundable security deposit (X9), before any other deposit
+                    security = security_deposit_wording(rec.tx.counterparty, rec.tx.description, rec.tx.reference)
+                    if security is not None and security.giving_back:
+                        continue  # money back saying it returns a deposit is not a deposit received
+                words = None if security is not None else deposit_wording(
+                    rec.tx.counterparty, rec.tx.description, rec.tx.reference, outgoing=rec.tx.amount < 0)
+                if words is None and security is None:
                     continue
                 if quoted is None:
                     quoted = [d for d in repo.documents.values() if d.document.invoice_number and not d.supporting
@@ -4883,20 +5060,36 @@ class StagedPaymentsAgent(_Agent):
                     continue  # it quotes an invoice of its own: it pays that invoice, it is not money paid ahead
             incoming = rec.tx.amount > 0
             party = display_name(rec.tx.counterparty) if incoming else self.o.merchant_name(rec.tx)
-            why = words.why if words is not None else (
+            why = security.why if security is not None else words.why if words is not None else (
                 f"It pays {'your' if incoming else 'the'} advance invoice {self.number(advance)}.")
             dep = DepositRecord(tx_id=rec.id, company_id=rec.company_id, direction="in" if incoming else "out",
                                 party=party, amount=abs(rec.tx.amount), currency=rec.tx.currency,
                                 received_on=rec.tx.booked_on, why=why,
                                 reference=words.reference if words is not None else None,
-                                advance_document_id=advance.id if advance is not None else None)
+                                advance_document_id=advance.id if advance is not None else None,
+                                security=security is not None)
             repo.deposits[rec.id] = dep
+            values: dict[str, Any] = {"direction": dep.direction, "amount": dep.amount, "reference": dep.reference,
+                                      "advance_invoice": dep.advance_document_id}
+            if dep.security:
+                values["security"] = True
+                # The customer's money, held for them: no invoice covers it, its return does (X9).
+                rec.decision = ExpectationDecision(
+                    rec.tx.id, EvidenceExpectation.BANK_EVIDENCE_SUFFICES,
+                    f"A security deposit held for {party}. It closes when it goes back to them: no invoice needed.",
+                    Quality.AMBER, "security_deposit")
+                self.o.reconciliation.log("expect", subject_id=rec.id, evidence_ids=[rec.evidence_id],
+                                          values={"expectation": rec.decision.expectation.value,
+                                                  "rule": rec.decision.rule},
+                                          response={"quality": rec.decision.quality.value,
+                                                    "reason": rec.decision.reason})
             self.log("record_deposit", subject_id=rec.id,
                      evidence_ids=[rec.evidence_id, *(advance.evidence_ids if advance else [])],
-                     values={"direction": dep.direction, "amount": dep.amount, "reference": dep.reference,
-                             "advance_invoice": dep.advance_document_id}, response={"why": why})
+                     values=values, response={"why": why})
             money = format_money(dep.amount, dep.currency)
-            text = (f"Recorded a {money} deposit from {party}. It is not income until the work is invoiced."
+            text = (f"Recorded a {money} security deposit from {party}. I hold it for them: it is not income."
+                    if dep.security else
+                    f"Recorded a {money} deposit from {party}. It is not income until the work is invoiced."
                     if incoming else f"Recorded a {money} deposit paid to {party}. Its invoice will take it off.")
             self.o.activity(now, "checked", text, rec.company_id, amount=dep.amount, currency=dep.currency,
                             evidence_ids=[rec.evidence_id])
@@ -4908,7 +5101,7 @@ class StagedPaymentsAgent(_Agent):
         dated around it, and only one way to pair them."""
         repo = self.repo
         deposits = [d for d in repo.deposits.values() if d.status == "held" and d.advance_document_id is None
-                    and d.available == d.amount and self._open_tx(repo.transactions[d.tx_id])]
+                    and not d.security and d.available == d.amount and self._open_tx(repo.transactions[d.tx_id])]
         advances = [r for r in repo.documents.values() if r.advance and not r.matched_tx_ids and not r.on_hold
                     and r.document.quality is Quality.GREEN and not repo.items[r.item_id].is_done
                     and repo.items[r.item_id].stage not in (Stage.NEEDS_OWNER, Stage.CONFLICT)]
@@ -4954,8 +5147,8 @@ class StagedPaymentsAgent(_Agent):
         out = []
         for dep in sorted(repo.deposits.values(), key=lambda d: (d.received_on, d.tx_id)):
             rec = repo.transactions[dep.tx_id]
-            if dep.status != "held" or dep.advance_document_id is not None or dep.available <= 0:
-                continue
+            if dep.status != "held" or dep.advance_document_id is not None or dep.available <= 0 or dep.security:
+                continue  # a security deposit is the customer's money: kept only by :meth:`_keep_security`
             if record.id in dep.not_for_document_ids or not self._open_tx(rec) or not self._same_way(rec, record):
                 continue
             if (dep.received_on - issued).days > 7 or (amount is not None and dep.available != amount):
@@ -5051,6 +5244,13 @@ class StagedPaymentsAgent(_Agent):
                          f"{day_month(dep.received_on, repo.today())}", said,
                          f"{who}: {dep.party}, as on the invoice", *self.progress_lines(record))
         rec.match_headline = f"Deposit taken off {words}."
+        if dep.security:
+            money = format_money(dep.amount, dep.currency)
+            back = [f"Given back: {format_money(dep.returned, dep.currency)}"] if dep.returned else []
+            rec.match_why = (f"Security deposit received: {money} on {day_month(dep.received_on, repo.today())}",
+                             *back, f"Kept for {words}: {self.money(amount, record)}",
+                             f"{who}: {dep.party}, as on the invoice")
+            rec.match_headline = f"The {self.money(amount, record)} kept from the security deposit pays {words}."
         for n in repo.needs.values():
             if n.subject_id == rec.id and n.status == "open" and n.kind == "deposit" and not answer_ev:
                 n.status, n.resolution = "resolved", "evidence"
@@ -5058,9 +5258,11 @@ class StagedPaymentsAgent(_Agent):
                  evidence_ids=[rec.evidence_id, *record.evidence_ids, *([answer_ev] if answer_ev else [])],
                  values={"invoice": record.id, "amount": amount}, validations=list(rec.match_why),
                  actor=OWNER_ACTOR if answer_ev else SYSTEM, response={"kind": "deposit"})
-        self.o.activity(now, "checked", f"Took the {self.money(amount, record)} deposit from {dep.party} off {words}."
-                        if record.sales else f"Took the {self.money(amount, record)} deposit you paid {dep.party} off "
-                        f"{words}.", rec.company_id, amount=amount, currency=record.document.currency,
+        line = (f"The {self.money(amount, record)} kept from {dep.party}'s security deposit pays {words}."
+                if dep.security else
+                f"Took the {self.money(amount, record)} deposit from {dep.party} off {words}." if record.sales else
+                f"Took the {self.money(amount, record)} deposit you paid {dep.party} off {words}.")
+        self.o.activity(now, "checked", line, rec.company_id, amount=amount, currency=record.document.currency,
                         evidence_ids=[rec.evidence_id, *record.evidence_ids])
 
     def _release_held(self, now: datetime) -> int:
@@ -5178,6 +5380,57 @@ class StagedPaymentsAgent(_Agent):
             if len(found) == 1 and len(exact) == 1:
                 self.give_back(exact[0], rec, answer_ev=None, now=now)
                 moved += 1
+                continue
+            # Part of a security deposit going back (the rest kept for damage, or paid back later): to the same
+            # account, saying it gives the security deposit back, and the only one it could be (X9).
+            dep = found[0] if len(found) == 1 else None
+            said = security_deposit_wording(rec.tx.counterparty, rec.tx.description, rec.tx.reference)
+            came_from = repo.transactions[dep.tx_id].tx.counterparty_iban if dep is not None else None
+            if dep is not None and dep.security and said is not None and iban and came_from \
+                    and normalize_iban(came_from) == iban:
+                self.give_back(dep, rec, answer_ev=None, now=now)
+                moved += 1
+        return moved
+
+    def keep_invoice(self, dep: DepositRecord) -> DocumentRecord | None:
+        """Your invoice for the part of a security deposit you keep (damage, charges): to the same customer, for
+        exactly what is still held, dated after the deposit, and only one. It counts once some of the deposit
+        went back (the rest is what was kept) or when it says it is taken from the security deposit."""
+        repo = self.repo
+        rec = repo.transactions[dep.tx_id]
+        found = []
+        for record in sorted(repo.documents.values(), key=lambda d: d.id):
+            doc = record.document
+            if not record.sales or record.matched_tx_ids or repo.items[record.item_id].is_done \
+                    or not self._usable(record) or not self._same_way(rec, record) \
+                    or record.id in dep.not_for_document_ids:
+                continue
+            if abs(doc.gross_amount or _ZERO) != dep.available or (doc.issue_date and doc.issue_date < dep.received_on):
+                continue
+            if not (dep.returned > 0 or mentions_security_deposit(record.text)):
+                continue
+            if self.party_matches(rec, record):
+                found.append(record)
+        return found[0] if len(found) == 1 else None
+
+    def _keep_security(self, now: datetime) -> int:
+        """The part of a security deposit that was kept, paid by your invoice for it: the deposit pays that
+        invoice (it becomes income with the invoice as its evidence, X9)."""
+        moved = 0
+        for dep in sorted(self.repo.deposits.values(), key=lambda d: (d.received_on, d.tx_id)):
+            if not dep.security or dep.status != "held" or dep.available <= 0 or dep.kept_answer:
+                continue
+            rec = self.repo.transactions[dep.tx_id]
+            if rec.document_ids or rec.private or self.repo.items[rec.item_id].is_done:
+                continue
+            record = self.keep_invoice(dep)
+            if record is None:
+                continue
+            for n in self.repo.needs.values():
+                if n.subject_id == dep.tx_id and n.status == "open" and n.kind == "deposit_kept":
+                    n.status, n.resolution = "resolved", "evidence"
+            self.apply_deposit(record, dep, index=None, answer_ev=None, now=now)
+            moved += 1
         return moved
 
     def give_back(self, dep: DepositRecord, rec: TxRecord, *, answer_ev: str | None, now: datetime) -> None:
@@ -5192,18 +5445,20 @@ class StagedPaymentsAgent(_Agent):
             rec.part_answer_ev = answer_ev
         money = format_money(dep.amount, dep.currency)
         when = day_month(dep.received_on, repo.today())
-        how = ("You said: it gives the deposit back" if answer_ev else
-               "Bank account: the one the deposit came from")
-        rec.match_why = (f"Deposit received: {money} from {dep.party} on {when}",
+        how = (f"You said: it gives the {dep.noun} back" if answer_ev else
+               f"Bank account: the one the {dep.noun} came from")
+        rec.match_why = (f"{dep.noun.capitalize()} received: {money} from {dep.party} on {when}",
                          f"Money paid back: {format_money(amount, rec.tx.currency)}", how)
-        rec.match_headline = f"Refund of the {money} deposit {dep.party} paid on {when}."
+        rec.match_headline = f"Refund of the {money} {dep.noun} {dep.party} paid on {when}."
+        if dep.security and dep.available > 0:
+            rec.match_why = (*rec.match_why, f"Still held for them: {format_money(dep.available, dep.currency)}")
         self.log("give_back_deposit", subject_id=rec.id,
                  evidence_ids=[rec.evidence_id, repo.transactions[dep.tx_id].evidence_id,
                                *([answer_ev] if answer_ev else [])],
                  values={"deposit": dep.tx_id, "amount": amount}, validations=list(rec.match_why),
                  actor=OWNER_ACTOR if answer_ev else SYSTEM)
         self.o.activity(now, "checked", f"Linked the {format_money(amount, rec.tx.currency)} paid to {dep.party} to "
-                        f"the deposit they paid on {when}.", rec.company_id, amount=amount, currency=rec.tx.currency,
+                        f"the {dep.noun} they paid on {when}.", rec.company_id, amount=amount, currency=rec.tx.currency,
                         evidence_ids=[rec.evidence_id])
 
     def settled_without_document(self, rec: TxRecord) -> tuple[list[str], str] | None:
@@ -5217,16 +5472,28 @@ class StagedPaymentsAgent(_Agent):
             evidence = [rec.evidence_id, paid.evidence_id, *([rec.part_answer_ev] if rec.part_answer_ev else [])]
             return evidence, rec.match_headline or "Refund of a deposit."
         dep = repo.deposits.get(rec.id)
-        if dep is None or dep.status != "refunded" or dep.available != 0 or rec.document_ids \
+        if dep is None or dep.status not in ("refunded", "kept") or dep.available != 0 or rec.document_ids \
                 or dep.advance_document_id is not None:
             return None
         refunds = sorted((repo.transactions[t] for t in dep.refunds if t in repo.transactions),
                          key=lambda r: (r.tx.booked_on, r.id))
+        if dep.status == "kept":  # a security deposit: what went back, and the rest kept on the owner's word (X9)
+            if not dep.security or not dep.kept_answer or dep.returned + dep.kept != dep.amount:
+                return None
+            evidence = [rec.evidence_id, *(r.evidence_id for r in refunds),
+                        *(r.part_answer_ev for r in refunds if r.part_answer_ev), dep.kept_answer]
+            kept = format_money(dep.kept, dep.currency)
+            if refunds:
+                back = format_money(dep.returned, dep.currency)
+                on = day_month(refunds[-1].tx.booked_on, repo.today())
+                return evidence, f"Security deposit settled: {back} given back on {on}, {kept} kept, as you confirmed."
+            return evidence, f"Security deposit kept in full ({kept}), as you confirmed."
         if not refunds or sum(dep.refunds.values(), _ZERO) != dep.amount:
             return None
         evidence = [rec.evidence_id, *(r.evidence_id for r in refunds),
                     *(r.part_answer_ev for r in refunds if r.part_answer_ev)]
-        return evidence, f"Deposit given back in full on {day_month(refunds[-1].tx.booked_on, repo.today())}."
+        noun = dep.noun.capitalize()
+        return evidence, f"{noun} given back in full on {day_month(refunds[-1].tx.booked_on, repo.today())}."
 
     # ----------------------------------------------------------------- one question, never a guess
 
@@ -5238,6 +5505,33 @@ class StagedPaymentsAgent(_Agent):
         self._ask_deposits(now, docs)
         self._ask_parts(now, docs)
         self._ask_refunds(now)
+        self._ask_kept(now)
+
+    def _ask_kept(self, now: datetime) -> None:
+        """Part of a security deposit went back and no invoice is for the rest: did the owner keep it? One question;
+        what is kept becomes income only on that answer (X9)."""
+        repo = self.repo
+        for dep in sorted(repo.deposits.values(), key=lambda d: (d.received_on, d.tx_id)):
+            rec = repo.transactions[dep.tx_id]
+            if not dep.security or dep.status != "held" or dep.returned <= 0 or dep.available <= 0 \
+                    or dep.kept_answer or dep.kept_later_at == dep.returned or self._asked(rec.id) \
+                    or not self._open_tx(rec) or self.keep_invoice(dep) is not None:
+                continue
+            money, back, rest = (format_money(v, dep.currency) for v in (dep.amount, dep.returned, dep.available))
+            when = day_month(dep.received_on, repo.today())
+            prompt = (f"You gave back {back} of the {money} security deposit {dep.party} paid on {when}. "
+                      f"Did you keep the other {rest}?")
+            options = [CheckOption(id="kept", label=f"Yes, I kept {rest} for damage or another charge",
+                                   values={"deposit": dep.tx_id}),
+                       CheckOption(id="later", label="No, it will go back to them later",
+                                   values={"deposit": dep.tx_id})]
+            why = [f"It is a security deposit: it belongs to {dep.party} until it goes back or you keep part of it.",
+                   f"{back} went back to them.",
+                   "What you keep counts as income only with your OK or an invoice for it, so I won't count it on a "
+                   "guess."]
+            refunds = [repo.transactions[t].evidence_id for t in dep.refunds if t in repo.transactions]
+            self._new_question("deposit_kept", rec, prompt, options, why, [rec.evidence_id, *refunds], now,
+                               f"Asked you whether you kept {rest} of {dep.party}'s security deposit.")
 
     def _asking(self) -> list[TxRecord]:
         """Payments that could be asked about: open, not waiting for an answer, in booking order."""
@@ -5295,7 +5589,7 @@ class StagedPaymentsAgent(_Agent):
         for dep in sorted(repo.deposits.values(), key=lambda d: (d.received_on, d.tx_id)):
             rec = repo.transactions[dep.tx_id]
             if dep.status != "held" or dep.advance_document_id is not None or dep.available <= 0 \
-                    or not self._open_tx(rec) or self._asked(rec.id):
+                    or dep.security or not self._open_tx(rec) or self._asked(rec.id):
                 continue
             found = [r for r in self._candidates(rec, dep.available, docs, deposit=True)
                      if r.id not in dep.not_for_document_ids and self.party_matches(rec, r)][:3]
@@ -5456,6 +5750,8 @@ class StagedPaymentsAgent(_Agent):
             self.o.activity(now, "answered", f"You said the {money} is for something else.", rec.company_id,
                             evidence_ids=[answer_ev])
             return AnswerOutcome(ok=True, message="Done. I'll keep them apart.")
+        if needs.kind == "deposit_kept":
+            return self._answer_kept(needs, option, rec, answer_ev, now)
         kind, _, target = option.id.partition(":")
         if needs.kind == "deposit_refund":
             dep = repo.deposits.get(target)
@@ -5527,6 +5823,36 @@ class StagedPaymentsAgent(_Agent):
                                                   f"{self.money(held.amount, record)} held back{self._until(held)}.")
         return AnswerOutcome(ok=True, message=f"Done. {words[:1].upper()}{words[1:]} is paid in full.")
 
+    def _answer_kept(self, needs: NeedsYouRecord, option: CheckOption, rec: TxRecord, answer_ev: str,
+                     now: datetime) -> AnswerOutcome:
+        """The owner said whether they kept the rest of a security deposit (their answer is the evidence)."""
+        repo = self.repo
+        dep = repo.deposits.get(rec.id)
+        if dep is None or not dep.security or dep.status != "held" or dep.available <= 0:
+            raise ValueError("That deposit is no longer held.")
+        needs.status, needs.answer, needs.answered_at = "answered", option.id, now
+        owner = f"{OWNER_ACTOR}:{repo.owner.email}"
+        rest = format_money(dep.available, dep.currency)
+        item = repo.items[rec.item_id]
+        if option.id == "later":
+            dep.kept_later_at = dep.returned
+            self.log("security_deposit_still_held", subject_id=rec.id, evidence_ids=[rec.evidence_id, answer_ev],
+                     values={"held": dep.available}, actor=OWNER_ACTOR)
+            self.o.advance(item, Stage.UNDERSTOOD, [rec.evidence_id, answer_ev], agent=self.name, actor=owner,
+                           note="Still held for them, as you said.")
+            self.o.activity(now, "answered", f"You said the other {rest} of {dep.party}'s security deposit goes "
+                            "back to them later.", rec.company_id, evidence_ids=[answer_ev])
+            return AnswerOutcome(ok=True, message=f"Done. I keep holding {rest} for {dep.party}.")
+        dep.kept, dep.kept_answer, dep.status = dep.available, answer_ev, "kept"
+        self.log("security_deposit_kept", subject_id=rec.id, evidence_ids=[rec.evidence_id, answer_ev],
+                 values={"kept": dep.kept, "returned": dep.returned}, actor=OWNER_ACTOR)
+        self.o.advance(item, Stage.UNDERSTOOD, [rec.evidence_id, answer_ev], agent=self.name, actor=owner,
+                       note=f"{rest} kept, as you said.")
+        self.o.activity(now, "answered", f"You said you kept {rest} of {dep.party}'s security deposit. I counted it "
+                        "as income.", rec.company_id, amount=dep.kept, currency=dep.currency,
+                        evidence_ids=[rec.evidence_id, answer_ev])
+        return AnswerOutcome(ok=True, message=f"Done. I counted the {rest} you kept as income.")
+
     # ----------------------------------------------------------------- plans and the story, for the owner
 
     def plan(self, rec: TxRecord) -> str | None:
@@ -5535,6 +5861,17 @@ class StagedPaymentsAgent(_Agent):
         dep = repo.deposits.get(rec.id)
         money = format_money(abs(rec.tx.amount), rec.tx.currency)
         when = day_month(rec.tx.booked_on, repo.today())
+        if dep is not None and dep.security and not rec.document_ids:
+            money = format_money(dep.amount, dep.currency)
+            if dep.returned and dep.available > 0:
+                back, rest = format_money(dep.returned, dep.currency), format_money(dep.available, dep.currency)
+                if self._asked(rec.id, ("deposit_kept",)):
+                    return (f"{back} of the {money} security deposit {dep.party} paid on {when} went back to them. "
+                            f"I asked you whether you kept the other {rest}.")
+                return (f"{back} of the {money} security deposit {dep.party} paid on {when} went back to them. "
+                        f"{rest} is still held for them.")
+            return (f"{dep.party} paid a {money} security deposit on {when}. I hold it for them, not as income: it "
+                    "closes when it goes back to them.")
         if dep is not None and not rec.document_ids:
             asked = self._asked(rec.id, ("deposit",))
             if dep.returned and dep.available > 0:
@@ -5606,8 +5943,9 @@ class StagedPaymentsAgent(_Agent):
             paid = repo.transactions[d.tx_id]
             money = format_money(d.amount, d.currency)
             when = day_month(d.received_on, repo.today())
-            payment(paid, "deposit", f"Deposit of {money} from {d.party} on {when}" if d.direction == "in" else
-                    f"Deposit of {money} paid to {d.party} on {when}")
+            noun = d.noun.capitalize()
+            payment(paid, "deposit", f"{noun} of {money} from {d.party} on {when}" if d.direction == "in" else
+                    f"{noun} of {money} paid to {d.party} on {when}")
             advance_step(repo.documents.get(d.advance_document_id or ""))
             for t in d.refunds:
                 back = repo.transactions.get(t)
@@ -5615,6 +5953,9 @@ class StagedPaymentsAgent(_Agent):
                     given = format_money(d.refunds[t], d.currency)
                     payment(back, "deposit_refund",
                             f"Given back to {d.party}: {given} on {day_month(back.tx.booked_on, repo.today())}")
+            if d.status == "kept" and d.kept_answer:  # the part of a security deposit kept, on the owner's word
+                add("deposit_kept", f"kept:{d.tx_id}", f"Kept, as you confirmed: {format_money(d.kept, d.currency)}",
+                    None, d.kept, d.currency, [d.kept_answer])
         if record is not None:
             for a in record.linked_advances:
                 advance_step(repo.documents.get(a))
@@ -5676,11 +6017,17 @@ class ClosureAgent(_Agent):
                 continue
             if rec.proof_evidence_ids:
                 evidence = [rec.evidence_id, *rec.proof_evidence_ids]
-                moved += self._close(item, evidence, note="The payment matches the tax letter's amount and reference.")
+                moved += self._close(item, evidence, note=rec.proof_note or
+                                     "The payment matches the tax letter's amount and reference.")
                 continue
             given_back = self.o.staged.settled_without_document(rec)
             if given_back is not None:  # a deposit given back, and the money that gave it back (checklist X8)
                 evidence, note = given_back
+                moved += self._close(item, evidence, note=note)
+                continue
+            disputed = self.o.chargebacks.settled(rec)
+            if disputed is not None:  # a disputed card payment linked to its sale, or to the money won back (I7)
+                evidence, note = disputed
                 moved += self._close(item, evidence, note=note)
                 continue
             if not rec.document_ids:
@@ -5938,6 +6285,8 @@ class AuditorAgent(_Agent):
         if not rec.document_ids:
             if self.o.staged.settled_without_document(rec) is not None:
                 return None  # a deposit given back, proven by both bank lines (checklist X8)
+            if self.o.chargebacks.settled(rec) is not None:
+                return None  # a disputed card payment, proven by what it is linked to (I7)
             return "The payment has lost its document."
         docs = [repo.documents.get(d) for d in rec.document_ids]
         if any(d is None or d.on_hold or d.document.quality is not Quality.GREEN for d in docs):
@@ -6528,6 +6877,9 @@ class Orchestrator:
 
         self.staff = StaffAgent(self)
         self.payroll = PayrollAgent(self)
+        from backoffice.chargebacks import ChargebackAgent  # disputed card payments on the bank statement (I7)
+
+        self.chargebacks = ChargebackAgent(self)
         self._activity_seq = 0
         # What sends the emails the back office writes itself (backoffice.mailer): the demo's simulated
         # outbox, or None. With None they wait in ``repo.outbox``; the production server sends each one
@@ -7630,14 +7982,28 @@ class Orchestrator:
         when = day_month(rec.tx.booked_on, repo.today())
         letter = self.obligations.payment_letter(ob)
         received = day_month(ob.received_on, repo.today()) if ob.received_on else None
-        prompt = f"Does the {amount} payment to {who} on {when} pay the {letter}{f' of {received}' if received else ''}?"
+        of = f" of {received}" if received else ""
         due = format_money(ob.obligation.amount, rec.tx.currency) if ob.obligation.amount is not None else amount
-        why = (f"The letter asks for {due} by {day_month(ob.obligation.due_on, repo.today())}.",
-               f"This payment is {amount}, made after the letter arrived.",
-               "The bank line does not show that it went to whoever wrote the letter.",
-               "Until you answer, I won't count the letter as paid.")
-        options = (CheckOption(id="yes", label="Yes, it pays that letter", values={"obligation": ob.obligation.id}),
-                   CheckOption(id="no", label="No, it is for something else", values={"obligation": ob.obligation.id}))
+        if rec.tx.amount > 0:  # a grant announced by a letter: money in
+            who = display_name(rec.tx.counterparty)
+            prompt = f"Is the {amount} from {who} on {when} the grant payment in the {letter}{of}?"
+            why = (f"The letter says {due} will be paid by {day_month(ob.obligation.due_on, repo.today())}.",
+                   f"This money is {amount}.",
+                   "The bank line does not show that it came from whoever wrote the letter.",
+                   "Until you answer, I won't count the grant as received.")
+            options = (CheckOption(id="yes", label="Yes, it is that grant", values={"obligation": ob.obligation.id}),
+                       CheckOption(id="no", label="No, it is for something else",
+                                   values={"obligation": ob.obligation.id}))
+        else:
+            prompt = f"Does the {amount} payment to {who} on {when} pay the {letter}{of}?"
+            why = (f"The letter asks for {due} by {day_month(ob.obligation.due_on, repo.today())}.",
+                   f"This payment is {amount}, made after the letter arrived.",
+                   "The bank line does not show that it went to whoever wrote the letter.",
+                   "Until you answer, I won't count the letter as paid.")
+            options = (CheckOption(id="yes", label="Yes, it pays that letter",
+                                   values={"obligation": ob.obligation.id}),
+                       CheckOption(id="no", label="No, it is for something else",
+                                   values={"obligation": ob.obligation.id}))
         needs_id = _unique_id(repo.needs, f"nd_{_slug(who.split()[0])}_letter")
         repo.needs[needs_id] = NeedsYouRecord(
             id=needs_id, kind="obligation", subject_type="transaction", subject_id=rec.id, item_id=rec.item_id,
@@ -7666,6 +8032,13 @@ class Orchestrator:
         result = satisfy(ob.obligation, [ObligationAgent._payment_fact(rec)])
         if not result.satisfied or result.quality is not Quality.GREEN:  # the letter changed meanwhile
             raise ValueError("That payment no longer fits the letter.")
+        if ob.obligation.kind is ObligationKind.GRANT_PAYMENT:
+            self.obligations.grant_received(ob, [rec], result, answer_ev=answer_ev)
+            ob.confirmed_by = (answer_ev,)
+            self.activity(now, "answered", f"You confirmed the {amount} is the grant in the {letter}.",
+                          rec.company_id, amount=abs(rec.tx.amount), currency=rec.tx.currency,
+                          evidence_ids=[rec.evidence_id, answer_ev])
+            return AnswerOutcome(ok=True, message="Done. The grant is recorded as received.")
         self.obligations._done(ob, result, how=f"Paid on {day_month(rec.tx.booked_on)}, as you confirmed.",
                                extra=(answer_ev,))
         ob.confirmed_by = (answer_ev,)
@@ -7802,6 +8175,7 @@ class Orchestrator:
             moved += self.reconciliation.customer_refunds()  # money back to a customer: your own credit note
             moved += self.staff.settle(now)  # a transfer paying an employee back their approved expense claims
             moved += self.settlement.settle(now)  # payouts first: their reports and commission invoices
+            moved += self.chargebacks.link(now)  # disputed card payments: the sale taken back, the money won back
             moved += self.staged.settle(now)  # deposits, advance and final invoices, parts held back (X8)
             moved += self.payroll.prove()  # salaries: only by that month's payslip for that employee (J3)
             matches = self.reconciliation.match()
@@ -7819,6 +8193,7 @@ class Orchestrator:
         self.cost_centers.allocate(now)  # which job, property, vehicle ...: nothing at all without cost centers
         self._ask_about_refund_amounts(now)  # a refund that does not match its credit note: one question
         self.staged.ask(now)  # a deposit, a part payment or a deposit given back that is not proven: one question
+        self.chargebacks.ask(now)  # a disputed card payment whose sale (or money taken back) is not found
         report.expected = self.missing.check_recurring(now)  # usual invoices that are overdue (§23)
         self.statements.review(now)  # suppliers' account statements: nothing at all without one
         linked = self.missing.chase_broken_links(now)  # invoice links that no longer work: nothing without one
@@ -7830,6 +8205,9 @@ class Orchestrator:
         report.sent = self.deliver(now)
         self._announce_waiting(now)
         report.reopened = self.auditor.recheck()
+        # Invoices in another currency closed on the bank's conversion line: their exchange difference, for the
+        # accountant (I11). Nothing at all without a reference-rate source (the browser demo has none).
+        record_exchange_differences(self, now)
         report.closed_months = self.closure.record_closures(now)
         self._record_recovered(now)
         self._onboarding_progress(now)
@@ -8794,7 +9172,7 @@ class Orchestrator:
         if needs.kind == "cost_center":
             # Checked before anything is recorded: a split that doesn't add up changes nothing.
             chosen = self._cost_center_choice(needs, option_id, split)
-        elif needs.kind in ("statement", "recharge", *_STAGED_QUESTIONS, *self.staff.NEEDS_KINDS) and \
+        elif needs.kind in ("statement", "recharge", "chargeback", *_STAGED_QUESTIONS, *self.staff.NEEDS_KINDS) and \
                 option_id not in {o.id for o in needs.options}:
             raise ValueError("not one of the options")
         answer_ev = self._record_answer(needs, option_id, now, split=split if needs.kind == "cost_center" else None)
@@ -8825,6 +9203,8 @@ class Orchestrator:
             outcome = self.staged.answer(needs, option_id, answer_ev, now)
         elif needs.kind in self.staff.NEEDS_KINDS:
             outcome = self.staff.answer(needs, option_id, answer_ev, now)
+        elif needs.kind == "chargeback":
+            outcome = self.chargebacks.answer(needs, option_id, answer_ev, now)
         else:
             outcome = self._answer_choice(needs, option_id, remember, answer_ev, now)
         self.run(now)

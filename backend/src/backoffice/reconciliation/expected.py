@@ -15,7 +15,9 @@ Rules run in a fixed order, first hit wins:
 5. payouts (money in from a card terminal or a payment / sales platform: a net
    settlement whose evidence is the provider's payout report, never customer
    revenue on its own),
-6. tax authorities named outright,
+6. tax authorities named outright, then the municipal tourist tax paid to the municipality (its notice or
+   payment proof covers it) and grants and subsidies received (the agency's letter covers them: never a
+   sale, checklist X26, X30),
 7. bank fees the bank itself flags,
 8. loans (before fee wording: a loan instalment mentions interest, 'JUROS'),
 9. bank fees and interest by wording,
@@ -63,7 +65,9 @@ __all__ = [
     "BANK_FEE_PHRASES",
     "LOAN_PHRASES",
     "PAYROLL_WORDS",
+    "GRANT_PHRASES",
     "TAX_AUTHORITY_PHRASES",
+    "TOURIST_TAX_PHRASES",
     "EvidenceExpectation",
     "EvidenceProvider",
     "ExpectationDecision",
@@ -177,6 +181,38 @@ TAX_WORDS: frozenset[str] = frozenset({"IVA", "IRC", "IRS", "IMI", "IUC", "IMT"}
 STATE_WORDS: frozenset[str] = frozenset(
     {"ESTADO", "AT", "IMPOSTO", "IMPOSTOS", "FINANCAS", "TRIBUTARIA", "HMRC"}
 )
+
+# The municipal tourist tax paid to the municipality (a local fee, checklist X26).
+TOURIST_TAX_PHRASES: tuple[str, ...] = (
+    "TAXA TURISTICA",
+    "TAXAS TURISTICAS",
+    "TAXA MUNICIPAL TURISTICA",
+    "TAX MUN TURISTICA",
+    "TOURIST TAX",
+    "CITY TAX",
+)
+
+# Grants and subsidies paid to the business (checklist X30): the agencies and the words that mean a grant.
+# ("GRANT" alone is also a name, e.g. an audit firm: only "GRANT PAYMENT" counts.)
+GRANT_PHRASES: tuple[str, ...] = (
+    "IFAP",
+    "PEPAC",
+    "PORTUGAL 2030",
+    "PT2030",
+    "COMPETE 2030",
+    "RECUPERAR PORTUGAL",
+    "IAPMEI",
+    "FUNDO AMBIENTAL",
+    "SUBSIDIO",
+    "SUBSIDIOS",
+    "SUBVENCAO",
+    "SUBSIDY",
+    "GRANT PAYMENT",
+)
+
+# Payroll allowances ("subsídio de férias"): never a grant.
+_PAYROLL_ALLOWANCES: tuple[str, ...] = ("SUBSIDIO DE FERIAS", "SUBSIDIO DE NATAL", "SUBSIDIO DE REFEICAO",
+                                        "SUBSIDIO DE ALIMENTACAO")
 
 BANK_FEE_PHRASES: tuple[str, ...] = (
     "COMISSAO",
@@ -377,6 +413,8 @@ class ExpectedEvidenceEngine:
             lambda: self._payout(tx),
             # 'PAGAMENTO AO ESTADO IMPOSTO DO SELO' is tax, not a bank charge.
             lambda: self._tax(tx, tax == "strong"),
+            lambda: self._tourist_tax(tx, text),
+            lambda: self._grant(tx, text),
             lambda: self._bank_fee(tx, text, worded=False),
             # 'PREST EMPRESTIMO CAPITAL E JUROS' is a loan instalment, not a charge.
             lambda: self._loan(tx, text),
@@ -504,6 +542,27 @@ class ExpectedEvidenceEngine:
             Quality.AMBER,
             "tax_wording",
         )
+
+    def _tourist_tax(self, tx: Transaction, text: str) -> ExpectationDecision | None:
+        """The tourist tax paid to the municipality: its notice or payment proof covers it (wording: AMBER)."""
+        if tx.amount >= 0 or is_card_purchase(tx) or not phrase_in(text, TOURIST_TAX_PHRASES):
+            return None
+        return self._decide(
+            tx, EvidenceExpectation.TAX_NOTICE_OR_PROOF,
+            "Tourist tax paid to the municipality. Its notice or payment proof covers it.", Quality.AMBER,
+            "tourist_tax",
+        )  # fmt: skip
+
+    def _grant(self, tx: Transaction, text: str) -> ExpectationDecision | None:
+        """Money in from a grant or subsidy: the agency's letter covers it, never an invoice (wording: AMBER)."""
+        if tx.amount <= 0 or is_card_purchase(tx) or not phrase_in(text, GRANT_PHRASES):
+            return None
+        if phrase_in(text, _PAYROLL_ALLOWANCES):
+            return None  # a payroll allowance, never a grant
+        return self._decide(
+            tx, EvidenceExpectation.TAX_NOTICE_OR_PROOF,
+            "A grant or subsidy. The letter about it covers it: it is not a sale.", Quality.AMBER, "grant",
+        )  # fmt: skip
 
     def _payroll(
         self, tx: Transaction, text: str, supplier: SupplierMatch

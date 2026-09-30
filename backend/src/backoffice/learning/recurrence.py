@@ -28,6 +28,15 @@ skipped. Gaps fit by length in days (within the cadence tolerance) or by
 anchor periods (26 Feb and 22 Mar are one month apart around the 24th). Untrusted series
 are returned as AMBER for display but never produce an overdue notice, so a
 thin pattern never triggers chasing (§21, §57).
+
+Seasonal series (checklist X29): a supplier that bills every month of a season only (a pool service
+from May to September, a harvest contractor from August to October, a ski-school rental from December
+to March) is learned as a monthly series with its ``season``: the months of the year it runs, one
+unbroken stretch of the calendar. A season is learned only from what repeated: the months outside it
+were empty every time the history crossed them, and either the history crossed them twice or they are
+at least three months long (a single skipped month or two is an occasional skip, not a season). Its
+expected dates skip the months outside the season, so an overdue or "missing" notice never fires out
+of season and does fire in season; its typical amount is the in-season median.
 """
 
 from __future__ import annotations
@@ -68,6 +77,7 @@ __all__ = [
     "method_of",
     "payment_method_note",
     "detect_price_change",
+    "season_words",
     "learn_from_documents",
     "learn_from_transactions",
     "learn_series",
@@ -111,6 +121,8 @@ CADENCE_SPECS: dict[Cadence, CadenceSpec] = {
 }
 MIN_FIT_RATIO = Decimal("0.75")  # share of gaps that must fit the cadence
 MAX_OFF_CYCLE_SHARE = Decimal("0.25")  # arrival days allowed off the rhythm (one-off extras)
+# A months-long quiet stretch crossed once is a season; a shorter one must have been crossed twice.
+SEASON_MIN_OFF_MONTHS = 3
 PRICE_STABLE_TOLERANCE = Decimal("0.005")  # 0.5%: FX-billed subscriptions wobble a little
 PRICE_MIN_CHANGE = Decimal("0.01")  # 1%: smaller moves are noise, not a price change
 USUAL_METHOD_SHARE = Decimal("0.8")  # the usual card or account pays at least 80% of the regular payments
@@ -176,6 +188,9 @@ class RecurringSeries(BaseModel):
     fixed_amount: bool = False
     price_change: PriceChange | None = None
     usual_method: str | None = None  # the card or account it is usually paid from (L4)
+    # Seasonal (monthly) series: the months of the year it runs, in calendar order from the season's first
+    # month ((5, 6, 7, 8, 9) for May to September; (12, 1, 2, 3) for December to March). Empty: all year.
+    season: tuple[int, ...] = ()
 
     @property
     def quality(self) -> Quality:
@@ -185,6 +200,21 @@ class RecurringSeries(BaseModel):
     @property
     def spec(self) -> CadenceSpec:
         return CADENCE_SPECS[self.cadence]
+
+    @property
+    def seasonal(self) -> bool:
+        return bool(self.season)
+
+    @property
+    def rhythm(self) -> str:
+        """'every month', 'every 3 months', 'every month from May to September'."""
+        if self.season:
+            return f"{self.spec.phrase} {season_words(self.season)}"
+        return self.spec.phrase
+
+    def in_season(self, value: date) -> bool:
+        """Whether ``value``'s month is one the series runs in (always, for a series without a season)."""
+        return not self.season or value.month in self.season
 
 
 class ExpectedWindow(BaseModel):
@@ -230,11 +260,30 @@ def _anchor_date(value: date, cadence: Cadence, anchor: int) -> date:
     return min(candidates, key=lambda c: (abs((value - c).days), c))
 
 
-def _step(anchor_date: date, cadence: Cadence, anchor: int, periods: int = 1) -> date:
+def _step(anchor_date: date, cadence: Cadence, anchor: int, periods: int = 1, season: Sequence[int] = ()) -> date:
+    """The anchor date ``periods`` periods later; a seasonal series skips the months outside its season."""
     if cadence is Cadence.WEEKLY:
         return anchor_date + timedelta(days=7 * periods)
+    if season and cadence is Cadence.MONTHLY:
+        year, month, left = anchor_date.year, anchor_date.month, periods
+        while left > 0:
+            year, month = _month_shift(year, month, 1)
+            if month in season:
+                left -= 1
+        return _on_day(year, month, anchor)
     months = CADENCE_SPECS[cadence].months * periods
     return _on_day(*_month_shift(anchor_date.year, anchor_date.month, months), anchor)
+
+
+def season_words(season: Sequence[int]) -> str:
+    """(5, 6, 7, 8, 9) -> 'from May to September'; (12, 1, 2) -> 'from December to February'."""
+    from .plain import MONTHS
+
+    if not season:
+        return ""
+    if len(season) == 1:
+        return f"in {MONTHS[season[0] - 1]}"
+    return f"from {MONTHS[season[0] - 1]} to {MONTHS[season[-1] - 1]}"
 
 
 def _best_anchor(dates: Sequence[date], cadence: Cadence) -> int:
@@ -255,6 +304,7 @@ class _Fit:
     cadence: Cadence
     ratio: Decimal
     missed: int
+    season: tuple[int, ...] = ()
 
 
 def _whole_periods(gap: int, units: int, spec: CadenceSpec) -> int | None:
@@ -342,8 +392,66 @@ def _fit_series(dates: Sequence[date]) -> tuple[_Fit, int, list[date]] | None:
             continue
         fit = _fit(on_cycle, cadence, anchor)
         if fit is not None and fit.missed <= _missed_budget(len(on_cycle)):
+            if cadence is Cadence.MONTHLY and fit.missed:
+                # The months it skipped may be the same months every year: a season, not skips.
+                seasonal = _fit_seasonal(dates)
+                if seasonal is not None:
+                    return seasonal
             return fit, anchor, on_cycle
-    return None
+    return _fit_seasonal(dates)
+
+
+def _season_of(months: set[int]) -> tuple[int, ...] | None:
+    """The months as one unbroken stretch of the calendar, from its first month ({12, 1, 2} -> (12, 1, 2)), or
+    None when they are all twelve, fewer than two, or more than one stretch."""
+    if not 2 <= len(months) <= 11:
+        return None
+    starts = [m for m in months if (m - 2) % 12 + 1 not in months]  # a month whose previous month is not in it
+    if len(starts) != 1:
+        return None
+    first = starts[0]
+    return tuple((first - 1 + i) % 12 + 1 for i in range(len(months)))
+
+
+def _fit_seasonal(dates: Sequence[date]) -> tuple[_Fit, int, list[date]] | None:
+    """A monthly rhythm that runs in the same months every year and is quiet in the others (module docstring).
+
+    The on-cycle days (as for a monthly series) must fall in one unbroken stretch of months; every stretch of
+    quiet months between two of them must be the whole quiet part of the year (never a whole season skipped);
+    in season, only the occasional month is skipped.
+    """
+    cadence = Cadence.MONTHLY
+    spec = CADENCE_SPECS[cadence]
+    if len(dates) < spec.min_observations:
+        return None
+    anchor = _best_anchor(dates, cadence)
+    near = [d for d in dates if abs(_offset(d, cadence, anchor)) <= spec.tolerance_days]
+    on_cycle = _one_per_period(near, cadence, anchor)
+    extras = len(dates) - len(on_cycle)
+    if len(on_cycle) < spec.min_observations or Decimal(extras) > MAX_OFF_CYCLE_SHARE * len(dates):
+        return None
+    periods = [_anchor_units(d, cadence, anchor) for d in on_cycle]  # month indexes, increasing
+    season = _season_of({p % 12 + 1 for p in periods})
+    if season is None:
+        return None
+    quiet = 12 - len(season)
+    missed = singles = crossings = 0
+    for a, b in pairwise(periods):
+        between = [p % 12 + 1 for p in range(a + 1, b)]
+        off = sum(1 for m in between if m not in season)
+        if off:
+            if off != quiet:
+                return None  # a whole season went by without it: that is no rhythm
+            crossings += 1
+        skipped = len(between) - off
+        missed += skipped
+        singles += skipped == 0
+    if crossings == 0 or (crossings < 2 and quiet < SEASON_MIN_OFF_MONTHS):
+        return None
+    gaps = len(periods) - 1
+    if missed > _missed_budget(len(on_cycle)) or singles * 2 <= gaps:
+        return None
+    return _Fit(cadence, Decimal(1), missed, season), anchor, on_cycle
 
 
 # --------------------------------------------------------------------------- amounts
@@ -492,6 +600,7 @@ def learn_series(
         amount_max=amounts.high,
         fixed_amount=amounts.fixed,
         price_change=amounts.change,
+        season=fit.season,
     )
 
 
@@ -598,13 +707,17 @@ def _next_period(series: RecurringSeries, arrivals: Iterable[date]) -> date:
     document can never silence a missing invoice (§22, §23).
     """
     tolerance = timedelta(days=series.spec.tolerance_days)
-    expected = _step(_anchor_date(series.last_seen, series.cadence, series.anchor), series.cadence, series.anchor)
+
+    def step(value: date) -> date:
+        return _step(value, series.cadence, series.anchor, season=series.season)
+
+    expected = step(_anchor_date(series.last_seen, series.cadence, series.anchor))
     for arrival in sorted(set(arrivals)):
         if arrival < expected - tolerance:
             continue
-        while _step(expected, series.cadence, series.anchor) - tolerance <= arrival:
-            expected = _step(expected, series.cadence, series.anchor)
-        expected = _step(expected, series.cadence, series.anchor)
+        while step(expected) - tolerance <= arrival:
+            expected = step(expected)
+        expected = step(expected)
     return expected
 
 
@@ -636,8 +749,8 @@ def check_overdue(
         return None
     missed, expected = 0, window.expected
     while today > expected + timedelta(days=series.grace_days):
-        missed += 1
-        expected = _step(expected, series.cadence, series.anchor)
+        missed += 1  # a seasonal series counts only the months of its season
+        expected = _step(expected, series.cadence, series.anchor, season=series.season)
     likely_ended = missed >= series.spec.ended_after_missed
     return OverdueNotice(
         key=series.key,
@@ -675,6 +788,8 @@ def _overdue_message(series: RecurringSeries, due: date, today: date, likely_end
 
 def _lead(series: RecurringSeries, when: str) -> str:
     name = series.display_name
+    if series.season:
+        when = f"{when}, {series.rhythm}"  # "by the 12th, every month from May to September"
     if series.basis is Basis.INVOICES:
         return f"{name} normally issues an invoice {when}."
     if series.direction is Direction.OUT:

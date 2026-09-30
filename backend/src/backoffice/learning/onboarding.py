@@ -358,7 +358,7 @@ def recurring_expense_question(
 
 
 def _recurring_prompt(series: RecurringSeries) -> str:
-    rhythm = series.spec.phrase
+    rhythm = series.rhythm  # "every month", or "every month from May to September" for a seasonal one
     name = series.display_name
     if series.typical_amount is None:
         return f"{name} appears {rhythm}."

@@ -24,6 +24,17 @@ Rules of evidence:
   that runs past the deadline. Last month's rent is not this month's rent.
 * A zero or negative total ("-405,00 €") is never read as an amount to pay.
 
+Local fees and grants (checklist X26, X30):
+
+* The municipal tourist tax ("taxa turística", "taxa municipal turística", "tourist tax", "city tax"):
+  with an amount it is a payment to the municipality (proven by that payment), without one it is the
+  monthly declaration (proven by the submission receipt or the owner's confirmation).
+* Grant and subsidy communications (IFAP, PEPAC, Portugal 2030, COMPETE 2030, Recuperar Portugal,
+  "subsídio", "apoio", "candidatura", "grant", "subsidy"): documents to send by a deadline (proven by
+  the agency's acknowledgement or the owner's confirmation), and a grant payment announced, approved
+  or made (proven only by the money arriving in the bank). Payroll words ("subsídio de férias",
+  "subsídio de refeição") and "apoio ao cliente" are never a grant.
+
 Everything here is wording, not law. The phrase tables are common letter
 conventions (unverified against a corpus, verified_as_of: never); the
 consequences are cautious "may" statements unless the letter itself names
@@ -70,6 +81,7 @@ __all__ = [
     "ConfirmationFinding",
     "DueItem",
     "EvidenceFact",
+    "GRANT_KINDS",
     "Issuer",
     "ObligationFinding",
     "ProofKind",
@@ -78,12 +90,16 @@ __all__ = [
     "detect_confirmation",
     "detect_obligation",
     "due_soon",
+    "grant_agency",
+    "is_grant_text",
+    "mentions_tourist_tax",
     "normalize_reference",
     "proof_for",
     "satisfy",
 ]
 
 DEFAULT_DUE_SOON_DAYS = 14  # product default for Home "Due soon" (§35), not a legal figure
+GRANT_NOTICE_LEAD_DAYS = 7  # a grant payment may be booked up to a week before the letter's (or its own) date
 # The consequence of a renewal that happens by itself: nothing is needed unless the owner wants a change.
 AUTO_RENEWS = "It renews on its own unless you act."
 
@@ -97,6 +113,8 @@ class Issuer(str, Enum):
     BANK = "bank"
     LANDLORD = "landlord"
     INSURER = "insurer"
+    MUNICIPALITY = "municipality"
+    GRANT_AGENCY = "grant_agency"
     OTHER = "other"
 
 
@@ -123,6 +141,16 @@ _ISSUER_PHRASES: dict[Issuer, tuple[str, ...]] = {
     Issuer.BANK: ("o seu banco", "your bank", "o banco", "the bank"),
     Issuer.LANDLORD: ("senhorio", "landlord", "arrendamento", "contrato de arrendamento", "lease"),
     Issuer.INSURER: ("seguradora", "companhia de seguros", "insurer", "insurance company", "apolice"),
+    Issuer.MUNICIPALITY: ("camara municipal", "municipio de", "municipio do", "municipio da", "junta de freguesia",
+                          "city council", "municipality", "town hall"),
+}  # fmt: skip
+# Agencies that run grants and subsidies, as their letters name them (folded), with their names for the owner.
+_GRANT_AGENCIES: dict[str, str] = {
+    "ifap": "IFAP", "instituto de financiamento da agricultura e pescas": "IFAP", "pepac": "PEPAC",
+    "portugal 2030": "Portugal 2030", "pt2030": "Portugal 2030", "compete 2030": "COMPETE 2030",
+    "norte 2030": "Norte 2030", "centro 2030": "Centro 2030", "lisboa 2030": "Lisboa 2030",
+    "alentejo 2030": "Alentejo 2030", "algarve 2030": "Algarve 2030", "balcao dos fundos": "Balcão dos Fundos",
+    "recuperar portugal": "Recuperar Portugal", "iapmei": "IAPMEI", "fundo ambiental": "Fundo Ambiental",
 }  # fmt: skip
 _SOURCE_ISSUER = {SourceKind.BANK: Issuer.BANK, SourceKind.CARD: Issuer.BANK}
 
@@ -155,6 +183,30 @@ _PAYMENT_DEADLINE = ("pagamento ate", "data limite de pagamento", "data limite p
                      "data de vencimento", "vencimento:", "vence em", "vence a", "due by",
                      "payment due", "amount due", "due date", "pay by", "valor a pagar",
                      "total a pagar")  # fmt: skip
+# The municipal tourist tax (Lisbon, Porto, ... charge it per night; the operator declares and pays monthly).
+_TOURIST_TAX = ("taxa turistica", "taxas turisticas", "taxa municipal turistica", "taxas municipais turisticas",
+                "tourist tax", "city tax", "taxa de dormida", "taxa de dormidas", "overnight tax")
+# Grant words. Some are enough on their own; a core word ("candidatura", "apoio") needs a second grant word next to
+# it (a loan letter's "financiamento" and "investimento" alone are never a grant).
+_GRANT_ALONE = ("subsidio", "subsidios", "subvencao", "subvencoes", "subsidy", "subsidies", "fundo perdido",
+                "grant application", "grant agreement", "grant payment", "grant award", "grant funding",
+                "apoio financeiro", "incentivo financeiro")
+_GRANT_CORE = ("candidatura", "candidaturas", "grant", "grants", "apoio", "apoios", "incentivo", "incentivos",
+               "comparticipacao")
+_GRANT_PAIRED = (*_GRANT_CORE, "financiamento", "aprovada", "aprovado", "aprovacao", "beneficiario", "investimento",
+                 "fundos", "funding", "awarded", "beneficiary")
+# Never a grant: payroll allowances, customer support lines, access being granted.
+_NOT_GRANT = ("subsidio de ferias", "subsidio de natal", "subsidio de refeicao", "subsidio de alimentacao",
+              "subsidio de desemprego", "subsidio de doenca", "subsidio de parentalidade", "subsidio de turno",
+              "subsidios de ferias", "subsidios de natal", "apoio ao cliente", "linha de apoio", "apoio tecnico",
+              "customer support", "grant access", "granted access", "grants access")
+# In a grant letter: documents to send (an application, a payment claim, an acceptance) ...
+_GRANT_DOCUMENTS = ("submeter", "submissao", "enviar", "entregar", "apresentar", "documentos", "documentacao",
+                    "elementos em falta", "comprovativos", "pedido de pagamento", "termo de aceitacao",
+                    "submit", "send", "provide", "upload", "documents", "supporting documents", "acceptance form")
+# ... or money the agency pays: approved, to be paid, or paid.
+_GRANT_PAID = ("pagamento", "pago", "paga", "transferencia", "transferido", "transferida", "aprovada", "aprovado",
+               "aprovacao", "payment", "paid", "approved", "transfer", "transferred")
 _AUTO_RENEW = ("renova automaticamente", "renovacao automatica", "renovado automaticamente",
                "renews automatically", "automatic renewal", "auto-renew", "auto renew",
                "tacitamente")  # fmt: skip
@@ -199,6 +251,10 @@ _GENERIC_CONSEQUENCE: dict[ObligationKind, str] = {
     ObligationKind.RENT: "Paying late may cost a late fee.",
     ObligationKind.DEBT_COLLECTION: "Not paying may lead to legal action.",
     ObligationKind.PAYMENT_DEADLINE: "Paying late may cost a fee.",
+    ObligationKind.TOURIST_TAX: "Paying late may lead to a fine and interest.",
+    ObligationKind.TOURIST_TAX_DECLARATION: "Declaring late may lead to a fine.",
+    ObligationKind.GRANT_DOCUMENTS: "The grant may be delayed or cancelled if the documents are late.",
+    ObligationKind.GRANT_PAYMENT: "Nothing to pay. I check that the money arrives.",
 }
 
 _PROOF_FOR_KIND: dict[ObligationKind, ProofKind] = {
@@ -213,7 +269,14 @@ _PROOF_FOR_KIND: dict[ObligationKind, ProofKind] = {
     ObligationKind.INSURANCE_RENEWAL: ProofKind.RENEWAL,
     ObligationKind.CONTRACT_RENEWAL: ProofKind.RENEWAL,
     ObligationKind.LICENSE_RENEWAL: ProofKind.RENEWAL,
+    ObligationKind.TOURIST_TAX: ProofKind.PAYMENT,
+    ObligationKind.TOURIST_TAX_DECLARATION: ProofKind.SUBMISSION,
+    ObligationKind.GRANT_DOCUMENTS: ProofKind.REPLY,
+    ObligationKind.GRANT_PAYMENT: ProofKind.PAYMENT,  # money in: the grant arriving in the bank
 }
+
+# Grant and subsidy obligations (checklist X30).
+GRANT_KINDS: frozenset[ObligationKind] = frozenset({ObligationKind.GRANT_DOCUMENTS, ObligationKind.GRANT_PAYMENT})
 
 RENEWAL_KINDS: frozenset[ObligationKind] = frozenset(
     {ObligationKind.INSURANCE_RENEWAL, ObligationKind.CONTRACT_RENEWAL, ObligationKind.LICENSE_RENEWAL}
@@ -582,7 +645,10 @@ _P = {
         "rent": _RENT, "bank_request": _BANK_REQUEST, "payment_deadline": _PAYMENT_DEADLINE,
         "auto_renew": _AUTO_RENEW, "strong_date": _STRONG_DATE_ANCHORS,
         "weak_date": _WEAK_DATE_ANCHORS, "strong_amount": _STRONG_AMOUNT_ANCHORS,
-        "weak_amount": _WEAK_AMOUNT_ANCHORS,
+        "weak_amount": _WEAK_AMOUNT_ANCHORS, "tourist_tax": _TOURIST_TAX, "grant_alone": _GRANT_ALONE,
+        "grant_paired": _GRANT_PAIRED, "grant_core": _GRANT_CORE, "not_grant": _NOT_GRANT,
+        "grant_documents": _GRANT_DOCUMENTS,
+        "grant_paid": _GRANT_PAID, "grant_agency": tuple(_GRANT_AGENCIES),
     }.items()
 }  # fmt: skip
 _ISSUER_PATTERNS = {issuer: phrase_pattern(p) for issuer, p in _ISSUER_PHRASES.items()}
@@ -594,15 +660,49 @@ def _has(name: str, folded: str) -> bool:
 
 
 def _issuer(folded: str, source_kind: SourceKind | None) -> Issuer:
+    if _P["grant_agency"].search(folded):  # a grant letter may name Social Security among the proofs it wants
+        return Issuer.GRANT_AGENCY
     for issuer in (Issuer.TAX_AUTHORITY, Issuer.SOCIAL_SECURITY):
         if _ISSUER_PATTERNS[issuer].search(folded):
             return issuer
     if source_kind in _SOURCE_ISSUER:
         return _SOURCE_ISSUER[source_kind]
-    for issuer in (Issuer.BANK, Issuer.INSURER, Issuer.LANDLORD):
+    for issuer in (Issuer.BANK, Issuer.INSURER, Issuer.LANDLORD, Issuer.MUNICIPALITY):
         if _ISSUER_PATTERNS[issuer].search(folded):
             return issuer
     return Issuer.OTHER
+
+
+def grant_agency(text: str) -> str | None:
+    """The grant agency a text names, as the owner knows it ('IFAP', 'Portugal 2030'), or None."""
+    m = _P["grant_agency"].search(fold(text))
+    return _GRANT_AGENCIES.get(" ".join(m.group(0).split())) if m else None
+
+
+def mentions_tourist_tax(text: str) -> bool:
+    """'Taxa Municipal Turística', 'tourist tax', 'city tax'."""
+    return _has("tourist_tax", fold(text))
+
+
+def is_grant_text(text: str) -> bool:
+    """A grant or subsidy communication: an agency named, a word that means a grant on its own ('subsídio',
+    'subsidy'), or two grant words together ('candidatura' and 'apoio'). Payroll allowances ('subsídio de
+    férias') and support lines ('apoio ao cliente') never count."""
+    folded = _P["not_grant"].sub(" ", fold(text))
+    if _P["grant_agency"].search(folded) or _P["grant_alone"].search(folded):
+        return True
+    if not _P["grant_core"].search(folded):
+        return False
+    return len({" ".join(m.group(0).split()) for m in _P["grant_paired"].finditer(folded)}) >= 2
+
+
+def _grant_kind(folded: str, has_amount: bool) -> ObligationKind | None:
+    """Documents to send come first (a payment claim is documents too); then money the agency pays."""
+    if _has("grant_documents", folded):
+        return ObligationKind.GRANT_DOCUMENTS
+    if has_amount and _has("grant_paid", folded):
+        return ObligationKind.GRANT_PAYMENT
+    return None
 
 
 def _government_kind(folded: str, has_amount: bool) -> ObligationKind:
@@ -628,6 +728,10 @@ def _classify(folded: str, issuer: Issuer, has_amount: bool) -> ObligationKind |
     """First matching rule wins; the order is the policy."""
     if _has("kyc", folded):
         return ObligationKind.KYC_REQUEST
+    if _has("tourist_tax", folded):  # the municipality's tourist tax: the payment, or the declaration
+        return ObligationKind.TOURIST_TAX if has_amount else ObligationKind.TOURIST_TAX_DECLARATION
+    if is_grant_text(folded):
+        return _grant_kind(_P["not_grant"].sub(" ", folded), has_amount)
     if issuer in (Issuer.TAX_AUTHORITY, Issuer.SOCIAL_SECURITY):
         return _government_kind(folded, has_amount)
     if _has("debt", folded):
@@ -662,6 +766,10 @@ def _title(kind: ObligationKind, issuer: Issuer) -> str:
         ObligationKind.RENT: "Rent payment",
         ObligationKind.DEBT_COLLECTION: "Debt collection letter",
         ObligationKind.PAYMENT_DEADLINE: "Payment due",
+        ObligationKind.TOURIST_TAX: "Tourist tax payment",
+        ObligationKind.TOURIST_TAX_DECLARATION: "Tourist tax declaration",
+        ObligationKind.GRANT_DOCUMENTS: "Documents for your grant",
+        ObligationKind.GRANT_PAYMENT: "Grant payment to receive",
     }[kind]
 
 
@@ -783,6 +891,7 @@ class ObligationFinding:
     reasons: tuple[str, ...]
     missing: tuple[str, ...]
     obligation: Obligation | None
+    agency: str | None = None  # the grant agency the letter names ("IFAP"), for a grant letter
 
     @property
     def complete(self) -> bool:
@@ -859,6 +968,12 @@ def _relative_deadline(folded: str, received_on: date) -> tuple[date, str] | Non
 
 
 def _required_evidence(kind: ObligationKind, condition: VerificationCondition) -> str:
+    if kind is ObligationKind.GRANT_DOCUMENTS:
+        by = f" by {day_month(condition.by)}" if condition.by is not None else ""
+        return f"Proof that the documents were sent{by}."
+    if kind is ObligationKind.GRANT_PAYMENT:
+        amount = f" of {format_money(condition.amount, condition.currency)}" if condition.amount is not None else ""
+        return f"The grant payment{amount} arriving in your bank."
     if condition.proof is ProofKind.RENEWAL:
         thing = {
             ObligationKind.INSURANCE_RENEWAL: "policy",
@@ -897,15 +1012,21 @@ def detect_obligation(
     issuer = _issuer(everything, source_kind)
     kind = _classify(everything, issuer, amount_pick.value is not None)
     deadline = _deadline(body, received_on) if kind is not None else None
+    if kind is ObligationKind.GRANT_PAYMENT and (deadline is None or deadline.due_on is None):
+        deadline = _payment_date(body, received_on) or deadline  # "was paid on 15/10": the date it was made
     if kind is None or deadline is None:
         return None
 
     amount, currency, amount_reasons = _amount_due(amount_pick)
     reference = _reference(body)
     entity_id, entity_problem = _entity(everything, entities, default_entity_id)
+    since = received_on
+    if kind is ObligationKind.GRANT_PAYMENT:
+        # A notice that a grant was paid often arrives after the money: a week before the payment date counts.
+        since = min(received_on, deadline.due_on or received_on) - timedelta(days=GRANT_NOTICE_LEAD_DAYS)
     condition = _condition(
         kind, amount, currency, reference, deadline.due_on,
-        since=received_on, disputed=amount_pick.conflict,
+        since=since, disputed=amount_pick.conflict,
     )  # fmt: skip
     missing = [m for m in ("the due date" if deadline.due_on is None else None, entity_problem) if m]
     if condition.proof is ProofKind.PAYMENT and amount is None and (reference is None or amount_pick.conflict):
@@ -926,12 +1047,14 @@ def detect_obligation(
         condition=condition,
         quality=Quality.RED if (deadline.conflict or amount_pick.conflict) else Quality.AMBER,
         reasons=(
-            *_why_lines(issuer, deadline.due_on, amount, currency, reference, received_on),
+            *_why_lines(issuer, deadline.due_on, amount, currency, reference, received_on,
+                        agency=grant_agency(everything)),
             *deadline.reasons,
             *amount_reasons,
         ),
         missing=tuple(missing),
         obligation=None,
+        agency=grant_agency(everything) if kind in GRANT_KINDS else None,
     )
     return replace(finding, obligation=_obligation(finding, tenant_id))
 
@@ -954,6 +1077,14 @@ def _deadline(body: str, received_on: date) -> _Deadline | None:
     if _has("strong_date", body):
         return _Deadline(None, (), False)
     return None
+
+
+def _payment_date(body: str, received_on: date) -> _Deadline | None:
+    """A grant payment the letter says was made (or is made) on a date: the latest date it names."""
+    values = sorted({h.value for h in _date_hits(body, received_on)})  # type: ignore[type-var]
+    if not values:
+        return None
+    return _Deadline(values[-1], (), False)  # type: ignore[arg-type]
 
 
 def _amount_due(pick: _Pick) -> tuple[Decimal | None, str, tuple[str, ...]]:
@@ -1016,6 +1147,8 @@ _ISSUER_LINE = {
     Issuer.BANK: "From your bank",
     Issuer.LANDLORD: "From your landlord",
     Issuer.INSURER: "From your insurer",
+    Issuer.MUNICIPALITY: "From the municipality",
+    Issuer.GRANT_AGENCY: "From the grant agency",
 }
 
 
@@ -1026,9 +1159,13 @@ def _why_lines(
     currency: str,
     reference: str | None,
     today: date,
+    *,
+    agency: str | None = None,
 ) -> list[str]:
     """§54 "Why?" lines for a detected obligation."""
     lines = [_ISSUER_LINE[issuer]] if issuer in _ISSUER_LINE else []
+    if issuer is Issuer.GRANT_AGENCY and agency:
+        lines = [f"From {agency}"]
     if due_on is not None:
         lines.append(f"Due {day_month(due_on, today)}")
     if amount is not None:
@@ -1128,6 +1265,10 @@ def _validity(body: str, received_on: date) -> date | None:
 
 
 def _confirmed_kinds(proof: ProofKind, body: str, issuer: Issuer) -> frozenset[ObligationKind]:
+    if issuer is Issuer.GRANT_AGENCY or (proof is ProofKind.REPLY and is_grant_text(body)):
+        return frozenset({ObligationKind.GRANT_DOCUMENTS})
+    if proof is ProofKind.SUBMISSION and _has("tourist_tax", body):
+        return frozenset({ObligationKind.TOURIST_TAX_DECLARATION})
     if proof in (ProofKind.RENEWAL, ProofKind.DECISION):
         if _has("license", body):
             return frozenset({ObligationKind.LICENSE_RENEWAL})
@@ -1173,6 +1314,8 @@ def detect_confirmation(
     if proof is None:
         return None
     issuer = _issuer(everything, source_kind)
+    if proof is ProofKind.SUBMISSION and (issuer is Issuer.GRANT_AGENCY or is_grant_text(body)):
+        proof = ProofKind.REPLY  # an application submitted to the agency: what it asked for was sent
     valid_until = _validity(body, received_on) if proof is ProofKind.RENEWAL else None
     reference = _reference(body)
     entity_id, _ = _entity(everything, entities, default_entity_id)
