@@ -27,20 +27,36 @@ WORKDIR /app/backend
 
 COPY pyproject.toml ./
 COPY src ./src
-# The worker needs temporalio: the "workflows" extra of the same package. The api reads
-# uploaded PDFs and photos: "documents" (PDF text), "qr" (fiscal QR codes), "vision"
-# (page rendering and masking before any external reading, §53).
+# The worker needs temporalio (the "workflows" extra); the production API needs
+# psycopg, boto3 and anthropic (the "server" extra), and reads uploaded PDFs and
+# photos: "documents" (PDF text), "qr" (fiscal QR codes), "vision" (page rendering
+# and masking before any external reading, §53).
 RUN find src -name __pycache__ -type d -prune -exec rm -rf {} + \
-    && pip install -e ".[workflows,documents,qr,vision]"
+    && pip install -e ".[workflows,server,documents,qr,vision]"
 
 COPY --from=db migrations /app/db/migrations
 COPY --from=db backoffice_db /app/db/backoffice_db
 
+# Evidence files when no S3 bucket is configured (BACKOFFICE_OBJECT_DIR); mount a
+# volume here. Owned by the service user so a fresh named volume is writable.
+RUN mkdir -p /var/lib/backoffice/objects \
+    && chown -R backoffice:backoffice /var/lib/backoffice \
+    && chmod 700 /var/lib/backoffice/objects
+
 USER backoffice:backoffice
+
+# Uvicorn reads these itself. WEB_CONCURRENCY: worker processes. In production
+# mode tenants are shared through the database, so any number works (compose
+# runs 2; on ECS scale tasks instead). The demo keeps its tenant in memory: 1.
+# FORWARDED_ALLOW_IPS: the proxy allowed to set client addresses.
+ENV WEB_CONCURRENCY=1 \
+    FORWARDED_ALLOW_IPS=127.0.0.1
 
 EXPOSE 8000
 
-# Behind a load balancer set FORWARDED_ALLOW_IPS so client addresses are trusted
-# only from it. Worker: python -m backoffice.workflows.worker
-# Migrations:            python -m backoffice_db migrate
-CMD ["uvicorn", "backoffice.api.app:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
+# Behind a load balancer set FORWARDED_ALLOW_IPS to its address range so client
+# addresses (rate limits) are trusted only from it.
+# Worker:     python -m backoffice.workflows.worker
+# Migrations: python -m backoffice_db migrate
+CMD ["uvicorn", "backoffice.api.app:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", \
+     "--no-server-header", "--timeout-graceful-shutdown", "20"]

@@ -21,7 +21,8 @@ PACKAGE = SRC / "backoffice"
 DEFAULT_OUT = HERE.parent.parent / "web" / "public" / "engine" / "backoffice.zip"
 DATA_SUFFIXES = {".py", ".json", ".txt", ".eml", ".xml", ".csv", ".typed"}
 # Server-only parts that need fastapi/uvicorn/temporalio; the browser never imports them.
-SKIP_DIRS = {"__pycache__"}
+# backoffice/server is the production API (sign-in, PostgreSQL, push): never in the browser.
+SKIP_DIRS = {"__pycache__", "server"}
 FIXED_TIME = (2026, 1, 1, 0, 0, 0)
 
 

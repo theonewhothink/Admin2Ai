@@ -185,11 +185,11 @@ jobs:
           APP_DB_PASSWORD: ci-only-app-password
         run: python -m backoffice_db ensure-login backoffice_api --member-of backoffice_app
 
-      - name: Database behaviour tests (isolation, immutability, golden rule, pgvector)
+      - name: Database behaviour tests (isolation, immutability, golden rule, pgvector, production store)
         working-directory: backend
         env:
           BACKOFFICE_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
-        run: python -m pytest -q tests/test_infra_postgres.py
+        run: python -m pytest -q tests/test_infra_postgres.py tests/test_server_postgres.py
 
   infra:
     name: Infrastructure (Terraform, Compose)
