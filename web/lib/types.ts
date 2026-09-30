@@ -63,10 +63,22 @@ export interface Connection {
   lastSyncedAt: ISODateTime;
   /** Optional pre-formatted label, e.g. "14:42 yesterday". */
   lastSyncedLabel?: string;
+  /** Plain words about the problem, when it is stale. */
+  message?: string;
+  /** Production: what reconnecting takes, e.g. "Sign in to Gmail again". */
+  action?: string;
+  /**
+   * Production: "catching_up" once the owner signed in again (or asked to try again). It stays
+   * "stale" until a sync has actually worked; only then does it come back as "healthy".
+   */
+  reconnect?: "catching_up";
 }
 
 export interface HomeData {
   greeting: string;
+  /** The engine's own status line ("Action required.", "I need 2 things from you."); it counts stale connections. */
+  headline?: string;
+  /** Open questions plus connections that need reconnecting. */
   needsYouCount: number;
   dueSoon: DueItem[];
   currentMonth: { key: MonthKey; label: string; percentClosed: number };
@@ -128,6 +140,8 @@ export interface NeedsYouApprovalItem {
   verification: {
     optionLabel: string;
     instruction: string;
+    /** Checkbox the owner ticks after the call; required before release. */
+    checkboxLabel: string;
     confirmLabel: string;
     confirmOptionId: string;
     confirmedMessage: string;
@@ -139,6 +153,8 @@ export type NeedsYouItem = NeedsYouChoiceItem | NeedsYouApprovalItem;
 
 export interface AnswerResult {
   ok: boolean;
+  /** What the engine said, in plain language, when it has something to say. */
+  message?: string;
 }
 
 /* ---------- Activity ---------- */
@@ -151,7 +167,9 @@ export type ActivityKind =
   | "checked"
   | "closed"
   | "protected"
-  | "learned";
+  | "learned"
+  /** An email written but not sent yet (no mailer accepted it). Never counted as handled. */
+  | "waiting";
 
 export interface ActivityItem {
   id: string;
@@ -276,7 +294,38 @@ export interface AccountantClientRow {
   month: string;
   complete: number;
   missing: number;
+  /** What only the accountant can decide: tax flags and questions routed to them. */
   needsAccountant: number;
+  /** Production: the client business the company belongs to (when the accountant may see all of it). */
+  business?: string;
+}
+
+/** An original the accountant can open: `href` returns `{ filename, contentType, data }` (base64). */
+export interface EvidenceLink {
+  id: string;
+  label: string;
+  href: string;
+  kind?: "payment" | "document" | "email" | "letter" | "file";
+  sourceLabel?: string;
+  receivedAt?: string;
+  filename?: string | null;
+}
+
+/** One payment of the month and what proves it (§20, §54). */
+export interface ReconciliationRow {
+  id: string;
+  date: ISODate;
+  payee: string;
+  description: string;
+  amount: number;
+  direction: "in" | "out";
+  currency: string;
+  status: "closed" | "not_required" | "conflict" | "waiting_for_owner" | "open";
+  statusLabel: string;
+  tone: Tone;
+  documents: { id: string; label: string; href?: string; evidenceId?: string }[];
+  evidence: EvidenceLink[];
+  why: string[];
 }
 
 export interface AccountantClientDetail extends AccountantClientRow {
@@ -285,11 +334,128 @@ export interface AccountantClientDetail extends AccountantClientRow {
   evidence: { label: string; value: string }[];
   anomalies: { id: string; title: string; detail: string; tone: Tone }[];
   taxFlags: { id: string; title: string; detail: string }[];
-  questions: { id: string; question: string; status: "answered" | "waiting"; answer?: string }[];
+  questions: {
+    id: string;
+    question: string;
+    status: "answered" | "waiting";
+    answer?: string;
+    evidence?: EvidenceLink[];
+  }[];
   exportState: {
     state: "ready" | "partial" | "exported";
     ready: number;
     total: number;
     note: string;
   };
+  /** The month being prepared, the period the export covers. */
+  period?: { key: MonthKey; from: string; to: string };
+  /** The company's own accountant, else the business's. */
+  accountant?: { name: string; firm: string; email: string } | null;
+  evidenceLinks?: EvidenceLink[];
+  reconciliation?: ReconciliationRow[];
+  missingDocuments?: { id: string; date: ISODate; payee: string; amount: number | null; currency: string; plan: string }[];
+  openReasons?: string[];
+  /** Rules of this client's accountant that apply to it: "client" (this client) or "all" (all clients). */
+  rules?: { id: string; label: string; scope: string }[];
+  links?: { export: string; rules: string };
+}
+
+export interface AccountantInvitation {
+  id: string;
+  email: string;
+  clientName?: string | null;
+  taxIds: string[];
+  createdAt: string;
+  expiresAt: string;
+  status: string;
+  statusLabel: string;
+}
+
+/* ---------- Sources (GET /api/sources) ---------- */
+
+export type SourceStatus = "healthy" | "stale" | "not_connected" | "known" | "hold";
+
+export interface SourceItem {
+  id: string;
+  name: string;
+  company: string;
+  detail: string;
+  status: SourceStatus;
+  lastSyncedAt?: string | null;
+  lastSeen?: string | null;
+  foundIn?: string;
+  renewsOn?: string | null;
+  signIn?: string;
+}
+
+export interface SourceGroup {
+  id: string;
+  title: string;
+  description: string;
+  items: SourceItem[];
+}
+
+export interface SourcesData {
+  groups: SourceGroup[];
+  companies: { id: string; name: string }[];
+}
+
+/* ---------- Diagram (GET /api/pipeline, backend/src/backoffice/pipeline.py) ---------- */
+
+export interface PipelineStage {
+  id: string;
+  label: string;
+  description: string;
+  now: number;
+  passed?: number;
+}
+
+export interface PipelineStep {
+  stage: string;
+  label: string;
+  agent: string;
+  agentLabel: string;
+  at: string;
+  note: string;
+  evidence: number;
+}
+
+export interface PipelineItem {
+  id: string;
+  kind: "payment" | "document" | string;
+  title: string;
+  detail: string;
+  amount: number | null;
+  currency: string;
+  date: string | null;
+  company: string | null;
+  stage: string;
+  stageLabel: string;
+  quality: "verified" | "likely" | "conflict" | string;
+  open: boolean;
+  source: string;
+  reason: string;
+  updatedAt: string | null;
+  href?: string;
+  journey: PipelineStep[];
+}
+
+export interface Pipeline {
+  today: string;
+  summary: {
+    items: number;
+    open: number;
+    closed: number;
+    waiting: number;
+    conflicts: number;
+    notRequired: number;
+    openDeadlines: number;
+    steps: number;
+  };
+  stages: PipelineStage[];
+  side: PipelineStage[];
+  sources: { id: string; label: string; count: number }[];
+  agents: { id: string; label: string; description: string; count: number; unit: string }[];
+  outputs: { id: string; label: string; items: { label: string; detail: string; tone: string; href?: string }[] }[];
+  items: PipelineItem[];
 }

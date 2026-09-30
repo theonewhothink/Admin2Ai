@@ -1,0 +1,73 @@
+From: Vodafone <faturas@vodafone.pt>
+To: Ana Silva <ana@padaria-exemplo.pt>
+Subject: A sua fatura Vodafone de setembro
+Date: Thu, 24 Sep 2026 09:15:00 +0100
+Message-ID: <fatura-2026-09-183@vodafone.pt>
+List-Unsubscribe: <https://www.vodafone.pt/unsubscribe?u=1>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="===============1110660556853851189=="
+
+--===============1110660556853851189==
+Content-Type: multipart/alternative;
+ boundary="===============4491115915986501199=="
+
+--===============4491115915986501199==
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+Olá Ana,
+
+A sua fatura de setembro já está disponível.
+Descarregue a sua fatura: https://minha.vodafone.pt/faturas/FT2026-183.pdf
+
+Obrigado.
+
+--===============4491115915986501199==
+MIME-Version: 1.0
+Content-Type: multipart/related;
+ boundary="===============8160852680885109966=="
+
+--===============8160852680885109966==
+Content-Type: text/html; charset="utf-8"
+Content-Transfer-Encoding: quoted-printable
+
+<html><head><title>Fatura</title></head><body bgcolor=3D"#ffffff">
+<table width=3D"100%" bgcolor=3D"#ffffff"><tr><td>
+<img src=3D"cid:logo@vodafone.pt" alt=3D"Vodafone">
+<p>Ol=C3=A1 Ana, a sua fatura de setembro no valor de 92,40&nbsp;=E2=82=AC j=
+=C3=A1 est=C3=A1 dispon=C3=ADvel.</p>
+<table><tr><td bgcolor=3D"#e60000" style=3D"border-radius:4px">
+<a href=3D"https://minha.vodafone.pt/faturas/view?id=3DFT2026-183&amp;src=3De=
+mail" style=3D"color:#fff">Ver fatura</a>
+</td></tr></table>
+<p><a href=3D"https://www.vodafone.pt/ajuda">Ajuda</a> =C2=B7
+<a href=3D"https://www.facebook.com/vodafonept">Facebook</a> =C2=B7
+<a href=3D"https://www.vodafone.pt/unsubscribe?u=3D1">Cancelar a subscri=C3=
+=A7=C3=A3o</a> =C2=B7
+<a href=3D"mailto:apoio@vodafone.pt">Contacte-nos</a></p>
+</td></tr></table></body></html>
+
+--===============8160852680885109966==
+Content-Type: image/png
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="logo.png"
+Content-ID: <logo@vodafone.pt>
+MIME-Version: 1.0
+
+iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgAAACAAFUok9dAAAA
+AElFTkSuQmCC
+
+--===============8160852680885109966==--
+
+--===============4491115915986501199==--
+
+--===============1110660556853851189==
+Content-Type: application/pdf
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="Fatura FT 2026-183.pdf"
+MIME-Version: 1.0
+
+JVBERi0xLjQKMSAwIG9iajw8IC9UeXBlIC9DYXRhbG9nID4+ZW5kb2JqCnRyYWlsZXI8PCAvUm9v
+dCAxIDAgUiA+PgolJUVPRgo=
+
+--===============1110660556853851189==--

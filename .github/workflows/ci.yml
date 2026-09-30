@@ -1,0 +1,231 @@
+name: CI
+
+on:
+  push:
+    # main plus the claude/* working branches (the default branch is one of them).
+    branches: [main, "claude/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (Python 3.11)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+
+      - name: Install
+        run: pip install -e "./backend[dev]"
+
+      # The runner image ships PostgreSQL server binaries: the database tests
+      # start a throwaway cluster (pgvector-only tests skip; the sql job runs them).
+      - name: Test
+        working-directory: backend
+        run: python -m pytest -q
+
+  web:
+    name: Web (Next.js)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+
+      # Production mode (sign-in on): builds again and drives Chromium through
+      # sign-in, sign-up, onboarding and Settings → Account against a mock of
+      # the production API contract (tests/e2e.py; data comes from the engine).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Production mode in a browser
+        run: |
+          pip install "playwright==1.56.0" pydantic
+          python -m playwright install --with-deps chromium
+          python tests/e2e.py production
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+
+  mobile:
+    name: Mobile (Expo, TypeScript)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v4
+
+      # hashFiles() is only allowed in step conditions, not in a job-level
+      # `if`: every step after checkout is skipped until the mobile app has a
+      # lockfile (npm ci needs one).
+      - uses: actions/setup-node@v4
+        if: hashFiles('mobile/package-lock.json') != ''
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      - run: npm ci
+        if: hashFiles('mobile/package-lock.json') != ''
+      - run: npx tsc --noEmit
+        if: hashFiles('mobile/package-lock.json') != ''
+      - run: npm test
+        if: hashFiles('mobile/package-lock.json') != ''
+
+  sql:
+    name: SQL migrations standalone (psql, PostgreSQL 16 + pgvector)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: backoffice
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d backoffice"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: backoffice
+    steps:
+      - uses: actions/checkout@v4
+
+      # Plain psql, file by file in order, each in one transaction: the
+      # migrations must stand on their own, without the Python runner.
+      - name: Apply db/migrations/*.sql in order
+        run: |
+          set -euo pipefail
+          for file in db/migrations/*.sql; do
+            echo "::group::${file}"
+            psql -X -q -v ON_ERROR_STOP=1 --single-transaction -f "${file}"
+            echo "::endgroup::"
+          done
+
+  db:
+    name: Database (migration runner, PostgreSQL 16 + pgvector)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: backoffice
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d backoffice"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: backoffice
+      PYTHONPATH: db
+      MIGRATION_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/backoffice
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+
+      - name: Install
+        run: pip install -e "./backend[dev]"
+
+      - name: Lint migration files
+        run: python -m backoffice_db lint
+
+      # The runner applies db/migrations in version order, each in its own
+      # transaction, and records checksums so edited migrations are caught.
+      - name: Apply db/migrations in order (runner)
+        run: python -m backoffice_db migrate
+
+      - name: Runner is idempotent
+        run: |
+          set -euo pipefail
+          python -m backoffice_db migrate | tee migrate-again.log
+          grep -q "nothing to apply" migrate-again.log
+          python -m backoffice_db status
+
+      - name: Schema invariants (RLS, no floats, append-only history, roles)
+        run: python -m backoffice_db check
+
+      - name: Service login can be created
+        env:
+          APP_DB_PASSWORD: ci-only-app-password
+        run: python -m backoffice_db ensure-login backoffice_api --member-of backoffice_app --member-of backoffice_scheduler
+
+      - name: Database behaviour tests (isolation, immutability, golden rule, pgvector, production store)
+        working-directory: backend
+        env:
+          BACKOFFICE_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: python -m pytest -q tests/test_infra_postgres.py tests/test_server_postgres.py
+
+  infra:
+    name: Infrastructure (Terraform, Compose)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: infra/terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.4" # the version the configuration was validated with
+          terraform_wrapper: false
+
+      - run: terraform fmt -check -recursive
+      - run: terraform init -backend=false -input=false
+      - run: terraform validate
+      # Mocked providers: no AWS credentials needed.
+      - run: terraform test
+
+      - name: docker compose config
+        working-directory: .
+        run: docker compose --env-file .env.example config --quiet

@@ -1,0 +1,263 @@
+# Local development stack for the AI Back-Office Operator (§44-45).
+#
+#   cp .env.example .env        # then replace every change-me value
+#   docker compose up --build
+#
+# Ports bind to 127.0.0.1 only. Production runs on AWS (infra/terraform).
+
+name: backoffice
+
+x-backend-build: &backend-build
+  context: ./backend
+  dockerfile: Dockerfile
+  additional_contexts:
+    db: ./db
+
+x-backend-env: &backend-env
+  # backoffice_api is a member of backoffice_app: row-level security applies (§52).
+  DATABASE_URL: postgresql://backoffice_api:${BACKOFFICE_DB_APP_PASSWORD:?set BACKOFFICE_DB_APP_PASSWORD}@postgres:5432/backoffice
+  REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
+  TEMPORAL_ADDRESS: temporal:7233
+  TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-backoffice}
+  TEMPORAL_TASK_QUEUE: ${TEMPORAL_TASK_QUEUE:-backoffice}
+  AWS_REGION: ${AWS_REGION:-eu-south-2}
+  S3_ENDPOINT_URL: http://minio:9000
+  EVIDENCE_BUCKET: ${EVIDENCE_BUCKET:-backoffice-evidence-eu}
+  EVIDENCE_OBJECT_LOCK_MODE: GOVERNANCE
+  EVIDENCE_RETENTION_DAYS: ${EVIDENCE_RETENTION_DAYS:-1}
+  # Local MinIO credentials; in AWS the task role is used instead.
+  AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER}
+  AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+  # HMAC key of the audit chain (>= 32 bytes): records cannot be re-forged from the database alone.
+  AUDIT_HMAC_KEY: ${AUDIT_HMAC_KEY:?set AUDIT_HMAC_KEY}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+# The production back office (backend/src/backoffice/server), shared by the api
+# and the sync worker.
+x-production-env: &production-env
+  BACKOFFICE_MODE: ${BACKOFFICE_MODE:-production}
+  BACKOFFICE_ALLOWED_ORIGINS: ${BACKOFFICE_ALLOWED_ORIGINS:-http://localhost:3000}
+  BACKOFFICE_API_URL: ${BACKOFFICE_API_URL:-http://localhost:8000}
+  BACKOFFICE_WEB_URL: ${BACKOFFICE_WEB_URL:-http://localhost:3000}
+  # Plain http on localhost: cookies without the Secure flag. Never in production.
+  BACKOFFICE_INSECURE_COOKIES: ${BACKOFFICE_INSECURE_COOKIES:-1}
+  BACKOFFICE_ADMIN_EMAILS: ${BACKOFFICE_ADMIN_EMAILS:-}
+  BACKOFFICE_STATE_KEY: ${BACKOFFICE_STATE_KEY:?set BACKOFFICE_STATE_KEY}
+  BACKOFFICE_VAULT_KEY: ${BACKOFFICE_VAULT_KEY:-}
+  BACKOFFICE_DB_POOL_SIZE: ${BACKOFFICE_DB_POOL_SIZE:-10}
+  # Evidence files on the objects volume locally; in AWS set S3_BUCKET (and the task role).
+  BACKOFFICE_OBJECT_DIR: /var/lib/backoffice/objects
+  BACKOFFICE_GOOGLE_CLIENT_ID: ${BACKOFFICE_GOOGLE_CLIENT_ID:-}
+  BACKOFFICE_GOOGLE_CLIENT_SECRET: ${BACKOFFICE_GOOGLE_CLIENT_SECRET:-}
+  BACKOFFICE_MICROSOFT_CLIENT_ID: ${BACKOFFICE_MICROSOFT_CLIENT_ID:-}
+  BACKOFFICE_MICROSOFT_CLIENT_SECRET: ${BACKOFFICE_MICROSOFT_CLIENT_SECRET:-}
+  GOCARDLESS_SECRET_ID: ${GOCARDLESS_SECRET_ID:-}
+  GOCARDLESS_SECRET_KEY: ${GOCARDLESS_SECRET_KEY:-}
+  BACKOFFICE_SMTP_HOST: ${BACKOFFICE_SMTP_HOST:-}
+  BACKOFFICE_SMTP_PORT: ${BACKOFFICE_SMTP_PORT:-587}
+  BACKOFFICE_SMTP_USER: ${BACKOFFICE_SMTP_USER:-}
+  BACKOFFICE_SMTP_PASSWORD: ${BACKOFFICE_SMTP_PASSWORD:-}
+  BACKOFFICE_SMTP_FROM: ${BACKOFFICE_SMTP_FROM:-}
+  EXPO_ACCESS_TOKEN: ${EXPO_ACCESS_TOKEN:-}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  # Reading PDFs and photos: PDF text and QR codes locally; a PP-OCRv6 sidecar when set.
+  BACKOFFICE_DOCUMENT_READING: ${BACKOFFICE_DOCUMENT_READING:-on}
+  # Invoice links opened before each change is recorded (§9); off: they wait unopened.
+  BACKOFFICE_LINK_FETCHING: ${BACKOFFICE_LINK_FETCHING:-on}
+  BACKOFFICE_OCR_URL: ${BACKOFFICE_OCR_URL:-}
+  BACKOFFICE_EXTERNAL_AI: ${BACKOFFICE_EXTERNAL_AI:-off}
+  BACKOFFICE_SYNC_INTERVAL: ${BACKOFFICE_SYNC_INTERVAL:-900}
+  BACKOFFICE_HISTORY_DAYS: ${BACKOFFICE_HISTORY_DAYS:-90}
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-pgvector/pgvector:pg16}
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: backoffice
+      BACKOFFICE_DB_APP_PASSWORD: ${BACKOFFICE_DB_APP_PASSWORD:?set BACKOFFICE_DB_APP_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/docker/initdb:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d backoffice"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # One-shot: applies db/migrations as the schema owner, then exits.
+  migrate:
+    build: *backend-build
+    image: backoffice-backend:local
+    command: ["python", "-m", "backoffice_db", "migrate"]
+    environment:
+      MIGRATION_DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/backoffice
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  temporal:
+    image: temporalio/auto-setup:${TEMPORAL_VERSION:-1.29.7}
+    environment:
+      DB: postgres12
+      DB_PORT: "5432"
+      POSTGRES_USER: postgres
+      POSTGRES_PWD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_SEEDS: postgres
+      DEFAULT_NAMESPACE: ${TEMPORAL_NAMESPACE:-backoffice}
+      # Closed workflow histories are kept for a week; open ones wait as long as needed (§45).
+      DEFAULT_NAMESPACE_RETENTION: 168h
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:7233:7233"
+    restart: unless-stopped
+
+  temporal-ui:
+    image: temporalio/ui:${TEMPORAL_UI_VERSION:-2.54.1}
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:3000
+    depends_on:
+      - temporal
+    ports:
+      - "127.0.0.1:8080:8080"
+    restart: unless-stopped
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:7.4-alpine}
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD}"]
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+    volumes:
+      - redisdata:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # S3-compatible evidence store in an EU region, versioned, Object Lock (§44, §52).
+  minio:
+    image: ${MINIO_IMAGE:-quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z}
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+      MINIO_SITE_REGION: ${AWS_REGION:-eu-south-2}
+    volumes:
+      - miniodata:/data
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # One-shot: creates the evidence bucket (versioning + Object Lock GOVERNANCE).
+  minio-setup:
+    image: ${AWS_CLI_IMAGE:-amazon/aws-cli:2.37.4}
+    entrypoint: ["/bin/sh", "/setup/minio-setup.sh"]
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+      AWS_REGION: ${AWS_REGION:-eu-south-2}
+      AWS_CONFIG_FILE: /setup/aws-config
+      S3_ENDPOINT_URL: http://minio:9000
+      EVIDENCE_BUCKET: ${EVIDENCE_BUCKET:-backoffice-evidence-eu}
+      EVIDENCE_RETENTION_DAYS: ${EVIDENCE_RETENTION_DAYS:-1}
+    volumes:
+      - ./infra/docker:/setup:ro
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+
+  # The production API (sign-in, real businesses saved in PostgreSQL). Set
+  # BACKOFFICE_MODE=demo in .env for the single built-in demo business instead.
+  api:
+    build: *backend-build
+    image: backoffice-backend:local
+    command: ["uvicorn", "backoffice.api.app:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers",
+              "--no-server-header", "--timeout-graceful-shutdown", "20"]
+    environment:
+      <<: [*backend-env, *production-env]
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
+    volumes:
+      - objects:/var/lib/backoffice/objects
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      minio-setup:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    # Ready = database reachable and every migration applied (GET /readyz).
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # Reads connected mailboxes (Gmail, Microsoft 365, IMAP) and banks (GoCardless)
+  # into every business and runs each business's day, with nobody signed in.
+  # Production mode only: with BACKOFFICE_MODE=demo it exits cleanly and stays stopped.
+  sync-worker:
+    build: *backend-build
+    image: backoffice-backend:local
+    command: ["python", "-m", "backoffice.server.worker"]
+    environment:
+      <<: [*backend-env, *production-env]
+    volumes:
+      - objects:/var/lib/backoffice/objects
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      minio-setup:
+        condition: service_completed_successfully
+    stop_grace_period: 2m
+    restart: on-failure
+
+  worker:
+    build: *backend-build
+    image: backoffice-backend:local
+    command: ["python", "-m", "backoffice.workflows.worker"]
+    environment:
+      <<: *backend-env
+      # package.module:factory returning WorkflowServices; the worker refuses
+      # to start without it rather than run with stand-in services.
+      BACKOFFICE_WORKFLOW_SERVICES: ${BACKOFFICE_WORKFLOW_SERVICES:-}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      minio-setup:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+  objects:

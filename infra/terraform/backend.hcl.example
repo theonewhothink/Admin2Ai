@@ -1,0 +1,11 @@
+# Copy to backend.hcl (per environment) and run:
+#   terraform init -backend-config=backend.hcl
+# State holds generated secrets (Redis token, app DB password): keep the state
+# bucket private, versioned and KMS-encrypted, in an EU region.
+
+bucket       = "<state-bucket-name>"
+key          = "backoffice/production/terraform.tfstate"
+region       = "eu-south-2"
+encrypt      = true
+kms_key_id   = "<kms key arn for state>"
+use_lockfile = true # S3 native locking (Terraform >= 1.10)

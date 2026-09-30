@@ -1,0 +1,6 @@
+Atlantic Paper Co.
+Invoice number: AP-7781
+Invoice date: 2026-08-28
+Supplier VAT: PT500123454
+Description | Qty | Price
+Paper A4 | 10 | 45.00

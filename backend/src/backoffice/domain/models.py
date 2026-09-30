@@ -9,21 +9,61 @@ The system starts from Evidence, not from Invoice:
 from __future__ import annotations
 
 import hashlib
+import itertools
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+# Set only while an event-sourced tenant applies one event (backoffice.server):
+# ids and "now" then come from the event itself, so replaying the event log
+# rebuilds exactly the same state. Unset (the demo, tests, the browser) they
+# are random ids and the wall clock, as before.
+_ID_SOURCE: ContextVar[Callable[[str], str] | None] = ContextVar("backoffice_id_source", default=None)
+_NOW_SOURCE: ContextVar[Callable[[], datetime] | None] = ContextVar("backoffice_now_source", default=None)
 
 
 def new_id(prefix: str) -> str:
+    source = _ID_SOURCE.get()
+    if source is not None:
+        return source(prefix)
     return f"{prefix}_{uuid4().hex[:16]}"
 
 
 def utcnow() -> datetime:
+    source = _NOW_SOURCE.get()
+    if source is not None:
+        return source().astimezone(timezone.utc)
     return datetime.now(timezone.utc)
+
+
+@contextmanager
+def deterministic(seed: str, now: Callable[[], datetime]) -> Iterator[None]:
+    """Within this block, :func:`new_id` derives ids from ``seed`` and :func:`utcnow` reads ``now``.
+
+    Ids are ``prefix_`` + 16 hex digits of SHA-256(seed, n) for the n-th id made
+    in the block, so the same seed and the same sequence of calls give the same
+    ids in any process.
+    """
+    counter = itertools.count()
+
+    def make(prefix: str) -> str:
+        digest = hashlib.sha256(f"{seed}\x1f{next(counter)}".encode()).hexdigest()
+        return f"{prefix}_{digest[:16]}"
+
+    id_token = _ID_SOURCE.set(make)
+    now_token = _NOW_SOURCE.set(now)
+    try:
+        yield
+    finally:
+        _NOW_SOURCE.reset(now_token)
+        _ID_SOURCE.reset(id_token)
 
 
 class SourceKind(str, Enum):
@@ -162,6 +202,147 @@ class Evidence(BaseModel):
         return hashlib.sha256(data).hexdigest()
 
 
+_CENT = Decimal("0.01")
+
+
+def _money_in_cents(value: Decimal, name: str) -> Decimal:
+    if isinstance(value, float) or not isinstance(value, Decimal):
+        raise TypeError(f"{name} must be Decimal, never float")
+    if not value.is_finite() or value != value.quantize(_CENT):
+        raise ValueError(f"{name} must be a whole number of cents")
+    return value
+
+
+class DocumentLine(BaseModel):
+    """One line of an invoice: what was bought, at which VAT rate, and for whom when the line says so."""
+
+    model_config = {"frozen": True}
+
+    id: str  # the line number as printed ("1", "2", ...)
+    description: str = ""
+    net_amount: Decimal | None = None
+    vat_rate: Decimal | None = None  # percent, e.g. Decimal("23")
+    quantity: Decimal | None = None
+    reference: str | None = None  # project code, order line or cost reference printed on the line
+    customer_tax_id: str | None = None  # the end customer named on a reseller line
+
+    @property
+    def text(self) -> str:
+        return " ".join(p for p in (self.description, self.reference or "", self.customer_tax_id or "") if p)
+
+
+class VatPart(BaseModel):
+    """One VAT rate's share of an amount: net plus VAT. ``rate`` is None when the rate is not known."""
+
+    model_config = {"frozen": True}
+
+    rate: Decimal | None = None
+    net: Decimal
+    vat: Decimal = Decimal("0.00")
+
+    @property
+    def gross(self) -> Decimal:
+        return self.net + self.vat
+
+
+class AllocationMethod(str, Enum):
+    """Why an amount sits on a cost center (strongest first). Every allocation also keeps its reasons."""
+
+    OWNER = "owner"  # the owner said so (Needs You or a direct choice)
+    RULE = "rule"  # a rule the owner taught ("always put ... on Job Rua das Flores")
+    LEARNED_SPLIT = "learned_split"  # a split the owner taught ("always split EDP 40/30/30")
+    IDENTIFIER = "identifier"  # a project code, address, plate, tax number ... found on the evidence
+    LINES = "lines"  # the invoice lines name different cost centers
+    INVOICE = "invoice"  # carried over between a payment and its matched invoice
+    CARD = "card"  # paid with a card or account that belongs to one cost center
+    HISTORY = "history"  # this supplier always went to the same cost center before (likely, not proven)
+
+
+class AllocationShare(BaseModel):
+    """The part of one amount that belongs to one cost center."""
+
+    model_config = {"frozen": True}
+
+    cost_center_id: str
+    amount: Decimal  # positive, in cents
+    parts: tuple[VatPart, ...] = ()  # the amount by VAT rate, when the rates are known
+    percent: Decimal | None = None  # when the split was given in percent
+    line_ids: tuple[str, ...] = ()  # invoice lines behind this share
+    # Bought for the client this cost center is, to recharge to them (a reimbursable cost, a disbursement,
+    # media bought for a client, a pass-through licence): recoverable from them, not the business's own cost.
+    recharge: bool = False
+
+    @model_validator(mode="after")
+    def _exact(self) -> AllocationShare:
+        _money_in_cents(self.amount, "amount")
+        if self.amount <= 0:
+            raise ValueError("a share must be more than zero")
+        if self.parts and sum((p.gross for p in self.parts), Decimal(0)) != self.amount:
+            raise ValueError("a share's VAT parts must add up to its amount")
+        return self
+
+
+class CostAllocation(BaseModel):
+    """Which cost center(s) an amount belongs to: one, a split adding up exactly, or general costs.
+
+    ``total`` is the absolute amount of the payment or document. The shares
+    always add up to it to the cent; an allocation that does not is refused
+    when it is built, never stored.
+    """
+
+    model_config = {"frozen": True}
+
+    total: Decimal
+    currency: str = "EUR"
+    shares: tuple[AllocationShare, ...] = ()
+    general: bool = False  # the company's general costs, not one cost center
+    method: AllocationMethod
+    quality: Quality = Quality.GREEN
+    why: tuple[str, ...] = ()
+    rule_id: str | None = None
+    evidence_ids: tuple[str, ...] = ()
+    # Why a share is (or is not) to recharge to the client: "owner" | "rule" | "setting" | "evidence" |
+    # "history" (likely, not proven); None when nothing was decided about it (the business's own cost).
+    recharge_method: str | None = None
+    recharge_why: tuple[str, ...] = ()  # the reasons for it, shown under "Why?" after ``why``
+
+    @model_validator(mode="after")
+    def _adds_up(self) -> CostAllocation:
+        _money_in_cents(self.total, "total")
+        if self.total < 0:
+            raise ValueError("the total is an absolute amount")
+        if self.general and self.shares:
+            raise ValueError("general costs have no cost center shares")
+        if not self.general and not self.shares:
+            raise ValueError("an allocation needs at least one share, or general costs")
+        ids = [s.cost_center_id for s in self.shares]
+        if len(set(ids)) != len(ids):
+            raise ValueError("one share per cost center")
+        if self.shares and sum((s.amount for s in self.shares), Decimal(0)) != self.total:
+            raise ValueError("the shares must add up exactly to the total")
+        return self
+
+    @property
+    def cost_center_ids(self) -> tuple[str, ...]:
+        return tuple(s.cost_center_id for s in self.shares)
+
+    @property
+    def is_split(self) -> bool:
+        return len(self.shares) > 1
+
+    def amount_for(self, cost_center_id: str) -> Decimal:
+        return next((s.amount for s in self.shares if s.cost_center_id == cost_center_id), Decimal(0))
+
+    def recharge_for(self, cost_center_id: str) -> Decimal:
+        """The part of this amount on ``cost_center_id`` that its client pays back (0 when none)."""
+        return next((s.amount for s in self.shares if s.cost_center_id == cost_center_id and s.recharge), Decimal(0))
+
+    @property
+    def recharged(self) -> Decimal:
+        """The part of this amount to recharge to clients (not the business's own cost)."""
+        return sum((s.amount for s in self.shares if s.recharge), Decimal(0))
+
+
 class DocumentType(str, Enum):
     INVOICE = "invoice"
     INVOICE_RECEIPT = "invoice_receipt"
@@ -174,7 +355,28 @@ class DocumentType(str, Enum):
     PAYROLL = "payroll"
     LOAN_STATEMENT = "loan_statement"
     CONTRACT = "contract"
+    # Documents that are not accounting documents (§3, §50): they never prove a purchase
+    # or a payment. Kept as supporting evidence only.
+    PRO_FORMA = "pro_forma"
+    QUOTE = "quote"
+    DELIVERY_NOTE = "delivery_note"  # guia de remessa / guia de transporte
+    ORDER_CONFIRMATION = "order_confirmation"
+    SUPPLIER_STATEMENT = "supplier_statement"  # extrato de conta corrente
+    # A card terminal's or payment/sales platform's settlement statement: the sales, fees,
+    # refunds and disputes behind one payout into the bank (backoffice.settlements).
+    PAYOUT_REPORT = "payout_report"
     OTHER = "other"
+
+
+# Supporting evidence only: attached to the supplier and the payment, never the invoice,
+# never booked, never enough to close a payment (§3).
+SUPPORTING_DOCUMENT_TYPES: frozenset[DocumentType] = frozenset({
+    DocumentType.PRO_FORMA,
+    DocumentType.QUOTE,
+    DocumentType.DELIVERY_NOTE,
+    DocumentType.ORDER_CONFIRMATION,
+    DocumentType.SUPPLIER_STATEMENT,
+})
 
 
 class Document(BaseModel):
@@ -197,6 +399,8 @@ class Document(BaseModel):
     entity_id: str | None = None
     fields: dict[str, VerifiedField] = Field(default_factory=dict)
     quality: Quality = Quality.AMBER
+    lines: tuple[DocumentLine, ...] = ()
+    cost_allocation: CostAllocation | None = None  # which job, property, vehicle ... (cost centers)
 
     @property
     def signed_gross(self) -> Decimal | None:
@@ -230,6 +434,7 @@ class Transaction(BaseModel):
     counterparty_iban: str | None = None
     reference: str | None = None
     entity_id: str | None = None
+    cost_allocation: CostAllocation | None = None  # which job, property, vehicle ... (cost centers)
 
 
 class LegalEntity(BaseModel):
@@ -265,6 +470,14 @@ class ObligationKind(str, Enum):
     DEBT_COLLECTION = "debt_collection"
     BANK_REQUEST = "bank_request"
     PAYMENT_DEADLINE = "payment_deadline"
+    # Municipal tourist tax (taxa turística): the monthly payment to the municipality, or its declaration.
+    TOURIST_TAX = "tourist_tax"
+    TOURIST_TAX_DECLARATION = "tourist_tax_declaration"
+    # Grants and subsidies (IFAP, PEPAC, Portugal 2030 ...): documents to send by a deadline, and a grant
+    # payment announced (approved or made) that is to arrive in the bank.
+    GRANT_DOCUMENTS = "grant_documents"
+    GRANT_PAYMENT = "grant_payment"
+    VAT_RETURN = "vat_return"  # a periodic VAT return its country's calendar sets (Spain's modelo 303)
 
 
 class Obligation(BaseModel):

@@ -1,0 +1,9 @@
+Northwind Consulting Ltd
+Invoice no: NW-2291
+Issue date: 2026-09-03
+VAT number: GB 123 4567 89
+Net amount: 1,240.00
+VAT amount: 248.00
+Total due: £1,488.00
+Currency: GBP
+IBAN: GB82 WEST 1234 5698 7654 32

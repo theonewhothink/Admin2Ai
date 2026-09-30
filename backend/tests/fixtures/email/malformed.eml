@@ -1,0 +1,23 @@
+From: =?utf-8?q?Fornecedor_=C3=81gua?= <faturas@xn--gua-hla.pt>
+To: undisclosed-recipients:;
+Subject: =?x-unknown-charset?q?Fatura_de_=E1gua?=
+Date: not a real date
+Message-ID: bare-id-without-brackets@agua.pt
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="BOUNDARY"
+
+--BOUNDARY
+Content-Type: text/plain; charset="x-unknown-charset"
+Content-Transfer-Encoding: quoted-printable
+
+Fatura dispon=EDvel em https://agua.pt/f/123).
+--BOUNDARY
+Content-Type: application/pdf; name="fatura.pdf"
+Content-Disposition: attachment; filename="..\..\fatura.pdf"
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjQKJSBtYWxmb3JtZWQgYnV0IHJlYWwKJSVFT0YK
+--BOUNDARY
+Content-Type: text/html
+
+<p>Unclosed <a href="https://agua.pt/faturas/123">Ver fatura

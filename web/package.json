@@ -6,7 +6,13 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "next typegen && tsc --noEmit",
+    "lint": "eslint .",
+    "engine:fetch": "bash ../backend/scripts/fetch_pyodide.sh public/pyodide",
+    "engine:bundle": "python3 ../backend/scripts/bundle_engine.py public/engine/backoffice.zip",
+    "engine:snapshot": "python3 ../backend/scripts/snapshot_engine.py public/engine/snapshot.json",
+    "build:pages": "npm run engine:fetch && npm run engine:bundle && npm run engine:snapshot && NEXT_PUBLIC_ENGINE=browser NEXT_PUBLIC_BASE_PATH=/Admin2Ai next build",
+    "dev:engine": "npm run engine:fetch && npm run engine:bundle && npm run engine:snapshot && NEXT_PUBLIC_ENGINE=browser next dev"
   },
   "dependencies": {
     "geist": "^1.7.2",
@@ -18,6 +24,8 @@
     "@types/node": "^22.20.4",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
+    "eslint": "^9.39.5",
+    "eslint-config-next": "^16.3.6",
     "typescript": "~5.9.3"
   }
 }

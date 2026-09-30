@@ -1,0 +1,35 @@
+From: Acme Cloud Billing <billing@acme-cloud.com>
+To: Ana Silva <ana@padaria-exemplo.pt>
+Subject: Your invoice is ready
+Date: Thu, 24 Sep 2026 09:15:00 +0100
+Message-ID: <inv-5521@mail.acme-cloud.com>
+MIME-Version: 1.0
+Content-Type: multipart/alternative;
+ boundary="===============4437286448592143383=="
+
+--===============4437286448592143383==
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Your invoice INV-5521 for EUR 39.00 is ready.
+View it here: https://billing.acme-cloud.com/i/5521
+
+--===============4437286448592143383==
+Content-Type: text/html; charset="utf-8"
+Content-Transfer-Encoding: quoted-printable
+MIME-Version: 1.0
+
+<!DOCTYPE html><html><body>
+<p>Your invoice <b>INV-5521</b> for &euro;39.00 is ready.</p>
+<!--[if mso]><v:roundrect xmlns:v=3D"urn:schemas-microsoft-com:vml" href=3D"h=
+ttps://billing.acme-cloud.com/i/5521" style=3D"height:40px;width:200px" arcsi=
+ze=3D"10%" fillcolor=3D"#1a73e8"><w:anchorlock/><center style=3D"color:#fffff=
+f">View invoice</center></v:roundrect><![endif]-->
+<!--[if !mso]><!--><a class=3D"btn btn-primary" href=3D"https://billing.acme-=
+cloud.com/i/5521">View invoice</a><!--<![endif]-->
+<p><a href=3D"https://acme-cloud.com/email/view-in-browser?id=3D5521">View in=
+ browser</a> |
+<a href=3D"https://acme-cloud.com/privacy">Privacy</a></p>
+</body></html>
+
+--===============4437286448592143383==--
