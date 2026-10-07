@@ -230,3 +230,8 @@
 .matchWhy :global(.disclosure-body) {
   padding-bottom: var(--s-1);
 }
+
+.matchMore {
+  margin-top: var(--s-1);
+  font-size: 15px;
+}

@@ -1,6 +1,9 @@
+import { Suspense } from "react";
 import { Icon, type IconName } from "@/components/Icon";
 import { Status } from "@/components/ui";
 import { ReportDelivery } from "@/components/documents/ReportDelivery";
+import { AutomationSettings } from "@/components/settings/AutomationSettings";
+import { BillingReturn, SettingsLinks } from "@/components/settings/SettingsLinks";
 import { owner } from "@/lib/data";
 import { production } from "@/lib/mode";
 import type { ConnectionKind, HomeData, Owner } from "@/lib/types";
@@ -31,6 +34,11 @@ export function SettingsView({ home, who = owner, account }: { home: HomeData; w
       </header>
 
       <div className="stack-6">
+        <Suspense fallback={null}>
+          <BillingReturn />
+        </Suspense>
+        <SettingsLinks />
+        <AutomationSettings />
         <ReportDelivery />
         <section aria-labelledby="conn-h" id="connections">
           <div className="section-head">

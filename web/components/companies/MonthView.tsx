@@ -2,6 +2,7 @@ import Link from "next/link";
 import { Icon } from "@/components/Icon";
 import { CheckList, Disclosure, Dot, Progress } from "@/components/ui";
 import { formatDay, formatDayShort, formatMoney, formatMonth, formatNumber, plural } from "@/lib/format";
+import { liveData } from "@/lib/api";
 import type { MonthClose, MonthStats } from "@/lib/types";
 import styles from "./companies.module.css";
 
@@ -137,6 +138,13 @@ export function MonthView({ month }: { month: MonthClose }) {
                 </div>
                 <Disclosure summary="Why?" className={styles.matchWhy}>
                   <CheckList items={m.reasons} />
+                  {liveData && m.id.startsWith("m_") ? (
+                    <p className={styles.matchMore}>
+                      <Link href={`/payments/detail?id=${encodeURIComponent(m.id.slice(2))}`} className="link">
+                        The payment and its proof
+                      </Link>
+                    </p>
+                  ) : null}
                 </Disclosure>
               </li>
             ))}

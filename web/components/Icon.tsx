@@ -42,6 +42,9 @@ const paths = {
   download: "M12 4.5v10m-4-4 4 4 4-4M5 15.5V18a1.5 1.5 0 0 0 1.5 1.5h11A1.5 1.5 0 0 0 19 18v-2.5",
   alert: "M12 20.5a8.5 8.5 0 1 0 0-17 8.5 8.5 0 0 0 0 17ZM12 7.8v5m0 3.4v.1",
   trash: "M5 7h14M10 7V5h4v2m-7 0 .8 11.1a1.5 1.5 0 0 0 1.5 1.4h5.4a1.5 1.5 0 0 0 1.5-1.4L17 7",
+  briefcase: "M4.5 8.5h15a1 1 0 0 1 1 1v8.5a1 1 0 0 1-1 1h-15a1 1 0 0 1-1-1V9.5a1 1 0 0 1 1-1Zm5-3h5a1 1 0 0 1 1 1v2h-7v-2a1 1 0 0 1 1-1Zm-6 8h17",
+  plus: "M12 5v14M5 12h14",
+  card: "M3.5 7.5a2 2 0 0 1 2-2h13a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2v-9Zm0 3h17M7 15h3",
 } as const;
 
 export type IconName = keyof typeof paths;

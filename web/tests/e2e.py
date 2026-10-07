@@ -19,6 +19,7 @@ when it is set.
 
 from __future__ import annotations
 
+import base64
 import http.server
 import json
 import os
@@ -88,6 +89,7 @@ class MockApi:
         self.users = {EMAIL: {"id": "u1", "email": EMAIL, "name": "Laura Martins", "password": PASSWORD}}
         self.lock = threading.Lock()
         self.reconnects: list[str] = []
+        self.checkouts: list[dict[str, Any]] = []
 
     def session_for(self, headers: Any) -> dict[str, Any] | None:
         cookie = SimpleCookie(headers.get("Cookie") or "")
@@ -173,6 +175,10 @@ def make_handler(api: MockApi) -> type[http.server.BaseHTTPRequestHandler]:
             if path == "/fake-google":
                 return self.reply(200, raw=b"<!doctype html><title>Google sign-in</title><p>Sign in again</p>",
                                   ctype="text/html")
+            # The fake Stripe payment page a plan change sends the owner to.
+            if path == "/fake-stripe":
+                return self.reply(200, raw=b"<!doctype html><title>Stripe checkout</title><p>Pay</p>",
+                                  ctype="text/html")
             if method == "POST" and self.headers.get("X-Requested-With") != "admin2ai":
                 return self.reply(403, {"error": "csrf", "message": "Refresh the page and try again."})
             reconnect = re.fullmatch(r"/api/connections/([^/]+)/reconnect", path)
@@ -217,6 +223,19 @@ def make_handler(api: MockApi) -> type[http.server.BaseHTTPRequestHandler]:
             if path == "/api/onboarding/accountant":
                 session["accountant"] = body
                 return self.reply(200, {"ok": True})
+            if path == "/api/billing" and method == "GET":
+                # Production contract for a paying business (the demo engine's own business is never billed):
+                # the Free plan, payments set up on the server, no paid plan yet.
+                status, data = api.engine.dispatch("GET", path, None)
+                free = next(p for p in data["plans"] if p["id"] == "free")
+                return self.reply(status, data | {
+                    "plan": free | {"status": "active", "renewsOn": None}, "demo": False, "limits": free["limits"],
+                    "canUpgrade": True, "canManage": False, "message": None})
+            if path == "/api/billing/checkout":
+                api.checkouts.append(body)
+                port = self.server.server_address[1]
+                return self.reply(200, {"url": f"http://{HOST}:{port}/fake-stripe?plan={body.get('plan')}",
+                                        "via": "checkout", "plan": body.get("plan")})
             if path == "/api/connections/bank/start":
                 return self.reply(200, {"redirectUrl": f"http://{HOST}:{self.server.server_address[1]}/fake-bank?institution={body.get('institutionId')}"})
             status, data = api.engine.dispatch(method, path + (f"?{query}" if query else ""), body or None)
@@ -259,6 +278,38 @@ def next_server(port: int, env: dict[str, str]) -> Iterator[None]:
     finally:
         os.killpg(proc.pid, signal.SIGTERM)
         proc.wait(timeout=20)
+
+
+# --------------------------------------------------------------------------- engine fixtures
+
+
+def nif(prefix8: str) -> str:
+    """A Portuguese tax number with a valid check digit."""
+    total = sum(int(d) * w for d, w in zip(prefix8, range(9, 1, -1), strict=True))
+    check_digit = 11 - total % 11
+    return prefix8 + str(0 if check_digit >= 10 else check_digit)
+
+
+def cafe_receipt() -> bytes:
+    """A till receipt (fatura simplificada) to Hazel Tree with its fiscal QR code: €19.02 + €4.38 VAT."""
+    from backoffice.demo.evidence import qr_payload
+
+    shop = nif("51234568")
+    qr = qr_payload(A=shop, B="516123459", C="PT", D="FS", E="N", F="20260930", G="FS 2026/12", H="CSDF7T5H-12",
+                    I1="PT", I7="19.02", I8="4.38", N="4.38", O="23.40", Q="e1Dk", R="1422")
+    return "\n".join(["Café Central", f"NIF: {shop}", "Fatura simplificada n.º FS 2026/12", "ATCUD: CSDF7T5H-12",
+                      "Data: 30/09/2026", "NIF cliente: 516123459", "Base tributável (23%): 19,02", "IVA 23%: 4,38",
+                      "Total: 23,40 €", f"Código QR: {qr}", ""]).encode()
+
+
+# A letter from the bank asking Hazel Tree for proof of address by 20 October: a deadline only the owner can close.
+BANK_LETTER = ("Caro cliente,\nNo âmbito da atualização de dados da conta da Hazel Tree Interiores, Lda., NIF 516 123 459, "
+               "solicitamos o envio do comprovativo de morada até 20/10/2026.\nSem estes documentos poderemos bloquear "
+               "a conta.\n")
+
+
+def posts(api: MockApi, pattern: str) -> list[dict[str, Any]]:
+    return [r for r in api.requests if r["method"] == "POST" and re.fullmatch(pattern, r["path"])]
 
 
 # --------------------------------------------------------------------------- production
@@ -436,7 +487,11 @@ def production() -> None:
         page.goto("/settings")  # back where the next steps start
         expect(page.get_by_text("Signed in as")).to_be_visible(timeout=15000)
 
+        owner_screens(page, api, expect)
+
         print("sign out")
+        page.goto("/settings")
+        expect(page.get_by_text("Signed in as")).to_be_visible(timeout=15000)
         page.get_by_role("button", name="Account and settings").click()
         page.get_by_role("button", name="Sign out").click()
         page.wait_for_url(re.compile(r"/signin$"), timeout=15000)
@@ -532,11 +587,195 @@ def production() -> None:
         browser.close()
 
 
+def owner_screens(page: Any, api: MockApi, expect: Any) -> None:
+    """The owner's screens beyond the five places: navigation, cost centers, people, plan, automation, deadlines."""
+    print("navigation: five places on top, the rest in the profile menu")
+    page.goto("/")
+    expect(page.get_by_role("heading", name=re.compile("^Good"))).to_be_visible(timeout=15000)
+    def labels(links: Any) -> list[str]:  # the Needs You badge ("2 waiting") is not part of the place's name
+        return links.evaluate_all(
+            "els => els.map(e => { const c = e.cloneNode(true); c.querySelectorAll('[class*=badge]').forEach(b => b.remove());"
+            " return c.textContent.replace(/\\s+/g, ' ').trim(); })")
+
+    names = labels(page.locator("header nav[aria-label=Main] a"))
+    check(names == ["Home", "Needs You", "Companies", "Activity", "Ask"], f"the header has exactly the five places {names}")
+    for name, url in (("Documents", "/documents"), ("Sources", "/sources"), ("Diagram", "/diagram")):
+        page.get_by_role("button", name="Account and settings").click()
+        page.locator("header").get_by_role("link", name=name, exact=True).click()
+        page.wait_for_url(re.compile(rf"{url}$"), timeout=15000)
+        check(True, f"profile menu → {name} (two taps)")
+    page.set_viewport_size({"width": 390, "height": 844})
+    bottom = labels(page.locator("nav[aria-label=Main]:not(header nav) a"))
+    check(bottom == ["Home", "Needs You", "Scan a receipt", "Activity", "Ask"], f"the phone bar keeps its five {bottom}")
+    page.set_viewport_size({"width": 1280, "height": 900})
+
+    print("cost centers: in the company's own words, a page each, an owner statement, a split")
+    page.goto("/companies/hazel-tree")
+    expect(page.get_by_role("heading", name="Jobs")).to_be_visible(timeout=15000)
+    page.get_by_role("button", name="Add a job").click()
+    form = page.locator("form#cc-add")  # its name follows the company's own word, which changes below
+    form.get_by_label("Name").fill("Rua das Flores 12")
+    form.get_by_role("button", name="Add", exact=True).click()
+    expect(form.get_by_text("Done. Job Rua das Flores 12 is set up.", exact=False)).to_be_visible(timeout=15000)
+    sent = posts(api, r"/api/companies/hazel-tree/cost-centers")
+    check(bool(sent) and json.loads(sent[-1]["body"]) == {"name": "Rua das Flores 12", "kind": "Job"}
+          and sent[-1]["csrf"] == "admin2ai", "Add posts the job to the company's cost centers")
+    form.get_by_label("Name").fill("2B")
+    form.get_by_label("Kind").fill("Apartment")
+    form.get_by_label("Owner").fill("Marta Gonçalves")
+    form.get_by_label("Management fee, %").fill("10")
+    form.get_by_role("button", name="Add", exact=True).click()
+    expect(form.get_by_text("Done. Apartment 2B is set up.", exact=False)).to_be_visible(timeout=15000)
+    check(json.loads(posts(api, r"/api/companies/hazel-tree/cost-centers")[-1]["body"]) == {
+        "name": "2B", "kind": "Apartment", "owner": "Marta Gonçalves", "managementFee": {"percent": "10"}},
+        "a property is added with its owner and management fee")
+    expect(page.get_by_text(re.compile(r"I need you to tell me which .* payments? (is|are) for\."))).to_be_visible()
+    shots(page, "company-cost-centers")
+    page.get_by_role("link", name=re.compile("^Apartment 2B")).click()
+    page.wait_for_url(re.compile(r"/companies/cost-center\?id=cc-2b$"), timeout=15000)
+    expect(page.get_by_role("heading", name="Apartment 2B", level=1)).to_be_visible(timeout=15000)
+    expect(page.get_by_role("heading", name="Owner statement", exact=True)).to_be_visible()
+    expect(page.get_by_text(re.compile(r"^Owner statement · Apartment 2B · "))).to_be_visible(timeout=15000)
+    check(any(r["path"] == "/api/cost-centers/cc-2b/statement" and r["query"].startswith("month=")
+              for r in api.requests), "the owner statement is read for one month")
+    shots(page, "cost-center-property")
+    no_sideways_scroll(page, "/companies/cost-center")
+
+    page.goto("/needs-you")
+    card = page.locator("article", has=page.get_by_role("heading", name="EDP"))
+    expect(card).to_be_visible(timeout=15000)
+    card.get_by_text("Split it between several").click()
+    card.get_by_role("textbox", name="Apartment 2B").fill("30")
+    card.get_by_role("textbox", name="Job Rua das Flores 12").fill("30")
+    card.get_by_role("button", name="Confirm").click()
+    expect(card.get_by_role("alert")).to_contain_text("They must match to the cent.", timeout=15000)
+    shots(page, "needs-split")
+    check(True, "a split that does not add up shows the engine's plain words")
+    card.get_by_role("textbox", name="Job Rua das Flores 12").fill("34.10")
+    card.get_by_role("button", name="Confirm").click()
+    expect(page.get_by_text(re.compile(r"^Done\. The EDP payment is now split"))).to_be_visible(timeout=15000)
+    split = json.loads(posts(api, r"/api/needs-you/[^/]+/answer")[-1]["body"])
+    check(split["option_id"] == "split" and split["split"] == [
+        {"costCenterId": "cc-2b", "amount": "30"}, {"costCenterId": "cc-rua-das-flores-12", "amount": "34.10"}],
+        "the split is sent as amounts per job")
+
+    print("cost center: rename and archive")
+    page.goto("/companies/cost-center?id=cc-rua-das-flores-12")
+    expect(page.get_by_text("its part of €64.10")).to_be_visible(timeout=15000)
+    page.get_by_role("button", name="Rename").click()
+    page.get_by_role("form", name=re.compile("^Change")).get_by_label("Name").fill("Rua das Flores 14")
+    page.get_by_role("button", name="Save").click()
+    expect(page.get_by_text("Done. It is now called Job Rua das Flores 14.")).to_be_visible(timeout=15000)
+    page.get_by_role("button", name="Archive", exact=True).click()
+    page.get_by_role("button", name="Archive it").click()
+    expect(page.get_by_text("Done. Job Rua das Flores 14 is archived. Its past costs stay on it.")).to_be_visible(timeout=15000)
+    check(json.loads(posts(api, r"/api/cost-centers/cc-rua-das-flores-12")[-1]["body"]) == {"active": False},
+          "Archive posts active: false")
+
+    print("payment and document detail")
+    edp = next(r.id for r in api.engine.repo.transactions.values() if r.tx.counterparty == "EDP COMERCIAL")
+    page.goto(f"/payments/detail?id={edp}")
+    expect(page.get_by_role("heading", name="EDP", level=1)).to_be_visible(timeout=15000)
+    shots(page, "payment-detail")
+    page.get_by_role("button", name="It always has one").click()
+    expect(page.get_by_text(re.compile(r"^Done\. .*I will remember this\."))).to_be_visible(timeout=15000)
+    check(json.loads(posts(api, rf"/api/transactions/{edp}/evidence")[-1]["body"]) == {"need": "invoice"},
+          "It always has one posts need: invoice")
+    page.goto("/documents")
+    page.get_by_role("link", name=re.compile("^Marta Gonçalves")).first.click()
+    page.wait_for_url(re.compile(r"/documents/detail\?id="), timeout=15000)
+    expect(page.get_by_role("heading", name="Proof")).to_be_visible(timeout=15000)
+    page.get_by_role("button", name="Mark as sensitive").click()
+    expect(page.get_by_text(re.compile(r"^Done\. Only you and the company’?'?s accountant"))).to_be_visible(timeout=15000)
+    expect(page.get_by_role("button", name="It is not sensitive")).to_be_visible()
+    shots(page, "document-detail")
+    no_sideways_scroll(page, "/documents/detail")
+
+    print("people and expense claims: one tap to pay someone back")
+    page.goto("/settings/people")
+    expect(page.get_by_role("heading", name="People and expenses")).to_be_visible(timeout=15000)
+    page.get_by_role("button", name="Add someone").click()
+    person = page.get_by_role("form", name="Add someone")
+    person.get_by_label("Name").fill("Rui Costa")
+    person.get_by_label("Email").fill("rui@hazeltree.pt")
+    person.get_by_label("Company cards").fill("5521")
+    person.get_by_label("Works for").select_option(label="Hazel Tree")
+    person.get_by_role("button", name="Add", exact=True).click()
+    expect(person.get_by_text("Done. When a payment on card •••• 5521 misses its receipt, I will ask Rui, not you.")).to_be_visible(timeout=15000)
+    check(json.loads(posts(api, r"/api/employees")[-1]["body"]) == {
+        "name": "Rui Costa", "email": "rui@hazeltree.pt", "cards": ["5521"], "companyId": "hazel-tree"},
+        "Add posts the person with their card")
+    page.get_by_role("button", name="Send a receipt for someone").click()
+    claim_form = page.get_by_role("form", name="Send a receipt for someone")
+    claim_form.get_by_label("The receipt").set_input_files(
+        files=[{"name": "cafe.txt", "mimeType": "text/plain", "buffer": cafe_receipt()}])
+    claim_form.get_by_role("button", name="Send").click()
+    expect(claim_form.get_by_text("Got it. Rui's €23.40 receipt from Café Central is waiting for your OK to pay it back."))\
+        .to_be_visible(timeout=15000)
+    claim = page.get_by_role("listitem", name="Rui Costa, Café Central")
+    expect(claim.get_by_text("Waiting for approval")).to_be_visible(timeout=15000)
+    claim.get_by_role("button", name="Yes, pay Rui back").click()
+    expect(claim.get_by_text("Done. When you pay Rui back €23.40, I will match the transfer and close it.")).to_be_visible(timeout=15000)
+    expect(claim.get_by_text("Approved, to be paid back")).to_be_visible(timeout=15000)
+    answered = posts(api, r"/api/needs-you/nd_claim_rui_23/answer")
+    check(bool(answered) and json.loads(answered[-1]["body"])["option_id"] == "approve" and answered[-1]["csrf"] == "admin2ai",
+          "approving the claim answers its Needs You question")
+    shots(page, "people")
+    no_sideways_scroll(page, "/settings/people")
+
+    print("plan: usage, limits, upgrade goes to Stripe's page")
+    page.goto("/settings/plan")
+    expect(page.get_by_role("heading", name="Your plan")).to_be_visible(timeout=15000)
+    expect(page.locator("p.lead")).to_have_text("Free")
+    expect(page.get_by_text("Documents this month")).to_be_visible()
+    shots(page, "plan")
+    no_sideways_scroll(page, "/settings/plan")
+    page.get_by_role("button", name="Choose Solo").click()
+    page.wait_for_url(re.compile(r"/fake-stripe\?plan=solo$"), timeout=15000)
+    check(api.checkouts == [{"plan": "solo"}], "Choose Solo asks the API for the payment page and goes there")
+    check(posts(api, r"/api/billing/checkout")[-1]["csrf"] == "admin2ai", "checkout sends the CSRF header")
+    page.goto("/settings?billing=cancelled")
+    expect(page.get_by_text("Nothing was charged. Your plan is as it was.")).to_be_visible(timeout=15000)
+
+    print("automation: a switch, in plain words")
+    switch = page.get_by_role("switch", name="Send each month to your accountant")
+    expect(switch).to_have_attribute("aria-checked", "false", timeout=15000)
+    switch.click()
+    expect(page.get_by_text("Done. I will send each month to your accountant.")).to_be_visible(timeout=15000)
+    expect(switch).to_have_attribute("aria-checked", "true")
+    shots(page, "settings-automation")
+    toggled = posts(api, r"/api/settings/automation")
+    check(bool(toggled) and json.loads(toggled[-1]["body"]) == {"monthlyPackage": True} and toggled[-1]["csrf"] == "admin2ai",
+          "the switch posts monthlyPackage: true")
+
+    print("deadlines: who does it, what proves it done, and It is done")
+    with api.lock:
+        letter = api.engine.dispatch("POST", "/api/evidence", {
+            "filename": "carta.txt", "contentType": "text/plain",
+            "dataBase64": base64.b64encode(BANK_LETTER.encode()).decode()})
+    check(letter[0] == 200, "the bank's letter becomes a deadline")
+    page.goto("/deadlines")
+    expect(page.get_by_role("heading", name="Deadlines", level=1)).to_be_visible(timeout=15000)
+    due = page.get_by_role("listitem").filter(has=page.get_by_text("Your bank needs updated details", exact=True))
+    expect(due.get_by_text("What proves it done")).to_be_visible()
+    expect(due.get_by_text("A copy of the reply that was sent by 20 October.")).to_be_visible()
+    expect(due.get_by_text("Who does it")).to_be_visible()
+    shots(page, "deadlines")
+    no_sideways_scroll(page, "/deadlines")
+    due.get_by_role("button", name="It is done").click()
+    due.get_by_text("I sent what they asked for").click()
+    due.get_by_role("button", name="Confirm").click()
+    expect(page.get_by_text("Done. Your bank needs updated details is closed with your confirmation.")).to_be_visible(timeout=15000)
+    done = posts(api, r"/api/obligations/[^/]+/done")
+    check(bool(done) and json.loads(done[-1]["body"]) == {"outcome": "sent"} and done[-1]["csrf"] == "admin2ai",
+          "It is done posts the confirmation the API offers")
+
+
 # --------------------------------------------------------------------------- demo
 
 
 def demo() -> None:
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import expect, sync_playwright
 
     out = WEB / "out"
     if not (out / "index.html").exists():
@@ -564,12 +803,24 @@ def demo() -> None:
             page = browser.new_page()
             seen: list[str] = []
             page.on("request", lambda r: seen.append(r.url))
-            for path in ["/", "/settings/", "/needs-you/", "/onboarding/", "/companies/hazel-tree/", "/accountant/"]:
+            for path in ["/", "/settings/", "/needs-you/", "/onboarding/", "/companies/hazel-tree/", "/accountant/",
+                         "/deadlines/", "/settings/people/", "/documents/detail/?id=doc_796709c2823e768a"]:
                 page.goto(f"http://{HOST}:{port}/Admin2Ai{path}")
                 page.wait_for_timeout(1500)
                 check("/signin" not in page.url, f"demo {path}: no redirect to sign-in")
                 check(len(page.locator("main").first.inner_text().strip()) > 20, f"demo {path}: the page rendered")
             check(not [u for u in seen if "/api/auth" in u or "/signin" in u or "/signup" in u], "demo: no auth request, no sign-in page loaded")
+            # The plan page says it is the demo; choosing a plan explains that, and never opens a payment page.
+            page.goto(f"http://{HOST}:{port}/Admin2Ai/settings/plan/")
+            expect(page.locator("main").get_by_text("Demo", exact=True).first).to_be_visible(timeout=180000)
+            page.get_by_role("button", name="Choose Solo").click()
+            expect(page.get_by_text(re.compile(r"This is the demo, so nothing is billed"))).to_be_visible()
+            check(page.url.endswith("/Admin2Ai/settings/plan/"), "demo: choosing a plan stays on the page")
+            check(not [u for u in seen if "stripe" in u or "/api/billing" in u], "demo: no payment provider is called")
+            top = page.locator("header nav[aria-label=Main] a").evaluate_all(
+                "els => els.map(e => { const c = e.cloneNode(true); c.querySelectorAll('[class*=badge]').forEach(b => b.remove());"
+                " return c.textContent.replace(/\\s+/g, ' ').trim(); })")
+            check(top == ["Home", "Needs You", "Companies", "Activity", "Ask"], f"demo: the header has the five places {top}")
             for path in ["/signin/", "/signup/"]:
                 r = urllib.request.Request(f"http://{HOST}:{port}/Admin2Ai{path}")
                 try:

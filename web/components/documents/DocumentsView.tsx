@@ -1,6 +1,8 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
+import { documentHref } from "@/components/detail/parts";
 import { Icon } from "@/components/Icon";
 import { call, download, query } from "@/lib/api";
 import { formatMoney } from "@/lib/format";
@@ -17,6 +19,7 @@ interface Doc {
   company: string;
   status: string;
   filename: string;
+  sensitive?: boolean;
 }
 interface DocList {
   items: Doc[];
@@ -197,11 +200,12 @@ export function DocumentsView() {
                 <li key={d.id} className="list-row">
                   <Icon name="document" size={18} style={{ color: "var(--text-2)", flexShrink: 0 }} />
                   <span style={{ flex: 1, minWidth: 0, display: "grid" }}>
-                    <span style={{ fontWeight: 600, overflowWrap: "anywhere" }}>
+                    <Link href={documentHref(d.id)} className="link" style={{ overflowWrap: "anywhere" }}>
                       {d.supplier} {d.number}
-                    </span>
+                    </Link>
                     <span className="meta" style={{ overflowWrap: "anywhere" }}>
                       {d.date} · {d.company || "No company yet"} · {d.type} · {d.status}
+                      {d.sensitive ? " · sensitive" : ""}
                     </span>
                   </span>
                   <span className="tabular" style={{ fontWeight: 600 }}>

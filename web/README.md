@@ -93,7 +93,13 @@ Evidence ids use prefixes so the UI can link them: `month:<company>:<yyyy-mm>`, 
 | `/activity`                         | Quiet timeline of what was handled, grouped by day                          |
 | `/ask`                              | Ask box, example prompts, answers with evidence chips (`/ask?q=…`)          |
 | `/scan`                             | Upload receipts; explains that capture lives on the phone                   |
-| `/settings`                         | Connections, things I remember, notifications (reached from profile menu)   |
+| `/settings`                         | People, deadlines and plan links; "What I do on my own" switches (`GET/POST /api/settings/automation`); monthly report; connections; notifications (reached from profile menu) |
+| `/settings/people`                  | People and their company cards (`GET/POST /api/employees`, `POST /api/employees/{id}`); expense claims with one-tap "pay them back" or not (`GET/POST /api/expense-claims`, answered through `POST /api/needs-you/{id}/answer`) |
+| `/settings/plan`                    | Plan, this month's use against its limits (`GET /api/billing`); "Choose …" goes to Stripe's page (`POST /api/billing/checkout`), payment details to its portal (`POST /api/billing/portal`). The demo says it is the demo and never calls either |
+| `/deadlines`                        | Every deadline (`GET /api/obligations`): who does it, what proves it done, and "It is done" with the confirmations the API offers (`POST /api/obligations/{id}/done`) |
+| `/companies/cost-center?id=…`       | One job, property, vehicle …: spent, received, open items, payments and documents with their originals, and for a property the owner statement (`GET /api/cost-centers/{id}`, `…/statement?month=`); rename, owner and fee, archive (`POST /api/cost-centers/{id}`). The company page lists them in the company's own word (`GET/POST /api/companies/{id}/cost-centers`) |
+| `/documents/detail?id=…`            | One document (`GET /api/documents/{id}`): proof, payments, credit notes and refunds, parts and held back, import chain, a supplier statement checked line by line, history; "Mark as sensitive" (`POST /api/documents/{id}/sensitive`) |
+| `/payments/detail?id=…`             | One payment (`GET /api/transactions/{id}`): what it needs, its documents and why they match, history; "It never has an invoice / It always has one" (`POST /api/transactions/{id}/evidence`) |
 | `/onboarding`                       | Six steps: account, company number, email, bank, accountant, Start (production: five, against the API) |
 | `/signin`, `/signup`                | Production only (server builds; not in the static demo)                     |
 | `/onboarding/learning`              | Live counters, then four one-tap questions, then Home                       |
@@ -101,7 +107,9 @@ Evidence ids use prefixes so the UI can link them: `month:<company>:<yyyy-mm>`, 
 | `/accountant`, `/accountant/[id]`   | Accountant workspace (its own layout): clients table and client invitations; client detail with the reconciliation (payment ↔ document, "Why?"), what is still open, the originals as links (`GET /api/accountant/clients/{id}/evidence/{evidence}/file`), export (`…/export`) and rules (`POST …/rules`) |
 | `/invite`                           | Production only: the invited owner accepts their accountant's invitation (`POST /api/invitations/accept`) |
 
-The profile menu (top right) has a **Preview** section that links to the audit, onboarding, and the stale-connection demo. It also has "Bring back answered items", which resets the answers stored for the current browser session.
+The top bar has exactly the five places of spec §34 (Home, Needs You, Companies, Activity, Ask). Everything else is in the profile menu (top right), two taps away: Documents, Deadlines, People and expenses, Sources, Diagram, Plan, Settings, Add documents (and, on phones, Your businesses). Detail pages that take an `?id=` read it in the browser, because ids are made at run time (a new job, a new document) and the static demo cannot pre-build a page per id.
+
+The profile menu also has a **Preview** section that links to the audit, onboarding, and the stale-connection demo. It also has "Bring back answered items", which resets the answers stored for the current browser session.
 
 ## How the demo keeps its state
 

@@ -15,15 +15,25 @@ interface MenuLink {
   href: string;
   label: string;
   icon: IconName;
+  /** Only on phones, where the bottom bar has no room for it (desktop has it in the top bar). */
+  phoneOnly?: boolean;
 }
 
-const main: MenuLink[] = [
+/** Everything that is not one of the five top-level places (spec §34): one tap to open, one to go. */
+const business: MenuLink[] = [
+  { href: "/companies", label: "Your businesses", icon: "building", phoneOnly: true },
   { href: "/documents", label: "Documents", icon: "document" },
+  { href: "/deadlines", label: "Deadlines", icon: "clock" },
+  { href: "/settings/people", label: "People and expenses", icon: "users" },
   { href: "/sources", label: "Sources", icon: "link" },
   { href: "/diagram", label: "Diagram", icon: "flow" },
+];
+
+const main: MenuLink[] = [
+  { href: "/settings/plan", label: "Plan", icon: "bookmark" },
   { href: "/settings", label: "Settings", icon: "settings" },
   { href: "/scan", label: "Add documents", icon: "upload" },
-  { href: "/accountant", label: "Accountant workspace", icon: "users" },
+  { href: "/accountant", label: "Accountant workspace", icon: "briefcase" },
 ];
 
 const demo: MenuLink[] = [
@@ -92,6 +102,16 @@ export function ProfileMenu({ owner, sampleData }: { owner?: Owner; sampleData: 
             <div className="meta">{owner.email}</div>
           </div>
         ) : null}
+        <ul className={styles.menuList} aria-label="Your business">
+          {business.map((l) => (
+            <li key={l.href} className={l.phoneOnly ? styles.phoneOnly : undefined}>
+              <Link href={l.href} className={styles.menuItem} onClick={close}>
+                <Icon name={l.icon} size={18} />
+                {l.label}
+              </Link>
+            </li>
+          ))}
+        </ul>
         <ul className={styles.menuList}>
           {links.map((l) => (
             <li key={l.href}>

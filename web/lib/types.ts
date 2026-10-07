@@ -105,21 +105,40 @@ export interface RememberRule {
   defaultChecked: boolean;
 }
 
+/** "Split it between several": amounts or percentages per cost center that must add up exactly. */
+export interface SplitOffer {
+  optionId: string;
+  label: string;
+  costCenters: { id: string; label: string }[];
+  total: number;
+  hint: string;
+}
+
+/** One part of a split answer: an amount or a percentage for one cost center. */
+export interface SplitPart {
+  costCenterId: string;
+  amount?: string;
+  percent?: string;
+}
+
 export interface NeedsYouChoiceItem {
   id: string;
   kind: "choice";
   tone: Tone;
   eyebrow: string;
   merchant: string;
-  amount: number;
+  /** Null when nothing could be read yet (a photo to retake). */
+  amount: number | null;
   currency: string;
-  date: ISODate;
+  date: ISODate | null;
   companyId?: string;
   paidWith?: string;
   question: string;
   options: DecisionOption[];
   why: string[];
   remember?: RememberRule;
+  /** "Which job is this for?" with more than one job: the payment can be split between them. */
+  split?: SplitOffer;
 }
 
 export interface NeedsYouApprovalItem {
@@ -155,6 +174,8 @@ export interface AnswerResult {
   ok: boolean;
   /** What the engine said, in plain language, when it has something to say. */
   message?: string;
+  /** The rule the engine learned from the answer ("Always use Hazel Tree for IKEA ..."), when it learned one. */
+  learned?: string;
 }
 
 /* ---------- Activity ---------- */
@@ -458,4 +479,381 @@ export interface Pipeline {
   agents: { id: string; label: string; description: string; count: number; unit: string }[];
   outputs: { id: string; label: string; items: { label: string; detail: string; tone: string; href?: string }[] }[];
   items: PipelineItem[];
+}
+
+/* ---------- Proof shared by the detail pages ---------- */
+
+/** One original (a bank line, a document, an email): opened with GET /api/evidence/{id}/file. */
+export interface EvidenceRef {
+  id: string;
+  label: string;
+}
+
+/** One step of a document's or payment's history. */
+export interface HistoryStep {
+  at: string;
+  stage: string;
+  label: string;
+  note: string;
+}
+
+/** Invoice -> payment -> credit note -> refund, or deposit -> invoice -> each part -> held back. */
+export interface ChainStep {
+  step: string;
+  id: string;
+  label: string;
+  date: ISODate | null;
+  amount: number | null;
+  currency: string;
+  evidenceIds: string[];
+}
+
+export interface ImportChain {
+  id: string;
+  name: string;
+  order: string | null;
+  mrn: string | null;
+  line: string;
+  references: string[];
+  pieces: { kind: string; id: string; role: string; label: string; date: ISODate | null; amount: number | null; currency: string; text: string }[];
+}
+
+/* ---------- Cost centers (GET /api/companies/{id}/cost-centers, GET /api/cost-centers/{id}) ---------- */
+
+export interface CostCenterCard {
+  id: string;
+  companyId: string;
+  name: string;
+  /** The business's own word: "Job", "Property", "Vehicle", "Outlet", "Event", "Course", "Client". */
+  kind: string;
+  /** "Job Rua das Flores", "Apartment 2B". */
+  label: string;
+  active: boolean;
+  identifiers: Record<string, string[]>;
+  recharge: boolean;
+  owner: string | null;
+  managementFee: { percent: number | null; monthly: number | null } | null;
+  isProperty: boolean;
+}
+
+export interface CostCenterRow extends CostCenterCard {
+  spent: number;
+  received: number;
+  payments: number;
+  documents: number;
+  openItems: number;
+  currency: string;
+}
+
+export interface Period {
+  from: ISODate | null;
+  to: ISODate | null;
+  label: string;
+}
+
+export interface CostCentersData {
+  companyId: string;
+  companyName: string;
+  kind: string;
+  kindPlural: string;
+  usesCostCenters: boolean;
+  period: Period | null;
+  costCenters: CostCenterRow[];
+  general: { spent: number; received: number; payments: number };
+  notDecided: { payments: number; amount: number; needsYouIds: string[] };
+  headline: string;
+}
+
+export interface CostCenterPayment {
+  id: string;
+  date: ISODate;
+  merchant: string;
+  direction: "in" | "out";
+  amount: number;
+  total: number;
+  currency: string;
+  split: boolean;
+  status: "closed" | "open";
+  likely: boolean;
+  why: string[];
+  evidence: EvidenceRef[];
+  toRecharge: boolean;
+}
+
+export interface CostCenterDocument {
+  id: string;
+  date: ISODate;
+  supplier: string;
+  label: string;
+  amount: number;
+  total: number;
+  currency: string;
+  split: boolean;
+  paid: boolean;
+  why: string[];
+  evidence: EvidenceRef[];
+}
+
+export interface OpenItem {
+  id: string;
+  text: string;
+  evidence: EvidenceRef[];
+}
+
+export interface CostCenterDetail extends CostCenterCard {
+  companyName: string;
+  period: Period | null;
+  currency: string;
+  spent: number;
+  received: number;
+  payments: CostCenterPayment[];
+  documents: CostCenterDocument[];
+  openItems: OpenItem[];
+  evidence: EvidenceRef[];
+  summary: string;
+  recharged: { text: string; toRecharge: number; paidBack: number; outstanding: number; clientMoney: boolean } | null;
+}
+
+export interface CostCenterStatement {
+  costCenter: CostCenterCard;
+  companyName: string;
+  title: string;
+  owner: string | null;
+  ownerStatement: boolean;
+  period: Period | null;
+  currency: string;
+  moneyIn: (CostCenterPayment & { kind: string; label: string })[];
+  received: number;
+  costs: CostCenterPayment[];
+  spent: number;
+  managementFee: { amount: number; label: string; percent: number | null; monthly: number | null } | null;
+  net: number;
+  netDueToOwner: number | null;
+  documents: CostCenterDocument[];
+  openItems: OpenItem[];
+  final: boolean;
+  status: string;
+  evidence: EvidenceRef[];
+  summary: string;
+}
+
+/* ---------- People and expense claims (GET /api/employees, GET /api/expense-claims) ---------- */
+
+export interface Employee {
+  id: string;
+  name: string;
+  email: string | null;
+  phone: string | null;
+  companyId: string | null;
+  companyName: string;
+  cards: { last4: string; label: string }[];
+  learnedFromBank: boolean;
+  receiptsMissing: number;
+  receiptsAsked: number;
+  claimsWaiting: number;
+  toPayBack: number | null;
+}
+
+export interface ExpenseClaim {
+  id: string;
+  merchant: string;
+  amount: number | null;
+  currency: string;
+  date: ISODate;
+  /** waiting (for the owner's OK), approved (to be paid back), paid (paid back), declined. */
+  status: "waiting" | "approved" | "paid" | "declined" | string;
+  statusLabel: string;
+  employeeId: string;
+  employee: string;
+  companyId: string | null;
+  companyName: string;
+  evidenceIds: string[];
+  paidBy: string | null;
+  /** The open Needs You question that approves or declines it. */
+  needsId: string | null;
+  note: string;
+}
+
+/* ---------- Plan (GET /api/billing) ---------- */
+
+export interface PlanLimits {
+  companies: number | null;
+  documentsPerMonth: number | null;
+  users: number | null;
+}
+
+export interface BillingPlan {
+  id: string;
+  name: string;
+  monthly: number;
+  perClient: number | null;
+  limits: PlanLimits;
+  summary: string;
+  price: string;
+}
+
+export interface BillingData {
+  plan: BillingPlan & { status: string; renewsOn: ISODate | null };
+  demo: boolean;
+  usage: { month: MonthKey; companies: number; documents: number; users: number | null; clients: number };
+  limits: PlanLimits;
+  over: string[];
+  prompt: string | null;
+  notice: string | null;
+  graceUntil: ISODate | null;
+  waiting: number;
+  held: boolean;
+  plans: BillingPlan[];
+  canUpgrade: boolean;
+  canManage: boolean;
+  message: string | null;
+}
+
+/* ---------- What I may do on my own (GET /api/settings/automation) ---------- */
+
+export interface AutomationItem {
+  id: string;
+  label: string;
+  detail: string;
+  on: boolean;
+  onFor: string[];
+  companies: { companyId: string; companyName: string; on: boolean }[];
+  level: string;
+  levelLabel: string;
+}
+
+export interface AutomationData {
+  items: AutomationItem[];
+  summary: string;
+  never: string;
+  ok?: boolean;
+  message?: string;
+}
+
+/* ---------- Deadlines (GET /api/obligations) ---------- */
+
+export interface Obligation {
+  id: string;
+  title: string;
+  kind: string;
+  companyId: string | null;
+  companyName: string;
+  due: ISODate;
+  amount: number | null;
+  currency: string;
+  reference: string;
+  /** "You" or "Your accountant". */
+  responsible: string;
+  consequence: string;
+  requiredProof: string;
+  /** What proves it done, in plain words. */
+  condition: string;
+  status: "open" | "done" | "information";
+  tone: Tone;
+  nextStep: string;
+  why: string[];
+  evidenceIds: string[];
+  /** How the owner can say it is done; empty when only a payment or a document can close it. */
+  confirmOptions: { id: string; label: string; needsDate?: boolean }[];
+}
+
+export interface ObligationsData {
+  today: ISODate;
+  items: Obligation[];
+}
+
+/* ---------- One document (GET /api/documents/{id}) ---------- */
+
+export interface StatementLine {
+  row: number;
+  status: string;
+  text: string;
+  evidence: EvidenceRef[];
+  document?: { id: string; label: string };
+  payment?: EvidenceRef;
+}
+
+export interface SupplierStatement {
+  supplier: string;
+  supplierKnown: boolean;
+  note: string;
+  summary: string;
+  complete: boolean;
+  lines?: StatementLine[];
+  missing: StatementLine[];
+  differences: StatementLine[];
+  paymentsNotFound: StatementLine[];
+  notOnStatement: { id: string; label: string; date: ISODate | null; amount: number | null; evidence: EvidenceRef[] }[];
+  notOnStatementText?: string;
+  balance: { statement: number | null; ours: number | null; difference: number | null; agrees: boolean; text: string } | null;
+  request: { status: string; to?: string; text: string } | null;
+  needsYouId: string | null;
+}
+
+export interface DocumentDetail {
+  id: string;
+  label: string;
+  supplier: string;
+  number: string;
+  type: string;
+  date: ISODate | null;
+  amount: number | null;
+  currency: string;
+  companyId: string;
+  companyName: string;
+  /** The golden path stage: acquired, understood, verified, matched, confirmed, closed, conflict, needs_owner … */
+  stage: string;
+  statusLabel: string;
+  /** Plain words when it is held (a large first purchase, a changed bank account). */
+  waiting: string | null;
+  corrects: { id: string; label: string } | null;
+  creditNotes: { id: string; label: string }[];
+  payments: (EvidenceRef & { transactionId: string })[];
+  supportsPayments: EvidenceRef[];
+  history: HistoryStep[];
+  chain: ChainStep[];
+  evidence: EvidenceRef[];
+  evidenceIds: string[];
+  why: string[];
+  filename?: string;
+  sensitive?: boolean;
+  sensitiveReason?: string;
+  due?: ISODate | null;
+  dueLine?: string;
+  parts?: ChainStep[];
+  received?: { received: number; total: number; stillToCome: number; text: string };
+  heldBack?: { amount: number; until: ISODate | null; status: string; text: string };
+  importChain?: ImportChain;
+  statement?: SupplierStatement;
+}
+
+/* ---------- One payment (GET /api/transactions/{id}) ---------- */
+
+export interface TransactionDetail {
+  id: string;
+  date: ISODate;
+  amount: number;
+  currency: string;
+  direction: "in" | "out";
+  counterparty: string;
+  companyId: string | null;
+  companyName: string;
+  status: string;
+  statusLabel: string;
+  /** What it needs to close: "EDP should send an invoice for this payment." */
+  expects: string;
+  documents: { id: string; label: string; evidenceIds: string[] }[];
+  headline: string;
+  why: string[];
+  history: HistoryStep[];
+  chain: ChainStep[];
+  evidenceIds: string[];
+  nextStep?: string;
+  /** One tap teaches it for every later payment: "It never has an invoice" / "It always has one". */
+  evidenceChoices?: { need: "none" | "invoice"; label: string }[];
+  notes?: string[];
+  parts?: ChainStep[];
+  deposit?: { status: string; text: string };
+  disputed?: { status: string; text: string };
+  importChain?: ImportChain;
 }
