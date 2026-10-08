@@ -3,6 +3,7 @@ import { Icon, type IconName } from "@/components/Icon";
 import { Status } from "@/components/ui";
 import { ReportDelivery } from "@/components/documents/ReportDelivery";
 import { AutomationSettings } from "@/components/settings/AutomationSettings";
+import { ReadingSettings } from "@/components/settings/ReadingSettings";
 import { BillingReturn, SettingsLinks } from "@/components/settings/SettingsLinks";
 import { owner } from "@/lib/data";
 import { production } from "@/lib/mode";
@@ -39,6 +40,7 @@ export function SettingsView({ home, who = owner, account }: { home: HomeData; w
         </Suspense>
         <SettingsLinks />
         <AutomationSettings />
+        <ReadingSettings />
         <ReportDelivery />
         <section aria-labelledby="conn-h" id="connections">
           <div className="section-head">

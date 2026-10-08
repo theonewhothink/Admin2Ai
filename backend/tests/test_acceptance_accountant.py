@@ -51,7 +51,7 @@ class FakeMailer:
         self.fail = fail
         self.sent: list[tuple[list[str], str, str]] = []
 
-    def send(self, to: list[str], subject: str, body: str, files: list[Any]) -> None:
+    def send(self, to: list[str], subject: str, body: str, files: list[Any], headers: Any = None) -> None:
         if self.fail:
             raise OSError("the mail server refused the connection")
         self.sent.append((list(to), subject, body))
@@ -175,7 +175,7 @@ def test_scoped_reads_never_show_another_companys_documents_payments_evidence_or
              *(f"/api/transactions/{t}" for t in a_txs), "/api/obligations", f"/api/companies/{a}/cost-centers",
              "/api/cost-centers/cc_hazel", "/api/cost-centers/cc_hazel/statement",
              "/api/settings/report", "/api/settings/accountant", "/api/settings/mailboxes", "/api/onboarding",
-             "/api/settings/automation",
+             "/api/settings/automation", "/api/settings/reading",
              "/api/accountant/api-keys", "/api/connections", "/api/accountant/clients", f"/api/accountant/clients/{a}",
              f"/api/accountant/clients/{a}/export", *(f"/api/accountant/clients/{a}/evidence/{e}/file" for e in a_evidence),
              *(f"/api/accountant/clients/company-b/evidence/{e}/file" for e in a_evidence),
@@ -516,7 +516,7 @@ def test_an_accountant_of_company_b_cannot_read_company_a_through_any_get_route(
              *(f"/api/cost-centers/{cc}/statement?month=2026-09" for cc in seen["cost_centers"]),
              "/api/settings/report",
              "/api/settings/accountant", "/api/settings/mailboxes", "/api/onboarding", "/api/settings/automation",
-             "/api/accountant/api-keys", "/api/connections", "/api/accountant/clients",
+             "/api/settings/reading", "/api/accountant/api-keys", "/api/connections", "/api/accountant/clients",
              f"/api/accountant/clients/{a}", f"/api/accountant/clients/{a}/export",
              *(f"/api/accountant/clients/{a}/evidence/{e}/file" for e in a_evidence),
              *(f"/api/accountant/clients/second-company/evidence/{e}/file" for e in a_evidence),

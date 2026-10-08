@@ -156,7 +156,7 @@ def test_two_processes_share_one_log(tmp_path: Path) -> None:
 
 def test_a_failed_live_apply_is_voided_and_left_out(tmp_path: Path) -> None:
     class BrokenMailer:
-        def send(self, *args: object) -> None:
+        def send(self, *args: object, **kwargs: object) -> None:
             raise ConnectionError("smtp down")
 
     h = harness(tmp_path, mailer=BrokenMailer())

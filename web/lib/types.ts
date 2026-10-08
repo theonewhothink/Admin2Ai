@@ -784,6 +784,25 @@ export interface AutomationData {
   message?: string;
 }
 
+/* ---------- How I read your email and bank (GET /api/settings/reading) ---------- */
+
+/** How far back the first read of a new mailbox or bank goes: the last 90 days or the last 12 months. */
+export type HistoryChoice = "90d" | "12m";
+
+export interface ReadingData {
+  history: HistoryChoice;
+  historyOptions: { id: HistoryChoice; label: string }[];
+  historyLabel: string;
+  historyDetail: string;
+  lookInSpam: boolean;
+  spamLabel: string;
+  spamDetail: string;
+  /** Mailboxes and banks reading their older months now (after choosing 12 months). */
+  reading: string[];
+  ok?: boolean;
+  message?: string;
+}
+
 /* ---------- Deadlines (GET /api/obligations) ---------- */
 
 export interface Obligation {

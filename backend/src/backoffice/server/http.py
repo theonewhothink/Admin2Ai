@@ -126,7 +126,7 @@ _ROUTE_WORDS = frozenset(
     "readiness acceptance cost-centers allocate obligations transactions expected-invoices not-coming statement "
     "invitations accept employee employees card-payments expense-claims profile mailboxes seen automation manager "
     "outlets sensitive access-log billing checkout portal webhook identity accounting webhooks gmail microsoft "
-    "lifecycle portals code".split())
+    "lifecycle portals code reading".split())
 # One client company of any business: /api/accountant/clients/<tenant id>~<company id>[/…] (§28, §29).
 _CLIENT_REF = re.compile(r"/api/accountant/clients/(?P<tenant>[A-Za-z0-9][A-Za-z0-9_.-]{0,127})~(?P<company>[^/~]+)"
                          r"(?P<rest>/.*)?")
@@ -679,7 +679,8 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
             raise AuthError(400, "bad_request", "Choose your bank from the list.")
         if aggregator_factory is None or manager.vault is None or len(config.state_key) < 32:
             raise AuthError(503, "unavailable", "Bank connections are not set up on this server yet.")
-        companies = await run_in_threadpool(manager.read, principal.tenant.id, lambda svc: list(svc.repo.companies))
+        companies, history = await run_in_threadpool(
+            manager.read, principal.tenant.id, lambda svc: (list(svc.repo.companies), svc.history_days()))
         company = str(body.get("companyId") or (companies[0] if companies else ""))
         if company not in companies:
             raise AuthError(400, "bad_request", "Choose which company this bank account belongs to.")
@@ -690,9 +691,16 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
 
         def start() -> str:
             aggregator = aggregator_factory()
-            link = aggregator.create_link(institution_id=institution,
-                                          redirect_url=f"{config.api_url}/api/connections/bank/callback",
-                                          reference=reference, history_days=90, access_days=180)
+            redirect = f"{config.api_url}/api/connections/bank/callback"
+            try:  # as far back as the owner chose to read (§6, checklist A9)
+                link = aggregator.create_link(institution_id=institution, redirect_url=redirect,
+                                              reference=reference, history_days=history, access_days=180)
+            except Exception:
+                if history <= 90:
+                    raise
+                # Some banks share only 90 days: link those for 90; the older months then say a statement is needed.
+                link = aggregator.create_link(institution_id=institution, redirect_url=redirect,
+                                              reference=reference, history_days=90, access_days=180)
             manager.vault.store(principal.tenant.id, pending, "open_banking",
                                 {"requisition_id": link.requisition_id, "agreement_id": link.agreement_id or "",
                                  "institution_id": institution})

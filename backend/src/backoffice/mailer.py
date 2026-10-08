@@ -17,6 +17,15 @@ that raises when it could not deliver):
 Owner-confirmed drafts (the chat's Send button) and the back office's own
 messages (supplier invoice requests, answers to the accountant) all go through
 one of these; without one, they wait.
+
+**Replies come back where they are read.** Every email goes out from the one
+sending address (BACKOFFICE_SMTP_FROM), which nobody reads. So each carries a
+``Reply-To``: the business's connected mailbox, the one the sync worker reads
+(``Orchestrator.reply_address``). A supplier's answer then lands in that
+mailbox, arrives with the next sync, and is tied to the request by its
+In-Reply-To / References (the Message-ID we set and remember) or the reference
+in the subject (``missing.match_reply``), even when the sending service
+replaces our Message-ID with its own.
 """
 
 from __future__ import annotations
@@ -31,6 +40,9 @@ __all__ = ["SIMULATED_NOTE", "AcceptedMessage", "SimulatedOutbox", "SmtpMailer",
 
 # Said once, where a demo send is confirmed to the owner.
 SIMULATED_NOTE = "This is the demo: no real email leaves it."
+# The headers a sent email keeps from the back office: its thread (so the answer is matched to it) and where the
+# answer goes (the mailbox the sync reads). Nothing else is copied (no Bcc, no From).
+_THREAD_HEADERS = ("message-id", "in-reply-to", "references", "reply-to")
 
 
 class SmtpMailer:
@@ -46,7 +58,7 @@ class SmtpMailer:
         msg = EmailMessage()
         msg["From"], msg["To"], msg["Subject"] = self.sender, ", ".join(to), subject
         for name, value in (headers or {}).items():
-            if value and name.lower() in ("message-id", "in-reply-to", "references"):
+            if value and name.lower() in _THREAD_HEADERS:
                 msg[name] = value
         msg.set_content(body)
         for name, content_type, data in files:
