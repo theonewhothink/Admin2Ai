@@ -49,9 +49,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Protocol
-
-import httpx
+from typing import TYPE_CHECKING, Any, Protocol
 
 from backoffice.domain.models import ExtractionMethod
 
@@ -73,6 +71,9 @@ from ..layout import geometry, to_bbox
 from ._chat import DEFAULT_TRANSCRIBE_PROMPT, chat_payload, chat_text, file_part, image_part, split_pages
 from ._common import DEFAULT_CLOCK, Clock, build_result, confidence, text_lines
 from ._http import EndpointConfig, JSONEndpoint, b64
+
+if TYPE_CHECKING:  # only for annotations: httpx is imported where a request is made
+    import httpx
 
 __all__ = [
     "CommercialOCRConfig",

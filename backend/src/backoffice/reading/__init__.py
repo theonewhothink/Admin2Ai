@@ -10,12 +10,17 @@ Public API
                                                 not available, switched off, skipped, failed)
     run_sync(factory)                          (async engines from synchronous code)
 
+    BrowserReader().supply(data, reading)      (the static demo: what the visitor's browser read,
+                                                see .browser)
+
 Importing this package needs only pydantic: every optional reader (pypdf,
-zxing-cpp, pyzbar, Pillow, pypdfium2) and the engine clients (httpx) are
-imported when a file is actually read. The browser demo never creates a
-reader, so uploads there are stored and wait, as before.
+zxing-cpp, pyzbar, Pillow, pypdfium2, rapidocr) and the engine clients
+(httpx) are imported when a file is actually read. The browser demo's reader
+(:class:`BrowserReader`) reads nothing itself: it takes what the page read
+in the visitor's browser and runs the normal chain on it.
 """
 
+from .browser import BrowserReader, DeviceReading, DeviceReadingError
 from .config import external_ai_enabled, reader_from_env
 from .reader import AUTO, DocumentReader, ReadOutcome, ReadRequest, run_sync
 from .stage0 import (
@@ -33,6 +38,9 @@ from .stage0 import (
 
 __all__ = [
     "AUTO",
+    "BrowserReader",
+    "DeviceReading",
+    "DeviceReadingError",
     "DocumentReader",
     "PyzbarQRDecoder",
     "QRDecoder",

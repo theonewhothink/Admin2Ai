@@ -12,11 +12,12 @@ from __future__ import annotations
 import base64
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
-
-import httpx
+from typing import TYPE_CHECKING, Any
 
 from ..base import OCRRejected, OCRResponseError, OCRUnavailable
+
+if TYPE_CHECKING:
+    import httpx
 
 __all__ = ["EndpointConfig", "JSONEndpoint", "b64"]
 
@@ -75,10 +76,14 @@ class JSONEndpoint:
 
     def _http(self) -> httpx.AsyncClient:
         if self._client is None:
+            import httpx
+
             self._client = httpx.AsyncClient(verify=self._config.verify_tls)
         return self._client
 
     async def post(self, path: str, payload: Mapping[str, Any]) -> Any:
+        import httpx  # here, not at import time: the browser engine imports this package and has no httpx
+
         engine = self._engine
         try:
             response = await self._http().post(

@@ -1282,7 +1282,8 @@ class Repository:
         self.closed_months: dict[tuple[str, str], date] = {}
         self.recovered_tx_ids: set[str] = set()
         # Reads uploaded PDFs and photos (backoffice.reading.DocumentReader, set by the server from its
-        # environment). None in the browser demo: such files are stored and wait, unread.
+        # environment; the browser demo's BrowserReader takes what the visitor's browser read). None: such
+        # files are stored and wait, unread.
         self.reader: Any = None
         self.reads: dict[str, Any] = {}  # evidence id -> ReadOutcome (what was read, by which steps)
         # Jobs, properties, vehicles, outlets, events, courses or clients of each company (cost centers).
@@ -7652,6 +7653,8 @@ class Orchestrator:
         missing = {s.step for s in outcome.missing_readers()} if outcome is not None else set()
         if outcome is None or outcome.found_anything:
             return "Got it. I stored it, but I couldn't read it."
+        if "ocr_browser" in missing:  # the static demo: the page could not read this file before sending it
+            return "Got it. I stored it, but this browser couldn't read it. Try sending it again."
         if evidence.format is EvidenceFormat.PDF and "pdf_text" in missing:
             return "Got it. I stored it. Reading PDFs is not set up here yet."
         if "ocr" in missing:

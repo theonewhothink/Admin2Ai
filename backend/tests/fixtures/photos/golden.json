@@ -1,0 +1,54 @@
+{
+  "name": "photographed-receipts",
+  "version": "2026-10-08",
+  "documents": [
+    {
+      "id": "ft-fba2026-1207-photo",
+      "description": "A4 invoice from a hardware shop with its fiscal QR code, photographed at an angle on a desk (perspective, uneven light, sensor noise, JPEG).",
+      "pages": ["ft-fba2026-1207.jpg"],
+      "tags": ["pt", "photo", "ocr", "qr-image", "perspective", "expect:verified", "bank:mbcp-ht:2026-09-24:-118.70:FERRAGENS BOAVISTA LDA", "transcription:ft-fba2026-1207.txt"],
+      "expected": {
+        "invoice_number": "FT FBA2026/1207",
+        "supplier_tax_id": "514732288",
+        "customer_tax_id": "516123459",
+        "gross_amount": "118.70",
+        "net_amount": "96.50",
+        "vat_amount": "22.20",
+        "currency": "EUR",
+        "issue_date": "2026-09-23",
+        "due_date": "2026-10-23"
+      }
+    },
+    {
+      "id": "fs-pb2026-0441-photo",
+      "description": "A café's thermal till receipt (simplified invoice, monospace print) with its fiscal QR code, photographed on a table.",
+      "pages": ["fs-pb2026-0441.jpg"],
+      "tags": ["pt", "photo", "ocr", "qr-image", "thermal", "expect:verified", "bank:card-5530:2026-09-26:-8.40:PASTELARIA DO BOLHAO", "transcription:fs-pb2026-0441.txt"],
+      "expected": {
+        "invoice_number": "FS PB2026/441",
+        "supplier_tax_id": "509882412",
+        "customer_tax_id": "516123459",
+        "gross_amount": "8.40",
+        "net_amount": "7.43",
+        "vat_amount": "0.97",
+        "currency": "EUR",
+        "issue_date": "2026-09-26"
+      }
+    },
+    {
+      "id": "fs-mr2026-0088-photo",
+      "description": "A restaurant receipt from an older till (no QR code), photographed 4 degrees rotated and a little out of focus. One reading of pixels: likely, never verified on its own.",
+      "pages": ["fs-mr2026-0088.jpg"],
+      "tags": ["pt", "photo", "ocr", "rotated", "blurred", "no-qr", "expect:likely", "transcription:fs-mr2026-0088.txt"],
+      "expected": {
+        "invoice_number": "FS MR2026/88",
+        "supplier_tax_id": "507311566",
+        "customer_tax_id": "516123459",
+        "gross_amount": "45.60",
+        "vat_amount": "5.25",
+        "currency": "EUR",
+        "issue_date": "2026-09-24"
+      }
+    }
+  ]
+}

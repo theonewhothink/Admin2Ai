@@ -65,6 +65,8 @@ x-production-env: &production-env
   # Invoice links opened before each change is recorded (§9); off: they wait unopened.
   BACKOFFICE_LINK_FETCHING: ${BACKOFFICE_LINK_FETCHING:-on}
   BACKOFFICE_OCR_URL: ${BACKOFFICE_OCR_URL:-}
+  # No sidecar: PP-OCRv6 runs in the API process (the image installs it); off: photos wait unread.
+  BACKOFFICE_OCR_LOCAL: ${BACKOFFICE_OCR_LOCAL:-auto}
   BACKOFFICE_EXTERNAL_AI: ${BACKOFFICE_EXTERNAL_AI:-off}
   BACKOFFICE_SYNC_INTERVAL: ${BACKOFFICE_SYNC_INTERVAL:-900}
   BACKOFFICE_HISTORY_DAYS: ${BACKOFFICE_HISTORY_DAYS:-90}

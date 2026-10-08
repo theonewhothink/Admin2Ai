@@ -8,7 +8,9 @@
  *
  * Every change the visitor makes (answers, uploads, …) is kept in
  * sessionStorage and replayed when the engine starts again, so a reload keeps
- * their progress for the rest of the visit.
+ * their progress for the rest of the visit. An upload's body carries what the
+ * page read from a photo or PDF (lib/ocr.ts), so the replay gives the same
+ * result without reading the file again.
  *
  * Starting Python in the browser takes seconds (tens of seconds on slower
  * machines). The demo it starts from never changes, so the build also writes

@@ -6,6 +6,12 @@
  * backoffice.zip, builds BackOfficeService.demo() and answers requests with
  * BackOfficeService.dispatch(method, path, body).
  *
+ * Photos and PDFs are read by the page before they are sent (lib/ocr.ts:
+ * tesseract.js, jsQR, pdf.js); the upload carries that reading, and the
+ * engine's BrowserReader runs its normal reading chain on it
+ * (backoffice.reading.browser). Replaying the journal sends the same reading
+ * again: nothing is read twice.
+ *
  * Messages in:
  *   { type: "init", version, journal: [{ method, path, body }] }
  *   { type: "call", id, method, path, body }
@@ -21,9 +27,11 @@ const here = new URL(".", self.location.href);
 const BOOT = `
 import json, sys
 sys.path.insert(0, "/engine")
+from backoffice.reading import BrowserReader
 from backoffice.service import BackOfficeService
 
 _service = BackOfficeService.demo()
+_service.repo.reader = BrowserReader()  # takes what the page read from a photo or PDF
 
 def _call(method, path, body=None):
     if not isinstance(body, str):

@@ -1,14 +1,19 @@
 """Cheap image-quality signals for OCR routing and capture feedback (§11, §15, §17).
 
-Two sources, no numpy or Pillow needed:
+Three sources:
 
 * **Precomputed metrics** from whoever looked at the pixels: the phone's
-  capture pipeline measures blur, glare and brightness on-device (§11), an
-  image worker can do the same server-side. They arrive as
-  :class:`ImageMetrics` (``from_mapping`` accepts snake_case or camelCase).
+  capture pipeline measures blur, glare and brightness on-device (§11), the
+  browser demo measures edge sharpness before it reads a photo. They arrive
+  as :class:`ImageMetrics` (``from_mapping`` accepts snake_case or camelCase).
 * **Header probing** (:func:`probe_image`): width, height, resolution and
   EXIF orientation read from PNG, JPEG and TIFF headers with the standard
   library only.
+* **Pixel measurement** (:func:`measure_pixels`, needs the optional Pillow
+  and numpy): edge sharpness, how steep the edges of the printed text are
+  compared with their contrast. Scale- and light-independent, and not fooled
+  by sensor noise the way the variance of the Laplacian is. A blank or
+  textless image is "not measured", never "blurry".
 
 :func:`assess` turns metrics into flags. Flags are data for routing
 (complex-layout engine, §15) and for a calm retake request (§11); a missing
@@ -41,6 +46,8 @@ __all__ = [
     "QualityThresholds",
     "assess",
     "assess_image",
+    "edge_sharpness",
+    "measure_pixels",
     "probe_image",
 ]
 
@@ -75,12 +82,14 @@ class ImageMetrics:
     saturation (0-1). ``brightness``: mean luma (0-255).
     ``rotation_degrees``: how far the stored pixels are turned from upright
     (0, 90, 180, 270). ``skew_degrees``: residual tilt of text lines.
+    ``edge_sharpness``: :func:`edge_sharpness` (0-1, higher is sharper).
     """
 
     width: int | None = None
     height: int | None = None
     dpi: float | None = None
     sharpness: float | None = None
+    edge_sharpness: float | None = None
     glare_ratio: float | None = None
     brightness: float | None = None
     rotation_degrees: int | None = None
@@ -134,6 +143,7 @@ _VALID: Mapping[str, Callable[[float], bool]] = {
     "height": lambda v: v > 0,
     "dpi": lambda v: _finite(v) and v > 0,
     "sharpness": lambda v: _finite(v) and v >= 0,
+    "edge_sharpness": lambda v: _finite(v) and 0 <= v <= 1,
     "glare_ratio": lambda v: _finite(v) and 0 <= v <= 1,
     "brightness": lambda v: _finite(v) and 0 <= v <= 255,
     "rotation_degrees": lambda v: True,
@@ -144,6 +154,10 @@ _VALID: Mapping[str, Callable[[float], bool]] = {
 @dataclass(frozen=True)
 class QualityThresholds:
     min_sharpness: float = 100.0
+    # Edge sharpness under which print is too soft to read reliably. PP-OCRv6 on photographed receipts and
+    # invoices blurred step by step: everything read down to about 0.5 (small print) or 0.35 (till receipts),
+    # readings garbled around 0.3, nothing read at 0.22-0.3. A starting point to tune on the golden set (§56).
+    min_edge_sharpness: float = 0.32
     max_glare_ratio: float = 0.02
     min_short_side_px: int = 900
     min_dpi: float = 150.0
@@ -190,6 +204,10 @@ def assess(metrics: ImageMetrics, thresholds: QualityThresholds = DEFAULT_THRESH
         "sharpness": (
             m.sharpness, QualityFlag.BLURRY, m.sharpness is not None and m.sharpness < t.min_sharpness
         ),
+        "edge_sharpness": (
+            m.edge_sharpness, QualityFlag.BLURRY,
+            m.edge_sharpness is not None and m.edge_sharpness < t.min_edge_sharpness,
+        ),
         "glare_ratio": (
             m.glare_ratio, QualityFlag.GLARE, m.glare_ratio is not None and m.glare_ratio > t.max_glare_ratio
         ),
@@ -205,6 +223,8 @@ def assess(metrics: ImageMetrics, thresholds: QualityThresholds = DEFAULT_THRESH
     }
     flags = {flag for _, flag, bad in checks.values() if bad}
     unknown = {name for name, (value, _, _) in checks.items() if value is None} | impossible
+    if m.sharpness is not None or m.edge_sharpness is not None:  # either measure of blur is enough
+        unknown -= {"sharpness", "edge_sharpness"}
     if m.brightness is not None and m.brightness > t.max_brightness:
         flags.add(QualityFlag.OVEREXPOSED)
     if _low_resolution(m, t):
@@ -230,6 +250,72 @@ def assess_image(
     from_header = header.metrics() if header else ImageMetrics()
     metrics = (measured or ImageMetrics()).merged(from_header)
     return assess(metrics, thresholds)
+
+
+# --------------------------------------------------------------------------- pixel measurement
+
+# How edge sharpness is measured; the browser demo measures it the same way (web/lib/ocr.ts).
+EDGE_SIDE = 600  # the image is first scaled down to this longer side (area average): noise and scale even out
+EDGE_TILE = 16  # square tiles of this many pixels
+EDGE_CONTRAST = 80.0  # a tile holds print when its 1st-99th percentile grey range is at least this
+EDGE_MIN_TILES = 4  # fewer tiles with print: not measured
+
+
+def edge_sharpness(gray: Any) -> float | None:
+    """How sharp the print in a greyscale image is, 0-1 (higher is sharper), or None when there is no print.
+
+    ``gray`` is a 2-D numpy array (0-255) already scaled to :data:`EDGE_SIDE`. For each tile with print, the
+    steepest step between neighbouring pixels divided by the tile's contrast: a crisp edge drops from ink to
+    paper in about one pixel (close to 1), a blurred one over many (close to 0). The score is the median of the
+    sharpest quarter of tiles, so a page that is partly out of focus is judged by its best text.
+    """
+    import numpy as np
+
+    a = np.asarray(gray, dtype=np.float32)
+    t = EDGE_TILE
+    th, tw = a.shape[0] // t, a.shape[1] // t
+    if th == 0 or tw == 0:
+        return None
+    gx = np.zeros_like(a)
+    gy = np.zeros_like(a)
+    gx[:, :-1] = np.abs(np.diff(a, axis=1))
+    gy[:-1, :] = np.abs(np.diff(a, axis=0))
+    steep = np.maximum(gx, gy)[: th * t, : tw * t].reshape(th, t, tw, t).max(axis=(1, 3))
+    tiles = a[: th * t, : tw * t].reshape(th, t, tw, t).transpose(0, 2, 1, 3).reshape(th, tw, t * t)
+    low, high = np.percentile(tiles, [1, 99], axis=2)
+    contrast = high - low
+    printed = contrast >= EDGE_CONTRAST
+    if int(printed.sum()) < EDGE_MIN_TILES:
+        return None
+    ratios = np.sort(np.minimum(steep[printed] / contrast[printed], 1.0))[::-1]
+    best = ratios[: max(1, len(ratios) // 4)]
+    return round(float(np.median(best)), 4)
+
+
+def measure_pixels(data: bytes) -> ImageMetrics | None:
+    """Edge sharpness of an image file (:func:`edge_sharpness`); None when Pillow or numpy is missing, the
+    file is not an image they can open, or it holds no print."""
+    import io
+
+    from ._optional import MissingDependencyError, import_optional
+
+    try:
+        pil = import_optional("PIL.Image", feature="Measuring photo sharpness", package="Pillow")
+        import_optional("numpy", feature="Measuring photo sharpness")
+    except MissingDependencyError:
+        return None
+    try:
+        with pil.open(io.BytesIO(data)) as image:
+            image.draft("L", (EDGE_SIDE * 2, EDGE_SIDE * 2))  # JPEG: decode at a reduced size, much faster
+            gray = image.convert("L")
+            scale = EDGE_SIDE / max(gray.size)
+            if scale < 1:
+                gray = gray.resize((max(1, round(gray.width * scale)), max(1, round(gray.height * scale))),
+                                   pil.Resampling.BOX)
+            score = edge_sharpness(gray)
+    except Exception:  # unreadable or truncated image: not measured
+        return None
+    return ImageMetrics(edge_sharpness=score) if score is not None else None
 
 
 # --------------------------------------------------------------------------- header probing

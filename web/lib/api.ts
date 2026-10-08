@@ -442,13 +442,22 @@ export async function ask(question: string): Promise<AskAnswer> {
   );
 }
 
-/** Upload a receipt or invoice. Phase 0: accepted locally without a backend. */
-export async function uploadEvidence(file: File): Promise<AnswerResult> {
+/**
+ * Upload a receipt or invoice. Phase 0: accepted locally without a backend.
+ *
+ * On the static demo a photo or PDF is first read in this browser (lib/ocr.ts,
+ * loaded only now) and what was read goes with the file; `onStage` reports it.
+ */
+export async function uploadEvidence(file: File, onStage?: (stage: "loading" | "reading" | "sending") => void): Promise<AnswerResult> {
   if (browserEngine) {
+    const { readableKind, readInBrowser } = await import("./ocr");
+    const reading = readableKind(file) ? await readInBrowser(file, onStage) : null;
+    onStage?.("sending");
     return engineWrite("/api/evidence", {
       filename: file.name,
       contentType: file.type || null,
       dataBase64: await toBase64(file),
+      ...(reading ? { reading } : {}),
     });
   }
   const body = new FormData();

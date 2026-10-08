@@ -10,6 +10,8 @@
   generic JSON API, method VLM by default;
 * :class:`ClaudeVisionProvider`: ``claude-vision``, Anthropic Messages API with
   a forced tool call returning the critical fields as JSON, method VLM;
+* :class:`LocalOCRProvider`: ``rapidocr``, PP-OCRv6 small (ONNX) in this process
+  through RapidOCR, no sidecar and no network, method OCR;
 * :class:`FakeOCRProvider`: in memory, for tests and the golden dataset.
 
 Only the commercial and Claude providers are ``external``; both redact first (§53).
@@ -30,6 +32,7 @@ from .commercial import (
 from .fake import FakeOCRProvider
 from .paddle_vl import PaddleOCRVLConfig, PaddleOCRVLProvider
 from .ppocr import InProcessPaddleOCR, PPOCRConfig, PPOCRv6Provider, PPOCRVariant
+from .rapid import LocalOCRConfig, LocalOCRProvider, local_ocr_available
 from .unlimited import DEFAULT_TRANSCRIBE_PROMPT, Rasterizer, UnlimitedOCRConfig, UnlimitedOCRProvider
 
 __all__ = [
@@ -44,6 +47,8 @@ __all__ = [
     "EndpointConfig",
     "FakeOCRProvider",
     "InProcessPaddleOCR",
+    "LocalOCRConfig",
+    "LocalOCRProvider",
     "PPOCRConfig",
     "PPOCRVariant",
     "PPOCRv6Provider",
@@ -55,6 +60,7 @@ __all__ = [
     "TextRedaction",
     "UnlimitedOCRConfig",
     "UnlimitedOCRProvider",
+    "local_ocr_available",
     "masked_pages_redactor",
     "text_only_redactor",
 ]

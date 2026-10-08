@@ -10,3 +10,5 @@ npm-debug.log*
 /public/pyodide/
 /public/engine/backoffice.zip
 /public/engine/snapshot.json
+# In-browser OCR (tesseract.js, pdf.js; copied from node_modules by `npm run engine:ocr`)
+/public/ocr/

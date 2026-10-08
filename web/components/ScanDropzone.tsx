@@ -9,7 +9,8 @@ interface Upload {
   id: number;
   name: string;
   size: number;
-  state: "sending" | "received" | "failed";
+  /** loading / reading: the static demo reading a photo or PDF in this browser before sending it. */
+  state: "loading" | "reading" | "sending" | "received" | "failed";
   /** What happened, in the engine's words. */
   message?: string;
 }
@@ -40,7 +41,9 @@ export function ScanDropzone() {
   const send = (file: File) => {
     const id = ++counter.current;
     setUploads((prev) => [{ id, name: file.name, size: file.size, state: "sending" }, ...prev]);
-    void uploadEvidence(file).then((res) => {
+    const stage = (next: "loading" | "reading" | "sending") =>
+      setUploads((prev) => prev.map((u) => (u.id === id && (u.state === "loading" || u.state === "reading" || u.state === "sending") ? { ...u, state: next } : u)));
+    void uploadEvidence(file, stage).then((res) => {
       setUploads((prev) =>
         prev.map((u) => (u.id === id ? { ...u, state: res.ok ? "received" : "failed", message: res.message } : u)),
       );
@@ -84,7 +87,9 @@ export function ScanDropzone() {
         </span>
         <p className={styles.dropTitle}>Drop receipts or invoices here</p>
         <p className="meta" id={hintId}>
-          Photos, PDFs or invoice files. As many as you like.
+          {browserEngine
+            ? "Photos, PDFs or invoice files. They are read right here in your browser: nothing is sent anywhere."
+            : "Photos, PDFs or invoice files. As many as you like."}
         </p>
         <div className={styles.dropActions}>
           <button type="button" className={`btn btn-primary ${styles.cameraBtn}`} onClick={() => cameraInput.current?.click()}>
@@ -140,7 +145,11 @@ export function ScanDropzone() {
                 <span className="meta num">{formatSize(u.size)}</span>
               </span>
               <span className={styles.fileState} data-state={u.state}>
-                {u.state === "sending" ? (
+                {u.state === "loading" ? (
+                  "Getting the reader ready…"
+                ) : u.state === "reading" ? (
+                  "Reading…"
+                ) : u.state === "sending" ? (
                   "Sending…"
                 ) : u.state === "received" ? (
                   <>

@@ -2,6 +2,7 @@
 
     python tests/e2e.py production   # builds with sign-in on, runs against a mock API
     python tests/e2e.py demo         # needs `npm run build:pages` first (out/)
+    python tests/e2e.py ocr          # the same build: a photographed receipt read in the browser
 
 production: builds the app with NEXT_PUBLIC_REQUIRE_SIGNIN=1 against a tiny
 mock of the production API contract written here (cookie session, CSRF
@@ -11,6 +12,15 @@ demo engine (backend/src), so the pages render real shapes.
 
 demo: serves the static export under /Admin2Ai and checks that no page
 redirects to sign-in or calls an auth endpoint.
+
+ocr: serves the same static export and uploads a generated photo of a café
+receipt (backend/tests/fixtures/photos/fs-pb2026-0441.jpg) on Scan. The page
+reads it in the browser (tesseract.js, jsQR; lib/ocr.ts) with nothing but the
+site's own files, the engine verifies it against its fiscal QR code, and
+Documents shows its supplier and total, also after a reload (the journal
+replays the reading; the photo is not read again). Then a scanned PDF
+(pdf.js renders it, tesseract reads it) and a badly blurred photo (the retake
+task). The OCR files are loaded only once a photo is uploaded.
 
 Needs: Python Playwright with Chromium (`pip install playwright` and
 `python -m playwright install chromium`). Screenshots go to $SCREENSHOT_DIR
@@ -582,8 +592,134 @@ def demo() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+# --------------------------------------------------------------------------- reading a photo in the browser
+
+RECEIPT = WEB.parent / "backend" / "tests" / "fixtures" / "photos" / "fs-pb2026-0441.jpg"
+BLURRED = RECEIPT.with_name("fs-mr2026-0088-blurred.jpg")
+SCAN = WEB.parent / "backend" / "tests" / "fixtures" / "documents" / "central-fs-cc2026-3317-scan.pdf"
+
+
+@contextmanager
+def static_site() -> Iterator[int]:
+    """The static export served under /Admin2Ai, as GitHub Pages serves it."""
+    out = WEB / "out"
+    if not (out / "index.html").exists():
+        raise SystemExit("Build the static demo first: npm run build:pages")
+    if not (out / "ocr" / "tesseract" / "worker.min.js").exists():
+        raise SystemExit("The static build has no OCR files (npm run engine:ocr is part of build:pages)")
+    root = Path(tempfile.mkdtemp())
+    try:
+        (root / "Admin2Ai").symlink_to(out)
+        port = free_port()
+
+        class Static(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *a: Any, **kw: Any) -> None:
+                super().__init__(*a, directory=str(root), **kw)
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+            def copyfile(self, source: Any, outputfile: Any) -> None:
+                try:
+                    super().copyfile(source, outputfile)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        with serve(Static, port):
+            yield port
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def ocr() -> None:
+    from playwright.sync_api import expect, sync_playwright
+
+    with static_site() as port, sync_playwright() as pw:
+        site = f"http://{HOST}:{port}/Admin2Ai"
+        browser = pw.chromium.launch()
+        page = browser.new_page()
+        seen: list[str] = []
+        page.on("request", lambda r: seen.append(r.url))
+        errors: list[str] = []
+        page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
+
+        print("first load")
+        page.goto(f"{site}/scan/")
+        expect(page.get_by_text("They are read right here in your browser")).to_be_visible(timeout=30000)
+        page.wait_for_timeout(1500)
+        check(not [u for u in seen if "/ocr/" in u], "the OCR files are not loaded until a photo is uploaded")
+
+        print("a photographed café receipt")
+        started = time.time()
+        page.locator("input[type=file][multiple]").set_input_files(str(RECEIPT))
+        row = page.locator("li", has_text=RECEIPT.name)
+        expect(row.get_by_text("Got it.")).to_be_visible(timeout=240000)
+        took = time.time() - started
+        print(f"  read and filed in {took:.1f} s (OCR engine and models loaded on demand)")
+        ocr_bytes = sum(1 for u in seen if "/ocr/" in u)
+        check(ocr_bytes > 0, "the OCR files were loaded for the photo")
+        check(any(u.endswith("/ocr/tesseract/lang/por.traineddata.gz") for u in seen), "the Portuguese model is self-hosted")
+        foreign = sorted({u for u in seen if not u.startswith(f"http://{HOST}:{port}/") and not u.startswith(("data:", "blob:"))})
+        check(not foreign, f"nothing is fetched from anywhere but the site itself {foreign[:3]}")
+
+        def documents_show_the_receipt(when: str) -> None:
+            page.goto(f"{site}/documents/")
+            listed = page.locator("li", has_text="Pastelaria")
+            expect(listed.first).to_be_visible(timeout=120000)
+            text = listed.first.inner_text()
+            check("PB2026/441" in text, f"{when}: Documents lists the receipt's number")
+            check("8.40" in text, f"{when}: Documents shows its total, €8.40")
+
+        journal = json.loads(page.evaluate("sessionStorage.getItem('admin2ai:engine-journal')") or "[]")
+        sent = [e["body"] for e in journal if e["path"] == "/api/evidence"]
+        reading = (sent[-1] or {}).get("reading") if sent else None
+        check(bool(reading) and reading.get("method") == "ocr_browser", "the upload carries the browser's reading (journaled)")
+        if reading:
+            text = "\n".join(line["text"] for page_ in reading["pages"] for line in page_["lines"])
+            print(f"  OCR in the browser: {len(text.splitlines())} lines in {reading['ms'] / 1000:.1f} s, sharpness {reading['sharpness']}")
+            check("PASTELARIA" in text.upper() and "8,40" in text, "tesseract.js read the supplier and the total")
+            check(any(q.startswith("A:509882412*B:516123459*") for q in reading["qr"]), "jsQR decoded the fiscal QR code on the photo")
+            check((reading.get("sharpness") or 0) > 0.32, "the photo measured sharp: nobody is asked to retake it")
+            # The same upload through the same engine code, natively: the reading and the QR code agree (GREEN).
+            sys.path.insert(0, str(BACKEND_SRC))
+            from backoffice.reading import BrowserReader
+            from backoffice.service import BackOfficeService
+
+            engine = BackOfficeService.demo()
+            engine.repo.reader = BrowserReader()
+            status, out = engine.dispatch("POST", "/api/evidence", json.dumps(sent[-1]))
+            docs = [engine.repo.documents[d["id"]].document for d in out.get("documents", [])] if status == 200 else []
+            check(len(docs) == 1 and docs[0].quality.value == "verified" and str(docs[0].gross_amount) == "8.40",
+                  "the engine verified it: what the browser read agrees with the fiscal QR code")
+        documents_show_the_receipt("after the upload")
+        reads = sum(1 for u in seen if u.endswith("/ocr/tesseract/worker.min.js"))
+        page.reload()
+        documents_show_the_receipt("after a reload")
+        check(sum(1 for u in seen if u.endswith("/ocr/tesseract/worker.min.js")) == reads, "a reload replays the reading: the photo is not read again")
+
+        print("a scanned PDF and a blurred photo")
+        page.goto(f"{site}/scan/")
+        upload = page.locator("input[type=file][multiple]")
+        upload.set_input_files(str(SCAN))
+        expect(page.locator("li", has_text=SCAN.name).get_by_text("Got it.")).to_be_visible(timeout=240000)
+        journal = json.loads(page.evaluate("sessionStorage.getItem('admin2ai:engine-journal')") or "[]")
+        scan = [e["body"]["reading"] for e in journal if e["path"] == "/api/evidence" and e["body"].get("filename") == SCAN.name]
+        check(bool(scan) and scan[0]["textLayer"] == [""] and len(scan[0]["pages"]) == 1, "pdf.js found no text layer and the page was rendered and read")
+        check(bool(scan) and any(q.startswith("A:516722344*") for q in scan[0]["qr"]), "the QR code was decoded on the rendered page")
+        upload.set_input_files(str(BLURRED))
+        expect(page.locator("li", has_text=BLURRED.name).get_by_text("Take it again?")).to_be_visible(timeout=240000)
+        check(True, "a badly blurred photo becomes the plain retake task")
+        page.goto(f"{site}/documents/")
+        scanned = page.locator("li", has_text="CC2026/3317")
+        expect(scanned.first).to_be_visible(timeout=120000)
+        check("23.90" in scanned.first.inner_text(), "Documents shows the scanned receipt's total, €23.90")
+        crashed = [e for e in errors if "Uncaught" in e]
+        check(not crashed, f"no uncaught errors {crashed[:2]}")
+        browser.close()
+
+
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "production"
-    {"production": production, "demo": demo}[which]()
+    {"production": production, "demo": demo, "ocr": ocr}[which]()
     print(f"\n{len(failures)} failed" if failures else "\nall checks passed")
     sys.exit(1 if failures else 0)

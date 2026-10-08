@@ -169,19 +169,22 @@ QR_RENDER_PAGES = 2  # a fiscal QR code sits on the first page (or the last of a
 QR_RENDER_DPI = 200
 
 
-def read_pdf_stage0(data: bytes, decoder: QRDecoder | None = None) -> Stage0:
+def read_pdf_stage0(data: bytes, decoder: QRDecoder | None = None, *, content: Any = None) -> Stage0:
     """Text layer, fiscal QR payloads in text or metadata, and embedded e-invoice XML of a PDF.
 
     When neither the text nor the metadata carries a QR payload (a scan) and
     a QR ``decoder`` is given, the first pages are rendered (``pypdfium2``)
-    and the QR code image is decoded.
+    and the QR code image is decoded. ``content`` is the PDF's text layer and
+    metadata when something else already read them
+    (:class:`~backoffice.extraction.pdf.PdfContent`: pdf.js in the browser demo).
     """
-    try:
-        content = read_pdf(data)
-    except MissingDependencyError:
-        return Stage0(steps=(ReadStep("pdf_text", StepState.NOT_AVAILABLE, "pypdf is not installed"),))
-    except StructuredDataError as exc:
-        return Stage0(steps=(ReadStep("pdf_text", StepState.FAILED, exc.code),))
+    if content is None:
+        try:
+            content = read_pdf(data)
+        except MissingDependencyError:
+            return Stage0(steps=(ReadStep("pdf_text", StepState.NOT_AVAILABLE, "pypdf is not installed"),))
+        except StructuredDataError as exc:
+            return Stage0(steps=(ReadStep("pdf_text", StepState.FAILED, exc.code),))
     steps: list[ReadStep] = []
     pages = len(content.page_texts)
     text = content.text if content.has_text_layer else ""
@@ -221,12 +224,16 @@ def _qr_from_pages(data: bytes, decoder: QRDecoder | None) -> tuple[list[str], R
 
     if decoder is None:
         return [], ReadStep("pdf_qr_image", StepState.NOT_AVAILABLE, "no QR decoder is installed (zxing-cpp or pyzbar)")
-    try:
-        pages = render_pdf_pages(data, max_pages=QR_RENDER_PAGES, dpi=QR_RENDER_DPI)
-    except MissingDependencyError:
-        return [], ReadStep("pdf_qr_image", StepState.NOT_AVAILABLE, "no PDF page renderer is installed (pypdfium2)")
-    except StructuredDataError as exc:
-        return [], ReadStep("pdf_qr_image", StepState.FAILED, exc.code)
+    if getattr(decoder, "reads_whole_files", False):
+        pages: Sequence[tuple[bytes, int, int]] = ((data, 0, 0),)  # it already knows the codes on the file's pages
+    else:
+        try:
+            pages = render_pdf_pages(data, max_pages=QR_RENDER_PAGES, dpi=QR_RENDER_DPI)
+        except MissingDependencyError:
+            return [], ReadStep("pdf_qr_image", StepState.NOT_AVAILABLE,
+                                "no PDF page renderer is installed (pypdfium2)")
+        except StructuredDataError as exc:
+            return [], ReadStep("pdf_qr_image", StepState.FAILED, exc.code)
     found: list[str] = []
     for png, _, _ in pages:
         try:
