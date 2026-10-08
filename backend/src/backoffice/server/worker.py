@@ -13,7 +13,14 @@ OAuth apps, GoCardless keys, SMTP, Expo, Anthropic, document reading), plus:
                                business's files (AWS; its task role must be trusted)
 ``S3_REPLICA_BUCKET``          the evidence bucket's disaster-recovery copy, erased too
                                (``S3_REPLICA_REGION``)
+``BACKOFFICE_GMAIL_PUSH_TOPIC`` the Pub/Sub topic Gmail watches publish to (unset: Gmail
+                               is polled only)
+``BACKOFFICE_GRAPH_PUSH``      Microsoft Graph subscriptions (default: on when
+                               ``BACKOFFICE_API_URL`` is https)
 =============================  ==========================================================
+
+Every pass first works the durable job queue (server/jobs.py): syncs a push
+notification asked for, subscriptions a provider asked to renew.
 
 Its database login must be a member of ``backoffice_app`` and
 ``backoffice_scheduler`` (to list tenant ids; everything else stays under
@@ -35,11 +42,20 @@ from typing import Any
 
 from .config import PRODUCTION, ConfigError, ServerConfig
 
-__all__ = ["build_worker", "main"]
+__all__ = ["build_worker", "main", "push_settings"]
 
 log = logging.getLogger("backoffice.server.worker")
 
 PASS_EVERY_MAX = 300  # seconds: days roll over and due connections are picked up at least this often
+
+
+def push_settings(config: ServerConfig) -> Any:
+    """Where the providers push (server/webhooks.py): Gmail's Pub/Sub topic, Graph's public endpoints."""
+    from .sync import PushSettings
+
+    graph = f"{config.api_url}/api/webhooks/microsoft" if config.graph_push_enabled else None
+    return PushSettings(gmail_topic=config.gmail_push_topic or None, graph_url=graph,
+                        graph_lifecycle_url=f"{graph}/lifecycle" if graph else None)
 
 
 def build_worker(config: ServerConfig, services: dict[str, Any] | None = None) -> Any:
@@ -48,6 +64,7 @@ def build_worker(config: ServerConfig, services: dict[str, Any] | None = None) -
 
     from .erasure import purger_from_config
     from .http import build_manager, production_services
+    from .portals import PortalWorker
     from .sync import SyncWorker
 
     services = production_services(config, services or {})
@@ -55,11 +72,16 @@ def build_worker(config: ServerConfig, services: dict[str, Any] | None = None) -
     apps = services.get("oauth_apps")
     if apps is None:
         apps = {p: a for p in ("google", "microsoft", "moloni") if (a := app_from_env(p)) is not None}
+    portals = services.get("portal_worker")
+    if portals is None and services.get("vault") is not None:
+        portals = PortalWorker(manager, vault=services["vault"], factory=services.get("portal_factory"),
+                               history_days=config.history_days)
     return SyncWorker(manager, vault=services.get("vault"), aggregator_factory=services.get("aggregator"),
                       oauth_apps=apps, http_client=services.get("http_client"),
                       imap_factory=services.get("imap_factory"),
                       interval=timedelta(seconds=config.sync_interval_s), history_days=config.history_days,
-                      purger=services.get("purger") or purger_from_config(config, services["objects"]))
+                      purger=services.get("purger") or purger_from_config(config, services["objects"]),
+                      push=services.get("push") or push_settings(config), portals=portals)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -45,8 +45,8 @@ from .base import (
     TransientError,
     record_backfill,
     record_failure,
-    record_gap,
     record_success,
+    record_unreachable,
 )
 from .http import object_list, required_str, retry_after_seconds
 
@@ -486,12 +486,40 @@ class OpenBankingConnector:
         account_ids: Mapping[str, str] | None = None,  # aggregator account id -> our account id
         config: BankSyncConfig | None = None,
         clock: Callable[[], datetime] = utcnow,
+        unknown_account: Callable[[str | None, str], str] | None = None,
     ) -> None:
         self.aggregator = aggregator
         self.requisition_id = requisition_id
         self._account_ids = dict(account_ids or {})
         self.config = config or BankSyncConfig()
         self._clock = clock
+        # An account the consent covers that ``account_ids`` does not name (opened later, or one the business has
+        # not added): with ``unknown_account`` its IBAN is looked up and its payments are delivered under
+        # ``unknown_account(iban, aggregator id)``, never dropped. ``discovered``: aggregator id -> IBAN found so.
+        self._unknown_account = unknown_account
+        self.discovered: dict[str, str | None] = {}
+        # Our transaction id -> the bank's own transaction id (when it gives one), for every delivered transaction:
+        # deduplication keys on the bank's id, so a row the bank re-words is still one payment.
+        self.bank_ids: dict[str, str] = {}
+
+    def _our_account(self, provider_account: str) -> str:
+        known = self._account_ids.get(provider_account)
+        if known is not None:
+            return known
+        if self._unknown_account is None:
+            return provider_account
+        if provider_account not in self.discovered:
+            self.discovered[provider_account] = self.aggregator.account(provider_account).iban
+        mapped = self._unknown_account(self.discovered[provider_account], provider_account)
+        self._account_ids[provider_account] = mapped
+        return mapped
+
+    def _deliver(self, booked: Sequence[BookedTransaction], *, tenant_id: str, account_id: str,
+                 sink: Callable[[Transaction], None]) -> None:
+        for bt, tx in zip(booked, to_transactions(booked, tenant_id=tenant_id, account_id=account_id), strict=True):
+            if bt.provider_id:
+                self.bank_ids[tx.id] = bt.provider_id
+            sink(tx)
 
     def sync(self, state: ConnectorState, sink: BankSink, *, now: datetime | None = None) -> SyncOutcome:
         """Deliver booked transactions; consent expiry is tracked in ``auth_expires_at``."""
@@ -504,12 +532,11 @@ class OpenBankingConnector:
             wanted_from, date_from, date_to = self._window(state, consent, now)
             if state.cursor and date_from > wanted_from:
                 # The bank no longer serves that far back: the hole is known, never green (§47).
-                state = record_gap(state, TimeRange(start=_midnight(wanted_from), end=_midnight(date_from)))
+                state = record_unreachable(state, TimeRange(start=_midnight(wanted_from), end=_midnight(date_from)))
             for provider_account in consent.account_ids:
-                account_id = self._account_ids.get(provider_account, provider_account)
+                account_id = self._our_account(provider_account)
                 booked = self.aggregator.booked_transactions(provider_account, date_from, date_to)
-                for tx in to_transactions(booked, tenant_id=state.tenant_id, account_id=account_id):
-                    counted(tx)
+                self._deliver(booked, tenant_id=state.tenant_id, account_id=account_id, sink=counted)
         except ConnectorError as exc:
             if isinstance(exc, BankAccessDenied):  # consent revoked or expired at the bank: only the owner can fix it
                 exc = ReconnectRequired("bank_access_denied")
@@ -538,19 +565,19 @@ class OpenBankingConnector:
             if consent.max_historical_days:
                 reachable = max(first_day, today - timedelta(days=consent.max_historical_days))
             if reachable > last_day:
-                return SyncOutcome(state, 0)  # nothing the bank still serves
+                # Nothing the bank still serves: only a statement completes it (never retried, never green).
+                return SyncOutcome(record_unreachable(state, gap) if gap in state.known_gaps else state, 0)
             for provider_account in consent.account_ids:
-                account_id = self._account_ids.get(provider_account, provider_account)
+                account_id = self._our_account(provider_account)
                 booked = self.aggregator.booked_transactions(provider_account, reachable, last_day)
-                for tx in to_transactions(booked, tenant_id=state.tenant_id, account_id=account_id):
-                    counted(tx)
+                self._deliver(booked, tenant_id=state.tenant_id, account_id=account_id, sink=counted)
         except ConnectorError as exc:
             if isinstance(exc, BankAccessDenied):
                 exc = ReconnectRequired("bank_access_denied")
             return SyncOutcome(record_failure(state, at=now, error=exc), counted.count, error=exc)
         state = record_backfill(state, gap)
         if reachable > first_day:
-            state = record_gap(state, TimeRange(start=gap.start, end=_midnight(reachable)))
+            state = record_unreachable(state, TimeRange(start=gap.start, end=_midnight(reachable)))
         return SyncOutcome(state, counted.count)
 
     @staticmethod

@@ -59,12 +59,15 @@ __all__ = [
     "needs_backfill",
     "policy_for",
     "record_backfill",
+    "record_backfill_progress",
     "record_event",
     "record_failure",
     "record_gap",
     "record_reconnected",
     "record_success",
+    "record_unreachable",
     "record_webhook",
+    "record_webhook_lost",
     "since_phrase",
 ]
 
@@ -194,12 +197,20 @@ class ConnectorState(BaseModel):
     coverage_start: datetime | None = None  # everything from here ...
     coverage_end: datetime | None = None  # ... to here has been synced, except known gaps
     known_gaps: tuple[TimeRange, ...] = ()
+    # Known gaps the provider no longer serves (a bank's history limit): only a statement completes them, so no
+    # backfill is tried again; they stay in ``known_gaps`` (never green).
+    unreachable_gaps: tuple[TimeRange, ...] = ()
     consecutive_failures: int = Field(default=0, ge=0)
     last_error_code: str | None = Field(default=None, repr=False)  # internal only (§48, §70)
+    # Push subscriptions (Gmail watch, Microsoft Graph subscription): the provider's id when it has one, when the
+    # current subscription started, and when a poll found mail the push never announced (webhook loss).
+    subscription_id: str | None = None
+    webhook_since: datetime | None = None
+    webhook_lost_at: datetime | None = None
 
     @field_validator(
         "last_successful_sync", "last_attempt_at", "last_event_at", "auth_expires_at",
-        "webhook_expires_at", "coverage_start", "coverage_end",
+        "webhook_expires_at", "coverage_start", "coverage_end", "webhook_since", "webhook_lost_at",
     )
     @classmethod
     def _tz(cls, value: datetime | None, info: ValidationInfo) -> datetime | None:
@@ -275,6 +286,13 @@ def record_webhook(
     return state.model_copy(update={"webhook_state": webhook_state, "webhook_expires_at": expires_at})
 
 
+def record_webhook_lost(state: ConnectorState, *, at: datetime) -> ConnectorState:
+    """A poll found mail the push never announced: the subscription is treated as failed (re-created, and the
+    mailbox polled more often until a push arrives again)."""
+    _aware(at, "at")
+    return state.model_copy(update={"webhook_state": WebhookState.FAILED, "webhook_lost_at": at})
+
+
 def record_gap(state: ConnectorState, gap: TimeRange) -> ConnectorState:
     """A period the connector knows it did not sync (e.g. history expired)."""
     if gap in state.known_gaps:
@@ -297,10 +315,31 @@ def record_backfill(state: ConnectorState, window: TimeRange) -> ConnectorState:
     It does not count as a sync: cursor, last sync and failures are untouched.
     """
     gaps = tuple(g for g in state.known_gaps if not g.within(window.start, window.end))
+    unreachable = tuple(g for g in state.unreachable_gaps if g in gaps)
     start = state.coverage_start
     if start is not None and window.start < start <= window.end:
         start = window.start
-    return state.model_copy(update={"known_gaps": gaps, "coverage_start": start})
+    return state.model_copy(update={"known_gaps": gaps, "unreachable_gaps": unreachable, "coverage_start": start})
+
+
+def record_backfill_progress(state: ConnectorState, gap: TimeRange, until: datetime) -> ConnectorState:
+    """Part of ``gap`` (its start up to ``until``) was re-read: what remains of it stays a known gap, so the next
+    run resumes from ``until`` (bounded, resumable backfill)."""
+    _aware(until, "until")
+    if gap not in state.known_gaps:
+        return state
+    rest = tuple(g for g in state.known_gaps if g != gap)
+    if until < gap.end:
+        rest = (*rest, TimeRange(start=max(gap.start, until), end=gap.end))
+    return state.model_copy(update={"known_gaps": tuple(sorted(rest, key=lambda g: (g.start, g.end)))})
+
+
+def record_unreachable(state: ConnectorState, gap: TimeRange) -> ConnectorState:
+    """A period the provider no longer serves: a known gap no backfill can close (only a statement can)."""
+    state = record_gap(state, gap)
+    if gap in state.unreachable_gaps:
+        return state
+    return state.model_copy(update={"unreachable_gaps": (*state.unreachable_gaps, gap)})
 
 
 def record_reconnected(

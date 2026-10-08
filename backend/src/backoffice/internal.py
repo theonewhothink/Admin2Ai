@@ -75,7 +75,7 @@ from backoffice.readiness import readiness
 if TYPE_CHECKING:  # pragma: no cover
     from backoffice.service import BackOfficeService
 
-__all__ = ["ADMIN_PREFIX", "admin_only", "handle", "operations", "overview"]
+__all__ = ["ADMIN_PREFIX", "admin_only", "dead_letters", "handle", "operations", "overview"]
 
 ADMIN_PREFIX = "/api/internal/"
 DEADLINE_DAYS = 7  # deadlines this close are a critical fix
@@ -89,10 +89,12 @@ def admin_only(path: str) -> bool:
     return (path.split("?", 1)[0].rstrip("/") + "/").startswith(ADMIN_PREFIX)
 
 
-def handle(view: str, tenants: Sequence[BackOfficeService], body: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Route ``/api/internal/<view>`` (called from ``BackOfficeService._routes``)."""
+def handle(view: str, tenants: Sequence[BackOfficeService], body: Mapping[str, Any] | None = None, *,
+           dead_jobs: Sequence[Any] | None = None) -> dict[str, Any]:
+    """Route ``/api/internal/<view>`` (called from ``BackOfficeService._routes``). ``dead_jobs``: background work
+    that kept failing and is parked (the production server's job queue, server/jobs.py)."""
     if view == "overview":
-        return overview(tenants)
+        return overview(tenants, dead_jobs=dead_jobs)
     if view == "operations":
         return operations(tenants, limit=_limit((body or {}).get("limit")))
     if view == "readiness":
@@ -580,8 +582,31 @@ def _activation_rows(tenants: Sequence[_Tenant]) -> tuple[dict[str, Any], dict[s
 # --------------------------------------------------------------------------- the views
 
 
-def overview(tenants: Sequence[BackOfficeService]) -> dict[str, Any]:
-    """Command Center: targets, health, critical fixes, pipeline, tenants, connections, readiness."""
+_JOB_WORDS = {"sync.connection": "Reading a mailbox after a push notification",
+              "subscription.renew": "Renewing a mailbox's push subscription"}
+
+
+def dead_letters(jobs: Sequence[Any]) -> list[dict[str, Any]]:
+    """Background jobs that failed every attempt (server/jobs.py), parked for the team: never dropped."""
+    out = []
+    for job in jobs:
+        out.append({"id": f"job:{job.id}", "tenant": job.tenant_id, "kind": job.kind,
+                    "label": _JOB_WORDS.get(job.kind, job.kind), "connection": str(job.payload.get("connectionId")
+                                                                                  or ""),
+                    "attempts": job.attempts, "lastError": job.last_error or "", "since": _iso(job.updated_at)})
+    return out
+
+
+def _dead_letter_fixes(jobs: Sequence[Any]) -> list[dict[str, Any]]:
+    return [{"id": f"{job.tenant_id}:job:{job.id}", "severity": "red",
+             "label": f"{_JOB_WORDS.get(job.kind, job.kind)} kept failing",
+             "detail": f"Failed {_plural(job.attempts, 'time', 'times')} ({job.last_error or 'no detail'}). It is "
+                       "parked as a dead letter, not lost: fix the cause, then queue it again.",
+             "tenant": job.tenant_id, "company": None, "href": None} for job in jobs]
+
+
+def overview(tenants: Sequence[BackOfficeService], *, dead_jobs: Sequence[Any] | None = None) -> dict[str, Any]:
+    """Command Center: targets, health, critical fixes, pipeline, tenants, connections, readiness, dead letters."""
     if not tenants:
         raise ValueError("at least one tenant is required")
     read = [_read(s) for s in tenants]
@@ -589,10 +614,11 @@ def overview(tenants: Sequence[BackOfficeService]) -> dict[str, Any]:
     chains = [s.repo.audit.verify(s.repo.tenant_id) for s in tenants]
     golden = _golden(read)
     fixes = [f for t, p in zip(read, pipes, strict=True) for f in _fixes(t, p["items"])]
+    fixes += _dead_letter_fixes(dead_jobs or ())
     fixes.sort(key=lambda f: SEVERITY_ORDER[f["severity"]])
     first = tenants[0]
     companies = sum(len(s.repo.companies) for s in tenants)
-    return {
+    out = {
         "generatedAt": first._now().isoformat(),
         "today": first._today().isoformat(),
         "period": {"key": str(read[0].month), "label": f"{read[0].month.name} {read[0].month.year}"},
@@ -611,6 +637,9 @@ def overview(tenants: Sequence[BackOfficeService]) -> dict[str, Any]:
             {"id": "audit", "label": "Audit records", "value": sum(c.checked for c in chains)},
         ],
     }
+    if dead_jobs is not None:  # the production server's queue (server/jobs.py): what is parked, by job
+        out["deadLetters"] = dead_letters(dead_jobs)
+    return out
 
 
 def _limit(raw: Any) -> int:

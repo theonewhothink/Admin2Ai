@@ -240,17 +240,9 @@ def _text_or_none(value: Any) -> str | None:
 
 def bank_row(data: Mapping[str, Any]) -> Any:
     """A recorded bank row (BankRow.to_json) back as the engine's BankRow."""
-    from decimal import Decimal
-
-    from backoffice.domain.models import TransactionKind
     from backoffice.orchestrator import BankRow
 
-    return BankRow(bank_id=str(data["bank_id"]), account_id=str(data["account_id"]),
-                   booked_on=date.fromisoformat(str(data["booked_on"])), amount=Decimal(str(data["amount"])),
-                   counterparty=str(data.get("counterparty") or ""), description=str(data.get("description") or ""),
-                   kind=TransactionKind(str(data.get("kind") or "card")), card_last4=data.get("card_last4"),
-                   counterparty_iban=data.get("counterparty_iban"), reference=data.get("reference"),
-                   currency=str(data.get("currency") or "EUR"), cardholder=data.get("cardholder") or None)
+    return BankRow.from_json(data)
 
 
 def _read_keys(tenant_id: str, files: Sequence[tuple[Any, ...]]) -> set[str]:
@@ -958,13 +950,17 @@ class TenantManager:
     # ----------------------------------------------------------------- synced imports (server/sync.py)
 
     def record_mail(self, tenant_id: str, connection_id: str, messages: Sequence[bytes],
-                    state: Mapping[str, Any] | None) -> tuple[int, dict[str, Any]]:
-        """Messages a mailbox sync fetched (and, on the last batch, the sync's new state) as one event."""
+                    state: Mapping[str, Any] | None, *,
+                    backfill: Mapping[str, Any] | None = None) -> tuple[int, dict[str, Any]]:
+        """Messages a mailbox sync fetched (and, on the last batch, the sync's new state) as one event.
+        ``backfill``: the period these were re-read for (a known gap), recorded with them."""
         with self.open(tenant_id) as rt:
             env = self.live_env()
             refs = [self.put_file(tenant_id, raw, env) for raw in messages]
             data: dict[str, Any] = {"connectionId": connection_id, "messages": [{OBJECT: ref} for ref in refs],
                                     "state": dict(state) if state is not None else None, "env": self._facts()}
+            if backfill is not None:  # recorded only for a backfill: older events replay unchanged
+                data["backfill"] = dict(backfill)
             if messages and self.billing is not None and rt.service.intake_held(self.now().date()):
                 data["held"] = True  # kept, read once the plan covers them (backoffice.billing)
                 return self.record(rt, "sync.mail", data, "system:sync", env)
@@ -979,12 +975,48 @@ class TenantManager:
             return self.record(rt, "sync.mail", data, "system:sync", env)
 
     def record_bank(self, tenant_id: str, connection_id: str, rows: Sequence[Mapping[str, Any]],
-                    state: Mapping[str, Any] | None) -> tuple[int, dict[str, Any]]:
+                    state: Mapping[str, Any] | None, *,
+                    backfill: Mapping[str, Any] | None = None) -> tuple[int, dict[str, Any]]:
         """Booked transactions a bank sync fetched (BankRow JSON) and the sync's new state, as one event."""
         with self.open(tenant_id) as rt:
-            data = {"connectionId": connection_id, "rows": [dict(r) for r in rows],
-                    "state": dict(state) if state is not None else None}
+            data: dict[str, Any] = {"connectionId": connection_id, "rows": [dict(r) for r in rows],
+                                    "state": dict(state) if state is not None else None}
+            if backfill is not None:  # recorded only for a backfill: older events replay unchanged
+                data["backfill"] = dict(backfill)
             return self.record(rt, "sync.bank", data, "system:sync", self.live_env())
+
+    def record_webhook_state(self, tenant_id: str, connection_id: str,
+                             state: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
+        """A push subscription created, renewed or found lost (server/sync.py): the connection's new state."""
+        with self.open(tenant_id) as rt:
+            return self.record(rt, "sync.webhook", {"connectionId": connection_id, "state": dict(state)},
+                               "system:sync", self.live_env())
+
+    def record_portal_code(self, tenant_id: str, connection_id: str, *, channel: str | None,
+                           expires_at: datetime | None, state: Mapping[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        """A supplier's website sent the owner a sign-in code (server/portals.py). What the website needs to resume
+        stays in the vault; the event says only that a code is awaited, where it went and until when."""
+        with self.open(tenant_id) as rt:
+            data = {"connectionId": connection_id, "channel": channel or "",
+                    "expiresAt": expires_at.isoformat() if expires_at else "",
+                    "state": dict(state) if state is not None else None}
+            return self.record(rt, "portal.code_needed", data, "system:portal", self.live_env())
+
+    def record_portal_documents(self, tenant_id: str, connection_id: str,
+                                documents: Sequence[tuple[bytes, str | None, str | None, str]],
+                                state: Mapping[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        """Invoices a supplier's website gave (bytes, file name, type, the website's own id) as one event: the files
+        go to the object store and are read now, before the event is recorded, like any upload."""
+        with self.open(tenant_id) as rt:
+            env = self.live_env()
+            docs = [{OBJECT: self.put_file(tenant_id, data, env), "filename": filename, "contentType": ctype,
+                     "portalId": portal_id} for data, filename, ctype, portal_id in documents]
+            data: dict[str, Any] = {"connectionId": connection_id, "documents": docs,
+                                    "state": dict(state) if state is not None else None, "env": self._facts()}
+            reads = pre_read(rt.service, self.reader, [(d[0], d[1], d[2]) for d in documents])
+            if reads:
+                data["reads"] = reads
+            return self.record(rt, "portal.retrieved", data, "system:portal", env)
 
     def record_sync_failure(self, tenant_id: str, connection_id: str, state: Mapping[str, Any], *,
                             reconnect: bool) -> tuple[int, dict[str, Any]]:
@@ -1274,13 +1306,35 @@ def _bank_linked(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) ->
 def _sync_mail(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
     d = event.data
     raws = [m.get_file(rt.tenant_id, ref[OBJECT], env) for ref in d.get("messages") or []]
-    return 200, rt.service.sync_mail(str(d.get("connectionId")), raws, d.get("state"), held=bool(d.get("held")))
+    return 200, rt.service.sync_mail(str(d.get("connectionId")), raws, d.get("state"), held=bool(d.get("held")),
+                                     backfill=bool(d.get("backfill")))
 
 
 def _sync_bank(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
     d = event.data
     rows = [bank_row(r) for r in d.get("rows") or []]
-    return 200, rt.service.sync_bank(str(d.get("connectionId")), rows, d.get("state"))
+    return 200, rt.service.sync_bank(str(d.get("connectionId")), rows, d.get("state"),
+                                     backfill=bool(d.get("backfill")))
+
+
+def _sync_webhook(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
+    d = event.data
+    return 200, rt.service.sync_webhook(str(d.get("connectionId")), d.get("state") or {})
+
+
+def _portal_code_needed(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
+    d = event.data
+    until = datetime.fromisoformat(str(d["expiresAt"])) if d.get("expiresAt") else None
+    return 200, rt.service.portal_code_needed(str(d.get("connectionId")), channel=d.get("channel") or None,
+                                              expires_at=until, state=d.get("state"))
+
+
+def _portal_retrieved(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
+    """Invoices from a supplier's website, read before this was recorded (the reads come with the event)."""
+    d = event.data
+    files = [(m.get_file(rt.tenant_id, doc[OBJECT], env), doc.get("filename") or None, doc.get("contentType") or None)
+             for doc in d.get("documents") or [] if isinstance(doc, Mapping)]
+    return 200, rt.service.portal_retrieved(str(d.get("connectionId")), files, d.get("state"))
 
 
 def _sync_failed(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
@@ -1364,6 +1418,9 @@ _HANDLERS: dict[str, Handler] = {
     "sync.mail": _sync_mail,
     "sync.bank": _sync_bank,
     "sync.failed": _sync_failed,
+    "sync.webhook": _sync_webhook,
+    "portal.code_needed": _portal_code_needed,
+    "portal.retrieved": _portal_retrieved,
     "links.fetched": _links_fetched,
     "search.recorded": _search_recorded,
     "sync.files": _sync_files,

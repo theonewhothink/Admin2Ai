@@ -40,18 +40,6 @@ output "redis_endpoint" {
   value = aws_elasticache_replication_group.main.primary_endpoint_address
 }
 
-output "queues" {
-  value = { for k, q in aws_sqs_queue.main : k => q.url }
-}
-
-output "dead_letter_queues" {
-  value = merge({ for k, q in aws_sqs_queue.dlq : k => q.url }, { events = aws_sqs_queue.events_dlq.url })
-}
-
-output "event_bus_name" {
-  value = aws_cloudwatch_event_bus.main.name
-}
-
 output "evidence_deletion_role_arn" {
   value = aws_iam_role.evidence_deletion.arn
 }

@@ -34,12 +34,6 @@ mock_provider "aws" {
   mock_resource "aws_lb_target_group" {
     defaults = { arn = "arn:aws:elasticloadbalancing:eu-south-2:123456789012:targetgroup/mock/1" }
   }
-  mock_resource "aws_sqs_queue" {
-    defaults = {
-      arn = "arn:aws:sqs:eu-south-2:123456789012:mock"
-      url = "https://sqs.eu-south-2.amazonaws.com/123456789012/mock"
-    }
-  }
   mock_resource "aws_sns_topic" {
     defaults = { arn = "arn:aws:sns:eu-south-2:123456789012:mock-alarms" }
   }
@@ -174,8 +168,8 @@ run "production_defaults" {
   }
 
   assert {
-    condition     = length(aws_sqs_queue.dlq) == length(aws_sqs_queue.main)
-    error_message = "every queue needs a dead-letter queue"
+    condition     = aws_cloudwatch_log_metric_filter.dead_letter_jobs.pattern == "{ $.msg = \"job_dead_lettered\" }"
+    error_message = "every job parked as a dead letter must be counted"
   }
 
   assert {
@@ -199,8 +193,8 @@ run "production_defaults" {
   }
 
   assert {
-    condition     = length(aws_cloudwatch_metric_alarm.dlq_not_empty) == length(aws_sqs_queue.dlq) + 1
-    error_message = "every dead-letter queue (including the event bus one) needs an alarm"
+    condition     = aws_cloudwatch_metric_alarm.dead_letter_jobs.threshold == 0 && aws_cloudwatch_metric_alarm.dead_letter_jobs.metric_name == "DeadLetterJobs"
+    error_message = "a dead-lettered job must raise an alarm"
   }
 
   assert {

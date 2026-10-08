@@ -12,7 +12,13 @@ that the portal changed under it.
 
 When a portal wants a one-time code the adapter returns ``MFA_REQUIRED`` with
 the §9 prompt "Supplier X needs authentication." and a challenge to resume
-with once the owner answers on mobile.
+with once the owner answers on mobile. :meth:`PortalSync.resume` continues
+from that challenge with the code the owner entered: the adapter's
+:meth:`~SupplierPortalConnector.complete_mfa` finishes the sign-in and the
+retrieval goes on exactly as a normal sync. A wrong code
+(``CODE_REJECTED``) leaves the challenge waiting for another try; an expired
+one (``CODE_EXPIRED``, or past the challenge's ``expires_at``) needs a new
+code from the portal.
 """
 
 from __future__ import annotations
@@ -59,6 +65,7 @@ __all__ = [
     "RetrievalStrategy",
     "SupplierPortalConnector",
     "authentication_prompt",
+    "code_prompt",
     "default_registry",
     "plan_retrieval",
     "register_portal",
@@ -68,6 +75,11 @@ __all__ = [
 def authentication_prompt(supplier: str) -> str:
     """§9 mobile prompt, word for word."""
     return f"{supplier} needs authentication."
+
+
+def code_prompt(supplier: str) -> str:
+    """What the owner reads when a supplier's site sent them a one-time code to enter (push and Needs you)."""
+    return f"{supplier} needs a sign-in code."
 
 
 class PortalError(Exception):
@@ -87,6 +99,8 @@ class AuthStatus(str, Enum):
     MFA_REQUIRED = "mfa_required"
     LOGIN_REQUIRED = "login_required"  # stored credentials no longer work: owner reconnects
     FAILED = "failed"  # portal down or refused for another reason: retry later
+    CODE_REJECTED = "code_rejected"  # the one-time code was wrong: the same challenge waits for another try
+    CODE_EXPIRED = "code_expired"  # the one-time code is no longer valid: the portal must send a new one
 
 
 @dataclass(frozen=True)
@@ -113,6 +127,11 @@ class MfaChallenge:
     account: str
     channel: str | None = None  # "sms", "email", "app" — shown to the owner as-is
     resume_state: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    issued_at: datetime | None = None
+    expires_at: datetime | None = None  # the code's validity, when the portal says it
+
+    def expired(self, now: datetime) -> bool:
+        return self.expires_at is not None and now >= self.expires_at
 
 
 @dataclass(frozen=True)
@@ -190,9 +209,10 @@ class SupplierPortalConnector(ABC):
 
     @classmethod
     def mfa_required(cls, account: str, *, channel: str | None = None,
-                     resume_state: Mapping[str, Any] | None = None) -> AuthResult:
+                     resume_state: Mapping[str, Any] | None = None, issued_at: datetime | None = None,
+                     expires_at: datetime | None = None) -> AuthResult:
         """Helper for adapters: the standard MFA answer with the §9 owner prompt."""
-        challenge = MfaChallenge(cls.supplier_key, account, channel, dict(resume_state or {}))
+        challenge = MfaChallenge(cls.supplier_key, account, channel, dict(resume_state or {}), issued_at, expires_at)
         return AuthResult(AuthStatus.MFA_REQUIRED, challenge=challenge,
                           owner_message=authentication_prompt(cls.display_name))
 
@@ -297,6 +317,8 @@ class PortalSyncOutcome:
     owner_message: str | None = None  # "Vodafone needs authentication."
     adapter_broken: bool = False  # the portal changed: plan_retrieval(adapter_broken=True)
     retrieved_ids: tuple[str, ...] = ()
+    code_rejected: bool = False  # resume: the code was wrong; ``challenge`` still waits for another try
+    code_expired: bool = False  # resume: the code expired; the portal must send a new one
 
 
 class PortalSync:
@@ -325,27 +347,63 @@ class PortalSync:
     ) -> PortalSyncOutcome:
         """Authenticate if needed, fetch documents not seen before, deliver them."""
         now = now or self._clock()
+        if session is None or (session.expires_at is not None and session.expires_at <= now):
+            try:
+                session, early = self._authenticate(state, credentials, now)
+            except PortalError as exc:
+                return self._portal_failed(state, now, exc, None, CountingSink(sink), [])
+            if early is not None:
+                return early
+        assert session is not None
+        return self._retrieve(state, session, sink, known_ids, now)
+
+    def resume(
+        self,
+        state: ConnectorState,
+        challenge: MfaChallenge,
+        code: str,
+        sink: Callable[[PortalDocument], None],
+        *,
+        known_ids: Iterable[str] = (),
+        now: datetime | None = None,
+    ) -> PortalSyncOutcome:
+        """The owner entered the code ``challenge`` waited for: finish the sign-in, then retrieve as :meth:`sync`.
+
+        A wrong code keeps the challenge (``code_rejected``); an expired one needs a new code (``code_expired``).
+        Neither touches the connection's state: nothing is broken, the owner simply tries again.
+        """
+        now = now or self._clock()
+        if challenge.expired(now):
+            return PortalSyncOutcome(SyncOutcome(state, 0), code_expired=True)
+        try:
+            result = self.connector.complete_mfa(challenge, code)
+        except PortalError as exc:
+            return self._portal_failed(state, now, exc, None, CountingSink(sink), [])
+        if result.status is AuthStatus.AUTHENTICATED and result.session is not None:
+            return self._retrieve(state, result.session, sink, known_ids, now)
+        if result.status is AuthStatus.CODE_REJECTED:
+            return PortalSyncOutcome(SyncOutcome(state, 0), challenge=challenge, code_rejected=True)
+        if result.status is AuthStatus.CODE_EXPIRED:
+            return PortalSyncOutcome(SyncOutcome(state, 0), code_expired=True)
+        if result.status is AuthStatus.MFA_REQUIRED:  # one more step (another code)
+            failed = self._failed(state, now, _MfaPending("portal_mfa_required"))
+            message = result.owner_message or authentication_prompt(self.connector.display_name)
+            return PortalSyncOutcome(failed.outcome, challenge=result.challenge, owner_message=message)
+        if result.status is AuthStatus.LOGIN_REQUIRED:
+            return self._failed(state, now, ReconnectRequired("portal_login_rejected"))
+        return self._failed(state, now, TransientError("portal_auth_failed"))
+
+    def _retrieve(self, state: ConnectorState, session: PortalSession, sink: Callable[[PortalDocument], None],
+                  known_ids: Iterable[str], now: datetime) -> PortalSyncOutcome:
         counted = CountingSink(sink)
         retrieved: list[str] = []
         try:
-            if session is None or (session.expires_at is not None and session.expires_at <= now):
-                session, early = self._authenticate(state, credentials, now)
-                if early is not None:
-                    return early
-            assert session is not None
             since = (state.last_successful_sync or now - self.history_window).date() - timedelta(days=7)
             for ref in self.connector.detect_new(session, known_ids, since, now.date()):
                 counted(self.connector.retrieve_invoice(session, ref))
                 retrieved.append(ref.portal_id)
-        except PortalChanged as exc:
-            error = ProviderError(f"portal_changed:{exc.code}")
-            return PortalSyncOutcome(SyncOutcome(record_failure(state, at=now, error=error), counted.count,
-                                                 error=error), session, adapter_broken=True,
-                                     retrieved_ids=tuple(retrieved))
         except PortalError as exc:
-            error = TransientError(f"portal:{exc.code}")
-            return PortalSyncOutcome(SyncOutcome(record_failure(state, at=now, error=error), counted.count,
-                                                 error=error), session, retrieved_ids=tuple(retrieved))
+            return self._portal_failed(state, now, exc, session, counted, retrieved)
         except ConnectorError as exc:  # adapters built on the shared HTTP/OAuth helpers raise these
             return PortalSyncOutcome(SyncOutcome(record_failure(state, at=now, error=exc), counted.count,
                                                  error=exc), session, retrieved_ids=tuple(retrieved))
@@ -354,6 +412,18 @@ class PortalSync:
                                    coverage_start=now - self.history_window if first else None)
         return PortalSyncOutcome(SyncOutcome(new_state, counted.count, full_sync=first), session,
                                  retrieved_ids=tuple(retrieved))
+
+    @staticmethod
+    def _portal_failed(state: ConnectorState, now: datetime, exc: PortalError, session: PortalSession | None,
+                       counted: CountingSink, retrieved: list[str]) -> PortalSyncOutcome:
+        if isinstance(exc, PortalChanged):
+            error: ConnectorError = ProviderError(f"portal_changed:{exc.code}")
+            return PortalSyncOutcome(SyncOutcome(record_failure(state, at=now, error=error), counted.count,
+                                                 error=error), session, adapter_broken=True,
+                                     retrieved_ids=tuple(retrieved))
+        error = TransientError(f"portal:{exc.code}")
+        return PortalSyncOutcome(SyncOutcome(record_failure(state, at=now, error=error), counted.count,
+                                             error=error), session, retrieved_ids=tuple(retrieved))
 
     def _authenticate(
         self, state: ConnectorState, credentials: PortalCredentials | None, now: datetime

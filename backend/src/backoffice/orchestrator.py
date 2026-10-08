@@ -537,6 +537,10 @@ class ConnectorState:
     # A real connection that can be searched for a missing document (§22, backoffice.evidence_search): a signed-in
     # mailbox, Google Drive or OneDrive, the accounting software. The demo's simulated connections cannot.
     searchable: bool = False
+    # Periods inside the covered window it knows it did not read yet, as (start, end, reachable): a mailbox
+    # catching up after lost history, or a bank that no longer serves those days (not reachable). Every month
+    # they touch stays open (closure: catching up), never green (§47).
+    gaps: tuple[tuple[datetime, datetime, bool], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -566,6 +570,9 @@ class BankRow:
     currency: str = "EUR"
     # The cardholder's name when the bank's card details give it (employee cards, backoffice.staff).
     cardholder: str | None = None
+    # The bank's own id for this transaction, when it gives one (open banking): the same payment is one payment
+    # even when the bank re-words or re-dates the row between two syncs.
+    bank_tx_id: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.amount, float) or not isinstance(self.amount, Decimal):
@@ -587,7 +594,20 @@ class BankRow:
         }
         if self.cardholder:  # only when the bank named one: every other row keeps its evidence id
             out["cardholder"] = self.cardholder
+        if self.bank_tx_id:  # only when the bank gave one: rows without keep their evidence id
+            out["bank_tx_id"] = self.bank_tx_id
         return out
+
+    @classmethod
+    def from_json(cls, data: Mapping[str, Any]) -> BankRow:
+        """A row back from :meth:`to_json` (an event, a kept row)."""
+        return cls(bank_id=str(data["bank_id"]), account_id=str(data["account_id"]),
+                   booked_on=date.fromisoformat(str(data["booked_on"])), amount=Decimal(str(data["amount"])),
+                   counterparty=str(data.get("counterparty") or ""), description=str(data.get("description") or ""),
+                   kind=TransactionKind(str(data.get("kind") or "card")), card_last4=data.get("card_last4"),
+                   counterparty_iban=data.get("counterparty_iban"), reference=data.get("reference"),
+                   currency=str(data.get("currency") or "EUR"), cardholder=data.get("cardholder") or None,
+                   bank_tx_id=data.get("bank_tx_id") or None)
 
 
 @dataclass
@@ -1706,12 +1726,30 @@ class DiscoveryAgent(_Agent):
                  values={"route": outcome.route.value})
         return outcome
 
+    def bank_tx_key(self, row: BankRow) -> str | None:
+        """The payment id a row with the bank's own transaction id always gets: keyed on the account's IBAN (or our
+        account id) and the bank's id, never on the row's wording (deduplication, checklist S8)."""
+        if not row.bank_tx_id:
+            return None
+        account = self.repo.accounts.get(row.account_id)
+        where = (account.iban if account is not None and account.iban else row.account_id) or ""
+        digest = hashlib.sha256(f"{self.repo.tenant_id}|bank|{where}|{row.bank_tx_id}".encode()).hexdigest()
+        return "tx_" + digest[:16]
+
     def bank_rows(self, rows: Sequence[BankRow], at: datetime) -> list[TxRecord]:
         created: list[TxRecord] = []
         for row in rows:
             account = self.repo.accounts.get(row.account_id)
             if account is None:
                 raise ValueError(f"unknown account {row.account_id!r}")
+            keyed = self.bank_tx_key(row)
+            if keyed is not None and keyed in self.repo.transactions:
+                continue  # the bank's own id: the same payment, however the row is worded now
+            if keyed is not None:  # a row recorded before the bank's id was kept is the same payment too
+                legacy = {k: v for k, v in row.to_json().items() if k != "bank_tx_id"}
+                body = json.dumps(legacy, sort_keys=True, separators=(",", ":")).encode()
+                if self.repo.registry.index.find_by_sha256(self.repo.tenant_id, hashlib.sha256(body).hexdigest()):
+                    continue
             body = json.dumps(row.to_json(), sort_keys=True, separators=(",", ":")).encode()
             is_card = row.kind is TransactionKind.CARD
             reg = self.repo.registry.register(
@@ -1721,7 +1759,7 @@ class DiscoveryAgent(_Agent):
                 mime_type="application/json", retrieved_at=at,
                 metadata={"bank": account.bank, "account_id": account.id},
             )
-            tx_id = "tx_" + reg.evidence.id[3:19]
+            tx_id = keyed or "tx_" + reg.evidence.id[3:19]
             if tx_id in self.repo.transactions:
                 continue  # the same bank row seen twice is one payment
             tx = Transaction(
@@ -4323,6 +4361,7 @@ class MissingEvidenceAgent(_Agent):
         invoice due by that day be called missing (a mailbox still importing or out of sync may hold it)."""
         mailboxes = [c for c in self.repo.connectors.values() if c.kind == "email" and company_id in c.company_ids]
         return all(c.healthy and c.covered_until is not None and c.covered_until.astimezone(TZ).date() > day
+                   and not any(g[0].astimezone(TZ).date() <= day for g in c.gaps)  # a hole not read yet
                    for c in mailboxes)
 
     def _raise_expected(self, rid: str, *, key: str, supplier: Supplier | None, name: str, company_id: str,

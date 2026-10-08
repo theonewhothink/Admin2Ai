@@ -66,27 +66,10 @@ resource "aws_kms_alias" "vault" {
   target_key_id = aws_kms_key.vault.key_id
 }
 
-# SQS queues and the EventBridge bus. EventBridge must be able to encrypt
-# events on the bus and deliver them to encrypted queues.
+# The engineers' alarm topic (SNS, monitoring.tf). Background work queues live
+# in PostgreSQL (server/jobs.py), so no queue or event bus uses this key.
 data "aws_iam_policy_document" "messaging_key" {
   source_policy_documents = [data.aws_iam_policy_document.key_admin.json]
-
-  statement {
-    sid       = "EventBridgeUsesKey"
-    actions   = ["kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"]
-    resources = ["*"]
-
-    principals {
-      type        = "Service"
-      identifiers = ["events.amazonaws.com"]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:SourceAccount"
-      values   = [local.account_id]
-    }
-  }
 
   # CloudWatch alarms publish to the encrypted alarm topic (monitoring.tf).
   statement {
@@ -108,7 +91,7 @@ data "aws_iam_policy_document" "messaging_key" {
 }
 
 resource "aws_kms_key" "messaging" {
-  description             = "${local.name} queues and event bus"
+  description             = "${local.name} alarm topic"
   enable_key_rotation     = true
   deletion_window_in_days = 30
   policy                  = data.aws_iam_policy_document.messaging_key.json

@@ -84,6 +84,13 @@ BANK_CONSENT_DAYS = 180  # PSD2 access consent (RTS Art. 10, as amended 2022): r
 # this many days before (checklist R4): on Home ("Coming up"), in Needs you, and with one push in production.
 ACCESS_WARNING_DAYS = 7
 _RENEW = "renew_"  # Needs-you id of a connection whose access ends soon: renew_<connection id>
+_ACCOUNT = "account_"  # Needs-you id of a bank account the business has not added: account_<12 hex>
+_CODE = "code_"  # Needs-you id of a supplier website waiting for a sign-in code: code_<connection id>
+# Payments of a bank account the business has not added arrive under one of these (server/sync.py): kept, never
+# dropped, until the owner says where the account belongs (checklist S8).
+UNKNOWN_IBAN = "iban:"
+UNKNOWN_BANK_ACCOUNT = "bank:"
+_CODE_CHANNELS = {"sms": " to your phone", "phone": " to your phone", "email": " by email", "app": " in its app"}
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _SLUG = re.compile(r"[^a-z0-9]+")
 # Needs-You questions shown as one plain choice with the engine's own prompt and options (§37).
@@ -123,6 +130,11 @@ _SOURCE_WORD = {
     "mobile_scan": "Phone scan", "mobile_share": "Shared from a phone", "government": "Tax office",
     "accountant": "Accountant",
 }
+
+
+def code_prompt(supplier: str) -> str:
+    """A supplier's website sent the owner a one-time code (connectors.portals.code_prompt, same words)."""
+    return f"{supplier} needs a sign-in code."
 
 
 def _evidence_word(fmt: str, filename: str | None) -> str:
@@ -206,6 +218,9 @@ class BackOfficeService:
         self.real_sources = False
         # What each synced connection remembers between runs (connectors.base.ConnectorState as JSON).
         self.sync_states: dict[str, dict[str, Any]] = {}
+        # Payments a linked bank sent for an account the business has not added (checklist S8): kept here, by the
+        # Needs-you id that asks about them, until the owner adds the account to a company or ignores it.
+        self.unknown_accounts: dict[str, dict[str, Any]] = {}
         # Sensitive documents' originals read during the current request (§52): the production server records
         # them as an event with who read them (server/runtime.py); a service used directly (the demo) records
         # them at once, as read by ``viewer``.
@@ -567,6 +582,8 @@ class BackOfficeService:
         needs = self._open_needs()
         stale = self._stale_connectors()
         renewals = self.access_notices()  # a sign-in that ends within a week is one thing to do (R4)
+        # A bank account nobody added yet (S8) and a website waiting for a sign-in code (C6): one thing each.
+        renewals = [*renewals, *self._unknown_account_items(), *self._code_items()]
         risk = sum(1 for n in needs if n.kind == "approval")
         statuses = [self._status(c, month) for c in sorted(self.repo.companies)]
         done = sum((s.weighted_done if not s.closed else s.weighted_total) for s in statuses)
@@ -683,7 +700,8 @@ class BackOfficeService:
         notices = {n["id"]: n for n in self.access_notices()}
         out = []
         kind_source = {"email": SourceKind.EMAIL, "bank": SourceKind.BANK, "accountant": SourceKind.ACCOUNTANT,
-                       "files": SourceKind.CLOUD_STORAGE, "accounting": SourceKind.ACCOUNTING_SYSTEM}
+                       "files": SourceKind.CLOUD_STORAGE, "accounting": SourceKind.ACCOUNTING_SYSTEM,
+                       "portal": SourceKind.SUPPLIER_PORTAL}
         for c in self.repo.connectors.values():
             entry: dict[str, Any] = {
                 "id": c.id, "name": c.name, "kind": c.kind, "account": c.account,
@@ -862,6 +880,11 @@ class BackOfficeService:
             ("lenders", "Loans", "Repayments are matched to loan statements.", rel("lender")),
             ("government", "Tax and government", "Letters, deadlines and payments.", rel("government")),
         ]
+        portals = conn("portal")
+        if portals:  # supplier websites I sign in to (only listed when there are some)
+            groups.insert(4, ("portals", "Supplier websites", "Where I sign in to fetch your invoices.",
+                              [{"id": c["id"], "name": c["name"], "company": "All companies", "detail": c["account"],
+                                "status": c["status"], "lastSyncedAt": c.get("lastSyncedAt")} for c in portals]))
         for _, _, _, items in groups:
             for item in items:
                 label = self._sign_in_label(item["id"])
@@ -917,6 +940,11 @@ class BackOfficeService:
                     "I will remind you a week before; banks require this every 180 days.")
         if info.get("pending"):
             return "Waiting for you to finish signing in."
+        if info.get("provider") == "portal":
+            if info.get("code"):
+                return "Waiting for the sign-in code the website sent you."
+            return "Signed in with your username and password. I fetch your invoices there." if info.get("stored") \
+                else "Saved, but no password is stored yet."
         kind = info.get("mailbox")
         if info.get("access_until") and not info.get("pending"):
             until = _as_date(info["access_until"])
@@ -940,11 +968,12 @@ class BackOfficeService:
             "email": self._add_email, "bank": self._add_bank, "card": self._add_card, "supplier": self._add_supplier,
             "insurance": self._add_relationship, "investment": self._add_relationship,
             "loan": self._add_relationship, "government": self._add_relationship,
-            "files": self._add_files, "accounting": self._add_accounting,
+            "files": self._add_files, "accounting": self._add_accounting, "portal": self._add_portal,
         }.get(kind if isinstance(kind, str) else "")
         if handler is None:
             raise ServiceError(400, "I can add email, bank accounts, cards, cloud storage, accounting software, "
-                                    "suppliers, insurance, investments, loans and government offices.")
+                                    "suppliers, supplier websites, insurance, investments, loans and government "
+                                    "offices.")
         result = handler(body)
         self.orchestrator.setup_step(f"source:{kind}")
         self.orchestrator.log("discovery", "source_added", subject_id=result["id"], values={"kind": kind})
@@ -1015,6 +1044,35 @@ class BackOfficeService:
         if authorize_url:
             out["authorizeUrl"] = authorize_url
         return out
+
+    def _add_portal(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """A supplier's website the owner signs in to for their invoices (§9, §10): its username, and a password that
+        goes only to the vault. ``portal``: which adapter reads it (the server's registry); by default the name."""
+        supplier = self._text(body, "supplier", "Which supplier's website?")
+        key = self._text(body, "portal", "", required=False, limit=64) or \
+            (_SLUG.sub("_", supplier.lower()).strip("_") or "portal")
+        username = self._text(body, "username", "What is your username on that website?", limit=254)
+        password = body.get("password")
+        if not isinstance(password, str) or not password:
+            raise ServiceError(400, "Enter the password for that website.")
+        if any(c.kind == "portal" and c.name.lower() == supplier.lower() and c.account == username
+               for c in self.repo.connectors.values()):
+            raise ServiceError(409, f"{supplier} is already connected.")
+        company = self._company(body.get("companyId"), required=False)
+        cid = self._slug("portal", supplier)
+        stored = False
+        if self.vault is not None:
+            self.vault.store(self.repo.tenant_id, cid, "portal", {"username": username, "password": password,
+                                                                  "portal": key})
+            stored = True
+        self.repo.add_connector(ConnectorState(
+            id=cid, name=supplier, kind="portal", account=username,
+            company_ids=(company,) if company else tuple(self.repo.companies), healthy=True,
+            covered_from=None, covered_until=None, last_synced_at=None))
+        self.sign_in[cid] = {"provider": "portal", "portal": key, "stored": stored, "pending": False}
+        self.orchestrator.activity(self._now(), "checked", f"Saved the sign-in for {supplier}'s website.",
+                                   company)
+        return {"id": cid, "message": f"Done. I will sign in to {supplier} and fetch your invoices from there."}
 
     @staticmethod
     def _mailbox_options(provider: str, address: str, body: Mapping[str, Any]) -> dict[str, str]:
@@ -1160,9 +1218,14 @@ class BackOfficeService:
             return datetime.fromisoformat(value) if isinstance(value, str) and value else None
 
         start, end, last = when("coverage_start"), when("coverage_end"), when("last_successful_sync")
-        gaps = [datetime.fromisoformat(g["end"]) for g in state.get("known_gaps") or [] if isinstance(g, Mapping)]
-        if gaps and start is not None:  # a known hole: only what follows it is covered (never assumed complete)
-            start = max([start, *gaps])
+        # Known holes inside the window are never assumed complete: every month they touch stays open until they
+        # are read (a mailbox catches up by itself; days a bank no longer serves need a statement).
+        unreachable = {(g.get("start"), g.get("end")) for g in state.get("unreachable_gaps") or []
+                       if isinstance(g, Mapping)}
+        c.gaps = tuple(sorted(
+            (datetime.fromisoformat(g["start"]), datetime.fromisoformat(g["end"]),
+             (g["start"], g["end"]) not in unreachable)
+            for g in state.get("known_gaps") or [] if isinstance(g, Mapping) and g.get("start") and g.get("end")))
         c.healthy = not state.get("reconnect_required")
         c.covered_from, c.covered_until = start, end
         c.last_synced_at = last or c.last_synced_at
@@ -1189,11 +1252,12 @@ class BackOfficeService:
         return max(1, round((end - start).total_seconds() / 86400)) if start and end else 90
 
     def sync_mail(self, connection_id: str, messages: Sequence[bytes], state: Mapping[str, Any] | None,
-                  *, held: bool = False) -> dict[str, Any]:
+                  *, held: bool = False, backfill: bool = False) -> dict[str, Any]:
         """Messages read from a connected mailbox, then (last batch) what the mailbox sync remembers.
 
         ``held``: the server decided these messages wait for the plan (backoffice.billing): they are kept and read
-        once it covers them; the mailbox's own sync goes on as usual."""
+        once it covers them; the mailbox's own sync goes on as usual. ``backfill``: re-read days the mailbox had
+        missed (a known gap); once none is left, the activity says it caught up."""
         c = self.repo.connectors.get(connection_id)
         if c is None or c.kind != "email":
             raise ServiceError(404, "I can't find that mailbox.")
@@ -1205,29 +1269,99 @@ class BackOfficeService:
                                           source_kind=SourceKind.EMAIL, origin="email")
         self.billing_check()
         if state is not None:
+            missed = any(g[2] for g in c.gaps)
             days = self._synced(c, state)
             if days is not None:
                 self.orchestrator.activity(self._now(), "checked", f"Read {c.account}: the last {days} days are in.")
-            self.orchestrator.log("discovery", "connector_synced", subject_id=c.id,
-                                  values={"messages": len(messages)})
+            if backfill and missed and not any(g[2] for g in c.gaps):
+                self.orchestrator.activity(self._now(), "checked", f"Caught up on the email I had missed from "
+                                                                   f"{c.account}.")
+            self.orchestrator.log("discovery", "connector_backfilled" if backfill else "connector_synced",
+                                  subject_id=c.id, values={"messages": len(messages)})
             self.orchestrator.run()
         return {"ok": True, "messages": len(messages)}
 
-    def sync_bank(self, connection_id: str, rows: Sequence[Any], state: Mapping[str, Any] | None) -> dict[str, Any]:
-        """Booked transactions from a linked bank (open banking), then what the bank sync remembers."""
+    def sync_bank(self, connection_id: str, rows: Sequence[Any], state: Mapping[str, Any] | None,
+                  *, backfill: bool = False) -> dict[str, Any]:
+        """Booked transactions from a linked bank (open banking), then what the bank sync remembers.
+
+        Payments of an account the business has not added are never dropped (checklist S8): they are kept, and the
+        owner is asked once where that account belongs (:meth:`answer`); answering adds it and checks them."""
         c = self.repo.connectors.get(connection_id)
         if c is None or c.kind != "bank":
             raise ServiceError(404, "I can't find that bank connection.")
-        known = [r for r in rows if r.account_id in self.repo.accounts]
+        known: list[Any] = []
+        unknown: dict[str, list[Any]] = {}
+        for r in rows:
+            r = self._known_account(r)
+            if r.account_id in self.repo.accounts:
+                known.append(r)
+            else:
+                unknown.setdefault(r.account_id, []).append(r)
         if known:
             self.orchestrator.ingest_bank(known)
+        kept = sum(self._keep_unknown_rows(c, account, kept) for account, kept in sorted(unknown.items()))
         if state is not None:
             days = self._synced(c, state)
             if days is not None:
                 self.orchestrator.activity(self._now(), "checked", f"Imported the last {days} days from {c.name}.")
-            self.orchestrator.log("discovery", "connector_synced", subject_id=c.id, values={"rows": len(known)})
+            self.orchestrator.log("discovery", "connector_backfilled" if backfill else "connector_synced",
+                                  subject_id=c.id, values={"rows": len(known), "kept": kept})
             self.orchestrator.run()
-        return {"ok": True, "rows": len(known)}
+        return {"ok": True, "rows": len(known), "kept": kept}
+
+    def _known_account(self, row: Any) -> Any:
+        """The row under the business's own account when it has one for it now: an account added since (by its
+        IBAN), or one the owner added from a question about it."""
+        if row.account_id in self.repo.accounts:
+            return row
+        account_id = str(row.account_id)
+        if account_id.startswith(UNKNOWN_IBAN):
+            iban = normalize_iban(account_id[len(UNKNOWN_IBAN):])
+            found = next((a for a in self.repo.accounts.values() if a.iban and normalize_iban(a.iban) == iban), None)
+            if found is not None:
+                return replace(row, account_id=found.id)
+        rec = self.unknown_accounts.get(self._unknown_key(account_id))
+        if rec is not None and rec.get("status") == "added" and rec.get("accountId") in self.repo.accounts:
+            return replace(row, account_id=rec["accountId"])
+        return row
+
+    @staticmethod
+    def _unknown_key(account_id: str) -> str:
+        import hashlib
+
+        return _ACCOUNT + hashlib.sha256(account_id.encode()).hexdigest()[:12]
+
+    @staticmethod
+    def _unknown_last4(account_id: str) -> str:
+        bare = account_id.split(":", 1)[-1]
+        digits = re.sub(r"[^0-9A-Za-z]", "", bare)
+        return digits[-4:] or "????"
+
+    def _keep_unknown_rows(self, c: ConnectorState, account_id: str, rows: Sequence[Any]) -> int:
+        """Payments of an account the business has not added: kept (never dropped) until the owner answers."""
+        key = self._unknown_key(account_id)
+        now = self._now()
+        rec = self.unknown_accounts.get(key)
+        if rec is None:
+            iban = normalize_iban(account_id[len(UNKNOWN_IBAN):]) if account_id.startswith(UNKNOWN_IBAN) else None
+            rec = self.unknown_accounts[key] = {"account": account_id, "iban": iban, "connection": c.id,
+                                                "bank": c.name, "rows": [], "status": "open",
+                                                "since": now.isoformat()}
+        have = {r.get("bank_id") for r in rec["rows"]}
+        new = [r.to_json() for r in rows if r.bank_id not in have]
+        if not new:
+            return 0
+        first = not rec["rows"]
+        rec["rows"] = [*rec["rows"], *new]
+        last4 = self._unknown_last4(account_id)
+        self.orchestrator.log("discovery", "bank_rows_kept", subject_id=c.id,
+                              values={"account": f"…{last4}", "rows": len(new), "status": rec["status"]})
+        if first and rec["status"] == "open":
+            n = count_phrase(len(new), "payment")
+            self.orchestrator.activity(now, "checked", f"{c.name} sent {n} for an account I don't know (…{last4}). "
+                                       "I kept them and asked you where it belongs.")
+        return len(new)
 
     def follow_links(self, urls: Sequence[str]) -> dict[str, Any]:
         """Invoice links that were waiting, followed again (production: opened before the event was recorded)."""
@@ -1251,6 +1385,57 @@ class BackOfficeService:
             return self.mark_connection_stale(c.id, since=c.last_synced_at or self._now())
         self.orchestrator.log("discovery", "connector_failed", subject_id=c.id, values={"reconnect": reconnect})
         return {"ok": True}
+
+    def sync_webhook(self, connection_id: str, state: Mapping[str, Any]) -> dict[str, Any]:
+        """A connection's push subscription changed (created, renewed, lost): what its sync remembers (§47)."""
+        c = self.repo.connectors.get(connection_id)
+        if c is None:
+            raise ServiceError(404, "I can't find that connection.")
+        self.sync_states[c.id] = dict(state)
+        self.orchestrator.log("discovery", "connector_push", subject_id=c.id,
+                              values={"push": str(state.get("webhook_state") or ""),
+                                      "lost": bool(state.get("webhook_lost_at"))})
+        return {"ok": True}
+
+    def portal_code_needed(self, connection_id: str, *, channel: str | None, expires_at: datetime | None,
+                           state: Mapping[str, Any] | None) -> dict[str, Any]:
+        """A supplier's website sent the owner a one-time code (§9): they are asked for it in Needs you."""
+        c = self.repo.connectors.get(connection_id)
+        if c is None or c.kind != "portal":
+            raise ServiceError(404, "I can't find that website.")
+        now = self._now()
+        if state is not None:
+            self.sync_states[c.id] = dict(state)
+        info = self.sign_in.get(c.id) or {}
+        self.sign_in[c.id] = {**info, "code": {"channel": str(channel or ""), "asked": now.isoformat(),
+                                               "until": expires_at.isoformat() if expires_at else ""}}
+        self.orchestrator.log("discovery", "portal_code_needed", subject_id=c.id, values={"channel": channel or ""})
+        self.orchestrator.activity(now, "checked", f"{code_prompt(c.name)} I asked you for it in Needs you.")
+        return {"ok": True}
+
+    def portal_retrieved(self, connection_id: str, files: Sequence[tuple[bytes, str | None, str | None]],
+                         state: Mapping[str, Any] | None) -> dict[str, Any]:
+        """Invoices fetched from a supplier's website (read before this was recorded): in like any document."""
+        c = self.repo.connectors.get(connection_id)
+        if c is None or c.kind != "portal":
+            raise ServiceError(404, "I can't find that website.")
+        info = self.sign_in.get(c.id) or {}
+        self.sign_in[c.id] = {k: v for k, v in info.items() if k != "code"}
+        evidence: list[str] = []
+        for data, filename, content_type in files:
+            report = self.orchestrator.ingest_file(bytes(data), filename=filename, content_type=content_type,
+                                                   source_kind=SourceKind.SUPPLIER_PORTAL, origin="link", run=False)
+            evidence += report.evidence_ids
+        if state is not None:
+            self._synced(c, state)
+        self.orchestrator.log("discovery", "portal_retrieved", subject_id=c.id, evidence_ids=evidence,
+                              values={"documents": len(files)})
+        if files:
+            self.orchestrator.activity(self._now(), "collected",
+                                       f"Fetched {count_phrase(len(files), 'invoice')} from {c.name}'s website.",
+                                       evidence_ids=tuple(evidence))
+        self.orchestrator.run()
+        return {"ok": True, "documents": len(files), "evidenceIds": evidence}
 
     def _add_card(self, body: Mapping[str, Any]) -> dict[str, Any]:
         last4 = self._text(body, "last4", "The last 4 digits of the card.", limit=4)
@@ -2562,6 +2747,9 @@ class BackOfficeService:
             if b.kind in (BlockerKind.CONNECTOR, BlockerKind.NO_SOURCES):
                 lines.append({"id": f"r_{b.kind.value}_{len(lines)}", "text": b.message, "tone": "risk",
                               "href": "/settings#connections", "linkLabel": b.action or "Reconnect"})
+            elif b.kind is BlockerKind.CATCHING_UP:  # days a connection is still reading back (never green)
+                lines.append({"id": f"r_{b.kind.value}_{len(lines)}", "text": b.message,
+                              "tone": "attention" if b.needs_owner else "neutral"})
         for n in self._open_needs(company_id):
             if n.kind != "choice" or repo.item_month(repo.items[n.item_id]) != month:
                 continue
@@ -2730,6 +2918,8 @@ class BackOfficeService:
 
     def needs_you(self) -> dict[str, Any]:
         items = [self._renewal_item(notice) for notice in self.access_notices()]  # R4: before a sign-in ends
+        items += self._code_items()  # a supplier's website waiting for the code it sent the owner (C6)
+        items += self._unknown_account_items()  # payments of a bank account nobody added yet (S8)
         for n in self._open_needs():
             if n.kind == "check":
                 items.append(self._check(n))
@@ -2948,11 +3138,124 @@ class BackOfficeService:
             },
         }
 
+    # ----------------------------------------------------------------- Bank accounts nobody added (S8)
+
+    def _unknown_account_items(self) -> list[dict[str, Any]]:
+        """One plain question per bank account the bank sent payments for and the business has not added."""
+        return [self._unknown_account_item(key, rec) for key, rec in sorted(self.unknown_accounts.items())
+                if rec.get("status") == "open" and rec.get("rows")]
+
+    def _unknown_account_item(self, key: str, rec: Mapping[str, Any]) -> dict[str, Any]:
+        last4 = self._unknown_last4(str(rec["account"]))
+        connection = self.repo.connectors.get(str(rec.get("connection") or ""))
+        companies = list(self.repo.companies)
+        home = next((x for x in (connection.company_ids if connection else ()) if x in self.repo.companies),
+                    companies[0] if companies else None)
+        ordered = ([home] if home else []) + [x for x in companies if x != home]
+        name = self._company_name(home) or "your company"
+        rest = ", to another company," if len(ordered) > 1 else ","
+        rows = list(rec.get("rows") or [])
+        first = min((str(r.get("booked_on") or "") for r in rows), default="") or None
+        item: dict[str, Any] = {
+            "id": key, "kind": "choice", "tone": "attention", "eyebrow": "We need one answer",
+            "merchant": str(rec.get("bank") or "Your bank"), "amount": None, "currency": "EUR", "date": first,
+            "question": f"Your bank sent payments for an account I don't know (…{last4}). Add it to {name}{rest} "
+                        "or ignore it?",
+            "options": [*({"id": f"company:{x}", "label": f"Add it to {self._company_name(x)}"} for x in ordered),
+                        {"id": "ignore", "label": "Ignore it"}],
+            "why": [f"I kept the {count_phrase(len(rows), 'payment')} it sent, so nothing is lost.",
+                    "Once you answer, I check them like every other payment."],
+        }
+        if len(companies) == 1 and home:
+            item["companyId"] = home
+        return item
+
+    def assign_unknown_account(self, key: str, option_id: str) -> dict[str, Any]:
+        """The owner said where a bank account nobody added belongs: added to that company and its kept payments
+        checked like any other, or ignored (its payments stay kept, never deleted)."""
+        rec = self.unknown_accounts.get(key)
+        if rec is None or rec.get("status") != "open":
+            raise ServiceError(404, "I can't find that question any more.")
+        last4 = self._unknown_last4(str(rec["account"]))
+        rows = list(rec.get("rows") or [])
+        now = self._now()
+        if option_id == "ignore":
+            rec["status"] = "ignored"
+            self.orchestrator.log("discovery", "bank_account_ignored", subject_id=key,
+                                  values={"account": f"…{last4}"}, actor=f"owner:{self.repo.owner.email}")
+            self.orchestrator.activity(now, "checked", f"You said to ignore the account ending in {last4}. I keep "
+                                                       "what it sent, but I won't check it.")
+            return {"ok": True, "message": f"Done. I won't check payments from the account ending in {last4}."}
+        company = option_id.split(":", 1)[1] if option_id.startswith("company:") else ""
+        if company not in self.repo.companies:
+            raise ServiceError(400, "Please pick one of the options.")
+        from backoffice.orchestrator import BankRow
+
+        bank = str(rec.get("bank") or "Bank")
+        iban = rec.get("iban") or None
+        existing = next((a for a in self.repo.accounts.values() if iban and a.iban == iban), None)
+        if existing is not None:  # added by hand meanwhile: its payments go there
+            account_id, company = existing.id, existing.holder_id
+        else:
+            account_id = self._slug("acct", f"{bank} {(iban or last4)[-4:]}")
+            self.repo.add_account(Account(id=account_id, bank=bank, holder_id=company, iban=iban))
+        entity = self.repo.companies[company]
+        if iban and iban not in entity.own_ibans:
+            entity.own_ibans.append(iban)
+        connection = self.repo.connectors.get(str(rec.get("connection") or ""))
+        if connection is not None and company not in connection.company_ids:
+            connection.company_ids = (*connection.company_ids, company)
+        info = self.sign_in.get(str(rec.get("connection") or ""))
+        if info and info.get("consent_until"):  # the account shows the bank's consent like its siblings
+            self.sign_in[account_id] = {"provider": "open_banking", "consent_until": info["consent_until"]}
+        rec.update({"status": "added", "accountId": account_id, "company": company})
+        self.orchestrator.log("discovery", "bank_account_added", subject_id=account_id,
+                              values={"account": f"…{last4}", "company": company, "rows": len(rows)},
+                              actor=f"owner:{self.repo.owner.email}")
+        if rows:
+            self.orchestrator.ingest_bank([replace(BankRow.from_json(r), account_id=account_id) for r in rows])
+        else:
+            self.orchestrator.run()
+        name = self._company_name(company)
+        return {"ok": True, "accountId": account_id,
+                "message": f"Done. I added the account ending in {last4} to {name} and checked the "
+                           f"{count_phrase(len(rows), 'payment')} it sent."}
+
+    # ----------------------------------------------------------------- Sign-in codes (C6)
+
+    def _code_items(self) -> list[dict[str, Any]]:
+        """A supplier's website that sent the owner a one-time code: one item to enter it (the server's route)."""
+        out: list[dict[str, Any]] = []
+        for c in sorted(self.repo.connectors.values(), key=lambda c: c.id):
+            code = (self.sign_in.get(c.id) or {}).get("code") if c.kind == "portal" else None
+            if not code:
+                continue
+            where = _CODE_CHANNELS.get(str(code.get("channel") or "").lower(), "")
+            item: dict[str, Any] = {
+                "id": f"{_CODE}{c.id}", "kind": "code", "tone": "attention", "eyebrow": "Sign-in code",
+                "merchant": c.name, "title": code_prompt(c.name), "amount": None, "currency": "EUR",
+                "date": str(code.get("asked") or "")[:10] or None,
+                "question": f"{c.name} sent you a sign-in code{where}. Enter it so I can fetch your invoices.",
+                "code": {"submitPath": f"/api/portals/{c.id}/code", "label": "Sign-in code",
+                         "channel": str(code.get("channel") or "") or None,
+                         "expiresAt": str(code.get("until") or "") or None},
+                "options": [],
+                "why": [f"{c.name} asks for a one-time code when I sign in.", "I only use it to fetch your invoices."],
+            }
+            if len(c.company_ids) == 1:
+                item["companyId"] = c.company_ids[0]
+            out.append(item)
+        return out
+
     def answer(self, needs_id: str, option_id: str, remember: bool = False, split: Any = None) -> dict[str, Any]:
         if not isinstance(option_id, str) or not option_id.strip():
             raise ServiceError(400, "Please pick one of the options.")
         if isinstance(needs_id, str) and needs_id.startswith(_RENEW):
             return self.renew_access(needs_id[len(_RENEW):], option_id)
+        if isinstance(needs_id, str) and needs_id.startswith(_ACCOUNT):
+            return self.assign_unknown_account(needs_id, option_id)
+        if isinstance(needs_id, str) and needs_id.startswith(_CODE):
+            raise ServiceError(400, "Enter the code from the website in the box.")
         try:
             outcome = self.orchestrator.answer(needs_id, option_id, remember=bool(remember), split=split)
         except KeyError:

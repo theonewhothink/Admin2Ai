@@ -87,6 +87,21 @@ class ServerConfig:
     strict_reads: bool = False  # a read that changes a tenant raises (tests); otherwise logged and rebuilt
     sync_interval_s: int = 900  # the sync worker: how often each connection is read
     history_days: int = 90  # the first sync of a mailbox or bank reads this far back (§6: 90, or 365)
+    # Push notifications (server/webhooks.py). Gmail: the Pub/Sub topic its watches publish to, and the service
+    # account Pub/Sub signs its pushes with (checked when set). Microsoft Graph: on by default when the API is
+    # served over HTTPS (Graph only notifies public HTTPS addresses).
+    gmail_push_topic: str = ""
+    gmail_push_account: str = ""
+    graph_push: bool | None = None
+
+    @property
+    def gmail_push_audience(self) -> str:
+        """The audience Pub/Sub's push subscription puts in its signed token: this endpoint's address."""
+        return f"{self.api_url}/api/webhooks/gmail"
+
+    @property
+    def graph_push_enabled(self) -> bool:
+        return self.graph_push if self.graph_push is not None else self.api_url.startswith("https://")
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> ServerConfig:
@@ -133,6 +148,10 @@ class ServerConfig:
             strict_reads=_flag(e, "BACKOFFICE_STRICT_READS"),
             sync_interval_s=_int(e, "BACKOFFICE_SYNC_INTERVAL", 900, low=30, high=86_400),
             history_days=_int(e, "BACKOFFICE_HISTORY_DAYS", 90, low=30, high=365),
+            gmail_push_topic=e.get("BACKOFFICE_GMAIL_PUSH_TOPIC", "").strip(),
+            gmail_push_account=e.get("BACKOFFICE_GMAIL_PUSH_SERVICE_ACCOUNT", "").strip().lower(),
+            graph_push=(None if not e.get("BACKOFFICE_GRAPH_PUSH", "").strip()
+                        else _flag(e, "BACKOFFICE_GRAPH_PUSH")),
         )
 
     def require_production(self) -> None:

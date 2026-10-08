@@ -40,6 +40,17 @@ reports back at ``POST /api/billing/webhook``: public, and read only once its
 signature is checked; each event is recorded in the business's log and applied
 once. Card details only ever go to Stripe.
 
+Push notifications (server/webhooks.py), public and checked before anything is
+read from them: ``POST /api/webhooks/gmail`` (Google Pub/Sub, its signed token
+verified), ``POST /api/webhooks/microsoft`` and ``.../lifecycle`` (Microsoft
+Graph: the validation handshake, then notifications that must echo their
+subscription's secret). Each queues a sync for the sync worker (server/jobs.py);
+duplicates do nothing.
+
+Supplier websites (server/portals.py): ``POST /api/portals/<connection>/code``
+``{"code": ...}`` (the owner) continues a sign-in that waits for the one-time code
+the website sent; the invoices are fetched and read before they are recorded.
+
 Hardening: security headers on every response (HSTS, nosniff, a CSP that
 allows nothing, no framing, no referrer, no caching of API data), CORS only for
 BACKOFFICE_ALLOWED_ORIGINS (with credentials), request size limits, one JSON
@@ -93,7 +104,9 @@ UPLOAD_PATHS = frozenset({"/api/evidence", "/api/evidence/upload", "/api/receipt
 # base64 in JSON grows a file by a third; a little room for the other fields.
 UPLOAD_LIMIT = MAX_UPLOAD_BYTES * 4 // 3 + 1024 * 1024
 PUBLIC_API = frozenset({"/api/auth/signup", "/api/auth/login", "/api/oauth/callback",
-                        "/api/connections/bank/callback"})
+                        "/api/connections/bank/callback", "/api/webhooks/gmail", "/api/webhooks/microsoft",
+                        "/api/webhooks/microsoft/lifecycle"})
+_CODE = re.compile(r"^[A-Za-z0-9]{3,16}$")
 SECURITY_HEADERS = (
     (b"strict-transport-security", b"max-age=63072000; includeSubDomains"),
     (b"x-content-type-options", b"nosniff"),
@@ -112,7 +125,8 @@ _ROUTE_WORDS = frozenset(
     "onboarding company oauth start callback bank devices v1 healthz readyz internal overview operations "
     "readiness acceptance cost-centers allocate obligations transactions expected-invoices not-coming statement "
     "invitations accept employee employees card-payments expense-claims profile mailboxes seen automation manager "
-    "outlets sensitive access-log billing checkout portal webhook identity accounting".split())
+    "outlets sensitive access-log billing checkout portal webhook identity accounting webhooks gmail microsoft "
+    "lifecycle portals code".split())
 # One client company of any business: /api/accountant/clients/<tenant id>~<company id>[/…] (§28, §29).
 _CLIENT_REF = re.compile(r"/api/accountant/clients/(?P<tenant>[A-Za-z0-9][A-Za-z0-9_.-]{0,127})~(?P<company>[^/~]+)"
                          r"(?P<rest>/.*)?")
@@ -1086,6 +1100,73 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
             return JSONResponse({"received": True, "ignored": True})
         return JSONResponse({"received": True})
 
+    # ----------------------------------------------------------------- push notifications (server/webhooks.py)
+
+    from .webhooks import GooglePushVerifier, WebhookRefused, receive_gmail, receive_graph
+
+    push_verifier = services.get("push_verifier")
+    if push_verifier is None and config.gmail_push_topic:
+        push_verifier = GooglePushVerifier(config.gmail_push_audience, service_account=config.gmail_push_account)
+    graph_push = bool(services.get("graph_push", config.graph_push_enabled))
+
+    @app.post("/api/webhooks/gmail")
+    @_guarded
+    async def gmail_push(request: Request) -> Response:
+        """Google Pub/Sub: nothing is read from the body before Google's signature on the token is checked."""
+        if push_verifier is None:
+            return _error(404, "not_found", "I can't find that.")
+        try:
+            await run_in_threadpool(push_verifier.verify, request.headers.get("authorization"))
+        except WebhookRefused as exc:
+            log.warning("gmail_push_refused", extra={"reason": exc.code})
+            return _error(401, "unauthorized", "This request is not signed by Google.")
+        out = await run_in_threadpool(functools.partial(receive_gmail, store, await request.body(), now=now()))
+        return Response(status_code=out.status)
+
+    async def _graph(request: Request, *, lifecycle: bool) -> Response:
+        if not graph_push:
+            return _error(404, "not_found", "I can't find that.")
+        out = await run_in_threadpool(functools.partial(receive_graph, store, dict(request.query_params),
+                                                        await request.body(), now=now(), lifecycle=lifecycle))
+        if out.text:  # the validation handshake: the token back, as plain text
+            return Response(out.body, status_code=out.status, media_type="text/plain")
+        return JSONResponse(out.body, status_code=out.status)
+
+    @app.post("/api/webhooks/microsoft")
+    @_guarded
+    async def graph_push_notifications(request: Request) -> Response:
+        return await _graph(request, lifecycle=False)
+
+    @app.post("/api/webhooks/microsoft/lifecycle")
+    @_guarded
+    async def graph_lifecycle(request: Request) -> Response:
+        return await _graph(request, lifecycle=True)
+
+    # ----------------------------------------------------------------- supplier websites (server/portals.py)
+
+    portal_worker = services.get("portal_worker")
+    if portal_worker is None and manager.vault is not None:
+        from .portals import PortalWorker
+
+        portal_worker = PortalWorker(manager, vault=manager.vault, factory=services.get("portal_factory"),
+                                     history_days=config.history_days)
+    app.state.portals = portal_worker
+
+    @app.post("/api/portals/{connection_id}/code")
+    @_guarded
+    async def portal_code(connection_id: str, request: Request) -> Response:
+        """The one-time code a supplier's website sent the owner: the waiting sign-in continues and the invoices
+        are fetched, read and recorded. A wrong or expired code gets a plain answer to try again."""
+        principal, refresh = await _signed_in(request, owner=True)
+        body = await _json(request, required=True)
+        code = re.sub(r"[\s-]", "", str(body.get("code") or ""))
+        if not _CODE.match(code):
+            raise AuthError(400, "bad_request", "Enter the code exactly as you received it.")
+        if portal_worker is None:
+            raise AuthError(503, "unavailable", "Supplier websites are not set up on this server yet.")
+        status, out = await run_in_threadpool(portal_worker.submit_code, principal.tenant.id, connection_id, code)
+        return _reply(status, out, refresh=(refresh, _token(request)[0]))
+
     # ----------------------------------------------------------------- the team's dashboard (admins only)
 
     def _internal(principal: Principal, target: str, query: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -1104,7 +1185,15 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
             tenant_ids = []
         if principal.tenant.id not in tenant_ids:
             tenant_ids = [*tenant_ids, principal.tenant.id]
-        return 200, manager.read_many(tenant_ids, lambda services: internal.handle(view, services, query),
+        try:  # work that kept failing, parked as dead letters (server/jobs.py): the team must see it
+            dead = store.dead_jobs(50) if view == "overview" else []
+        except StoreUnavailable:
+            raise
+        except StoreError:
+            log.warning("dead_jobs_unavailable")
+            dead = []
+        return 200, manager.read_many(tenant_ids,
+                                      lambda services: internal.handle(view, services, query, dead_jobs=dead),
                                       what=f"GET {route_template(target)}")
 
     # ----------------------------------------------------------------- the accountant's clients (§28, §29, §51)

@@ -12,6 +12,9 @@ tenant into a multi-tenant service:
 * :mod:`.reads`     documents read before an event is recorded; replays use the recorded reading;
 * :mod:`.links`     invoice links opened before an event is recorded; replays use what came back;
 * :mod:`.sync`      the sync worker: mailboxes and banks into events, each tenant's day;
+* :mod:`.jobs`      the durable work queue (PostgreSQL): retries with backoff, dead letters;
+* :mod:`.webhooks`  push notifications from Gmail (Pub/Sub) and Microsoft Graph;
+* :mod:`.portals`   supplier websites: sign-in, one-time codes, invoices read before recording;
 * :mod:`.worker`    ``python -m backoffice.server.worker``;
 * :mod:`.auth`      sign-up, sign-in, sessions, CSRF guard, roles, rate limits;
 * :mod:`.notify`    Expo push notifications, for the few things that need the owner;

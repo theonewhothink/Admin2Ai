@@ -104,10 +104,6 @@ locals {
     EVIDENCE_KMS_KEY_ID       = aws_kms_key.evidence.arn
     EVIDENCE_OBJECT_LOCK_MODE = "GOVERNANCE"
     EVIDENCE_RETENTION_DAYS   = tostring(var.evidence_retention_days)
-    EVENT_BUS_NAME            = aws_cloudwatch_event_bus.main.name
-    INGEST_QUEUE_URL          = aws_sqs_queue.main["ingest"].url
-    OCR_QUEUE_URL             = aws_sqs_queue.main["ocr"].url
-    NOTIFICATIONS_QUEUE_URL   = aws_sqs_queue.main["notifications"].url
     OCR_SERVICE_URL           = local.ocr_url
     TEMPORAL_ADDRESS          = var.temporal_address
     TEMPORAL_NAMESPACE        = var.temporal_namespace
