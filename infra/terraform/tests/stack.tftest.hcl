@@ -217,7 +217,8 @@ run "production_defaults" {
   assert {
     condition = alltrue([for m in [module.api, module.sync] : length(setsubtract([
       "DATABASE_URL", "BACKOFFICE_STATE_KEY", "BACKOFFICE_GOOGLE_CLIENT_ID", "BACKOFFICE_GOOGLE_CLIENT_SECRET",
-      "BACKOFFICE_MICROSOFT_CLIENT_ID", "BACKOFFICE_MICROSOFT_CLIENT_SECRET", "GOCARDLESS_SECRET_ID",
+      "BACKOFFICE_MICROSOFT_CLIENT_ID", "BACKOFFICE_MICROSOFT_CLIENT_SECRET", "BACKOFFICE_MOLONI_CLIENT_ID",
+      "BACKOFFICE_MOLONI_CLIENT_SECRET", "GOCARDLESS_SECRET_ID",
       "GOCARDLESS_SECRET_KEY", "BACKOFFICE_SMTP_HOST", "BACKOFFICE_SMTP_USER", "BACKOFFICE_SMTP_PASSWORD",
       "BACKOFFICE_SMTP_FROM", "EXPO_ACCESS_TOKEN", "ANTHROPIC_API_KEY",
     ], m.secret_names)) == 0])
@@ -247,7 +248,7 @@ run "production_defaults" {
   }
 
   assert {
-    condition     = length(aws_secretsmanager_secret_version.connector) == 3 && length(aws_secretsmanager_secret_version.integration) == 3
+    condition     = length(aws_secretsmanager_secret_version.connector) == 4 && length(aws_secretsmanager_secret_version.integration) == 3
     error_message = "every operator secret exists with empty fields, so tasks start before it is filled in"
   }
 
