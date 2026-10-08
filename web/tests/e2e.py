@@ -668,9 +668,10 @@ def owner_screens(page: Any, api: MockApi, expect: Any) -> None:
     check(bottom == ["Home", "Needs You", "Scan a receipt", "Sources", "Activity"], f"the phone bar has its five {bottom}")
     chat = page.get_by_role("button", name="Chat", exact=True)
     expect(chat).to_be_visible()
-    bar = page.locator("nav[aria-label=Main]:not(header nav)").bounding_box()
+    header_box = page.locator("header").first.bounding_box()
     box = chat.bounding_box()
-    check(bool(bar and box and box["y"] + box["height"] <= bar["y"]), "on a phone the Chat button sits above the bottom bar")
+    check(bool(header_box and box and box["y"] >= header_box["y"] and box["y"] + box["height"] <= header_box["y"] + header_box["height"]),
+          "on a phone the Chat button sits in the header, never over the page")
     chat.click()
     expect(page.get_by_role("dialog", name="Ask")).to_be_visible()
     check(True, "Ask is one tap away on a phone (the Chat button)")
