@@ -548,6 +548,9 @@ class ConnectorState:
     # catching up after lost history, or a bank that no longer serves those days (not reachable). Every month
     # they touch stays open (closure: catching up), never green (§47).
     gaps: tuple[tuple[datetime, datetime, bool], ...] = ()
+    # A supplier's website (kind "portal"): the domains it is on ("edp.pt"), from its adapter's configuration
+    # (backoffice.invoice_sites). Which supplier's invoices it holds is learned (backoffice.supplier_websites).
+    hosts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1336,6 +1339,8 @@ class Repository:
         # what was fetched before the event was recorded (server/links.py). Never the network directly.
         self.links: LinkSource = PortalLinks(self.portal, clock=self.clock.now)
         self.links_seen: dict[str, LinkRecord] = {}  # every invoice link followed, by URL
+        # Where each supplier's invoices can be fetched, learned (backoffice.supplier_websites), by supplier id.
+        self.supplier_websites: dict[str, Any] = {}
         self.broken_links: dict[str, BrokenLinkRecord] = {}  # links that no longer work, by their own id
         self.closed_months: dict[tuple[str, str], date] = {}
         self.recovered_tx_ids: set[str] = set()
@@ -7420,6 +7425,10 @@ class Orchestrator:
 
         self.search = SearchAgent(self)
         self.follow_up = SupplierFollowUp(self)
+        # Which supplier website holds each supplier's invoices, learned from what was fetched there (L6).
+        from backoffice.supplier_websites import WebsiteAgent
+
+        self.websites = WebsiteAgent(self)
         self._activity_seq = 0
         # What sends the emails the back office writes itself (backoffice.mailer): the demo's simulated
         # outbox, or None. With None they wait in ``repo.outbox``; the production server sends each one
@@ -8058,10 +8067,14 @@ class Orchestrator:
                 report.stored_only = True
         supplier = email.supplier
         made = 0  # documents this email gave from its files and links
-        for url in email_invoice_links(parsed):
+        links = email_invoice_links(parsed)
+        for url in links:
             link = self.retrieval.follow(url, supplier=supplier, at=at, context={"email_evidence_id": message_id},
                                          source_kind=SourceKind.EMAIL, email_evidence_id=message_id)
             made += self._read_link(link, at=at, report=report, email=email)
+        if links and not _has_attachments(result):  # only a "view your invoice" link: where its invoices are (L6)
+            gave = report.document_ids[first_document:]
+            self.websites.from_email(supplier, links, gave, at=at, evidence_id=message_id)
         writer = _sender_line(parsed.sender)
         for file_parts in groups:
             if self.payroll.accept(file_parts, at=at, origin=origin, report=report, sender=sender, message_text=text,

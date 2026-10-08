@@ -850,10 +850,15 @@ class BackOfficeService:
                      f"{len(txs)} payment" + ("" if len(txs) == 1 else "s")]
             if s.known_ibans:
                 parts.append("bank details on file")
-            suppliers.append({"id": s.id, "name": s.name, "company": ", ".join(companies),
-                              "detail": " · ".join(parts),
-                              "lastSeen": last.isoformat() if last else None,
-                              "status": "hold" if any(d.on_hold and not d.hold_released for d in docs) else "known"})
+            website = self.orchestrator.websites.view(s)  # "Invoices: fetched from edp.pt" (L6)
+            if website is not None:
+                parts.append(website["text"])
+            item = {"id": s.id, "name": s.name, "company": ", ".join(companies), "detail": " · ".join(parts),
+                    "lastSeen": last.isoformat() if last else None,
+                    "status": "hold" if any(d.on_hold and not d.hold_released for d in docs) else "known"}
+            if website is not None:
+                item["invoicesFrom"] = website["text"]
+            suppliers.append(item)
         suppliers.sort(key=lambda x: x["name"].lower())
 
         def rel(kind: str) -> list[dict[str, Any]]:
@@ -1049,9 +1054,15 @@ class BackOfficeService:
 
     def _add_portal(self, body: Mapping[str, Any]) -> dict[str, Any]:
         """A supplier's website the owner signs in to for their invoices (§9, §10): its username, and a password that
-        goes only to the vault. ``portal``: which adapter reads it (the server's registry); by default the name."""
+        goes only to the vault. ``portal``: which adapter reads it (the server's registry); by default the known
+        website of the supplier named (backoffice.invoice_sites: "EDP" is read by the EDP adapter), else the name.
+        The website then holds that supplier's invoices (backoffice.supplier_websites)."""
+        from backoffice.invoice_sites import site_for_key, site_for_name
+
         supplier = self._text(body, "supplier", "Which supplier's website?")
-        key = self._text(body, "portal", "", required=False, limit=64) or \
+        given = self._text(body, "portal", "", required=False, limit=64)
+        site = site_for_key(given) if given else site_for_name(supplier)
+        key = given or (site.key if site is not None else "") or \
             (_SLUG.sub("_", supplier.lower()).strip("_") or "portal")
         username = self._text(body, "username", "What is your username on that website?", limit=254)
         password = body.get("password")
@@ -1070,8 +1081,10 @@ class BackOfficeService:
         self.repo.add_connector(ConnectorState(
             id=cid, name=supplier, kind="portal", account=username,
             company_ids=(company,) if company else tuple(self.repo.companies), healthy=True,
-            covered_from=None, covered_until=None, last_synced_at=None))
+            covered_from=None, covered_until=None, last_synced_at=None,
+            hosts=site.hosts if site is not None else ()))
         self.sign_in[cid] = {"provider": "portal", "portal": key, "stored": stored, "pending": False}
+        self.orchestrator.websites.connected(cid, self._now())
         self.orchestrator.activity(self._now(), "checked", f"Saved the sign-in for {supplier}'s website.",
                                    company)
         return {"id": cid, "message": f"Done. I will sign in to {supplier} and fetch your invoices from there."}
@@ -1436,6 +1449,7 @@ class BackOfficeService:
                                        f"Fetched {count_phrase(len(files), 'invoice')} from {c.name}'s website.",
                                        evidence_ids=tuple(evidence))
         self.orchestrator.run()
+        self.orchestrator.websites.fetched(c.id, evidence, self._now())  # whose invoices this website holds (L6)
         return {"ok": True, "documents": len(files), "evidenceIds": evidence}
 
     def _add_card(self, body: Mapping[str, Any]) -> dict[str, Any]:

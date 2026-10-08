@@ -14,6 +14,12 @@
   code didn't work. Check it and try again."); an expired one asks the website for a new code at once.
 * **Read before recording.** Invoices the website gave are stored and read (OCR, as for any upload) before the
   event that brings them in is recorded (``portal.retrieved``), so a replay never signs in, fetches or reads.
+* **Searched before asking.** When an invoice of the website's supplier is missing, the missing-document search
+  asks the website too (:meth:`PortalWorker.search_place`, server/search.py), with the saved session or a new
+  sign-in; a session it made and the invoices it fetched are kept in the vault (:meth:`PortalWorker.searched`).
+  A search never sends the owner a code: on a website that uses codes (``codes`` in the vault) or while one is
+  awaited, only a saved session is used; a first sign-in that asks for a code is recorded like the daily sync's
+  (``portal.code_needed``: one push, one Needs-you item), and entering it signs in and fetches what is new.
 """
 
 from __future__ import annotations
@@ -200,6 +206,57 @@ class PortalWorker:
                              "message": f"I couldn't finish signing in to {name} just now. I'll try again later."}
             return 200, {"ok": True, "documents": len(documents), "message": _fetched(name, len(documents))}
 
+    # ----------------------------------------------------------------- the missing-document search (server/search.py)
+
+    def search_place(self, tenant_id: str, connection_id: str, *, place: str, first: bool = False) -> Any:
+        """The website as a place to search for a missing document (missing.searches.PortalSearch), in a fresh,
+        isolated adapter with this connection's sign-in; None when this server has no adapter for it. Raises what
+        opening the vault raises (the attempt is noted as failed)."""
+        from backoffice.missing import PortalSearch
+
+        secret = self.vault.open(tenant_id, connection_id)
+        adapter = self.factory(str(secret.get("portal") or ""))
+        if adapter is None:
+            return None
+        session = self._session(secret)
+        now = self.now()
+        if session is not None and session.expires_at is not None and session.expires_at <= now:
+            session = None
+        waiting = self._challenge(secret)
+        waiting_now = waiting is not None and not waiting.expired(now)
+        return PortalSearch(adapter, credentials=self._credentials(secret), session=session, place=place,
+                            first=first, connection_id=connection_id, clock=self.now,
+                            sign_in=not (secret.get("codes") or waiting_now))
+
+    def searched(self, tenant_id: str, search: Any) -> None:
+        """After a search: the session it signed in with is kept for the next run, and the invoices it fetched are
+        not fetched again by the daily sync (they are already in)."""
+        cid = getattr(search, "connection_id", None)
+        if not cid or not (search.signed_in or search.retrieved or search.challenge is not None):
+            return
+        with self._lock(tenant_id, cid):
+            changes: dict[str, Any] = {}
+            if search.signed_in and search.session is not None:
+                changes["session"] = self._session_json(search.session)
+            if search.retrieved:
+                known = list(self.vault.open(tenant_id, cid).get("known") or [])
+                known += [i for i in search.retrieved if i not in known]
+                changes["known"] = known[-KNOWN_KEPT:]
+            if search.challenge is not None:  # the website sent the owner a code: asked for once, as a sync would
+                now = self.now()
+                challenge = search.challenge
+                issued = challenge.issued_at or now
+                expires = challenge.expires_at or issued + CODE_VALID_FOR
+                changes["codes"] = True
+                changes["challenge"] = {"supplier": challenge.supplier_key, "account": challenge.account,
+                                        "channel": challenge.channel, "resume": dict(challenge.resume_state),
+                                        "issued": _iso(issued), "expires": _iso(expires)}
+                self.vault.update(tenant_id, cid, changes)
+                self.manager.record_portal_code(tenant_id, cid, channel=challenge.channel, expires_at=expires,
+                                                state=None)
+                return
+            self.vault.update(tenant_id, cid, changes)
+
     # ----------------------------------------------------------------- recording (read before record)
 
     def _record(self, tenant_id: str, connection_id: str, outcome: PortalSyncOutcome,
@@ -215,6 +272,7 @@ class PortalWorker:
             changes["challenge"] = {"supplier": challenge.supplier_key, "account": challenge.account,
                                     "channel": challenge.channel, "resume": dict(challenge.resume_state),
                                     "issued": _iso(issued), "expires": _iso(expires)}
+            changes["codes"] = True  # this website sends codes: a search only ever uses a saved session
             self.vault.update(tenant_id, connection_id, changes)
             self.manager.record_portal_code(tenant_id, connection_id, channel=challenge.channel, expires_at=expires,
                                             state=state)

@@ -13,13 +13,16 @@ what it found as :class:`FoundFile` s (the bytes and where they came from):
 2. the same, ``historical=True`` (historical email): the months before that window, for the invoice number or
    the amount from that supplier only;
 3. :class:`CloudStorageSearch`: Google Drive or OneDrive / SharePoint;
-4. :class:`PortalSearch`: the supplier's portal, when an adapter and the owner's sign-in are configured;
+4. :class:`PortalSearch`: the supplier's website, through its adapter and the owner's sign-in there (the
+   saved session first; a new sign-in when the website signed it out);
 5. :class:`AccountingSearch`: TOConline, Moloni or InvoiceXpress;
 6. :class:`RecurringMailSearch` (recurring history): the way this supplier's invoices usually arrive, learned
    from the earlier ones (the usual sender, the words its subjects share, an attachment), in the window.
 
 :func:`run_searches` runs them in that order and notes each attempt: which place, when it started and finished,
 and what it gave (files found, nothing, failed, timed out). Nothing is judged here: the files go into the event.
+A place learned to hold this supplier's invoices (its website, backoffice.supplier_websites) is marked ``first``:
+it is asked before the others, live and when the record is applied (the attempt carries ``first``).
 
 **Applied** (live and on replay, inside the engine; backoffice.evidence_search). :class:`RecordedSearch` hands one
 place's recorded result to the autopilot as an ``EvidenceSearch``: its files are read into the pipeline when the
@@ -57,6 +60,7 @@ __all__ = [
     "amount_words",
     "run_recorded",
     "run_searches",
+    "search_order",
 ]
 
 MAX_FILES_PER_PLACE = 5  # what one place may hand in for one missing document
@@ -125,6 +129,7 @@ class SearchRequest:
     pattern: SearchPattern | None = None
     connections: tuple[str, ...] = ()  # the connected places to look in (connection ids)
     entity_id: str | None = None
+    first: tuple[str, ...] = ()  # connections learned to hold this supplier's invoices: asked before the others
 
     @property
     def name(self) -> str:
@@ -156,7 +161,7 @@ class SearchRequest:
                 "supplierTaxId": self.supplier_tax_id, "supplierDomains": list(self.supplier_domains),
                 "invoiceNumber": self.invoice_number, "direction": self.direction,
                 "pattern": self.pattern.to_json() if self.pattern else None, "connections": list(self.connections),
-                "entityId": self.entity_id}
+                "entityId": self.entity_id, "first": list(self.first)}
 
     @classmethod
     def from_json(cls, data: Mapping[str, Any]) -> SearchRequest:
@@ -172,7 +177,8 @@ class SearchRequest:
                    supplier_domains=tuple(str(d) for d in data.get("supplierDomains") or ()),
                    invoice_number=data.get("invoiceNumber"), direction=str(data.get("direction") or "purchases"),
                    pattern=SearchPattern.from_json(data.get("pattern")),
-                   connections=tuple(str(c) for c in data.get("connections") or ()), entity_id=data.get("entityId"))
+                   connections=tuple(str(c) for c in data.get("connections") or ()), entity_id=data.get("entityId"),
+                   first=tuple(str(c) for c in data.get("first") or ()))
 
 
 @dataclass(frozen=True)
@@ -353,44 +359,90 @@ class AccountingSearch:
 
 
 class PortalSearch:
-    """Search 4: the supplier's portal through its registered adapter (connectors.portals), when configured."""
+    """Search 4: the supplier's website through its adapter (connectors.portals), with the owner's sign-in there.
+
+    The saved session is used first; when there is none, it expired, or the website signed it out, the stored
+    password signs in again (once) and :attr:`session` holds the new session for the vault. ``sign_in=False``
+    (a website that sends a one-time code at sign-in): only a saved session is used, so a search never sends the
+    owner a code. A website that asks for a code is not searched this time; :attr:`challenge` keeps its request so
+    the owner is asked for the code once (server/portals.py), as the daily sync would. A refused password needs
+    the owner. Only the invoices that name this payment (its number or its amount) are downloaded; for a usual
+    invoice of a varying amount, the ones issued in the window.
+    """
 
     source = SearchSource.SUPPLIER_PORTAL
 
     def __init__(self, connector: Any, *, credentials: Any = None, session: Any = None, place: str,
-                 limit: int = MAX_FILES_PER_PLACE) -> None:
+                 limit: int = MAX_FILES_PER_PLACE, first: bool = False, connection_id: str | None = None,
+                 clock: Callable[[], datetime] | None = None, sign_in: bool = True) -> None:
         self.connector = connector
         self.credentials = credentials
         self.session = session
         self.place = place
         self.limit = limit
+        self.first = first  # learned to hold this supplier's invoices: asked before the other places
+        self.connection_id = connection_id
+        self.signed_in = False  # True once this search made a new session (to keep in the vault)
+        self.retrieved: list[str] = []  # the website's ids of the invoices it downloaded
+        self.challenge: Any = None  # the website asked for a one-time code (the owner is asked for it once)
+        self.may_sign_in = sign_in
+        self._clock = clock
 
-    def find(self, request: SearchRequest) -> list[FoundFile]:
+    def _sign_in(self) -> Any:
         from backoffice.connectors.base import ReconnectRequired, TransientError
         from backoffice.connectors.portals import AuthStatus
 
+        if not self.may_sign_in:
+            raise TransientError("portal_waiting_for_code")  # signing in would send the owner another code
+        if self.credentials is None:
+            raise ReconnectRequired("portal_no_credentials")
+        result = self.connector.authenticate(self.credentials)
+        if result.status is AuthStatus.AUTHENTICATED and result.session is not None:
+            self.session, self.signed_in = result.session, True
+            return result.session
+        if result.status is AuthStatus.LOGIN_REQUIRED:
+            raise ReconnectRequired("portal_login_required")
+        if result.status is AuthStatus.MFA_REQUIRED:
+            self.challenge = result.challenge
+        raise TransientError(f"portal_{result.status.value}")  # a code to enter, or the website is down
+
+    def _listed(self, request: SearchRequest) -> tuple[Any, list[Any]]:
+        from backoffice.connectors.portals import SessionExpired
+
         session = self.session
+        now = self._clock() if self._clock is not None else None
+        if session is not None and now is not None and session.expires_at is not None and session.expires_at <= now:
+            session = None
         if session is None:
-            if self.credentials is None:
-                raise ReconnectRequired("portal_no_credentials")
-            result = self.connector.authenticate(self.credentials)
-            if result.status is not AuthStatus.AUTHENTICATED or result.session is None:
-                raise (TransientError if result.status is AuthStatus.FAILED else ReconnectRequired)(
-                    f"portal_{result.status.value}")
-            session = result.session
+            session = self._sign_in()
+            return session, self.connector.list_invoices(session, request.window_start, request.window_end)
+        try:
+            return session, self.connector.list_invoices(session, request.window_start, request.window_end)
+        except SessionExpired:
+            session = self._sign_in()
+            return session, self.connector.list_invoices(session, request.window_start, request.window_end)
+
+    def find(self, request: SearchRequest) -> list[FoundFile]:
+        session, refs = self._listed(request)
         number = re.sub(r"[^0-9A-Z]", "", (request.invoice_number or "").upper())
         out: list[FoundFile] = []
-        for ref in self.connector.list_invoices(session, request.window_start, request.window_end):
+        for ref in refs:
             same_number = bool(number) and re.sub(r"[^0-9A-Z]", "", (ref.invoice_number or "").upper()) == number
             same_amount = request.amount is not None and ref.gross_amount is not None and \
                 abs(ref.gross_amount) == abs(request.amount)
-            if not (same_number or same_amount):
+            usual = request.amount is None and not number  # a usual invoice of a varying amount: any in the window
+            if not (same_number or same_amount or usual):
                 continue
             doc = self.connector.retrieve_invoice(session, ref)
+            self.retrieved.append(ref.portal_id)
+            provenance = {"source": "portal", "provider": self.connector.supplier_key, "portalId": ref.portal_id,
+                          "number": ref.invoice_number, "date": ref.issue_date.isoformat() if ref.issue_date else None}
+            if self.connection_id:
+                provenance["connectionId"] = self.connection_id
+            if getattr(doc, "source_url", None):
+                provenance["webUrl"] = doc.source_url
             out.append(FoundFile(self.source, self.place, doc.data, doc.filename or "invoice.pdf", doc.content_type,
-                                 {"source": "portal", "provider": self.connector.supplier_key,
-                                  "portalId": ref.portal_id, "number": ref.invoice_number,
-                                  "date": ref.issue_date.isoformat() if ref.issue_date else None}))
+                                 provenance))
             if len(out) >= self.limit:
                 break
         return out
@@ -414,12 +466,19 @@ def _outcome(exc: BaseException) -> tuple[str, str]:
     return ("timed_out" if timed_out else "failed"), f"{type(exc).__name__}:{code}" if code else type(exc).__name__
 
 
+def search_order(searches: Sequence[Any]) -> list[int]:
+    """The order places are asked in: the ones learned to hold the supplier's invoices (``first``), then the
+    spec's order (§22), stable. Indexes into ``searches``."""
+    rank = {source: i for i, source in enumerate(SEARCH_ORDER)}
+    return [i for i, _ in sorted(enumerate(searches), key=lambda pair: (
+        not getattr(pair[1], "first", False), rank[pair[1].source], pair[0]))]
+
+
 def run_searches(request: SearchRequest, searches: Sequence[SourceSearch], *,
                  clock: Callable[[], datetime], max_files: int = MAX_FILES_PER_PLACE) -> SearchRun:
-    """Ask every place, in the spec's order (§22), and note each attempt. A place that fails is noted and the
-    others are still asked: the engine decides later (a failed place means "look again later")."""
-    rank = {source: i for i, source in enumerate(SEARCH_ORDER)}
-    ordered = [s for _, s in sorted(enumerate(searches), key=lambda pair: (rank[pair[1].source], pair[0]))]
+    """Ask every place, in order (:func:`search_order`), and note each attempt. A place that fails is noted and
+    the others are still asked: the engine decides later (a failed place means "look again later")."""
+    ordered = [searches[i] for i in search_order(searches)]
     run = SearchRun(request)
     for search in ordered:
         started = clock()
@@ -434,6 +493,8 @@ def run_searches(request: SearchRequest, searches: Sequence[SourceSearch], *,
                                    "outcome": outcome, "found": len(files)}
         if failure:
             attempt["failure"] = failure
+        if getattr(search, "first", False):
+            attempt["first"] = True
         run.attempts.append(attempt)
         run.files += files
     return run

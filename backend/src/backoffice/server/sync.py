@@ -1120,6 +1120,7 @@ def _connections(tenant_id: str, svc: Any, kinds: tuple[str, ...] = ("email", "b
 
 
 def _searchable_connections(tenant_id: str, svc: Any) -> list[_Connection]:
-    """The connections the missing-document searches may use (read-only)."""
-    searchable = {c.id for c in svc.repo.connectors.values() if c.searchable}
-    return [c for c in _connections(tenant_id, svc, ("email", "files", "accounting")) if c.id in searchable]
+    """The connections the missing-document searches may use (read-only): mailboxes, cloud storage and accounting
+    software that can be searched, and suppliers' websites (each searched for its own supplier's documents)."""
+    searchable = {c.id for c in svc.repo.connectors.values() if c.searchable or c.kind == "portal"}
+    return [c for c in _connections(tenant_id, svc, ("email", "files", "accounting", "portal")) if c.id in searchable]

@@ -7,7 +7,8 @@ the searches its connections allow (``missing.searches``):
   supplier's usual way of sending (learned from the earlier invoices);
 * Google Drive or OneDrive / SharePoint;
 * the accounting software (TOConline, Moloni, InvoiceXpress);
-* the supplier's portal, when the server has an adapter and the owner's sign-in for it (``portal_factory``).
+* the supplier's website the owner connected (server/portals.py: its adapter and the sign-in in the vault), asked
+  first when it is learned to hold that supplier's invoices (``SearchRequest.first``, backoffice.supplier_websites).
 
 The searches run live (``run_searches``: each attempt timed and its result noted; a place that fails is noted and
 the others still searched). Then :meth:`TenantManager.record_search` reads the files found (OCR) and opens their
@@ -37,6 +38,7 @@ from backoffice.missing import (
     SearchSource,
     amount_words,
     run_searches,
+    search_order,
 )
 
 __all__ = ["SEARCHES_PER_PASS", "MissingSearches", "triage"]
@@ -122,6 +124,7 @@ class _Unavailable:
     place: str
     error: Exception
     connection_id: str
+    first: bool = False  # the place learned to hold the supplier's invoices (still asked first, and noted)
 
     def find(self, request: SearchRequest) -> list[FoundFile]:
         raise self.error
@@ -149,6 +152,7 @@ class MissingSearches:
             request = SearchRequest.from_json(raw)
             searches = self._searches(tenant_id, request, connections)
             run = run_searches(request, searches, clock=self.worker.now)
+            self._keep_sessions(tenant_id, searches)
             status, body = self.manager.record_search(tenant_id, run)
             if status == 404:
                 raise _Gone(tenant_id)
@@ -165,6 +169,11 @@ class MissingSearches:
         for cid in request.connections:
             c = connections.get(cid)
             if c is None:
+                continue
+            if c.kind == "portal":
+                website = self._website(tenant_id, c, first=cid in request.first)
+                if website is not None:
+                    searches.append(website)
                 continue
             try:
                 connector, provider = self.worker.search_connector(c)
@@ -197,8 +206,36 @@ class MissingSearches:
                 portal = None
             if portal is not None:
                 adapter, credentials = portal
-                searches.append(PortalSearch(adapter, credentials=credentials, place=f"{name}'s website"))
+                searches.append(PortalSearch(adapter, credentials=credentials,
+                                             place=f"your account on {name}'s website"))
         return searches
+
+    def _website(self, tenant_id: str, c: Any, *, first: bool) -> Any:
+        """The supplier's website as a place (server/portals.py), or a failed attempt when its sign-in cannot be
+        opened; None when this worker reads no websites or has no adapter for this one."""
+        portals = getattr(self.worker, "portals", None)
+        if portals is None:
+            return None
+        try:
+            website = portals.search_place(tenant_id, c.id, place=_place(c), first=first)
+        except Exception as exc:  # noqa: BLE001 - the vault or the adapter: a failed attempt, the others searched
+            from backoffice.connectors.base import ConnectorError
+
+            error = exc if isinstance(exc, ConnectorError) else RuntimeError(type(exc).__name__)
+            return _Unavailable(SearchSource.SUPPLIER_PORTAL, _place(c), error, c.id, first)
+        return website
+
+    def _keep_sessions(self, tenant_id: str, searches: Sequence[Any]) -> None:
+        """A website session a search signed in with, and the invoices it fetched, are kept (server/portals.py)."""
+        portals = getattr(self.worker, "portals", None)
+        if portals is None:
+            return
+        for search in searches:
+            if isinstance(search, PortalSearch) and search.connection_id:
+                try:
+                    portals.searched(tenant_id, search)
+                except Exception:  # noqa: BLE001 - only a convenience for the next run: the search stands
+                    log.warning("portal_session_not_kept", extra={"tenant": tenant_id})
 
     def _lost_access(self, tenant_id: str, searches: Sequence[Any], attempts: Sequence[Mapping[str, Any]],
                      connections: Mapping[str, Any]) -> None:
@@ -214,15 +251,19 @@ class MissingSearches:
 
 
 def _place(c: Any) -> str:
-    return "your email" if c.kind == "email" else f"your {c.name}" if c.kind == "files" else c.name
+    """The same words as the engine's ``evidence_search.place_of``."""
+    if c.kind == "email":
+        return "your email"
+    if c.kind == "files":
+        return f"your {c.name}"
+    if c.kind == "portal":
+        return f"your account on {c.name}'s website"
+    return c.name
 
 
 def _ordered(searches: Sequence[Any], attempts: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
-    """The attempts in the order of ``searches`` (run_searches sorts by the spec's order, stably)."""
-    from backoffice.missing import SEARCH_ORDER
-
-    rank = {source: i for i, source in enumerate(SEARCH_ORDER)}
-    order = [i for i, _ in sorted(enumerate(searches), key=lambda pair: (rank[pair[1].source], pair[0]))]
+    """The attempts in the order of ``searches`` (run_searches asks them in ``search_order``)."""
+    order = search_order(searches)
     out: list[Mapping[str, Any]] = [{} for _ in searches]
     for position, index in enumerate(order):
         if position < len(attempts):

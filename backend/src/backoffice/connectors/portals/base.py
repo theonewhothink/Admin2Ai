@@ -63,6 +63,7 @@ __all__ = [
     "PortalSyncOutcome",
     "RetrievalPlan",
     "RetrievalStrategy",
+    "SessionExpired",
     "SupplierPortalConnector",
     "authentication_prompt",
     "code_prompt",
@@ -92,6 +93,10 @@ class PortalError(Exception):
 
 class PortalChanged(PortalError):
     """The portal's pages or API no longer match the adapter (triggers AI fallback)."""
+
+
+class SessionExpired(PortalError):
+    """The saved session no longer works (the website signed it out): sign in again with the stored password."""
 
 
 class AuthStatus(str, Enum):
@@ -345,15 +350,22 @@ class PortalSync:
         known_ids: Iterable[str] = (),
         now: datetime | None = None,
     ) -> PortalSyncOutcome:
-        """Authenticate if needed, fetch documents not seen before, deliver them."""
+        """Authenticate if needed, fetch documents not seen before, deliver them. A saved session the website
+        no longer accepts (:class:`SessionExpired`) is replaced by a new sign-in, once."""
         now = now or self._clock()
-        if session is None or (session.expires_at is not None and session.expires_at <= now):
+        reused = session is not None and not (session.expires_at is not None and session.expires_at <= now)
+        if reused:
+            assert session is not None
             try:
-                session, early = self._authenticate(state, credentials, now)
-            except PortalError as exc:
-                return self._portal_failed(state, now, exc, None, CountingSink(sink), [])
-            if early is not None:
-                return early
+                return self._retrieve(state, session, sink, known_ids, now, signed_out=credentials is not None)
+            except SessionExpired:
+                pass  # signed out by the website: sign in again below (nothing was delivered yet)
+        try:
+            session, early = self._authenticate(state, credentials, now)
+        except PortalError as exc:
+            return self._portal_failed(state, now, exc, None, CountingSink(sink), [])
+        if early is not None:
+            return early
         assert session is not None
         return self._retrieve(state, session, sink, known_ids, now)
 
@@ -394,7 +406,8 @@ class PortalSync:
         return self._failed(state, now, TransientError("portal_auth_failed"))
 
     def _retrieve(self, state: ConnectorState, session: PortalSession, sink: Callable[[PortalDocument], None],
-                  known_ids: Iterable[str], now: datetime) -> PortalSyncOutcome:
+                  known_ids: Iterable[str], now: datetime, *, signed_out: bool = False) -> PortalSyncOutcome:
+        """``signed_out``: a :class:`SessionExpired` before anything was delivered is raised for a new sign-in."""
         counted = CountingSink(sink)
         retrieved: list[str] = []
         try:
@@ -402,6 +415,10 @@ class PortalSync:
             for ref in self.connector.detect_new(session, known_ids, since, now.date()):
                 counted(self.connector.retrieve_invoice(session, ref))
                 retrieved.append(ref.portal_id)
+        except SessionExpired:
+            if signed_out and not retrieved:
+                raise
+            return self._portal_failed(state, now, SessionExpired("session_expired"), None, counted, retrieved)
         except PortalError as exc:
             return self._portal_failed(state, now, exc, session, counted, retrieved)
         except ConnectorError as exc:  # adapters built on the shared HTTP/OAuth helpers raise these

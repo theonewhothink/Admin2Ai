@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="pt-PT">
+<head>
+  <meta charset="utf-8">
+  <title>Entrar | Área de Cliente EDP</title>
+  <link rel="stylesheet" href="/static/area-cliente.css">
+  <script src="/static/area-cliente.js" defer></script>
+</head>
+<body class="pagina-entrar">
+  <header class="cabecalho"><a class="logotipo" href="/">EDP</a></header>
+  <section class="entrar">
+    <h1>Entrar na Área de Cliente</h1>
+    $erro
+    <form id="form-login" class="formulario" method="post" action="/area-cliente/entrar">
+      <input type="hidden" name="_csrf" value="$csrf">
+      <input type="hidden" name="origem" value="area-cliente">
+      <label for="email">Email</label>
+      <input type="email" id="email" name="email" autocomplete="username" required>
+      <label for="password">Palavra-passe</label>
+      <input type="password" id="password" name="password" autocomplete="current-password" required>
+      <label class="lembrar"><input type="checkbox" name="lembrar" value="1"> Manter sessão iniciada</label>
+      <button type="submit" class="botao-principal">Entrar</button>
+    </form>
+    <p><a href="/area-cliente/recuperar">Esqueceu-se da palavra-passe?</a></p>
+  </section>
+  <footer class="rodape"><a href="/privacidade">Privacidade</a></footer>
+</body>
+</html>
