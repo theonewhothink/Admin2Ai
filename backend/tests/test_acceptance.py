@@ -116,6 +116,9 @@ def test_newly_fixed_behaviour_is_cited() -> None:
     """The fixes this QA pass made are proven where the checklist says they pass."""
     cited = " ".join(ref for c in CHECKS.values() for ref in c.evidence)
     for file in ("test_acceptance_engine_fixes.py", "test_acceptance_honesty_fixes.py",
-                 "test_acceptance_settlements.py", "test_acceptance_cost_centers.py"):
+                 "test_acceptance_settlements.py", "test_acceptance_cost_centers.py",
+                 # the company lookup, tax calendar and languages; searches and connectors; resilience; local OCR
+                 "test_acceptance_lookup_calendar_languages.py", "test_acceptance_search_connectors.py",
+                 "test_acceptance_resilience.py", "test_reading_local_ocr.py"):
         assert file in cited
     assert re.search(r"test_acceptance_engine_fixes\.py::test_a_credit_note", cited)
