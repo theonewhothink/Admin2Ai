@@ -45,9 +45,7 @@ import io
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any
-
-import httpx
+from typing import TYPE_CHECKING, Any
 
 from backoffice.domain.models import CriticalField, ExtractionMethod
 from backoffice.extraction._optional import MissingDependencyError, import_optional
@@ -70,6 +68,9 @@ from ..base import (
 from ..redact import RedactedPages, VisionRedactor, vision_redactor
 from ._common import DEFAULT_CLOCK, Clock, build_result, confidence, text_lines
 from ._http import EndpointConfig, JSONEndpoint, b64
+
+if TYPE_CHECKING:  # only for annotations: httpx is imported where a request is made
+    import httpx
 
 __all__ = [
     "CLAUDE_VISION",

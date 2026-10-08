@@ -31,7 +31,8 @@ Public API
 ----------
 Contract: OCRProviderInterface, OCRResult, OCRPage, OCRLine, OCRWord,
     LayoutSignals, OCRCapabilities, OCRHints, PageImage, errors (OCRError...)
-Engines: PPOCRv6Provider (TINY/MEDIUM, HTTP or in-process), PaddleOCRVLProvider,
+Engines: PPOCRv6Provider (TINY/MEDIUM, HTTP or in-process), LocalOCRProvider (PP-OCRv6
+    small on this server's CPU through RapidOCR, no sidecar), PaddleOCRVLProvider,
     UnlimitedOCRProvider, CommercialOCRProvider (+ redactors), ClaudeVisionProvider
     (+ backoffice.ocr.redact.vision_redactor), FakeOCRProvider
 Registry: EngineRegistry and conventional names (PP_OCR_V6_MEDIUM, ...)
@@ -111,6 +112,8 @@ from .providers import (
     EndpointConfig,
     FakeOCRProvider,
     InProcessPaddleOCR,
+    LocalOCRConfig,
+    LocalOCRProvider,
     PaddleOCRVLConfig,
     PaddleOCRVLProvider,
     PPOCRConfig,
@@ -121,11 +124,13 @@ from .providers import (
     TextRedaction,
     UnlimitedOCRConfig,
     UnlimitedOCRProvider,
+    local_ocr_available,
     masked_pages_redactor,
     text_only_redactor,
 )
 from .registry import (
     COMMERCIAL,
+    LOCAL_OCR,
     PADDLEOCR_VL,
     PP_OCR_V6_MEDIUM,
     PP_OCR_V6_TINY,
@@ -156,6 +161,7 @@ __all__ = [
     "COMMERCIAL",
     "INVOICE_FIELDS",
     "LATIN_LANGUAGES",
+    "LOCAL_OCR",
     "PADDLEOCR_VL",
     "PP_OCR_V6_MEDIUM",
     "PP_OCR_V6_TINY",
@@ -188,6 +194,8 @@ __all__ = [
     "InMemoryBudgetLedger",
     "InProcessPaddleOCR",
     "LayoutSignals",
+    "LocalOCRConfig",
+    "LocalOCRProvider",
     "OCRCapabilities",
     "OCRError",
     "OCRFieldReading",
@@ -231,6 +239,7 @@ __all__ = [
     "decide",
     "estimate_pdf_pages",
     "gate",
+    "local_ocr_available",
     "locate",
     "masked_pages_redactor",
     "owner_message",

@@ -19,6 +19,8 @@ npm run dev        # http://localhost:3000
 | `npm start`         | Serve the production build                                 |
 | `npm run typecheck` | Generate route types (`next typegen`), then `tsc --noEmit` |
 | `npm run lint`      | ESLint with `eslint-config-next`                           |
+| `npm run test:ocr`  | `node --test` for the in-browser reading's bridge          |
+| `npm run build:pages` | The static demo (`out/`): engine, snapshot, OCR files, export |
 
 ## Modes
 
@@ -30,6 +32,19 @@ The mode is decided once, at build time, in `lib/mode.ts` (Next.js inlines `NEXT
 | `production` | `NEXT_PUBLIC_API_URL=…` and `NEXT_PUBLIC_REQUIRE_SIGNIN=1`   | Real customers: sign-in, onboarding against the API, Account in Settings.  |
 | `api`        | `NEXT_PUBLIC_API_URL=…` only                                | A local backend in demo mode, no sign-in; falls back to sample data.       |
 | `sample`     | nothing                                                     | Sample data only.                                                          |
+
+## Photos and PDFs on the static demo
+
+The static site has no server, so a photo or PDF uploaded on Scan is read in the visitor's browser before it reaches the engine (`lib/ocr.ts`), with no key and nothing sent anywhere:
+
+- **Text:** tesseract.js 7 (Tesseract LSTM in WebAssembly) with the Portuguese and English models.
+- **Fiscal QR code:** jsQR on the photo, or on the first pages of a PDF: the strongest second source, so a receipt whose QR code and text agree is verified.
+- **PDFs:** pdf.js gives a born-digital PDF's own text and metadata (no OCR needed); a scanned PDF's pages are rendered and read.
+- **Blur:** the photo's edge sharpness, measured exactly as the server does, so a photo too blurred to read becomes the same "take it again" task.
+
+What was read goes with the upload (`POST /api/evidence` with `reading`, built in `lib/ocr-bridge.ts`); the engine's `BrowserReader` (`backend/src/backoffice/reading/browser.py`) runs its normal Stage 0, field reading and verification on it. A reading is one source: never verified on its own. The upload, reading included, is journaled, so a reload replays it without reading the file again. The production server ignores readings sent by a browser and reads every file itself.
+
+The engines are self-hosted under `public/ocr/` (`npm run engine:ocr`, part of `build:pages`; copied from `node_modules`, never committed) and loaded only when a photo or PDF is uploaded, so the first load is unchanged: about 18 MB on disk, of which a photo fetches about 8.5 MB once (tesseract.js 0.2 MB, one 3.9 MB WebAssembly core, the Portuguese 1.4 MB and English 3.0 MB models) and a PDF adds pdf.js (1.8 MB). `python tests/e2e.py ocr` (after `npm run build:pages`) uploads a photographed café receipt, a scanned PDF and a blurred photo in Chromium and checks what Documents shows, also after a reload; the Pages workflow runs it before publishing.
 
 ## Production mode
 
@@ -51,7 +66,7 @@ npm run build && npm start
 
 ### Browser checks
 
-`python tests/e2e.py production` builds in production mode against a small mock of the production API written in the test (cookie session, CSRF header, 401s; data endpoints answered by the real demo engine) and drives Chromium through sign-in, sign-up, onboarding, Settings → Account and sign-out, checking the headers, labels, `aria-describedby`, focus and plain-language errors. `python tests/e2e.py demo` (after `npm run build:pages`) checks that the static demo never redirects to sign-in or calls an auth endpoint. Needs `pip install playwright` and `python -m playwright install chromium`; `SCREENSHOT_DIR=…` saves screenshots at 1440 and 390 px. CI runs the production check.
+`python tests/e2e.py production` builds in production mode against a small mock of the production API written in the test (cookie session, CSRF header, 401s; data endpoints answered by the real demo engine) and drives Chromium through sign-in, sign-up, onboarding, Settings → Account and sign-out, checking the headers, labels, `aria-describedby`, focus and plain-language errors. `python tests/e2e.py demo` (after `npm run build:pages`) checks that the static demo never redirects to sign-in or calls an auth endpoint; `python tests/e2e.py ocr` checks that photos and scanned PDFs are read in the browser (above). Needs `pip install playwright` and `python -m playwright install chromium`; `SCREENSHOT_DIR=…` saves screenshots at 1440 and 390 px. CI runs the production check.
 
 ## Connecting the backend
 
@@ -76,7 +91,7 @@ All data access goes through `lib/api.ts`. Each call works as follows:
 | `GET /api/companies`                   | Companies, company page          | `CompanySummary[]` or `{ companies: [...] }`                      |
 | `GET /api/months/{company_id}/{yyyy-mm}` | Company page                   | `MonthClose`                                                      |
 | `POST /api/ask`                        | Ask (browser)                    | body `{ question }` → `{ answer, evidence: [{ label, id }] }`     |
-| `POST /api/evidence`                   | Scan / upload (browser)          | multipart field `file`, any 2xx                                   |
+| `POST /api/evidence`                   | Scan / upload (browser)          | multipart field `file`, any 2xx (static demo: JSON with `reading`) |
 
 The three POSTs are sent from the browser, so the backend must allow CORS from the web origin.
 

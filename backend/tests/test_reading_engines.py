@@ -380,11 +380,12 @@ def test_sidecar_down_is_recorded_and_the_upload_is_kept() -> None:
 
 def test_reader_from_env() -> None:
     assert reader_from_env({"BACKOFFICE_DOCUMENT_READING": "off"}) is None
-    plain = reader_from_env({})
+    local = {"BACKOFFICE_OCR_LOCAL": "off"}  # the local PP-OCRv6 engine has tests of its own (test_reading_local_ocr)
+    plain = reader_from_env(local)
     assert plain is not None and plain.engines() == () and not plain.external_ai
-    no_key = reader_from_env({"BACKOFFICE_EXTERNAL_AI": "on"})
+    no_key = reader_from_env({**local, "BACKOFFICE_EXTERNAL_AI": "on"})
     assert no_key is not None and not no_key.external_ai and no_key.engines() == ()
-    on = reader_from_env({"BACKOFFICE_EXTERNAL_AI": "on", "ANTHROPIC_API_KEY": "sk-x",
+    on = reader_from_env({**local, "BACKOFFICE_EXTERNAL_AI": "on", "ANTHROPIC_API_KEY": "sk-x",
                           "BACKOFFICE_VISION_COST_PER_PAGE": "0.05", "BACKOFFICE_OCR_MONTHLY_BUDGET": "2.50"})
     assert on is not None and on.external_ai and on.engines() == (COMMERCIAL,)
     provider = on._registry.find(COMMERCIAL)

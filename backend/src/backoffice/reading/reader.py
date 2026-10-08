@@ -7,8 +7,9 @@ the orchestrator's Document agent needs:
    payloads, embedded e-invoice XML. The caller's country pack turns them
    into field observations (``ReadRequest.stage0_fields``).
 2. **The OCR chain**: the existing :class:`~backoffice.ocr.router.OCRRouter`
-   with the engines registered by name (a PP-OCRv6 / PaddleOCR-VL sidecar,
-   the Claude vision fallback). The router skips OCR entirely when Stage 0
+   with the engines registered by name (a PP-OCRv6 / PaddleOCR-VL sidecar, or
+   PP-OCRv6 in this process when no sidecar is configured, the Claude vision
+   fallback). The router skips OCR entirely when Stage 0
    settles every required field, never pays when the document contradicts
    itself, and only calls the paid external engine while fields are missing
    or disputed, within the tenant's budget (§17).
@@ -21,17 +22,25 @@ the orchestrator's Document agent needs:
 
 Nothing here decides quality: readings are returned with their engine as
 source and method OCR/VLM, and the Verification agent grades them (§18, §57).
+A photo's quality is the phone's hints plus the reader's own estimate: its
+header (size, resolution, orientation) and, when Pillow and numpy are
+installed, the sharpness of its print (``measure_pixels``): a blurred photo
+goes to the stronger engine and, if nothing can read it, becomes one task to
+take it again (§11).
 
 The orchestrator is synchronous (and runs in a browser without any of
 this); engines are asynchronous. :func:`run_sync` runs the chain on a fresh
 event loop, in a helper thread when the caller is already inside one (the
 FastAPI handlers are ``async``). Engines' HTTP clients are closed inside that
-loop after every document.
+loop after every document. In the browser (Pyodide) there is no blocking event
+loop: the chain is stepped directly, which works because the browser's engines
+answer from readings already made and never wait.
 """
 
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -65,6 +74,8 @@ _VLM_TYPES = {
 
 def run_sync(factory: Callable[[], Awaitable[T]]) -> T:
     """Run a coroutine to completion from synchronous code, inside or outside an event loop."""
+    if sys.platform == "emscripten":  # Pyodide: no thread, no loop that can block
+        return _step(factory())
     try:
         asyncio.get_running_loop()
     except RuntimeError:
@@ -75,6 +86,17 @@ def run_sync(factory: Callable[[], Awaitable[T]]) -> T:
 
 async def _as_coroutine(factory: Callable[[], Awaitable[T]]) -> T:
     return await factory()
+
+
+def _step(awaitable: Awaitable[T]) -> T:
+    """Run a coroutine that never waits on anything, without an event loop."""
+    coroutine = _as_coroutine(lambda: awaitable)
+    try:
+        coroutine.send(None)
+    except StopIteration as done:
+        return done.value  # type: ignore[no-any-return]
+    coroutine.close()
+    raise RuntimeError("an engine waited on input or output, which this environment cannot do")
 
 
 @dataclass(frozen=True)
@@ -175,7 +197,7 @@ class DocumentReader:
     def read(self, request: ReadRequest) -> ReadOutcome:
         mime = sniff_mime(request.data) or request.mime_type
         if mime == MIME_PDF:
-            stage0 = read_pdf_stage0(request.data, self.qr_decoder)
+            stage0 = self.stage0_pdf(request.data)
         elif mime in IMAGE_MIME_TYPES:
             stage0 = read_image_stage0(request.data, self.qr_decoder)
         else:
@@ -199,17 +221,26 @@ class DocumentReader:
             needs_person=ocr["needs_person"],
         )
 
-    @staticmethod
-    def _quality(request: ReadRequest, mime: str) -> Any:
+    def stage0_pdf(self, data: bytes) -> Stage0:
+        """Stage 0 of a PDF: its text layer, QR payloads and embedded XML."""
+        return read_pdf_stage0(data, self.qr_decoder)
+
+    def measure(self, data: bytes) -> Any:
+        """Pixel measurements of a photo (edge sharpness), when Pillow and numpy are installed; else None."""
+        from backoffice.extraction.quality import measure_pixels
+
+        return measure_pixels(data)
+
+    def _quality(self, request: ReadRequest, mime: str) -> Any:
         """The image's quality report (§11, §15): the reader's own estimate from the photo's header (size,
-        resolution, orientation) plus what the phone measured when it was taken. None for a PDF the phone
-        said nothing about."""
+        resolution, orientation) and its pixels (sharpness), plus what the phone measured when it was
+        taken. None for a PDF the phone said nothing about."""
         from backoffice.extraction.quality import ImageMetrics, QualityFlag, QualityReport, assess_image
 
         known = {f.value for f in QualityFlag}
         phone = frozenset(QualityFlag(h) for h in request.quality_hints if h in known)
         if mime in IMAGE_MIME_TYPES:
-            report = assess_image(request.data)
+            report = assess_image(request.data, self.measure(request.data))
         elif phone:
             report = QualityReport(frozenset(), ImageMetrics(), frozenset())
         else:
@@ -254,9 +285,20 @@ class DocumentReader:
         registry = self._registry
         if registry is None or not len(registry) or request.extractor is None:
             return None
-        from backoffice.ocr import COMMERCIAL, OCRHints, OCRRouter, PageImage, RouterConfig, RoutingRequest
+        from backoffice.ocr import (
+            COMMERCIAL,
+            LOCAL_OCR,
+            OCRHints,
+            OCRRouter,
+            PageImage,
+            RouterConfig,
+            RoutingRequest,
+        )
 
         config = self._router_config or RouterConfig(corroborate_single_source=True)
+        if config.roles.primary not in registry and LOCAL_OCR in registry:
+            # No PP-OCRv6 sidecar: PP-OCRv6 in this process is the primary engine (§14).
+            config = replace(config, roles=replace(config.roles, primary=LOCAL_OCR))
         extra: list[ReadStep] = []
         if not self.external_ai:
             config = replace(config, roles=replace(config.roles, commercial=None))

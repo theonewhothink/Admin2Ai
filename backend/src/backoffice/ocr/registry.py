@@ -16,6 +16,7 @@ from .base import OCRProviderInterface
 
 __all__ = [
     "COMMERCIAL",
+    "LOCAL_OCR",
     "PADDLEOCR_VL",
     "PP_OCR_V6_MEDIUM",
     "PP_OCR_V6_TINY",
@@ -30,6 +31,8 @@ PP_OCR_V6_MEDIUM = "pp-ocrv6-medium"
 PADDLEOCR_VL = "paddleocr-vl"
 UNLIMITED_OCR = "unlimited-ocr"
 COMMERCIAL = "commercial"
+# PP-OCRv6 in the server's own process (RapidOCR + onnxruntime), the primary engine when no sidecar is configured.
+LOCAL_OCR = "rapidocr"
 
 
 class UnknownEngineError(KeyError):

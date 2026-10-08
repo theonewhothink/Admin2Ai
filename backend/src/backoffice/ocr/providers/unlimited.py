@@ -22,8 +22,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from functools import partial
-
-import httpx
+from typing import TYPE_CHECKING
 
 from backoffice.domain.models import ExtractionMethod
 
@@ -40,6 +39,9 @@ from ..base import (
 from ._chat import DEFAULT_TRANSCRIBE_PROMPT, chat_payload, chat_text, file_part, image_part, split_pages
 from ._common import DEFAULT_CLOCK, Clock, build_result, gather_ordered, text_lines
 from ._http import EndpointConfig, JSONEndpoint
+
+if TYPE_CHECKING:  # only for annotations: httpx is imported where a request is made
+    import httpx
 
 __all__ = [
     "DEFAULT_TRANSCRIBE_PROMPT",

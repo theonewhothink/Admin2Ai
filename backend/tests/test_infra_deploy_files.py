@@ -115,7 +115,9 @@ def test_dockerfile_is_slim_non_root_and_serves_uvicorn() -> None:
     assert re.search(r"^FROM python:3\.11-slim$", text, re.M)
     user = re.findall(r"^USER (\S+)", text, re.M)
     assert user and not user[-1].startswith(("root", "0"))
-    assert 'pip install -e ".[workflows,server,documents,qr,vision]"' in text  # temporalio, psycopg, boto3, anthropic, readers
+    # temporalio, psycopg, boto3, anthropic, the readers and PP-OCRv6 in the process (ocr-local)
+    assert 'pip install -e ".[workflows,server,documents,qr,vision,ocr-local]"' in text
+    assert 'pip install "opencv-python-headless==$cv"' in text  # no X11/GL libraries in a slim image
     assert 'CMD ["uvicorn", "backoffice.api.app:app"' in text
     assert text.index("USER ") > text.index("pip install")  # installs as root, runs as the user
 
@@ -141,6 +143,8 @@ def test_ci_uses_the_requested_runtimes() -> None:
     text = CI.read_text()
     assert 'python-version: "3.11"' in text and "node-version: 22" in text
     assert 'pip install -e "./backend[dev]"' in text
+    backend = "\n".join(step.get("run", "") for step in yaml.safe_load(text)["jobs"]["backend"]["steps"])
+    assert 'pip install -e "./backend[dev,ocr-local,qr]"' in backend  # the real OCR model runs in CI
 
 
 # --------------------------------------------------------------------------- Terraform

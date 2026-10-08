@@ -60,6 +60,16 @@ jobs:
           test -s out/engine/backoffice.zip
           test -s out/engine/snapshot.json
           test -s out/pyodide/pyodide.asm.wasm
+          test -s out/ocr/tesseract/lang/por.traineddata.gz
+
+      # A photographed receipt, a scanned PDF and a blurred photo uploaded on the built site: read in the
+      # browser with the site's own files only, verified by the engine, kept after a reload (tests/e2e.py ocr).
+      - name: Photos and scanned PDFs are read in the browser
+        working-directory: web
+        run: |
+          pip install "playwright==1.56.0"
+          python -m playwright install --with-deps chromium
+          python tests/e2e.py ocr
 
       - name: Publish to gh-pages
         working-directory: web/out

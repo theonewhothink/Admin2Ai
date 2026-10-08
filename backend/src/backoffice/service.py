@@ -3840,11 +3840,23 @@ class BackOfficeService:
 
     # ----------------------------------------------------------------- Evidence in
 
-    def upload_evidence(self, filename: str | None, content_type: str | None, data: bytes) -> dict[str, Any]:
+    def upload_evidence(self, filename: str | None, content_type: str | None, data: bytes,
+                        reading: Any = None) -> dict[str, Any]:
+        """Store and read one uploaded file. ``reading`` is what the visitor's browser read from it (the static
+        demo, backoffice.reading.browser); it is used only by a reader that takes device readings, never by the
+        server, which reads every file itself."""
         if not data:
             raise ServiceError(400, "There was nothing to save.")
         if len(data) > 25 * 1024 * 1024:
             raise ServiceError(413, "This file is too large to send.")
+        reader = self.repo.reader
+        if reading is not None and getattr(reader, "accepts_device_readings", False):
+            from backoffice.reading import DeviceReadingError
+
+            try:
+                reader.supply(data, reading)
+            except DeviceReadingError:
+                pass  # a malformed reading is ignored: the file is stored and says it was not read
         report = self.orchestrator.ingest_file(data, filename=filename, content_type=content_type,
                                                source_kind=SourceKind.UPLOAD, origin="upload")
         return self._report(report)
@@ -5070,7 +5082,7 @@ class BackOfficeService:
             ("POST", r("/api/ask"), lambda b: self.ask(_field(b, "question"))),
             ("POST", r("/api/evidence"),
              lambda b: self.upload_evidence(b.get("filename"), b.get("contentType") or b.get("content_type"),
-                                            _b64(b.get("dataBase64") or b.get("data_base64")))),
+                                            _b64(b.get("dataBase64") or b.get("data_base64")), b.get("reading"))),
             ("POST", r("/api/evidence/upload"), lambda b: self._upload_body(b)),
             ("POST", r("/api/receipts"), lambda b: self._upload_body(b)),
             ("POST", r("/api/share"), lambda b: self.share(b)),

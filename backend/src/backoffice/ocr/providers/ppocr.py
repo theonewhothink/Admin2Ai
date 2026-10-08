@@ -33,9 +33,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
 from functools import partial
-from typing import Any
-
-import httpx
+from typing import TYPE_CHECKING, Any
 
 from backoffice.domain.models import ExtractionMethod
 from backoffice.extraction._optional import import_optional
@@ -65,6 +63,9 @@ from ..layout import Box, geometry, infer_layout, to_bbox
 from ._common import DEFAULT_CLOCK, Clock, build_result, confidence, gather_ordered
 from ._http import EndpointConfig, JSONEndpoint, b64
 from ._paddlex import first_key, page_sizes, positive_int, pruned, rotation, unwrap
+
+if TYPE_CHECKING:  # only for annotations: httpx is imported where a request is made
+    import httpx
 
 __all__ = [
     "InProcessPaddleOCR",

@@ -30,9 +30,15 @@ COPY src ./src
 # The worker needs temporalio (the "workflows" extra); the production API needs
 # psycopg, boto3 and anthropic (the "server" extra), and reads uploaded PDFs and
 # photos: "documents" (PDF text), "qr" (fiscal QR codes), "vision" (page rendering
-# and masking before any external reading, §53).
+# and masking before any external reading, §53), "ocr-local" (PP-OCRv6 in this
+# process: photos and scanned PDFs are read with no sidecar and no network).
+# RapidOCR depends on opencv-python, which needs X11/GL libraries a slim image
+# does not have: the headless build of the same OpenCV version replaces it.
 RUN find src -name __pycache__ -type d -prune -exec rm -rf {} + \
-    && pip install -e ".[workflows,server,documents,qr,vision]"
+    && pip install -e ".[workflows,server,documents,qr,vision,ocr-local]" \
+    && cv="$(pip show opencv-python 2>/dev/null | sed -n 's/^Version: //p')" \
+    && if [ -n "$cv" ]; then pip uninstall -y opencv-python && pip install "opencv-python-headless==$cv"; fi \
+    && python -c "from backoffice.ocr import local_ocr_available; assert local_ocr_available()"
 
 COPY --from=db migrations /app/db/migrations
 COPY --from=db backoffice_db /app/db/backoffice_db

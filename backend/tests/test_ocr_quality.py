@@ -142,3 +142,48 @@ def test_metrics_from_phone_json_and_header_merge():
     assert report.metrics.width == 1500
     assert report.flags == {QualityFlag.BLURRY}
     assert QualityFlag.ROTATED in assess_image(jpeg(orientation=8)).flags
+
+
+# --------------------------------------------------------------------------- pixels (edge sharpness)
+
+PHOTOS = __import__("pathlib").Path(__file__).parent / "fixtures" / "photos"
+
+
+def test_edge_sharpness_flags_only_the_badly_blurred_photo():
+    pytest.importorskip("numpy")
+    pytest.importorskip("PIL")
+    from backoffice.extraction.quality import measure_pixels
+
+    scores = {}
+    for name in ("ft-fba2026-1207.jpg", "fs-pb2026-0441.jpg", "fs-mr2026-0088.jpg", "fs-mr2026-0088-blurred.jpg"):
+        data = (PHOTOS / name).read_bytes()
+        metrics = measure_pixels(data)
+        assert metrics is not None and metrics.sharpness is None  # its own measure, not a Laplacian variance
+        scores[name] = metrics.edge_sharpness
+        flags = assess_image(data, metrics).flags
+        assert (QualityFlag.BLURRY in flags) is (name == "fs-mr2026-0088-blurred.jpg"), (name, scores[name])
+    assert scores["fs-pb2026-0441.jpg"] > scores["fs-mr2026-0088.jpg"] > scores["fs-mr2026-0088-blurred.jpg"]
+
+
+def test_edge_sharpness_is_not_measured_on_a_blank_or_broken_image():
+    pytest.importorskip("numpy")
+    pil = pytest.importorskip("PIL.Image")
+    import io
+
+    from backoffice.extraction.quality import measure_pixels
+
+    blank = io.BytesIO()
+    pil.new("RGB", (800, 1000), (250, 250, 250)).save(blank, format="PNG")
+    assert measure_pixels(blank.getvalue()) is None  # no print: never "blurry"
+    assert measure_pixels(png()) is None  # a header with no pixels behind it
+    assert measure_pixels(b"not an image") is None
+
+
+def test_edge_sharpness_threshold_and_phone_metrics():
+    assert QualityFlag.BLURRY in assess(ImageMetrics(edge_sharpness=0.2)).flags
+    report = assess(ImageMetrics(edge_sharpness=0.9))
+    assert QualityFlag.BLURRY not in report.flags and "sharpness" not in report.unknown
+    assert "edge_sharpness" in assess(ImageMetrics(edge_sharpness=1.5)).unknown  # impossible: not measured
+    assert ImageMetrics.from_mapping({"edgeSharpness": 0.4}).edge_sharpness == 0.4
+    assert QualityFlag.BLURRY not in assess(ImageMetrics(edge_sharpness=0.2),
+                                            QualityThresholds(min_edge_sharpness=0.1)).flags

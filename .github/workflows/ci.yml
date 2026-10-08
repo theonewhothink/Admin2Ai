@@ -27,13 +27,17 @@ jobs:
           cache: pip
           cache-dependency-path: backend/pyproject.toml
 
+      # ocr-local and qr: the real PP-OCRv6 model (RapidOCR, ONNX on the CPU) and the
+      # QR decoder, so the photographed-receipt tests read real pixels here.
       - name: Install
-        run: pip install -e "./backend[dev]"
+        run: pip install -e "./backend[dev,ocr-local,qr]"
 
       # The runner image ships PostgreSQL server binaries: the database tests
       # start a throwaway cluster (pgvector-only tests skip; the sql job runs them).
       - name: Test
         working-directory: backend
+        env:
+          BACKOFFICE_REQUIRE_LOCAL_OCR: "1" # the photographed-receipt tests must run, never skip
         run: python -m pytest -q
 
   web:
@@ -55,6 +59,8 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run lint
+      # The in-browser reading's bridge to the engine (lib/ocr-bridge.ts), with node --test.
+      - run: npm run test:ocr
       - run: npm run build
         env:
           NEXT_TELEMETRY_DISABLED: "1"

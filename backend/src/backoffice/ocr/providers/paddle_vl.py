@@ -28,9 +28,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from functools import partial
-from typing import Any
-
-import httpx
+from typing import TYPE_CHECKING, Any
 
 from backoffice.domain.models import ExtractionMethod
 
@@ -52,6 +50,9 @@ from ._common import DEFAULT_CLOCK, Clock, build_result, gather_ordered
 from ._http import EndpointConfig, JSONEndpoint, b64
 from ._markup import html_table_rows, strip_tags
 from ._paddlex import first_key, page_sizes, positive_int, pruned, rotation, unwrap
+
+if TYPE_CHECKING:  # only for annotations: httpx is imported where a request is made
+    import httpx
 
 __all__ = ["PaddleOCRVLConfig", "PaddleOCRVLProvider", "page_from_layout", "parse_layout_response"]
 

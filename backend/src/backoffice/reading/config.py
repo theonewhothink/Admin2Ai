@@ -7,6 +7,9 @@ Variable                               Meaning
 ``BACKOFFICE_OCR_URL``                 PP-OCRv6 sidecar (PaddleX OCR-pipeline serving), e.g.
                                        ``http://ppocr:8080``; ``BACKOFFICE_OCR_PATH`` (``/ocr``),
                                        ``BACKOFFICE_OCR_API_KEY``, ``BACKOFFICE_OCR_TIMEOUT`` (s)
+``BACKOFFICE_OCR_LOCAL``               ``auto`` (default): when no ``BACKOFFICE_OCR_URL`` is set, PP-OCRv6
+                                       runs in this process (RapidOCR + onnxruntime, the ``ocr-local``
+                                       extra: free, no network, nothing leaves); ``off`` never
 ``BACKOFFICE_OCR_VL_URL``              PaddleOCR-VL sidecar (PaddleX layout-parsing serving);
                                        ``BACKOFFICE_OCR_VL_PATH`` (``/layout-parsing``),
                                        ``BACKOFFICE_OCR_VL_API_KEY``
@@ -83,10 +86,12 @@ def reader_from_env(env: Mapping[str, str] | None = None) -> DocumentReader | No
         ClaudeVisionProvider,
         EngineRegistry,
         InMemoryBudgetLedger,
+        LocalOCRProvider,
         PaddleOCRVLConfig,
         PaddleOCRVLProvider,
         PPOCRConfig,
         PPOCRv6Provider,
+        local_ocr_available,
     )
     from backoffice.ocr.providers.claude import DEFAULT_VISION_MODEL
 
@@ -94,6 +99,8 @@ def reader_from_env(env: Mapping[str, str] | None = None) -> DocumentReader | No
     if env.get("BACKOFFICE_OCR_URL"):
         registry.register(PPOCRv6Provider(PPOCRConfig(
             endpoint=_endpoint(env, "BACKOFFICE_OCR"), path=env.get("BACKOFFICE_OCR_PATH") or "/ocr")))
+    elif (env.get("BACKOFFICE_OCR_LOCAL") or "auto").strip().lower() not in _OFF and local_ocr_available():
+        registry.register(LocalOCRProvider())  # the primary engine when no sidecar is configured (§14)
     if env.get("BACKOFFICE_OCR_VL_URL"):
         registry.register(PaddleOCRVLProvider(PaddleOCRVLConfig(
             endpoint=_endpoint(env, "BACKOFFICE_OCR_VL"), path=env.get("BACKOFFICE_OCR_VL_PATH") or "/layout-parsing")))
