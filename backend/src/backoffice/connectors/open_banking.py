@@ -31,6 +31,7 @@ from typing import Any, Protocol, runtime_checkable
 
 import httpx
 
+from backoffice.countries import LazyPattern, pack_words
 from backoffice.domain.models import Transaction, TransactionKind, utcnow
 
 from .base import (
@@ -400,10 +401,9 @@ class GoCardlessBankAccountData:
 
 # --------------------------------------------------------------------------- domain mapping
 
-_CARD_LAST4 = re.compile(
-    r"(?:\*{2,}|x{2,}|•{2,}|\bcart[ãa]o\s*(?:n[º°.]?\s*)?|\bcard\s*(?:no\.?\s*)?(?:ending\s*(?:in\s*)?)?)(\d{4})\b",
-    re.IGNORECASE,
-)
+_CARD_LAST4 = LazyPattern(lambda: (  # a pack's own word for a card: "open_banking.card" (Portugal's "cartão nº")
+    r"(?:\*{2,}|x{2,}|•{2,}" + "".join(f"|{w}" for w in pack_words("open_banking.card"))
+    + r"|\bcard\s*(?:no\.?\s*)?(?:ending\s*(?:in\s*)?)?)(\d{4})\b"), re.IGNORECASE)
 _DIRECT_DEBIT_TEXT = re.compile(r"direct debit|d[ée]bito dire(c)?to|deb\.? dire(c)?to|\bSDD\b", re.IGNORECASE)
 
 

@@ -8,7 +8,7 @@ What it is good for is checking: this module reads its lines and compares
 them with the business's own documents and bank payments from that supplier.
 
 Reading (:func:`read_statement`)
-    Portuguese and English layouts, from a text layer (a PDF's text, an email,
+    English layouts and a pack's (Portugal's: "supplier_statements.*"), from a text layer (a PDF's text, an email,
     a text file) or a CSV export. Each line keeps its date, document number,
     description, debit, credit and running balance. Which side a line is on
     follows from the running balance when there is one (the balance goes up
@@ -41,7 +41,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from functools import cache
 
+from backoffice.countries import LazyPattern, pack_alternatives, pack_words
 from backoffice.learning.keys import fold
 from backoffice.learning.plain import count_phrase, day_month, format_money, join_and
 
@@ -80,31 +82,46 @@ _KIND_WORDS = {INVOICE: "invoice", CREDIT_NOTE: "credit note", DEBIT_NOTE: "debi
 
 # --------------------------------------------------------------------------- words
 
-# What a statement calls itself (folded text).
-_TITLE = re.compile(
-    r"(?<![a-z])(?:extrato\s+(?:de\s+)?conta[\s-]+corrente|extrato\s+de\s+cliente|conta[\s-]+corrente\s+(?:de\s+)?"
-    r"cliente|statement\s+of\s+account|account\s+statement|supplier\s+statement|customer\s+statement)(?![a-z])")
-_OPENING_WORDS = re.compile(
-    r"(?<![a-z])(?:saldo\s+(?:anterior|inicial|transitado|de\s+abertura)|opening\s+balance|balance\s+brought\s+"
-    r"forward|brought\s+forward|previous\s+balance|balance\s+b/?f)(?![a-z])")
-_CLOSING_WORDS = re.compile(
-    r"(?<![a-z])(?:saldo\s+(?:final|atual|actual|em\s+divida|devedor|a\s+pagar|em\s+aberto|em\s+\d)|total\s+em\s+"
-    r"(?:divida|aberto)|valor\s+em\s+divida|closing\s+balance|balance\s+due|amount\s+due|total\s+due|"
-    r"balance\s+outstanding|outstanding\s+balance|total\s+outstanding|balance\s+carried\s+forward|"
-    r"balance\s+c/?f)(?![a-z])")
-_CREDIT_WORDS = re.compile(r"(?<![a-z])(?:nota\s+de\s+credito|credit\s+note|credit\s+memo|devolucao)(?![a-z])")
-_DEBIT_WORDS = re.compile(r"(?<![a-z])(?:nota\s+de\s+debito|debit\s+note)(?![a-z])")
-_INVOICE_RECEIPT_WORDS = re.compile(r"(?<![a-z])(?:fa[c]?tura[\s-]+recibo|invoice[\s-]+receipt)(?![a-z])")
-_PAYMENT_WORDS = re.compile(
-    r"(?<![a-z])(?:recibo|pagamento|pago|liquidacao|transferencia|payment|paid|transfer|remittance|"
-    r"receipt|cobranca|debito\s+direto|direct\s+debit)(?![a-z])")
-_INVOICE_WORDS = re.compile(r"(?<![a-z])(?:fatura|factura|invoice|fatura\s+simplificada)(?![a-z])")
-_PREFIX_KINDS: dict[str, str] = {
-    **dict.fromkeys(("FT", "FAC", "FA", "FTR", "FR", "FS", "INV", "IN", "SI", "F"), INVOICE),
-    **dict.fromkeys(("NC", "CN", "CRN", "NCR", "CR"), CREDIT_NOTE),
-    **dict.fromkeys(("ND", "DN", "DBN"), DEBIT_NOTE),
-    **dict.fromkeys(("RE", "REC", "RC", "RG", "PAY", "PMT", "PG", "TRF", "LQ", "PAG"), PAYMENT),
+# What a statement calls itself, and what its lines say they are (folded text): English, and a pack's own words
+# ("supplier_statements.<concept>": Portugal's "extrato de conta corrente", "saldo anterior", "nota de crédito").
+
+
+def _or(concept: str) -> str:
+    return "".join(f"|{w}" for w in pack_words(f"supplier_statements.{concept}"))
+
+
+def _words(concept: str, english: str) -> LazyPattern:
+    return LazyPattern(lambda: (rf"(?<![a-z])(?:{pack_alternatives(f'supplier_statements.{concept}')}|{english})"
+                                r"(?![a-z])"))
+
+
+_TITLE = _words("title", r"statement\s+of\s+account|account\s+statement|supplier\s+statement|customer\s+statement")
+_OPENING_WORDS = _words("opening", r"opening\s+balance|balance\s+brought\s+forward|brought\s+forward|"
+                                   r"previous\s+balance|balance\s+b/?f")
+_CLOSING_WORDS = _words("closing", r"closing\s+balance|balance\s+due|amount\s+due|total\s+due|balance\s+outstanding|"
+                                   r"outstanding\s+balance|total\s+outstanding|balance\s+carried\s+forward|"
+                                   r"balance\s+c/?f")
+_CREDIT_WORDS = _words("credit_note", r"credit\s+note|credit\s+memo")
+_DEBIT_WORDS = _words("debit_note", r"debit\s+note")
+_INVOICE_RECEIPT_WORDS = _words("invoice_receipt", r"invoice[\s-]+receipt")
+_PAYMENT_WORDS = _words("payment", r"recibo|transferencia|payment|paid|transfer|remittance|receipt|"
+                                   r"direct\s+debit")
+_INVOICE_WORDS = _words("invoice", r"factura|invoice")
+# Document-number prefixes by kind; a pack adds its own series ("supplier_statements.prefix:<kind>", plain:
+# Portugal's "FT", "FR", "NC", "RG").
+_PREFIXES: dict[str, tuple[str, ...]] = {
+    INVOICE: ("FAC", "FA", "INV", "IN", "SI", "F"),
+    CREDIT_NOTE: ("CN", "CRN", "CR"),
+    DEBIT_NOTE: ("DN", "DBN"),
+    PAYMENT: ("RE", "REC", "RC", "PAY", "PMT", "TRF"),
 }
+
+
+@cache
+def _prefix_kinds() -> dict[str, str]:
+    return {prefix: kind for kind, prefixes in _PREFIXES.items()
+            for prefix in (*pack_words(f"supplier_statements.prefix:{kind}"), *prefixes)}
+
 
 _DATE = re.compile(r"(?<![\d/.-])(?:(\d{1,2})[/.-](\d{1,2})[/.-](\d{4}|\d{2})|(\d{4})-(\d{2})-(\d{2}))(?![\d/.-])")
 _CURRENCY = r"(?:€|EUR|£|GBP|\$|USD)"
@@ -116,13 +133,14 @@ _DOC_NUMBER = re.compile(
     r"(?<![\w/])(?:(?P<prefix>[A-Z]{1,5})\s+)?(?P<body>[A-Z0-9][A-Z0-9.\-]{0,20}/\d{1,10})(?![\w/])"
     r"|(?<![\w/])(?P<code>[A-Z]{2,5}(?:-\d{1,12}|\d{2,12})(?:[-/]\d{1,10})?)(?![\w/])"
     r"|(?<![\w/])#(?P<hash>\d{3,12})(?![\w/])")
-_PERIOD = re.compile(
-    r"(?:periodo|period|de|from|entre|between)\s*:?\s*(?P<a>\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}-\d{2}-\d{2})"
-    r"\s*(?:a|ate|to|-|–|e|and|until)\s*(?P<b>\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}-\d{2}-\d{2})")
-_AS_OF = re.compile(
-    r"(?:data\s+do\s+extrato|extrato\s+em|saldo\s+em|em\s+aberto\s+(?:a|em)|statement\s+date|open\s+items\s+at|"
+_PERIOD = LazyPattern(lambda: (
+    rf"(?:period|de|from|between{_or('period_from')})\s*:?\s*(?P<a>\d{{1,2}}[/.-]\d{{1,2}}[/.-]\d{{2,4}}|"
+    rf"\d{{4}}-\d{{2}}-\d{{2}})\s*(?:to|-|–|and|until{_or('period_to')})\s*"
+    r"(?P<b>\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}-\d{2}-\d{2})"))
+_AS_OF = LazyPattern(lambda: (
+    rf"(?:{pack_alternatives('supplier_statements.as_of')}|statement\s+date|open\s+items\s+at|"
     r"as\s+(?:of|at)|data)\s*:?\s*"
-    r"(?P<d>\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}-\d{2}-\d{2})")
+    r"(?P<d>\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}-\d{2}-\d{2})"))
 
 
 def _to_date(text: str) -> date | None:
@@ -200,8 +218,8 @@ def _kind(number: str | None, description: str) -> str:
         return PAYMENT
     if _INVOICE_WORDS.search(text):
         return INVOICE
-    if prefix in _PREFIX_KINDS:
-        return _PREFIX_KINDS[prefix]
+    if prefix in _prefix_kinds():
+        return _prefix_kinds()[prefix]
     return OTHER
 
 
@@ -416,19 +434,23 @@ def _read_text(text: str) -> list[_Raw]:
     return out
 
 
+# A CSV export's headings by column (folded): English and Spanish, and a pack's ("supplier_statements.column:<name>").
 _CSV_COLUMNS: dict[str, tuple[str, ...]] = {
-    "date": ("data", "date", "data doc", "data documento", "data mov", "data movimento", "data do documento",
-             "document date", "posting date", "data lancamento"),
-    "number": ("documento", "doc", "n documento", "no documento", "numero", "numero documento", "n doc",
-               "document", "document no", "document number", "doc no", "reference", "ref", "referencia",
-               "invoice", "invoice no", "invoice number", "n fatura", "numero fatura"),
-    "description": ("descricao", "description", "details", "detalhe", "tipo", "type", "tipo documento",
-                    "document type", "movimento", "narrative"),
-    "debit": ("debito", "debit", "debitos", "debits", "charges", "charge", "a debito"),
-    "credit": ("credito", "credit", "creditos", "credits", "payments", "a credito"),
-    "balance": ("saldo", "balance", "running balance", "saldo acumulado", "saldo corrente"),
-    "amount": ("valor", "montante", "amount", "importe", "total"),
+    "date": ("date", "document date", "posting date"),
+    "number": ("doc", "numero", "n doc", "document", "document no", "document number", "doc no", "reference", "ref",
+               "referencia", "invoice", "invoice no", "invoice number"),
+    "description": ("description", "details", "type", "document type", "narrative"),
+    "debit": ("debito", "debit", "debits", "charges", "charge"),
+    "credit": ("credito", "credit", "credits", "payments"),
+    "balance": ("saldo", "balance", "running balance"),
+    "amount": ("valor", "amount", "importe", "total"),
 }
+
+
+@cache
+def _csv_columns() -> dict[str, frozenset[str]]:
+    return {name: frozenset((*words, *pack_words(f"supplier_statements.column:{name}")))
+            for name, words in _CSV_COLUMNS.items()}
 
 
 def _header_key(cell: str) -> str:
@@ -447,7 +469,7 @@ def _read_csv(text: str) -> list[_Raw] | None:
         columns: dict[str, int] = {}
         for index, cell in enumerate(header):
             key = " ".join(_header_key(cell).split())
-            for name, words in _CSV_COLUMNS.items():
+            for name, words in _csv_columns().items():
                 if name not in columns and key in words:
                     columns[name] = index
                     break

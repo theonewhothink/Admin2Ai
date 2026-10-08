@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
+from backoffice.countries import LazyPattern, pack_words
 from backoffice.domain.models import Transaction, TransactionKind
 
 from ._text import currency_code, fold
@@ -135,9 +136,10 @@ NO_METADATA = BankMetadata()
 _AMOUNT = r"\d{1,3}(?:[ .,]\d{3})*(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?"
 _CUR_THEN_AMOUNT = re.compile(rf"(?<![A-Z])([A-Z]{{3}})\s?({_AMOUNT})(?![\d])")
 _AMOUNT_THEN_CUR = re.compile(rf"(?<![\d.,])({_AMOUNT})\s?([A-Z]{{3}})(?![A-Z])")
-_RATE = re.compile(
-    r"(?:RATE|TAXA|CAMBIO|CAMBIO APLICADO|TIPO CAMBIO|FX|@)\s*:?\s*(\d+[.,]\d+)"
-)
+_RATE = LazyPattern(lambda: (  # a pack's own word for the rate: "bank.fx_rate" (Portugal's "TAXA")
+    r"(?:RATE" + "".join(f"|{w}" for w in pack_words("bank.fx_rate")) + r"|CAMBIO|CAMBIO APLICADO|TIPO CAMBIO|FX|@)"
+    r"\s*:?\s*(\d+[.,]\d+)"
+))
 _KNOWN_CURRENCIES = frozenset(
     {"EUR", "USD", "GBP", "CHF", "JPY", "CAD", "AUD", "SEK", "NOK", "DKK", "PLN",
      "CZK", "HUF", "RON", "BGN", "ILS", "BRL", "MXN", "CNY", "HKD", "SGD", "ZAR",
@@ -205,16 +207,10 @@ def _parse_rate(raw: str) -> Decimal | None:
 
 # --------------------------------------------------------------------------- card repayments
 
-# Statement wording for a debit that pays off a credit card (PT / ES / EN).
-# Bank-statement conventions, not regulation; extend as feeds are observed.
+# Statement wording for a debit that pays off a credit card (ES / EN; a pack's own: "bank.card_repayment",
+# Portugal's "LIQUIDACAO CARTAO"). Bank-statement conventions, not regulation; extend as feeds are observed.
 # NOT a card-terminal sales payout (money in from an acquirer): see ``payouts``.
 CARD_REPAYMENT_PHRASES: tuple[str, ...] = (
-    "LIQUIDACAO CARTAO",
-    "LIQ CARTAO",
-    "LIQUIDACAO DE CARTAO",
-    "PAGAMENTO CARTAO CREDITO",
-    "PAGAMENTO CARTAO DE CREDITO",
-    "PAG CARTAO CREDITO",
     "LIQUIDACION TARJETA",
     "PAGO TARJETA CREDITO",
     "CREDIT CARD PAYMENT",
@@ -255,7 +251,7 @@ def is_card_repayment(tx: Transaction, meta: BankMetadata | None = None) -> bool
     if is_card_purchase(tx):
         return False  # a purchase made with a card, not a repayment of one
     text = f"{tx.counterparty} {tx.description}"
-    return phrase_in(text, CARD_REPAYMENT_PHRASES) is not None
+    return phrase_in(text, (*pack_words("bank.card_repayment"), *CARD_REPAYMENT_PHRASES)) is not None
 
 
 # The older name, kept for callers: it has always meant repaying a credit card, never a sales payout.

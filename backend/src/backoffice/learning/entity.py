@@ -55,9 +55,11 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from enum import Enum
+from functools import cache
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from backoffice.countries import LazyPattern, pack_alternatives, pack_words
 from backoffice.domain.models import Document, LegalEntity, Quality, Transaction
 
 from .keys import counterparty_key, display_name, fold, qualified_tax_id, same_tax_id
@@ -273,17 +275,23 @@ def _billing_name_vote(name: str | None, ctx: _Context, directory: CompanyDirect
     return Vote(VoteKind.BILLING_NAME, hits[0], f"Made out to {shown}", strong=False)
 
 
-_POSTAL_CODE = re.compile(r"(?<!\d)(\d{4})\s*-\s*(\d{3})(?!\d)")  # Portuguese postal code 1200-384
-_ADDRESS_FILLER = frozenset({"n", "no", "nr", "num", "numero", "number", "o", "a", "de", "da", "do", "das", "dos",
-                             "e", "the", "of"})
+# A postal code as a pack's country writes it ("entity.postal_code": Portugal's 1200-384, its parts as groups), and
+# words that are never part of an address (with a pack's own: "entity.address_filler").
+_POSTAL_CODE = LazyPattern(lambda: pack_alternatives("entity.postal_code"))
+_ADDRESS_FILLER = frozenset({"n", "no", "nr", "num", "numero", "number", "de", "the", "of"})
+
+
+@cache
+def _address_filler() -> frozenset[str]:
+    return _ADDRESS_FILLER | frozenset(pack_words("entity.address_filler"))
 
 
 def _address_parts(text: str) -> tuple[str | None, frozenset[str]]:
     folded = fold(text)
     found = _POSTAL_CODE.search(folded)
-    code = f"{found.group(1)}-{found.group(2)}" if found else None
+    code = "-".join(g for g in found.groups() if g) if found else None
     rest = _POSTAL_CODE.sub(" ", folded)
-    return code, frozenset(t for t in re.split(r"[^a-z0-9]+", rest) if t and t not in _ADDRESS_FILLER)
+    return code, frozenset(t for t in re.split(r"[^a-z0-9]+", rest) if t and t not in _address_filler())
 
 
 def same_address(known: str, printed: str) -> bool:

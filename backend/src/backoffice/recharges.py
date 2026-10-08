@@ -22,21 +22,21 @@ Pure Python over the engine's records; changes nothing.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
 from typing import Any
 
+from backoffice.countries import LazyPattern, pack_alternatives
 from backoffice.domain.cost_centers import CostCenter
 from backoffice.learning.keys import fold
 
 __all__ = ["ClientRecharge", "RechargeBook", "RechargeSummary"]
 
 _ZERO = Decimal("0.00")
-_PAYS_BACK = re.compile(
-    r"(?<![a-z])(?:reembols\w*|refatura\w*|re-?invoic\w*|reimburs\w*|recharg\w*|rebill\w*|despesas|expenses|"
-    r"disbursements?|media|meios|adiantamento|advance|pass[\s-]+through)(?![a-z])")
+_PAYS_BACK = LazyPattern(lambda: (  # a pack's own words in "recharges.pays_back" (Portugal's "refaturação")
+    rf"(?<![a-z])(?:{pack_alternatives('recharges.pays_back')}|re-?invoic\w*|reimburs\w*|recharg\w*|rebill\w*|"
+    r"expenses|disbursements?|media|advance|pass[\s-]+through)(?![a-z])"))
 
 
 @dataclass

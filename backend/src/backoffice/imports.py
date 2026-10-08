@@ -27,8 +27,10 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from functools import cache
 from typing import TYPE_CHECKING, Any
 
+from backoffice.countries import LazyPattern, pack_alternatives, pack_words
 from backoffice.domain.models import DocumentType
 
 if TYPE_CHECKING:
@@ -38,24 +40,33 @@ __all__ = ["ImportChain", "ImportPiece", "Reference", "find_chains", "import_vat
 
 ORDER, MRN, CONTAINER, BILL_OF_LADING = "order", "mrn", "container", "bill_of_lading"
 
-_ORDER_LABELLED = re.compile(
-    r"(?<![A-Za-z])(?:purchase\s+order|order|p\.?\s?o\.?|encomenda|pedido|nota\s+de\s+encomenda)(?![A-Za-z])"
-    r"\s*(?:n\.?\s?[ºo°]\.?|no\.?|nr\.?|number|num\.?|#|ref\.?)?\s*[:.]?\s*(?P<v>[A-Z0-9][A-Z0-9/\-.]{3,24}[A-Z0-9])",
-    re.IGNORECASE)
+# A pack's own words for each are in "imports.<concept>" (Portugal's "encomenda", "conhecimento de embarque",
+# "declaração aduaneira").
+_ORDER_LABELLED = LazyPattern(lambda: (
+    r"(?<![A-Za-z])(?:purchase\s+order|order|p\.?\s?o\.?|pedido|"
+    rf"{pack_alternatives('imports.order')})(?![A-Za-z])"
+    r"\s*(?:n\.?\s?[ºo°]\.?|no\.?|nr\.?|number|num\.?|#|ref\.?)?\s*[:.]?\s*"
+    r"(?P<v>[A-Z0-9][A-Z0-9/\-.]{3,24}[A-Z0-9])"), re.IGNORECASE)
 _ORDER_BARE = re.compile(r"\b(?P<v>PO[-/ ]?\d{2,4}(?:[-/]\d{1,6})+|PO[-/]?\d{4,})\b", re.IGNORECASE)
 _MRN = re.compile(r"\b(?P<v>\d{2}[A-Z]{2}[A-Z0-9]{14})\b")
 _CONTAINER = re.compile(r"\b(?P<v>[A-Z]{3}[UJZ]\s?\d{6}\s?\d)\b")
-_BILL = re.compile(
-    r"(?<![A-Za-z])(?:bill\s+of\s+lading|b\s?/\s?l|bl\s+no|conhecimento\s+de\s+embarque|awb|air\s+waybill)"
-    r"\s*(?:\s*\(\s*b\s?/\s?l\s*\))?"  # "Conhecimento de embarque (B/L): ..."
-    r"\s*(?:n\.?\s?[ºo°]\.?|no\.?|nr\.?|number|#)?[\s():.]*(?P<v>[A-Z0-9][A-Z0-9\-]{5,24})", re.IGNORECASE)
+_BILL = LazyPattern(lambda: (
+    rf"(?<![A-Za-z])(?:bill\s+of\s+lading|b\s?/\s?l|bl\s+no|{pack_alternatives('imports.bill')}|awb|air\s+waybill)"
+    r"\s*(?:\s*\(\s*b\s?/\s?l\s*\))?"  # "... (B/L): ..."
+    r"\s*(?:n\.?\s?[ºo°]\.?|no\.?|nr\.?|number|#)?[\s():.]*(?P<v>[A-Z0-9][A-Z0-9\-]{5,24})"), re.IGNORECASE)
 
-_CUSTOMS_PHRASES = ("declaracao aduaneira", "declaracao de importacao", "documento administrativo unico",
-                    "customs entry", "customs declaration", "import declaration", "declaracion aduanera")
-_FREIGHT_WORDS = ("freight", "frete", "transitario", "forwarder", "forwarding", "bill of lading",
-                  "conhecimento de embarque", "shipping", "transporte maritimo", "transporte internacional",
-                  "desalfandegamento", "customs clearance")
-_DEPOSIT_WORDS = ("deposit", "sinal", "adiantamento", "advance payment", "down payment", "prepayment", "anticipo")
+# Plain folded phrases (a pack's own: "imports.customs", "imports.freight", "imports.deposit", "imports.customs_word").
+_CUSTOMS_PHRASES = ("customs entry", "customs declaration", "import declaration", "declaracion aduanera")
+_FREIGHT_WORDS = ("freight", "forwarder", "forwarding", "bill of lading", "shipping", "transporte maritimo",
+                  "transporte internacional", "customs clearance")
+_DEPOSIT_WORDS = ("deposit", "advance payment", "down payment", "prepayment", "anticipo")
+
+
+@cache
+def _words(concept: str) -> tuple[str, ...]:
+    core = {"customs": _CUSTOMS_PHRASES, "freight": _FREIGHT_WORDS, "deposit": _DEPOSIT_WORDS,
+            "customs_word": ("dau", "mrn", "customs")}[concept]
+    return (*pack_words(f"imports.{concept}"), *core)
 _VAT_LINE = re.compile(r"^(?:.*\b(?:iva|vat|import\s+vat)\b.*?)(?P<v>\d{1,3}(?:[.\s]\d{3})*,\d{2}|\d+,\d{2}|"
                        r"\d{1,3}(?:,\d{3})*\.\d{2}|\d+\.\d{2})\s*(?:€|eur)?\s*$", re.IGNORECASE)
 
@@ -205,11 +216,11 @@ def _document_role(record: DocumentRecord, refs: Iterable[Reference]) -> str:
     folded = _fold(f"{record.document.supplier_name or ''}\n{record.text}")
     words = set(re.findall(r"[a-z]+", folded))
     kinds = {r.kind for r in refs}
-    if any(p in folded for p in _CUSTOMS_PHRASES) or (MRN in kinds and words & {"dau", "mrn", "customs"}):
+    if any(p in folded for p in _words("customs")) or (MRN in kinds and words & {"dau", "mrn", "customs"}):
         return "customs"
     if record.document.doc_type is DocumentType.PRO_FORMA:
         return "pro-forma"
-    if kinds & {CONTAINER, BILL_OF_LADING} and any(w in folded for w in _FREIGHT_WORDS):
+    if kinds & {CONTAINER, BILL_OF_LADING} and any(w in folded for w in _words("freight")):
         return "freight"
     return "invoice"
 
@@ -219,7 +230,7 @@ def _payment_role(rec: TxRecord, refs: Iterable[Reference], matched: Sequence[Im
     text = _fold(f"{rec.tx.counterparty} {rec.tx.description} {rec.tx.reference or ''}")
     if any(r.kind == MRN for r in refs):
         return "duties"
-    if any(w in text for w in _DEPOSIT_WORDS) or any(p.role == "pro-forma" for p in matched):
+    if any(w in text for w in _words("deposit")) or any(p.role == "pro-forma" for p in matched):
         return "deposit"
     if any(p.role == "freight" for p in matched):
         return "freight"
@@ -345,8 +356,8 @@ def find_chains(repo: Repository, *, company_id: str | None = None,
 def _is_customs_text(text: str, refs: Iterable[Reference]) -> bool:
     folded = _fold(text)
     words = set(re.findall(r"[a-z]+", folded))
-    return any(p in folded for p in _CUSTOMS_PHRASES) or (
-        any(r.kind == MRN for r in refs) and bool(words & {"dau", "mrn", "customs", "alfandega", "aduaneira"}))
+    return any(p in folded for p in _words("customs")) or (
+        any(r.kind == MRN for r in refs) and bool(words & set(_words("customs_word"))))
 
 
 def _stored_text(repo: Repository, evidence_id: str) -> str:

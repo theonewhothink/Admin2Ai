@@ -30,6 +30,7 @@ from collections.abc import Callable, Iterator, Mapping
 from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
 
+from backoffice.countries import LazyPattern, pack_words
 from backoffice.domain.models import EvidenceFormat, utcnow
 
 from .email import EmailIngestResult, ParsedEmail
@@ -105,19 +106,28 @@ def all_invoice_links(result: EmailIngestResult) -> Iterator[str]:
 
 # --------------------------------------------------------------------------- "see the invoice I sent on the 3rd"
 
-_DOCUMENT = r"(?:invoices?|receipts?|bills?|faturas?|facturas?|recibos?|fatura-recibo)"
-_SENT = (r"(?:sent|send|resent|forwarded|attached|enviei|envi[aá]mos|enviad[ao]s?|mandei|mand[aá]mos|reenviei"
-         r"|anexei|em anexo|seguiu|segue)")
-_EARLIER_WORDS = r"(?:earlier|before|previous(?:ly)?|last (?:week|month)|anterior(?:mente)?|antes|below|abaixo)"
-_EARLIER = re.compile(
-    rf"\b{_DOCUMENT}\b[^.\n]{{0,80}}?\b{_SENT}\b"  # "the invoice I sent on the 3rd", "a fatura que enviei"
-    rf"|\b{_SENT}\b[^.\n]{{0,60}}?\b{_DOCUMENT}\b[^.\n]{{0,60}}?\b{_EARLIER_WORDS}\b"  # "sent you the invoice earlier"
-    rf"|\b(?:see|ver|veja|consulte|check)\b[^.\n]{{0,40}}?\b{_DOCUMENT}\b[^.\n]{{0,60}}?\b{_EARLIER_WORDS}\b",
-    re.IGNORECASE,
-)
-_REPLY_SUBJECT = re.compile(r"^\s*(?:re|res|aw|sv|fw|fwd|enc|rv|tr)\s*:", re.IGNORECASE)
-_QUOTE_START = re.compile(
-    r"^\s*(?:on .{0,200} wrote:|em .{0,200} escreveu:|-{2,}\s*original message|de:\s|from:\s)", re.IGNORECASE)
+# English and Spanish; a pack's own words in "retrieval.<concept>" (Portugal's "a fatura que enviei", "Enc:",
+# "escreveu:"), alternatives in any case.
+
+
+def _with(concept: str) -> str:
+    return "".join(f"|{w}" for w in pack_words(f"retrieval.{concept}"))
+
+
+def _earlier() -> str:
+    document = rf"(?:invoices?|receipts?|bills?|facturas?|recibos?{_with('document')})"
+    sent = rf"(?:sent|send|resent|forwarded|attached|enviad[ao]s?{_with('sent')})"
+    earlier = (r"(?:earlier|before|previous(?:ly)?|last (?:week|month)|anterior(?:mente)?|antes|below"
+               rf"{_with('earlier')})")
+    return (rf"\b{document}\b[^.\n]{{0,80}}?\b{sent}\b"  # "the invoice I sent on the 3rd"
+            rf"|\b{sent}\b[^.\n]{{0,60}}?\b{document}\b[^.\n]{{0,60}}?\b{earlier}\b"  # "sent you the invoice earlier"
+            rf"|\b(?:see|ver|consulte|check{_with('see')})\b[^.\n]{{0,40}}?\b{document}\b[^.\n]{{0,60}}?\b{earlier}\b")
+
+
+_EARLIER = LazyPattern(_earlier, re.IGNORECASE)
+_REPLY_SUBJECT = LazyPattern(lambda: rf"^\s*(?:re|aw|sv|fw|fwd|rv|tr{_with('reply_prefix')})\s*:", re.IGNORECASE)
+_QUOTE_START = LazyPattern(lambda: (r"^\s*(?:on .{0,200} wrote:|-{2,}\s*original message|de:\s|from:\s"
+                                    rf"{_with('quote_start')})"), re.IGNORECASE)
 
 
 def _own_words(text: str) -> str:

@@ -23,9 +23,9 @@ Pure Python (runs in the browser build too).
 
 from __future__ import annotations
 
-import re
 from decimal import Decimal
 
+from backoffice.countries import LazyPattern, pack_words
 from backoffice.domain.models import Document, DocumentType
 from backoffice.learning import fold
 
@@ -47,15 +47,14 @@ HIGH_VALUE_MIN = Decimal("5000.00")  # total of a first purchase from a new supp
 
 CAPITAL_ASSET_FLAG = "Possible equipment purchase (capital asset) — accountant to confirm"
 
-# Folded (lower-case, accent-free) words that name equipment, Portuguese and English.
+# Folded (lower-case, accent-free) words that name equipment: English, and a pack's own ("purchases.equipment":
+# Portugal's "máquina", "portátil", "viatura").
 EQUIPMENT_WORDS: tuple[str, ...] = (
-    "maquina", "maquinas", "maquinaria", "equipamento", "equipamentos", "computador", "computadores",
-    "portatil", "portateis", "servidor", "servidores", "viatura", "viaturas", "veiculo", "veiculos",
-    "mobiliario", "machine", "machines", "machinery", "equipment", "laptop", "laptops", "computer",
+    "machine", "machines", "machinery", "equipment", "laptop", "laptops", "computer",
     "computers", "server", "servers", "vehicle", "vehicles",
 )  # fmt: skip
-_EQUIPMENT = re.compile(r"(?<![a-z0-9])(?:" + "|".join(sorted(EQUIPMENT_WORDS, key=len, reverse=True))
-                        + r")(?![a-z0-9])")
+_EQUIPMENT = LazyPattern(lambda: r"(?<![a-z0-9])(?:" + "|".join(
+    sorted((*pack_words("purchases.equipment"), *EQUIPMENT_WORDS), key=len, reverse=True)) + r")(?![a-z0-9])")
 
 # Documents that record a purchase the business books (not receipts of payment,
 # not credit notes, never supporting documents such as a pro-forma).

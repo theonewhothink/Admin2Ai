@@ -1,7 +1,8 @@
 """Supplier chasing (§22, §45): polite requests, reminders and reply matching.
 
 Messages are composed from facts only — invoice number when known, amount,
-payment date, and our company name and tax number — in Portuguese or English:
+payment date, and our company name and tax number — in English, or in the language of a supplier's country when
+its pack writes letters (``CompanyPack.supplier_letters``: Portugal's, in Portuguese):
 
     "Hello, could you please resend invoice FT 2026/183 relating to the
     €117.20 payment dated 18 September? Thank you."
@@ -30,16 +31,18 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
 from enum import Enum
+from functools import cache
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from backoffice.countries import CountryPackError, company_countries, company_pack
 from backoffice.domain.models import LegalEntity, Supplier, Transaction
 from backoffice.fraud.domains import email_domain, registrable_domain
 from backoffice.learning.keys import display_name, normalize_tax_id
-from backoffice.learning.plain import day_month, format_money, quantize_money
+from backoffice.learning.plain import day_month, format_money
 
 __all__ = [
-    "PT_MONTHS",
     "ChaseFacts",
     "ChaseMessage",
     "ChaseThread",
@@ -78,11 +81,41 @@ class Language(str, Enum):
     PT = "pt"
 
 
-PT_MONTHS = (
-    "janeiro", "fevereiro", "março", "abril", "maio", "junho",
-    "julho", "agosto", "setembro", "outubro", "novembro", "dezembro",
-)  # fmt: skip
-_PT_SYMBOLS = {"EUR": "€", "GBP": "£", "USD": "$"}
+def _letters(language: Language) -> Any | None:
+    """How a letter in ``language`` is worded: the letters of the company pack that writes in it (Portugal's for
+    Portuguese), or None for the core's English."""
+    return dict(_writers()).get(language)
+
+
+@cache
+def _writers() -> tuple[tuple[Language, Any], ...]:
+    out: dict[Language, Any] = {}
+    for _, language, letters in _writing_packs():
+        out.setdefault(language, letters)
+    return tuple(out.items())
+
+
+@cache
+def _writing_packs() -> tuple[tuple[str, Language, Any], ...]:
+    """(country code, language, letters) of every company pack that writes letters, in country order."""
+    languages = {lang.value for lang in Language}
+    out = []
+    for code in company_countries():
+        pack = company_pack(code)
+        letters = pack.supplier_letters()
+        if letters is not None and pack.language in languages:
+            out.append((code, Language(pack.language), letters))
+    return tuple(out)
+
+
+def _home_letters(country: str) -> Any | None:
+    """The letters of a company's own country's pack, when it writes any (its tax number then keeps its name)."""
+    try:
+        return company_pack(country.strip().upper()).supplier_letters()
+    except CountryPackError:
+        return None
+
+
 _TOKEN_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # Crockford base32: no I, L, O, U
 _TOKEN_LENGTH = 6
 _TOKEN_IN_SUBJECT = re.compile(r"\bref\b\.?\s*[:#]?\s*([0-9A-Z]{6})\b", re.IGNORECASE)
@@ -130,21 +163,13 @@ def _single_line(value: str) -> bool:
 
 
 def format_money_pt(amount: Decimal | int, currency: str = "EUR") -> str:
-    """'1.234,56 €' (Portuguese separators, symbol after the amount)."""
-    rounded = quantize_money(amount)
-    whole, cents = f"{abs(rounded):,.2f}".split(".")
-    digits = f"{whole.replace(',', '.')},{cents}"
-    sign = "-" if rounded < 0 else ""
-    code = currency.strip().upper()
-    return f"{sign}{digits} {_PT_SYMBOLS.get(code, code)}"
+    """Money as a letter in Portuguese writes it ('1.234,56 €'), by the pack that writes Portuguese letters."""
+    return _letters(Language.PT).money(amount, currency)
 
 
 def day_month_pt(value: date, today: date | None = None) -> str:
-    """'18 de setembro', or '18 de setembro de 2025' outside ``today``'s year."""
-    text = f"{value.day} de {PT_MONTHS[value.month - 1]}"
-    if today is not None and value.year != today.year:
-        text = f"{text} de {value.year}"
-    return text
+    """A day as a letter in Portuguese writes it (the year outside ``today``'s), by the pack that writes them."""
+    return _letters(Language.PT).day_month(value, today)
 
 
 def thread_token(tenant_id: str, subject_id: str) -> str:
@@ -159,11 +184,18 @@ def thread_token(tenant_id: str, subject_id: str) -> str:
 
 
 def choose_language(supplier: Supplier | None, email: str | None = None) -> Language:
-    """Portuguese for suppliers in Portugal (profile country or a .pt mailbox), else English."""
-    if supplier is not None and any(c.strip().upper() == "PT" for c in supplier.countries):
-        return Language.PT
+    """The language of a supplier's country when its pack writes letters (its profile country, else a mailbox in
+    that country's domain: Portugal's ".pt"), else English."""
+    writing = _writing_packs()
+    if supplier is not None:
+        for code, language, _ in writing:
+            if any(c.strip().upper() == code for c in supplier.countries):
+                return language
     domain = email_domain(email) if email else None
-    return Language.PT if domain and domain.endswith(".pt") else Language.EN
+    for code, language, _ in writing:
+        if domain and domain.endswith(f".{code.lower()}"):
+            return language
+    return Language.EN
 
 
 # --------------------------------------------------------------------------- facts and messages
@@ -251,10 +283,11 @@ def _guard(*texts: str) -> None:
 
 
 def _our_details(facts: ChaseFacts | RecurringChaseFacts | LinkChaseFacts) -> str:
-    is_pt = facts.company_country.strip().upper() == "PT"
-    tax_id = (normalize_tax_id(facts.company_tax_id) if is_pt else None) or facts.company_tax_id.strip()
-    label = "NIF" if is_pt else ("NIF/VAT" if facts.language is Language.PT else "VAT number")
-    lead = "Os nossos dados" if facts.language is Language.PT else "Our details"
+    home = _home_letters(facts.company_country)
+    tax_id = (normalize_tax_id(facts.company_tax_id) if home else None) or facts.company_tax_id.strip()
+    letters = _letters(facts.language)
+    label = home.tax_id_label if home else (letters.foreign_tax_id_label if letters else "VAT number")
+    lead = letters.our_details_lead if letters else "Our details"
     return f"{lead}: {facts.company_name}, {label} {tax_id}."
 
 
@@ -263,22 +296,18 @@ def _message_id(token: str, number: int, today: date, domain: str) -> str:
 
 
 def _money_and_date(facts: ChaseFacts, today: date) -> tuple[str, str]:
-    if facts.language is Language.PT:
-        return format_money_pt(facts.amount, facts.currency), day_month_pt(facts.paid_on, today)
+    letters = _letters(facts.language)
+    if letters is not None:
+        return letters.money(facts.amount, facts.currency), letters.day_month(facts.paid_on, today)
     return format_money(facts.amount, facts.currency), day_month(facts.paid_on, today)
 
 
 def _refund_request_text(facts: ChaseFacts, today: date) -> tuple[str, str]:
     """Money came back without its credit note: ask for the credit note (§20 refunds, §22)."""
     money, when = _money_and_date(facts, today)
-    if facts.language is Language.PT:
-        subject = f"Nota de crédito do reembolso de {money} de {when}"
-        body = (
-            f"Olá,\n\nRecebemos um reembolso de {money} a {when}. Poderiam, por favor, enviar-nos a nota de "
-            f"crédito correspondente? Agradecemos desde já.\n\n{_our_details(facts)}\n\n"
-            f"Com os melhores cumprimentos,\n{facts.company_name}"
-        )
-        return subject, body
+    letters = _letters(facts.language)
+    if letters is not None:
+        return letters.refund_request(money, when, _our_details(facts), facts.company_name)
     subject = f"Credit note for the {money} refund of {when}"
     body = (
         f"Hello,\n\nWe received a refund of {money} on {when}. Could you please send us the credit note for it? "
@@ -292,18 +321,9 @@ def _request_text(facts: ChaseFacts, today: date) -> tuple[str, str]:
         return _refund_request_text(facts, today)
     money, when = _money_and_date(facts, today)
     number = facts.invoice_number
-    if facts.language is Language.PT:
-        subject = f"Fatura {number}" if number else f"Fatura do pagamento de {money} de {when}"
-        ask = (
-            f"Poderiam, por favor, reenviar a fatura {number} referente ao pagamento de {money} de {when}?"
-            if number
-            else f"Poderiam, por favor, enviar-nos a fatura referente ao pagamento de {money} de {when}?"
-        )
-        body = (
-            f"Olá,\n\n{ask} Agradecemos desde já.\n\n{_our_details(facts)}\n\n"
-            f"Com os melhores cumprimentos,\n{facts.company_name}"
-        )
-        return subject, body
+    letters = _letters(facts.language)
+    if letters is not None:
+        return letters.request(number, money, when, _our_details(facts), facts.company_name)
     subject = f"Invoice {number}" if number else f"Invoice for the {money} payment of {when}"
     ask = (
         f"Could you please resend invoice {number} relating to the {money} payment dated {when}?"
@@ -317,24 +337,14 @@ def _request_text(facts: ChaseFacts, today: date) -> tuple[str, str]:
 def _reminder_text(facts: ChaseFacts, today: date) -> str:
     money, when = _money_and_date(facts, today)
     number = facts.invoice_number
+    letters = _letters(facts.language)
+    if letters is not None:
+        return letters.reminder(facts.refund, number, money, when, _our_details(facts), facts.company_name)
     if facts.refund:
-        if facts.language is Language.PT:
-            return (
-                f"Olá,\n\nRelembramos o nosso pedido: a nota de crédito do reembolso de {money} de {when}. "
-                f"Poderiam enviá-la assim que possível? Agradecemos desde já.\n\n{_our_details(facts)}\n\n"
-                f"Com os melhores cumprimentos,\n{facts.company_name}"
-            )
         return (
             f"Hello,\n\nA quick reminder about the credit note for the {money} refund of {when}. "
             f"Could you please send it when you can? Thank you.\n\n{_our_details(facts)}\n\n"
             f"Kind regards,\n{facts.company_name}"
-        )
-    if facts.language is Language.PT:
-        what = f"a fatura {number}" if number else "a fatura"
-        return (
-            f"Olá,\n\nRelembramos o nosso pedido: {what} referente ao pagamento de {money} de {when}. "
-            f"Poderiam enviá-la assim que possível? Agradecemos desde já.\n\n{_our_details(facts)}\n\n"
-            f"Com os melhores cumprimentos,\n{facts.company_name}"
         )
     what = f"invoice {number} for" if number else "the invoice for"
     return (
@@ -348,16 +358,9 @@ def _correction_text(facts: ChaseFacts, today: date) -> tuple[str, str]:
     """``facts.paid_on`` is the invoice's date here: the invoice is on hold and was not paid."""
     money, when = _money_and_date(facts, today)
     number = facts.invoice_number
-    if facts.language is Language.PT:
-        what = f"a fatura {number}" if number else "uma fatura"
-        subject = f"Fatura {number}: pedido de fatura corrigida" if number else "Pedido de fatura corrigida"
-        body = (
-            f"Olá,\n\nRecebemos {what} de {money}, com data de {when}, e alguns dos seus dados não correspondem "
-            "aos que temos registados. Não a vamos pagar tal como está.\n\n"
-            "Poderiam, por favor, enviar-nos uma fatura corrigida, ou confirmar-nos que está correta? "
-            f"Agradecemos desde já.\n\n{_our_details(facts)}\n\nCom os melhores cumprimentos,\n{facts.company_name}"
-        )
-        return subject, body
+    letters = _letters(facts.language)
+    if letters is not None:
+        return letters.correction(number, money, when, _our_details(facts), facts.company_name)
     what = f"invoice {number}" if number else "an invoice"
     subject = f"Invoice {number}: corrected invoice, please" if number else "Corrected invoice, please"
     body = (
@@ -403,22 +406,15 @@ class StatementItem:
             raise ValueError("document number must be one clean line (see clean_invoice_number)")
 
 
-_STATEMENT_WORDS = {
-    Language.EN: {"invoice": "Invoice", "credit_note": "Credit note", "debit_note": "Debit note"},
-    Language.PT: {"invoice": "Fatura", "credit_note": "Nota de crédito", "debit_note": "Nota de débito"},
-}
+_STATEMENT_WORDS = {"invoice": "Invoice", "credit_note": "Credit note", "debit_note": "Debit note"}
 
 
 def _statement_line(item: StatementItem, language: Language, currency: str, today: date) -> str:
-    word = _STATEMENT_WORDS[language].get(item.kind, _STATEMENT_WORDS[language]["invoice"])
+    letters = _letters(language)
+    if letters is not None:
+        return letters.statement_line(item.kind, item.number, item.on, item.amount, item.ours, currency, today)
+    word = _STATEMENT_WORDS.get(item.kind, _STATEMENT_WORDS["invoice"])
     number = f" {item.number}" if item.number else ""
-    if language is Language.PT:
-        when = f" de {day_month_pt(item.on, today)}" if item.on else ""
-        money = format_money_pt(item.amount, currency)
-        if item.ours is not None:
-            return (f"- {word}{number}{when}: no extrato {money}, na {word.lower()} que recebemos "
-                    f"{format_money_pt(item.ours, currency)}")
-        return f"- {word}{number}{when}, {money}"
     when = f" of {day_month(item.on, today)}" if item.on else ""
     money = format_money(item.amount, currency)
     if item.ours is not None:
@@ -457,20 +453,9 @@ def compose_statement_request(
         company_country=company_country, language=language))
     listed = "\n".join(_statement_line(i, language, currency, today) for i in items)
     one = len(items) == 1
-    if language is Language.PT:
-        if corrections:
-            subject = "Extrato de conta corrente: documentos com valores diferentes"
-            corrected = "o documento corrigido" if one else "os documentos corrigidos"
-            ask = ("O vosso extrato de conta corrente mostra valores diferentes dos documentos que recebemos:\n"
-                   f"{listed}\n\nPoderiam, por favor, enviar-nos {corrected}, ou uma nota de crédito ou de débito "
-                   "pela diferença?")
-        else:
-            subject = "Extrato de conta corrente: documentos em falta"
-            these = "este documento, que" if one else "estes documentos, que"
-            ask = (f"O vosso extrato de conta corrente indica {these} não recebemos:\n{listed}\n\n"
-                   f"Poderiam, por favor, {'enviá-lo' if one else 'enviá-los'}?")
-        body = (f"Olá,\n\n{ask} Agradecemos desde já.\n\n{details}\n\n"
-                f"Com os melhores cumprimentos,\n{company_name.strip()}")
+    letters = _letters(language)
+    if letters is not None:
+        subject, body = letters.statement_request(corrections, one, listed, details, company_name.strip())
     else:
         if corrections:
             subject = "Your account statement: amounts that differ"
@@ -734,14 +719,10 @@ def compose_recurring_request(facts: RecurringChaseFacts, *, token: str, today: 
     """Ask for a usual invoice that is overdue (§23): 'Your invoice for October 2026 usually reaches us by
     26 October, and we have not received it yet. Could you please send it?'"""
     ours = _our_details(facts)
-    if facts.language is Language.PT:
-        period = f"{PT_MONTHS[facts.period_month - 1]} de {facts.period_year}"
-        subject = f"Fatura de {period}"
-        body = (
-            f"Olá,\n\nA vossa fatura de {period} costuma chegar-nos até {day_month_pt(facts.usually_by, today)} e "
-            f"ainda não a recebemos. Poderiam, por favor, enviá-la? Agradecemos desde já.\n\n{ours}\n\n"
-            f"Com os melhores cumprimentos,\n{facts.company_name}"
-        )
+    letters = _letters(facts.language)
+    if letters is not None:
+        subject, body = letters.recurring_request(facts.period_year, facts.period_month, facts.usually_by, today,
+                                                  ours, facts.company_name)
     else:
         period = f"{_EN_MONTHS[facts.period_month - 1]} {facts.period_year}"
         subject = f"Invoice for {period}"
@@ -797,14 +778,9 @@ def compose_link_request(facts: LinkChaseFacts, *, token: str, today: date, mess
     """'The link to the invoice in your email of 12 September no longer works. Could you please send us the
     invoice as an attachment?'"""
     ours = _our_details(facts)
-    if facts.language is Language.PT:
-        when = day_month_pt(facts.emailed_on, today)
-        subject = f"Fatura do vosso email de {when}"
-        body = (
-            f"Olá,\n\nA ligação para a fatura no vosso email de {when} já não funciona. Poderiam, por favor, "
-            f"enviar-nos a fatura em anexo? Agradecemos desde já.\n\n{ours}\n\n"
-            f"Com os melhores cumprimentos,\n{facts.company_name}"
-        )
+    letters = _letters(facts.language)
+    if letters is not None:
+        subject, body = letters.link_request(facts.emailed_on, today, ours, facts.company_name)
     else:
         when = day_month(facts.emailed_on, today)
         subject = f"Invoice from your email of {when}"

@@ -8,8 +8,8 @@ supported by the evidence:
   the payment and its document;
 * a company named is the payment's own company;
 * any other word (what the payment is for: "the studio rent") appears in
-  the document's own description lines, directly or through a small
-  Portuguese/English glossary ("rent" = "renda").
+  the document's own description lines, directly or through the packs' small
+  glossaries ("glossary:rent": Portugal's "renda").
 
 Three kinds of question are understood:
 
@@ -31,7 +31,9 @@ import re
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from functools import cache
 
+from backoffice.countries import LazyPattern, pack_alternatives, pack_words
 from backoffice.learning import day_month, fold, format_money
 
 __all__ = ["AMOUNT", "PaymentFacts", "Reply", "amounts_in", "answer_question", "description_lines"]
@@ -45,9 +47,6 @@ _MONTHS = {name: i for i, name in enumerate(
      "november", "december"], start=1)}
 _MONTHS.update({name[:3]: i for name, i in list(_MONTHS.items())})
 _MONTHS.update({"sept": 9})
-_MONTHS.update({name: i for i, name in enumerate(
-    ["janeiro", "fevereiro", "marco", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro",
-     "novembro", "dezembro"], start=1)})
 _ORDINAL = re.compile(r"^(\d{1,2})(?:st|nd|rd|th)?$")
 
 # Words that carry no claim: question words, articles, and the plain ways to name a payment.
@@ -60,48 +59,28 @@ amount made sent went received
 """.split())
 _CONFIRM = frozenset({"is", "was", "are", "were", "does", "did", "do", "has", "have", "can", "could"})
 _DOCUMENT_NOUNS = frozenset({"invoice", "invoices", "receipt", "receipts", "document", "documents", "proof", "bill",
-                             "evidence", "fatura", "faturas", "recibo", "recibos"})
+                             "evidence"})
 _DOCUMENT_VERBS = frozenset({"prove", "proves", "support", "supports", "back", "backs", "behind", "show", "shows",
                              "match", "matches", "matched", "cover", "covers", "which", "what", "where"})
 # Judgments that are the accountant's or the owner's call: never confirmed from a document.
-_NEVER = frozenset({"vat", "iva", "tax", "taxes", "deductible", "deduct", "withholding", "exempt", "category",
+_NEVER = frozenset({"vat", "tax", "taxes", "deductible", "deduct", "withholding", "exempt", "category",
                     "account", "book", "booked", "booking", "expense", "cost", "personal", "private", "business",
                     "should", "correct", "right", "ok", "okay", "fine", "allowed", "legal"})
-# English words an accountant uses, and the Portuguese a document prints for them.
-_GLOSSARY: dict[str, tuple[str, ...]] = {
-    "rent": ("renda", "arrendamento", "aluguer"),
-    "rental": ("renda", "arrendamento", "aluguer"),
-    "lease": ("renda", "arrendamento", "aluguer", "locacao"),
-    "studio": ("estudio",),
-    "office": ("escritorio",),
-    "shop": ("loja",),
-    "warehouse": ("armazem",),
-    "flat": ("apartamento",),
-    "apartment": ("apartamento",),
-    "electricity": ("eletricidade", "electricidade", "energia"),
-    "energy": ("energia", "eletricidade", "electricidade"),
-    "gas": ("gas",),
-    "water": ("agua",),
-    "phone": ("telefone", "telemovel", "movel", "comunicacoes"),
-    "telephone": ("telefone", "telemovel", "comunicacoes"),
-    "mobile": ("telemovel", "movel"),
-    "internet": ("internet", "fibra"),
-    "subscription": ("subscricao", "assinatura"),
-    "trip": ("viagem",),
-    "ride": ("viagem",),
-    "taxi": ("viagem", "taxi"),
-    "travel": ("viagem", "viagens"),
-    "furniture": ("moveis", "mobiliario", "movel"),
-    "insurance": ("seguro", "seguros"),
-    "cleaning": ("limpeza",),
-    "maintenance": ("manutencao",),
-    "repair": ("reparacao",),
-}
 # Document lines that are fields (tax numbers, totals, dates), not a description of what was bought.
-_FIELD_LINE = re.compile(
-    r"^\s*(?:nif|nipc|atcud|data|cliente|fatura|factura|recibo|nota de credito|nota de debito|isento|base|iva|"
-    r"total|subtotal|codigo|n\.?\s*o|contribuinte|vencimento|referencia|iban|entidade|montante|valor|invoice|"
-    r"date|vat|tax|customer|due)\b")
+_FIELD_LINE = LazyPattern(lambda: (
+    r"^\s*(?:nif|data|cliente|factura|recibo|nota de credito|nota de debito|base|iva|"
+    r"total|subtotal|codigo|n\.?\s*o|referencia|iban|valor|invoice|"
+    rf"date|vat|tax|customer|due|{pack_alternatives('accountant_questions.field_line')})\b"))
+
+
+@cache
+def _words() -> tuple[dict[str, int], frozenset[str], frozenset[str]]:
+    """Month names, document nouns and judgment words: the core's English with every pack's own."""
+    months = dict(_MONTHS)
+    for n in range(1, 13):
+        months.update({name: n for name in pack_words(f"month:{n}")})
+    return (months, _DOCUMENT_NOUNS | frozenset(pack_words("accountant_questions.document_nouns")),
+            _NEVER | frozenset(pack_words("accountant_questions.never")))
 
 
 @dataclass(frozen=True)
@@ -205,7 +184,7 @@ def _phrase(name: str) -> str:
 
 def _supported(word: str, description: tuple[str, ...]) -> str | None:
     """The description line that shows ``word`` (itself, or a glossary equivalent), if any."""
-    stems = (word, *_GLOSSARY.get(word, ()))
+    stems = (word, *pack_words(f"glossary:{word}"))  # "rent": Portugal's "renda", "arrendamento", "aluguer"
     for line in description:
         words = _WORD.findall(fold(line))
         for stem in stems:
@@ -239,7 +218,8 @@ def answer_question(question: str, facts: PaymentFacts, today: date) -> Reply | 
     if not words:
         return None
 
-    doc_noun = any(w in _DOCUMENT_NOUNS for w in words)
+    month_words, document_nouns, never = _words()
+    doc_noun = any(w in document_nouns for w in words)
     if words[0] == "who":
         kind = "who"
     elif words[0] in ("which", "what") or (doc_noun and any(w in _DOCUMENT_VERBS for w in words)):
@@ -258,12 +238,12 @@ def answer_question(question: str, facts: PaymentFacts, today: date) -> Reply | 
     claims: list[str] = []
     quoted: list[str] = []
     for w in words:
-        if w in _NEVER:
+        if w in never:
             return None
-        if w in _FILLER or w in ("who", "which", "what", "where") or w in _DOCUMENT_NOUNS or w in _DOCUMENT_VERBS:
+        if w in _FILLER or w in ("who", "which", "what", "where") or w in document_nouns or w in _DOCUMENT_VERBS:
             continue
-        if w in _MONTHS:
-            months.append(_MONTHS[w])
+        if w in month_words:
+            months.append(month_words[w])
             continue
         if re.fullmatch(r"(19|20)\d\d", w):
             years.append(int(w))

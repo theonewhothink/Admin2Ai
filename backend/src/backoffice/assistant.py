@@ -36,6 +36,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 from backoffice.closure import RENEWAL_KINDS, TAX_OBLIGATION_KINDS, Month
+from backoffice.countries import LazyPattern, pack_words
 from backoffice.domain.models import ObligationKind
 from backoffice.learning import counterparty_key, day_month, display_name, fold, format_money, learn_from_transactions
 from backoffice.learning.plain import count_phrase, join_and
@@ -520,28 +521,42 @@ _SETTLE = re.compile(
     r"|\b(?:amount|total|value|vat|iban|date|number)\s+(?:is|was|should be)\s+(?:€|\d|the\s+(?:qr|pdf|first|second))"
     r"|\bset\s+(?:it|that|this|the\s+[\w ]{1,30}?invoice)\s+aside\b|\bneither\b", re.I)
 _SEND = re.compile(r"\b(?:send|email|e-mail|mail|forward|share)\b", re.I)
-_INCREASE = re.compile(r"\b(?:went|gone|go|going) up\b|\bincreas\w*|\bmore expensive\b|\bprices?\b|\bpricier\b|"
-                       r"\baument\w*|\bsubiu\b|\bsubiram\b")
+# A pack's own words ("aumentou", "faturas", "IVA") are in its pack: "assistant.<concept>" (backoffice.countries).
+_INCREASE = LazyPattern(lambda: (r"\b(?:went|gone|go|going) up\b|\bincreas\w*|\bmore expensive\b|\bprices?\b|"
+                                 r"\bpricier\b" + "".join(f"|{w}" for w in pack_words("assistant.increase"))))
 _OPTION_WORDS = {
     "spending": r"\b(?:paid|pay|spent|spend|spending|costs?|how much|total|money)\b",
-    "find_document": r"\b(?:invoices?|receipts?|documents?|bills?|faturas?)\b",
+    "find_document": r"\b(?:invoices?|receipts?|documents?|bills?{assistant.document_words})\b",
     "supplier_summary": r"\b(?:summar\w*|overview|issues?|problems?|check)\b",
     "month_status": r"\b(?:closed?|complete|done|finished|status|ready|closing)\b",
     "payment_lookup": r"\b(?:payments?)\b",
 }
+_TAXES = LazyPattern(lambda: _with_pack_words(r"\b(?:tax|taxes|vat{assistant.tax_words})\b"))
 _ACTIONS = frozenset({"report"})
+
+
+def _with_pack_words(pattern: str) -> str:
+    """``pattern`` with each "{concept}" replaced by the packs' alternatives for it, each after a "|"."""
+    return re.sub(r"\{(assistant\.[\w:]+)\}", lambda m: "".join(f"|{w}" for w in pack_words(m[1])), pattern)
+
+
+_STATEMENT_WORD = LazyPattern(lambda: _with_pack_words(r"\bsuppliers?\b{assistant.statement_word}"))
+_RENEWAL_WORD = LazyPattern(
+    lambda: _with_pack_words(r"\b(?:renew\w*|insurance{assistant.insurance}|policy|policies)\b"))
 # A question about a supplier's account statement ("Does our Vodafone statement match?").
-_STATEMENT_Q = re.compile(r"\b(?:account\s+)?statements?\b|\bextratos?\b|\bconta\s+corrente\b", re.I)
+_STATEMENT_Q = LazyPattern(lambda: _with_pack_words(r"\b(?:account\s+)?statements?\b{assistant.statement}"), re.I)
 # A question about what a product cost per unit ("How much did flour cost per kg this year?"), on folded text:
 # answered from the prices on invoice lines (backoffice.line_prices) when it names a product bought.
-_UNIT_PRICE_Q = re.compile(r"\bper (?:kg|kgs|kilos?|kilograms?|litres?|liters?|l|units?|pieces?|items?|bags?|"
-                           r"boxe?s?|dozen|bottles?|packs?)\b|\ba (?:kilo|kg|litre|liter)\b|\bunit (?:price|cost)s?\b|"
-                           r"\b(?:price|cost)s? per\b|\bpor (?:kg|quilo|kilo|litro|unidade|saco|caixa)\b|"
-                           r"\bprecos? (?:por|unitarios?)\b|\bprecios? (?:por|unitarios?)\b")
-_BASIS_WORDS = (("kg", r"\b(?:kg|kgs|kilos?|kilograms?|quilos?)\b"), ("l", r"\b(?:l|litres?|liters?|litros?)\b"),
-                ("unit", r"\b(?:units?|pieces?|items?|each|unidades?)\b"), ("bag", r"\b(?:bags?|sacos?)\b"),
-                ("box", r"\b(?:boxe?s?|caixas?)\b"), ("dozen", r"\bdozen\b"), ("bottle", r"\bbottles?\b"),
-                ("pack", r"\bpacks?\b"))
+_UNIT_PRICE_Q = LazyPattern(lambda: _with_pack_words(
+    r"\bper (?:kg|kgs|kilos?|kilograms?|litres?|liters?|l|units?|pieces?|items?|bags?|"
+    r"boxe?s?|dozen|bottles?|packs?)\b|\ba (?:kilo|kg|litre|liter)\b|\bunit (?:price|cost)s?\b|"
+    r"\b(?:price|cost)s? per\b{assistant.unit_price}|\bprecios? (?:por|unitarios?)\b"))
+# The unit a price is asked per (first that matches); a pack adds its own words ("assistant.basis:<unit>").
+_BASIS_WORDS = (("kg", r"\b(?:kg|kgs|kilos?|kilograms?{assistant.basis:kg})\b"),
+                ("l", r"\b(?:l|litres?|liters?{assistant.basis:l})\b"),
+                ("unit", r"\b(?:units?|pieces?|items?|each{assistant.basis:unit})\b"),
+                ("bag", r"\b(?:bags?{assistant.basis:bag})\b"), ("box", r"\b(?:boxe?s?{assistant.basis:box})\b"),
+                ("dozen", r"\bdozen\b"), ("bottle", r"\bbottles?\b"), ("pack", r"\bpacks?\b"))
 _BASIS_UNITS = {"kg": "kg", "l": "litres", "unit": "units", "bag": "bags", "box": "boxes", "dozen": "dozen",
                 "bottle": "bottles", "pack": "packs", "can": "cans", "hour": "hours", "m": "metres", "": "items"}
 _CADENCE = {"weekly": "a week", "monthly": "a month", "quarterly": "a quarter", "annual": "a year"}
@@ -720,7 +735,7 @@ class RuleBrain:
             if i < len(options) and re.search(pattern, t):
                 return options[i]
         for option in options:
-            if option in _OPTION_WORDS and re.search(_OPTION_WORDS[option], t):
+            if option in _OPTION_WORDS and re.search(_with_pack_words(_OPTION_WORDS[option]), t):
                 return option
         return u.intent if u.intent in options else None
 
@@ -1480,7 +1495,7 @@ class RuleBrain:
         found = [sr for sr in repo.statements.values()
                  if sr.document_id in repo.documents and (not wanted or sr.supplier_id in wanted)]
         if not found:
-            if not wanted and not repo.statements and not re.search(r"\bsuppliers?\b|\bextratos?\b", u.text):
+            if not wanted and not repo.statements and not _STATEMENT_WORD.search(u.text):
                 return None
             who = self._suppliers(sorted(wanted))
             return _Answer(f"I don't have an account statement from {who}." if who else
@@ -2174,13 +2189,13 @@ class RuleBrain:
 
     def _i_deadlines(self, u: Understanding) -> _Answer:
         s = u.slots
-        if re.search(r"\b(?:renew\w*|insurance|seguros?|policy|policies)\b", u.text):
+        if _RENEWAL_WORD.search(u.text):
             return self._renewals(u)
         items = self.svc._due_soon()
         names = {self.repo.company_name(c) for c in s.company_ids}
         if names:
             items = [i for i in items if i["companyName"] in names]
-        taxes = s.category == "tax" or re.search(r"\b(?:tax|taxes|vat|iva|impostos?)\b", u.text)
+        taxes = s.category == "tax" or _TAXES.search(u.text)
         if taxes:
             items = [i for i in items if (ob := self.repo.obligations.get(i["id"][4:])) is not None
                      and ob.obligation.kind in TAX_OBLIGATION_KINDS]
@@ -2234,7 +2249,7 @@ class RuleBrain:
         folded = fold(message)
         concepts = sorted(product_concepts(folded))
         name = concepts[0] if len(concepts) == 1 else groups[0][-1].product
-        want = next((basis for basis, pattern in _BASIS_WORDS if re.search(pattern, folded)), None)
+        want = next((basis for basis, pattern in _BASIS_WORDS if re.search(_with_pack_words(pattern), folded)), None)
         period = u.slots.period
         when = period.phrase if period is not None else "on your invoices"
         bought = [p for g in groups for p in g if period is None or period.start <= p.on <= period.end]

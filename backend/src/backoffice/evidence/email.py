@@ -30,6 +30,7 @@ from email.utils import getaddresses, parsedate_to_datetime
 from typing import Any
 from urllib.parse import urlsplit
 
+from backoffice.countries import LazyPattern, pack_words
 from backoffice.domain.models import Evidence, EvidenceFormat, SourceKind
 
 from .archive import ArchiveExpansion, ZipLimits, expand_zip
@@ -188,32 +189,39 @@ class ParsedEmail:
 
 # --------------------------------------------------------------------------- link ranking
 
-_INVOICE_WORDS = re.compile(
-    r"\b(invoices?|bills?|billing|receipts?|statements?|credit[ -]?notes?|faturas?|facturas?"
-    r"|fatura[s]?-recibo|recibos?|notas? de cr[ée]dito|extratos?|fattur[ae]|ricevut[ae]|factures?"
-    r"|re[çc]us?|rechnung(en)?|quittung|beleg|documento fiscal|segunda via|2[ªa] via)\b",
+# English, Spanish, French, Italian and German; a pack's own words are in "email.<concept>" (Portugal's "fatura",
+# "descarregar", "deixar de receber"), regular-expression alternatives (any case).
+
+
+def _with(concept: str) -> str:
+    return "".join(f"|{w}" for w in pack_words(f"email.{concept}"))
+
+
+_INVOICE_WORDS = LazyPattern(lambda: (
+    r"\b(invoices?|bills?|billing|receipts?|statements?|credit[ -]?notes?|facturas?"
+    r"|recibos?|notas? de cr[ée]dito|fattur[ae]|ricevut[ae]|factures?"
+    rf"|re[çc]us?|rechnung(en)?|quittung|beleg|documento fiscal{_with('invoice')})\b"),
     re.IGNORECASE,
 )
-_ACTION_WORDS = re.compile(
-    r"\b(view|see|download|open|get|access|ver|veja|visualizar|visualize|descarregar|descarregue"
-    r"|baixar|baixe|transferir|consultar|consulte|aceder|aceda|acessar|acesse|obter|abrir"
+_ACTION_WORDS = LazyPattern(lambda: (
+    r"\b(view|see|download|open|get|access|ver|visualizar|transferir|consultar|consulte|abrir"
     r"|descargar|descargue|voir|t[ée]l[ée]charger|scarica(re)?|visualizza(re)?|herunterladen"
-    r"|ansehen|pdf)\b",
+    rf"|ansehen|pdf{_with('action')})\b"),
     re.IGNORECASE,
 )
-_NEGATIVE_WORDS = re.compile(
-    r"unsubscribe|opt[- ]?out|(cancelar|anular|remover) (a )?(sua )?subscri[çc][ãa]o|deixar de receber"
+_NEGATIVE_WORDS = LazyPattern(lambda: (
+    r"unsubscribe|opt[- ]?out"
     r"|darse de baja|d[ée]sabonner|abbestellen|disiscriv|preferen|privac"
-    r"|\bterms (of|and|&)|termos (de|e) |t[ée]rminos (de|y) |condi[çc][õo]es gerais"
-    r"|in (your |the )?browser|view online|web version|vers[ãa]o (web|online)"
-    r"|(no|em|en el) (browser|navegador)|\bhelp\b|ajuda|suporte|support|contact|contacto|contato"
-    r"|\bfaq\b|forgot|password|palavra-passe"
-    r"|\bapps?\b|aplica[çc][ãa]o|aplicaci[oó]n",  # "Download our app": a store, not a document
+    r"|\bterms (of|and|&)|t[ée]rminos (de|y) "
+    r"|in (your |the )?browser|view online|web version"
+    r"|en el (browser|navegador)|\bhelp\b|support|contact|contacto"
+    r"|\bfaq\b|forgot|password"
+    r"|\bapps?\b|aplicaci[oó]n" + _with("not_a_document")),  # "Download our app": a store, not a document
     re.IGNORECASE,
 )
-_INVOICE_PATH = re.compile(
-    r"invoice|fatura|factura|fattura|billing|/bills?\b|receipt|recibo|document|download"
-    r"|statement|extrato|/pdf|\.pdf\b",
+_INVOICE_PATH = LazyPattern(lambda: (
+    r"invoice|factura|fattura|billing|/bills?\b|receipt|recibo|document|download"
+    r"|statement|/pdf|\.pdf\b" + _with("invoice_path")),
     re.IGNORECASE,
 )
 _NEGATIVE_PATH = re.compile(r"unsubscribe|optout|opt-out|preferences|privacy|/terms", re.IGNORECASE)

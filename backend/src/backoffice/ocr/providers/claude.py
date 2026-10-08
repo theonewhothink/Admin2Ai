@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
+from backoffice.countries import pack_text
 from backoffice.domain.models import CriticalField, ExtractionMethod
 from backoffice.extraction._optional import MissingDependencyError, import_optional
 from backoffice.extraction.media import MIME_GIF, MIME_JPEG, MIME_PDF, MIME_PNG, MIME_WEBP
@@ -92,9 +93,10 @@ _API_IMAGES = frozenset({MIME_PNG, MIME_JPEG, MIME_GIF, MIME_WEBP})
 _MAX_IMAGE_BYTES = 5 * 1024 * 1024
 _MAX_EDGE = 2000
 
+# Examples a country's documents give ("ocr.example:<field>", its tax number's name "ocr.tax_id_name") are its pack's.
 _FIELD_HELP: Mapping[CriticalField, str] = {
-    CriticalField.INVOICE_NUMBER: "Document number exactly as printed, e.g. 'FT 2026/183'.",
-    CriticalField.SUPPLIER_TAX_ID: "Issuer's VAT/tax number (NIF), digits with any country prefix as printed.",
+    CriticalField.INVOICE_NUMBER: "Document number exactly as printed{invoice_number}.",
+    CriticalField.SUPPLIER_TAX_ID: "Issuer's VAT/tax number{tax_id_name}, digits with any country prefix as printed.",
     CriticalField.CUSTOMER_TAX_ID: "Customer's VAT/tax number as printed, or omit when none is shown.",
     CriticalField.GROSS_AMOUNT: "Total including VAT, as a plain number with a dot for decimals, e.g. '483.60'.",
     CriticalField.NET_AMOUNT: "Total before VAT (taxable base), plain number with a dot for decimals.",
@@ -103,7 +105,7 @@ _FIELD_HELP: Mapping[CriticalField, str] = {
     CriticalField.ISSUE_DATE: "Issue date as YYYY-MM-DD.",
     CriticalField.DUE_DATE: "Payment due date as YYYY-MM-DD, or omit.",
     CriticalField.IBAN: "IBAN to pay into, if printed (it may be masked; then omit).",
-    CriticalField.PAYMENT_REFERENCE: "Payment reference (e.g. Multibanco entity/reference or RF...), or omit.",
+    CriticalField.PAYMENT_REFERENCE: "Payment reference (e.g. {payment_reference}RF...), or omit.",
 }
 
 _DOCUMENT_TYPES = ("invoice", "invoice_receipt", "simplified_invoice", "receipt", "credit_note", "debit_note",
@@ -121,6 +123,15 @@ USER_PROMPT = (
 )
 
 
+def _field_help(field: CriticalField) -> str:
+    number = pack_text("ocr.example:invoice_number")
+    name = pack_text("ocr.tax_id_name")
+    reference = pack_text("ocr.example:payment_reference")
+    return _FIELD_HELP[field].format(invoice_number=f", e.g. '{number}'" if number else "",
+                                     tax_id_name=f" ({name})" if name else "",
+                                     payment_reference=f"{reference} or " if reference else "")
+
+
 def tool_definition() -> dict[str, Any]:
     """The forced tool whose input is the structured answer (JSON Schema)."""
     reading = {
@@ -133,7 +144,7 @@ def tool_definition() -> dict[str, Any]:
         "required": ["value"],
         "additionalProperties": False,
     }
-    fields = {f.value: {**reading, "description": _FIELD_HELP[f]} for f in CriticalField}
+    fields = {f.value: {**reading, "description": _field_help(f)} for f in CriticalField}
     return {
         "name": TOOL_NAME,
         "description": "Record the critical fields printed on the document.",

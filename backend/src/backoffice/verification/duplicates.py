@@ -31,7 +31,9 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
+from functools import cache
 
+from backoffice.countries import pack_words
 from backoffice.domain.models import Document, DocumentType, Quality
 
 from .fields import severity
@@ -59,10 +61,16 @@ __all__ = [
 
 DEFAULT_NEAR_DAYS = 3
 
-# Legal-form words dropped when comparing supplier names ("Acme, S.A." = "ACME SA").
+# Legal-form words dropped when comparing supplier names ("Acme, S.A." = "ACME SA"; a pack's own:
+# "duplicates.legal_forms", Portugal's "Lda.").
 _LEGAL_FORMS = frozenset(
-    "sa lda ltda unipessoal ltd limited plc llc inc corp gmbh ag kg sl slu srl spa sas sarl bv nv".split()
+    "sa ltda ltd limited plc llc inc corp gmbh ag kg sl slu srl spa sas sarl bv nv".split()
 )
+
+
+@cache
+def _legal_forms() -> frozenset[str]:
+    return _LEGAL_FORMS | frozenset(pack_words("duplicates.legal_forms"))
 
 
 def supplier_name_key(name: str | None) -> str | None:
@@ -72,7 +80,7 @@ def supplier_name_key(name: str | None) -> str | None:
     folded = unicodedata.normalize("NFKD", name.casefold())
     plain = "".join(c for c in folded if not unicodedata.combining(c))
     words = re.sub(r"[^\w\s]", "", plain.replace("&", " and ")).split()
-    while words and words[-1] in _LEGAL_FORMS:
+    while words and words[-1] in _legal_forms():
         words.pop()
     return " ".join(words) or None
 

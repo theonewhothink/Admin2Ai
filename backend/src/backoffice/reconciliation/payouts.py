@@ -24,7 +24,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from functools import cache
 
+from backoffice.countries import pack_words
 from backoffice.domain.models import Transaction, TransactionKind
 
 from .bank import is_card_purchase, phrase_in
@@ -34,10 +36,12 @@ __all__ = [
     "PAYOUT_PROVIDERS",
     "PayoutProvider",
     "ProviderKind",
+    "bank_phrases",
     "compatible_providers",
     "payout_provider",
     "provider_by_key",
     "provider_named",
+    "provider_names",
 ]
 
 
@@ -111,14 +115,26 @@ PAYOUT_PROVIDERS: tuple[PayoutProvider, ...] = (
     _p("airbnb", "Airbnb", _K.ACCOMMODATION, ("AIRBNB",), ("AIRBNB PAYMENTS",), fee_word="commission"),
 )
 
+# A pack adds its own bank wording for a provider ("payouts.bank:<key>": Portugal's "VENDAS TPA",
+# "LIQUIDACAO MULTIBANCO" for the card terminal), read through bank_phrases() and provider_names().
 CARD_TERMINAL = _p(
     "card_terminal", "your card terminal", _K.CARD_TERMINAL,
-    ("TPA", "VENDAS TPA", "LIQ TPA", "LIQUIDACAO TPA", "TERMINAL PAGAMENTO", "TERMINAL DE PAGAMENTO",
-     "VENDAS MULTIBANCO", "LIQ MULTIBANCO", "LIQUIDACAO MULTIBANCO", "MULTIBANCO TPA", "CARD TERMINAL",
-     "POS SETTLEMENT", "MERCHANT SETTLEMENT"),
+    ("CARD TERMINAL", "POS SETTLEMENT", "MERCHANT SETTLEMENT"),
 )
 
 _BY_KEY = {p.key: p for p in (*PAYOUT_PROVIDERS, CARD_TERMINAL)}
+
+
+@cache
+def bank_phrases(provider: PayoutProvider) -> tuple[str, ...]:
+    """The words a bank line uses for ``provider``: its own, then every pack's ("payouts.bank:<key>")."""
+    return (*provider.bank_phrases, *pack_words(f"payouts.bank:{provider.key}"))
+
+
+@cache
+def provider_names(provider: PayoutProvider) -> tuple[str, ...]:
+    """Every name ``provider`` goes by (its bank wording included, every pack's too)."""
+    return tuple(dict.fromkeys((*provider.names, *pack_words(f"payouts.bank:{provider.key}"))))
 
 
 def provider_by_key(key: str | None) -> PayoutProvider | None:
@@ -136,7 +152,7 @@ def payout_provider(tx: Transaction) -> PayoutProvider | None:
         return None
     text = f"{tx.counterparty} {tx.description} {tx.reference or ''}"
     for provider in (*PAYOUT_PROVIDERS, CARD_TERMINAL):
-        if phrase_in(text, provider.bank_phrases):
+        if phrase_in(text, bank_phrases(provider)):
             return provider
     return None
 
@@ -147,7 +163,7 @@ def provider_named(*texts: str | None) -> PayoutProvider | None:
     if not joined.strip():
         return None
     for provider in (*PAYOUT_PROVIDERS, CARD_TERMINAL):
-        if phrase_in(joined, provider.names):
+        if phrase_in(joined, provider_names(provider)):
             return provider
     return None
 

@@ -26,6 +26,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
+from backoffice.countries import pack_text
 from backoffice.domain.lifecycle import Stage, TrackedItem
 from backoffice.domain.models import Document, DocumentType, Quality, Supplier
 from backoffice.learning import day_month, display_name, fold, format_money
@@ -502,7 +503,8 @@ class LeaseAgent(_Agent):
         if found is None:
             return []
         c = found[0].contract
-        text = " ".join(p for p in (c.asset, f"Matrícula {c.plate}" if c.plate else None) if p)
+        plate = f"{pack_text('leases.plate_word', 'Registration')} {c.plate}" if c.plate else None
+        text = " ".join(p for p in (c.asset, plate) if p)
         return [("the leasing contract", text)] if text else []
 
     def view(self, company_id: str) -> list[dict[str, Any]]:

@@ -32,6 +32,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
+from backoffice.countries import LazyPattern, pack_alternatives
 from backoffice.domain.lifecycle import Stage
 from backoffice.domain.models import Quality, Transaction
 from backoffice.learning import day_month, display_name, fold, format_money
@@ -56,6 +57,7 @@ from backoffice.reconciliation import (
     payout_provider,
 )
 from backoffice.reconciliation.bank import phrase_in
+from backoffice.reconciliation.payouts import bank_phrases
 
 __all__ = [
     "CHARGEBACK_RULES",
@@ -75,15 +77,20 @@ _KEEP_RULES = frozenset({"learned", "zero_amount", "own_iban", "own_company_iban
 QUESTION_KIND = "chargeback"
 LOOK_BACK_DAYS = 180  # a dispute can come months after the sale
 
-# Folded words. "chargeback", "disputa" and "contestação" say it outright; "estorno" and "reversal" only next to
-# a card sale.
-_SAID = re.compile(r"(?<![a-z])(?:chargebacks?|charge\s+backs?|disputas?|disputes?|disputed|contestacao|contestacoes"
-                   r"|contestada|contestado|retrocessao)(?![a-z])")
-_REVERSAL = re.compile(r"(?<![a-z])(?:estornos?|reversals?|reversao|reversed)(?![a-z])")
-_SALE = re.compile(r"(?<![a-z])(?:tpa|venda|vendas|terminal|pos|merchant|acquirer|adquirente)(?![a-z])")
-_PURCHASE = re.compile(r"(?<![a-z])(?:compra|compras|purchase)(?![a-z])")
+# Folded words. "chargeback" says it outright; "reversal" only next to a card sale. A pack's own are in
+# "chargebacks.<concept>" (Portugal's "contestação", "estorno", "venda", "comissão").
+
+
+def _words(concept: str, english: str) -> LazyPattern:
+    return LazyPattern(lambda: rf"(?<![a-z])(?:{pack_alternatives(f'chargebacks.{concept}')}|{english})(?![a-z])")
+
+
+_SAID = _words("said", r"chargebacks?|charge\s+backs?|disputes?|disputed")
+_REVERSAL = _words("reversal", r"reversals?|reversed")
+_SALE = _words("sale", r"terminal|pos|merchant|acquirer")
+_PURCHASE = _words("purchase", r"compra|compras|purchase")
 # The bank's own charge for handling a dispute: a cost, not the disputed money.
-_FEE = re.compile(r"(?<![a-z])(?:comissao|comissoes|fee|fees|encargos?|custos?|despesas?)(?![a-z])")
+_FEE = _words("fee", r"fee|fees")
 _DATE = re.compile(r"(?<!\d)(\d{1,2})[/.-](\d{1,2})(?:[/.-](\d{4}|\d{2}))?(?![\d/.-]?\d)")
 _TOKEN = re.compile(r"[a-z0-9_-]*\d[a-z0-9_-]*")
 
@@ -104,7 +111,7 @@ class ChargebackWords:
 
 def _provider(text: str) -> PayoutProvider | None:
     for provider in (*PAYOUT_PROVIDERS, CARD_TERMINAL):
-        if phrase_in(text, provider.bank_phrases):
+        if phrase_in(text, bank_phrases(provider)):
             return provider
     return None
 

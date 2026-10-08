@@ -1,7 +1,7 @@
 """Leasing and renting contracts read into a payment plan (checklist X24; cases 7, 9, 33, 35).
 
-A contract is recognised by its title near the top ("Contrato de locação financeira", "Contrato de leasing",
-"Contrato de renting", "Contrato de aluguer de longa duração" (ALD), "Lease agreement", "Hire agreement"),
+A contract is recognised by its title near the top ("Lease agreement", "Hire agreement"; a pack's own: Portugal's
+"Contrato de locação financeira", "Contrato de aluguer de longa duração" (ALD), "leases.title"),
 never by the word "leasing" alone: the leasing company's monthly invoice says "leasing" too, and it is an
 invoice. From the text (a PDF's text layer, a photo read, an uploaded text) it reads:
 
@@ -34,6 +34,7 @@ from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
 
 from backoffice._reading import amounts, first_date, tax_ids
+from backoffice.countries import LazyPattern, pack_alternatives
 from backoffice.learning.keys import fold
 from backoffice.learning.plain import day_month, format_money
 
@@ -45,47 +46,59 @@ _CENT = Decimal("0.01")
 CONTRACT_WITH_STATEMENT = frozenset({"GB"})
 PAYMENT_WINDOW_DAYS = 10  # a monthly payment taken this close to its due date is that month's payment
 
-_TITLE = re.compile(
-    r"(?<![a-z])(?:contrato\s+(?:de\s+)?(?:locacao\s+financeira|leasing|renting|aluguer\s+(?:de\s+)?"
-    r"(?:longa\s+duracao|operacional|de\s+viatura|de\s+equipamento)|ald)|locacao\s+financeira\s+(?:mobiliaria|"
-    r"imobiliaria)|(?:finance\s+|operating\s+|vehicle\s+|equipment\s+|car\s+)?lease\s+agreement|(?:vehicle\s+|"
-    r"contract\s+|equipment\s+)?hire\s+agreement|leasing\s+agreement)(?![a-z])")
-_NOT_A_CONTRACT = re.compile(r"(?<![a-z])(?:fatura|factura|invoice|atcud|recibo|receipt|nota\s+de\s+credito)"
-                             r"\s*(?:n\.?\s*[ºo°]|no\.?|number|#|:)")
-_RENTING = re.compile(r"(?<![a-z])(?:renting|aluguer|ald|operating\s+lease|hire|rental\s+agreement)(?![a-z])")
+# A country's own contract words ("Contrato de locação financeira", "renda", "com IVA") are in its pack:
+# "leases.<concept>" (backoffice.countries.wording), regular-expression alternatives over folded text.
 
-_LESSOR = re.compile(r"^\s*(?:o\s+|the\s+)?(?:locador(?:a)?|entidade\s+locadora|lessor|owner|leasing\s+company|"
-                     r"finance\s+company|financiador(?:a)?)\b\s*(?:\([^)]*\))?\s*[:\-]?\s*(.*)$")
-_CUSTOMER = re.compile(r"^\s*(?:o\s+|the\s+)?(?:locatari[oa]|lessee|hirer|cliente|customer)\b\s*(?:\([^)]*\))?"
-                       r"\s*[:\-]?\s*(.*)$")
-_NUMBER = re.compile(r"(?:contrato|contract|agreement)\s*(?:de\s+\w+(?:\s+\w+)?\s+)?(?:n\.?\s*[ºo°]\.?|no\.?|"
-                     r"number|#|numero|nr\.?)\s*[:.]?\s*([A-Z0-9][A-Z0-9/\-.]{2,24}[A-Z0-9])", re.IGNORECASE)
-_ASSET = re.compile(r"^\s*(?:bem\s+locado|bem\s+alugado|bem|equipamento|viatura|veiculo|vehicle|asset|goods|"
-                    r"equipment|objeto|objecto)\b[^:]{0,30}:\s*(.+)$")
-_PLATE = re.compile(r"(?:matricula|registration(?:\s+(?:no|number|mark))?|reg\.?\s*(?:no|mark)?)\s*[:.]?\s*"
-                    r"([a-z0-9]{2}[- ]?[a-z0-9]{2}[- ]?[a-z0-9]{2,3})(?![a-z0-9])")
-_START = re.compile(r"^\s*(?:data\s+de\s+inicio|inicio(?:\s+do\s+contrato)?|data\s+da\s+primeira\s+renda|"
-                    r"primeira\s+renda|1\.?\s*[ªa]?\s*renda|vencimento\s+da\s+primeira\s+renda|start\s+date|"
-                    r"commencement(?:\s+date)?|first\s+(?:monthly\s+)?(?:payment|rental|instalment)(?:\s+date|\s+due)?|"
-                    r"date\s+of\s+first\s+payment)\b")
-_TERM = re.compile(r"(?:prazo|duracao|term|periodo|period|n\.?\s*[ºo]?\s*de\s+rendas|numero\s+de\s+rendas|"
-                   r"number\s+of\s+(?:rentals|payments|instalments|installments))\b[^0-9\n]{0,20}(\d{1,3})\s*"
-                   r"(meses|months|rendas|rentals|payments|prestacoes|instalments|installments)?")
-_TERM_ALONE = re.compile(r"(?<!\d)(\d{1,3})\s+(?:rendas\s+mensais|monthly\s+(?:rentals|payments|instalments)|"
-                         r"prestacoes\s+mensais|meses)(?![a-z])")
-_INSTALMENT = re.compile(r"(?<![a-z])(?:renda|rendas|prestacao|rental|rentals|instalment|installment|monthly\s+"
-                         r"payment|mensalidade|monthly\s+rent)(?![a-z])")
-_NOT_INSTALMENT = re.compile(r"(?<![a-z])(?:numero\s+de|n\.?\s*[ºo]?\s*de|number\s+of|primeira|first|inicial|"
-                             r"initial|vencimento|due|data|date|dia\s+de|day\s+of|residual|final|caucao|deposit|"
-                             r"entrada|advance)(?![a-z])")
-_GROSS_WORDS = re.compile(r"(?<![a-z])(?:com\s+iva|c/\s*iva|iva\s+incluido|incluindo\s+iva|incl(?:uding|\.)?\s+"
-                          r"vat|inc\.?\s+vat|total)(?![a-z])")
-_NET_WORDS = re.compile(r"(?<![a-z])(?:sem\s+iva|s/\s*iva|excluindo\s+iva|excl(?:uding|\.)?\s+vat|ex\.?\s+vat|"
-                        r"\+\s*iva|\+\s*vat|plus\s+vat|acresce\s+iva|antes\s+de\s+iva|before\s+vat|base)(?![a-z])")
-_VAT_LINE = re.compile(r"(?<![a-z])(?:iva|vat)(?![a-z])")
+
+def _pt(concept: str) -> str:
+    return pack_alternatives(f"leases.{concept}")
+
+
+_TITLE = LazyPattern(lambda: (
+    rf"(?<![a-z])(?:{_pt('title')}|(?:finance\s+|operating\s+|vehicle\s+|equipment\s+|car\s+)?lease\s+agreement|"
+    r"(?:vehicle\s+|contract\s+|equipment\s+)?hire\s+agreement|leasing\s+agreement)(?![a-z])"))
+_NOT_A_CONTRACT = LazyPattern(lambda: (rf"(?<![a-z])(?:{_pt('document')}|factura|invoice|recibo|receipt)"
+                                       r"\s*(?:n\.?\s*[ºo°]|no\.?|number|#|:)"))
+_RENTING = LazyPattern(lambda: rf"(?<![a-z])(?:renting|{_pt('renting')}|operating\s+lease|hire|rental\s+agreement)(?![a-z])")
+
+_LESSOR = LazyPattern(lambda: (rf"^\s*(?:{_pt('article')}|the\s+)?(?:{_pt('lessor')}|lessor|owner|leasing\s+company|"
+                               r"finance\s+company)\b\s*(?:\([^)]*\))?\s*[:\-]?\s*(.*)$"))
+_CUSTOMER = LazyPattern(lambda: (rf"^\s*(?:{_pt('article')}|the\s+)?(?:{_pt('customer')}|lessee|hirer|customer)\b"
+                                 r"\s*(?:\([^)]*\))?\s*[:\-]?\s*(.*)$"))
+_NUMBER = LazyPattern(lambda: (rf"(?:{_pt('contract')}|contract|agreement)\s*(?:de\s+\w+(?:\s+\w+)?\s+)?"
+                               r"(?:n\.?\s*[ºo°]\.?|no\.?|number|#|numero|nr\.?)\s*[:.]?\s*"
+                               r"([A-Z0-9][A-Z0-9/\-.]{2,24}[A-Z0-9])"), re.IGNORECASE)
+_ASSET = LazyPattern(lambda: (rf"^\s*(?:{_pt('asset')}|vehicle|asset|goods|equipment)\b[^:]{{0,30}}:\s*(.+)$"))
+_PLATE_LABEL = LazyPattern(lambda: rf"\s*[,;]?\s*(?:{_pt('plate_label')}|registration|reg\.)", re.IGNORECASE)
+_PLATE = LazyPattern(lambda: (rf"(?:{_pt('plate')}|registration(?:\s+(?:no|number|mark))?|reg\.?\s*(?:no|mark)?)"
+                              r"\s*[:.]?\s*([a-z0-9]{2}[- ]?[a-z0-9]{2}[- ]?[a-z0-9]{2,3})(?![a-z0-9])"))
+_START = LazyPattern(lambda: (rf"^\s*(?:{_pt('start')}|start\s+date|commencement(?:\s+date)?|"
+                              r"first\s+(?:monthly\s+)?(?:payment|rental|instalment)(?:\s+date|\s+due)?|"
+                              r"date\s+of\s+first\s+payment)\b"))
+_TERM = LazyPattern(lambda: (rf"(?:{_pt('term')}|term|period|number\s+of\s+(?:rentals|payments|instalments|"
+                             r"installments))\b[^0-9\n]{0,20}(\d{1,3})\s*"
+                             rf"(months|{_pt('term_unit')}|rentals|payments|instalments|installments)?"))
+_TERM_ALONE = LazyPattern(lambda: (rf"(?<!\d)(\d{{1,3}})\s+(?:{_pt('term_alone')}|monthly\s+(?:rentals|payments|"
+                                   r"instalments))(?![a-z])"))
+_INSTALMENT = LazyPattern(lambda: (rf"(?<![a-z])(?:{_pt('instalment')}|rental|rentals|instalment|installment|"
+                                   r"monthly\s+payment|monthly\s+rent)(?![a-z])"))
+_NOT_INSTALMENT = LazyPattern(lambda: (rf"(?<![a-z])(?:{_pt('not_instalment')}|number\s+of|first|initial|due|date|"
+                                       r"day\s+of|residual|final|deposit|advance)(?![a-z])"))
+_GROSS_WORDS = LazyPattern(lambda: (rf"(?<![a-z])(?:{_pt('gross')}|incl(?:uding|\.)?\s+vat|inc\.?\s+vat|total)"
+                                    r"(?![a-z])"))
+_NET_WORDS = LazyPattern(lambda: (rf"(?<![a-z])(?:{_pt('net')}|excl(?:uding|\.)?\s+vat|ex\.?\s+vat|\+\s*vat|"
+                                  r"plus\s+vat|before\s+vat|base)(?![a-z])"))
+_VAT_LINE = LazyPattern(lambda: rf"(?<![a-z])(?:{_pt('vat')}|vat)(?![a-z])")
+# A line about the monthly payment, and one that says VAT is added on top of the amount it shows.
+_MONTHLY = LazyPattern(lambda: rf"{_pt('monthly')}|rental|instalment|installment|monthly")
+_MONTHLY_VAT = LazyPattern(lambda: rf"{_pt('monthly')}|rental|instalment|monthly")
+_PLUS_VAT = LazyPattern(lambda: rf"{_pt('plus_vat')}|\+\s*vat|plus\s+vat")
+_PLUS_VAT_FINAL = LazyPattern(lambda: rf"{_pt('plus_vat_final')}|plus\s+vat|\+\s*vat")
+_TAX_ID_TAIL = LazyPattern(lambda: rf"\s*(?:,\s*)?(?:{pack_alternatives('tax_id_label')}|VAT(?:\s+No\.?)?)\b",
+                           re.IGNORECASE)
 _RATE = re.compile(r"(\d{1,2}(?:[.,]\d)?)\s*%")
-_RESIDUAL = re.compile(r"(?<![a-z])(?:valor\s+residual|residual\s+value|opcao\s+de\s+compra|purchase\s+option|"
-                       r"option\s+to\s+purchase(?:\s+fee)?|balloon(?:\s+payment)?|final\s+payment)(?![a-z])")
+_RESIDUAL = LazyPattern(lambda: (rf"(?<![a-z])(?:{_pt('residual')}|residual\s+value|purchase\s+option|"
+                                 r"option\s+to\s+purchase(?:\s+fee)?|balloon(?:\s+payment)?|final\s+payment)(?![a-z])"))
 _EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 
@@ -189,7 +202,7 @@ def _after_label(lines: list[str], folded: list[str], i: int, captured: str) -> 
     value = raw[colon + 1:].strip() if colon >= 0 else captured.strip()
     if not value and i + 1 < len(lines):
         value = lines[i + 1].strip()
-    value = re.split(r"\s*(?:,\s*)?(?:NIF|NIPC|VAT(?:\s+No\.?)?|Contribuinte)\b", value, maxsplit=1, flags=re.IGNORECASE)[0]
+    value = _TAX_ID_TAIL.split(value, maxsplit=1)[0]
     return value.strip(" ,;-")
 
 
@@ -225,8 +238,7 @@ def read_lease(text: str, home: str = "PT") -> LeaseContract | None:
     if asset is not None:
         i = next(i for i, f in enumerate(folded) if _ASSET.match(f))
         asset_text = lines[i][lines[i].find(":") + 1:].strip()
-        asset_text = re.split(r"\s*[,;]?\s*(?:matr[ií]cula|registration|reg\.)", asset_text, maxsplit=1,
-                              flags=re.IGNORECASE)[0].strip(" ,;-") or None
+        asset_text = _PLATE_LABEL.split(asset_text, maxsplit=1)[0].strip(" ,;-") or None
     plate = _PLATE.search(whole)
     start = next((first_date(lines[i]) for i, f in enumerate(folded) if _START.match(f) and first_date(lines[i])),
                  None)
@@ -268,8 +280,7 @@ def _instalment(lines: list[str], folded: list[str]
         rates = [Decimal(r.replace(",", ".")) for r in _RATE.findall(f)]
         # "IVA sobre a renda (23%): 65,45 €" is the VAT of the monthly payment, not a monthly payment.
         vat_line = _VAT_LINE.search(f) and not _GROSS_WORDS.search(f) and not _NET_WORDS.search(f)
-        if vat_line and found and len(found) < 3 and re.search(
-                r"renda|rental|prestacao|instalment|installment|mensal|monthly", f):
+        if vat_line and found and len(found) < 3 and _MONTHLY.search(f):
             vat = vat or found[-1]
             rate = rate or (rates[0] if rates else None)
             continue
@@ -282,18 +293,18 @@ def _instalment(lines: list[str], folded: list[str]
                 gross = gross or found[-1]
             elif _NET_WORDS.search(f):
                 net = net or found[0]
-                plus_vat = plus_vat or bool(re.search(r"\+\s*(?:iva|vat)|acresce|plus\s+vat", f))
+                plus_vat = plus_vat or bool(_PLUS_VAT.search(f))
             else:
                 plain.append(found[-1])
             continue
-        if _VAT_LINE.search(f) and found and re.search(r"renda|rental|prestacao|instalment|mensal|monthly", f):
+        if _VAT_LINE.search(f) and found and _MONTHLY_VAT.search(f):
             vat = vat or found[-1]
             rate = rate or (rates[0] if rates else None)
         elif _VAT_LINE.search(f) and rates and not found:
             rate = rate or rates[0]
     problems: list[str] = []
     if plain and net is None and gross is None:
-        if plus_vat or any(re.search(r"acresce\s+iva|\+\s*iva|plus\s+vat|\+\s*vat", f) for f in folded):
+        if plus_vat or any(_PLUS_VAT_FINAL.search(f) for f in folded):
             net = plain[0]
         else:
             gross = plain[0]

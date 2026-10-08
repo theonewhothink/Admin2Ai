@@ -14,6 +14,9 @@ Documents from another country than the company's (checklist P7) are handled by
 issued a document, checks foreign VAT numbers, lists EU and UK VAT rates and
 reads English and Spanish invoice labels, so nothing is read as Portuguese
 merely because the company is.
+
+A country's own words for the core's other readers and writers (till reports, fraud phrases, the owner's
+chat, supplier emails ...) are in its pack too, asked for by concept (:mod:`backoffice.countries.wording`).
 """
 
 from .base import (
@@ -39,16 +42,21 @@ from .base import (
     VATBucket,
     VATRate,
     available_countries,
+    DEFAULT_COUNTRY,
     company_countries,
     company_pack,
     easter_sunday,
     get_pack,
     group_by_field,
     register_pack,
+    tax_id_hint,
     unregister_pack,
 )
+from .wording import PACK_WORDS, LazyPattern, pack_alternatives, pack_text, pack_words, spliced
 
 __all__ = [
+    "DEFAULT_COUNTRY",
+    "PACK_WORDS",
     "BankFeePolicy",
     "BankWording",
     "CompanyPack",
@@ -57,6 +65,7 @@ __all__ = [
     "DocumentFamily",
     "FiscalQRError",
     "FiscalQRResult",
+    "LazyPattern",
     "LearnedProfile",
     "NamedObservation",
     "NativeDocumentType",
@@ -76,6 +85,11 @@ __all__ = [
     "easter_sunday",
     "get_pack",
     "group_by_field",
+    "pack_alternatives",
+    "pack_text",
+    "pack_words",
     "register_pack",
+    "spliced",
+    "tax_id_hint",
     "unregister_pack",
 ]

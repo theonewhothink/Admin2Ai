@@ -44,6 +44,7 @@ try:  # httpx is only needed to fetch links; the browser build (Pyodide) has non
 except ImportError:  # pragma: no cover - exercised by the no-network import check
     httpx = None  # type: ignore[assignment]
 
+from backoffice.countries import LazyPattern, pack_words
 from backoffice.domain.models import EvidenceFormat, SourceKind, utcnow
 
 from .domains import LookalikeChecker, LookalikeFinding, display_name_for_host, registrable_domain, to_ascii_host
@@ -449,17 +450,17 @@ _INTERMEDIARIES = frozenset(
      "hubspotlinks.com", "mailjet.com", "sparkpostmail.com", "exacttarget.com",
      "outlook.com", "urldefense.com", "mimecast.com"}
 )  # fmt: skip
-_MFA_TEXT = re.compile(
+# English, Spanish, French and German; a pack's own in "links.mfa" and "links.login" (Portugal's "código de
+# verificação", "iniciar sessão"), alternatives in any case.
+_MFA_TEXT = LazyPattern(lambda: (
     r"verification code|one[- ]time (pass)?code|two[- ]factor|2-step|two-step|authenticator app"
     r"|enter the code|we (have )?sent (you )?a code|security code"
-    r"|c[oó]digo de (verifica[çc][ãa]o|seguran[çc]a|confirma[çc][ãa]o|acesso|autentica[çc][ãa]o)"
-    r"|autentica[çc][ãa]o (de dois fatores|em dois passos|forte)|(introduza|insira) o c[oó]digo"
-    r"|c[oó]digo (que )?envi[aá]mos|verificaci[oó]n en dos pasos|c[oó]digo de un solo uso",
+    r"|verificaci[oó]n en dos pasos|c[oó]digo de un solo uso" + "".join(f"|{w}" for w in pack_words("links.mfa"))),
     re.IGNORECASE,
 )
-_LOGIN_TEXT = re.compile(
-    r"sign ?in|log ?in|iniciar sess[ãa]o|inicie sess[ãa]o|entrar|aceder [àa] (sua )?conta"
-    r"|iniciar sesi[oó]n|acceder|se connecter|connexion|anmelden",
+_LOGIN_TEXT = LazyPattern(lambda: (
+    r"sign ?in|log ?in|entrar|iniciar sesi[oó]n|acceder|se connecter|connexion|anmelden"
+    + "".join(f"|{w}" for w in pack_words("links.login"))),
     re.IGNORECASE,
 )
 

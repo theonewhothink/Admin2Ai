@@ -34,6 +34,7 @@ from decimal import ROUND_DOWN, Decimal
 
 from pydantic import BaseModel, ConfigDict
 
+from backoffice.countries import LazyPattern, pack_alternatives
 from backoffice.domain.cost_centers import (
     CostCenter,
     SplitError,
@@ -545,13 +546,11 @@ def history_counts(entries: Iterable[tuple[str | None, str]]) -> dict[str, dict[
 
 
 # Words that say a cost is a client's, bought for them to pay back: an end customer named on the invoice,
-# "on behalf of", a disbursement, a cost to re-invoice (folded text).
-_FOR_THE_CLIENT = re.compile(
-    r"(?<![a-z])(?:cliente\s+final|utilizador\s+final|end[\s-]+(?:customer|client|user)|"
-    r"on\s+behalf\s+of|em\s+nome\s+(?:de|do|da)|por\s+conta\s+(?:de|do|da)|a\s+refaturar|para\s+refaturar|"
-    r"refaturacao|re-?invoic\w*|rebill\w*|to\s+(?:be\s+)?recharged?|recharge\s+to|reembols\w*|reimburs\w*|"
-    r"disbursements?|despesas?\s+(?:do|de)\s+cliente|client\s+(?:expense|disbursement)s?|pass[\s-]+through)"
-    r"(?![a-z])")
+# "on behalf of", a disbursement, a cost to re-invoice (folded text; a pack's own: "cost_centers.for_the_client").
+_FOR_THE_CLIENT = LazyPattern(lambda: (
+    rf"(?<![a-z])(?:{pack_alternatives('cost_centers.for_the_client')}|end[\s-]+(?:customer|client|user)|"
+    r"on\s+behalf\s+of|re-?invoic\w*|rebill\w*|to\s+(?:be\s+)?recharged?|recharge\s+to|reimburs\w*|"
+    r"disbursements?|client\s+(?:expense|disbursement)s?|pass[\s-]+through)(?![a-z])"))
 
 
 @dataclass(frozen=True)

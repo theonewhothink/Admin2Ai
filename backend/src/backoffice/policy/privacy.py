@@ -7,7 +7,8 @@ external answer can be restored on our side.
 
 Detection is deliberately biased toward over-redaction, but avoids eating the
 numbers extraction needs (tax ids, invoice numbers, dates, amounts).
-Address and phone patterns are best-effort for Portuguese and English text.
+Address and phone patterns are best-effort for English text and, from the country packs ("privacy.<concept>"),
+Portuguese addresses, postal codes and phone numbers (backoffice.countries.wording).
 
 Text from PDFs and OCR often uses no-break or thin spaces, typographic hyphens
 and invisible characters inside numbers; detection runs on a normalized copy
@@ -23,7 +24,10 @@ import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import cache
 from types import MappingProxyType
+
+from backoffice.countries import LazyPattern, pack_alternatives, pack_words
 
 
 class PiiKind(str, Enum):
@@ -316,18 +320,15 @@ def _find_emails(text: str) -> Iterable[tuple[int, int]]:
 _PHONE_CANDIDATE = re.compile(r"(?<![\w+])(?<!\w[-/.])\+?\(?\d[\d \t().-]{5,}\d(?!\w)")
 # The last group belongs to another token: "678 14:42", "678 14,50", "678 23%".
 _GLUED_AFTER = re.compile(r"[:%€/]|[.,]\d")
-_PHONE_KEYWORD = re.compile(
-    r"(?i)\b(?:tel|tlf|tlm|telef\w*|telem\w*|phone|mobile|mob|cell|fax|contacto|"
-    r"contact|whatsapp|call)\b[^\n\d]{0,6}$"
-)
+_PHONE_KEYWORD = LazyPattern(lambda: (
+    r"(?i)\b(?:tel|tlf|telef\w*|phone|mobile|mob|cell|fax|contacto|"
+    rf"contact|whatsapp|call{_or('phone_keyword')})\b[^\n\d]{{0,6}}$"
+))
 # Tax identifiers look like phone numbers; never treat them as one.
-_TAX_LABEL = re.compile(
-    r"(?:(?i:\b(?:nif|nipc|vat|iva|contribuinte|tax\s*id|n\.?\s*º?\s*fiscal)\b)[^\n\d]{0,8}"
+_TAX_LABEL = LazyPattern(lambda: (
+    rf"(?:(?i:\b(?:nif|vat|iva|tax\s*id|n\.?\s*º?\s*fiscal{_or('tax_label')})\b)[^\n\d]{{0,8}}"
     r"|(?<![A-Za-z])[A-Z]{2}[ ]?)$"  # country prefix such as "PT 509 123 456": uppercase only
-)
-_PT_NATIONAL = re.compile(
-    r"^(?:[29]\d{2}[ .-]?\d{3}[ .-]?\d{3}|2\d[ .-]\d{3}[ .-]\d{2}[ .-]\d{2})$"
-)
+))
 _UK_NATIONAL = re.compile(r"^0\d{2,4}[ -]?\d{3,4}[ -]?\d{3,4}$")
 # NANP: area code and exchange start with 2-9; "(555) 123-4567" is accepted as written.
 _US_NATIONAL = re.compile(
@@ -416,7 +417,7 @@ def _is_phone(candidate: str, *, keyword: bool) -> bool:
         return 10 <= len(digits) <= 17 and bool(_INTL_00.match(candidate))
     if candidate == digits:
         return False  # bare national numbers need a separator or a keyword
-    if len(digits) == 9 and _PT_NATIONAL.match(candidate):
+    if any(national.match(candidate) for national in _national_phones()):  # as a pack's country writes them
         return True
     if len(digits) in (10, 11) and _UK_NATIONAL.match(candidate):
         return True
@@ -425,32 +426,41 @@ def _is_phone(candidate: str, *, keyword: bool) -> bool:
 
 # --------------------------------------------------------------------------- address
 
-_WORD = r"[A-Za-zÀ-ÿ0-9][\wÀ-ÿ'.ºª-]*"
-_PT_STREET = re.compile(
-    r"(?<![\w])(?:Rua|R\.|Avenida|Av\.|Avª|Travessa|Trav\.|Tv\.|Largo|Lg\.|Praça|Pç\.|"
-    r"Praceta|Estrada|Estr\.|Alameda|Calçada|Beco|Rotunda|Urbanização|Urb\.|Bairro|"
-    r"Quinta|Caminho)"
-    rf"[ \t]+{_WORD}(?:[ \t]+{_WORD}){{0,7}}?"
-    # house number, then an optional floor; neither may be the start of a
-    # postal code such as "1200-820" (that belongs to the postal pattern)
-    r",?[ \t]*(?:n\.?[ \t]?º|nº|n\.|no\.|número)?[ \t]*\d{1,5}[A-Za-z]?\b(?!-\d)"
-    r"(?:,?[ \t]*\d{1,2}(?![\d-])[ \t]?(?:\.?[ºª°]|\.)?[ \t]*(?:andar|esq\.?|esquerdo|dto\.?|dt\.?|direito|"
-    r"frente|frt\.?|[A-D]\b)?)?",
-    re.IGNORECASE,
-)
-_PT_POSTAL = re.compile(
-    r"(?<![\w/-])\d{4}-\d{3}(?![\w-])"
-    r"(?P<locality>[ \t]+[A-ZÀ-Ý][A-Za-zÀ-ÿ'.-]{2,}"
-    r"(?:[ \t]+(?:de|do|da|dos|das)[ \t]+[A-ZÀ-Ý][A-Za-zÀ-ÿ'.-]+){0,2})?"
-)
-_PT_POSTAL_LABEL = re.compile(r"(?i)(?:c[óo]digo\s+postal|c\.?\s?p\.?)\s*:?\s*$")
+# A pack's own addresses ("privacy.street", any case: Portugal's "Rua ... 12, 3.º Esq."), postal codes
+# ("privacy.postal": its "code" group the code, its "locality" group the place after it), what a postal code needs
+# before it ("privacy.postal_label") or must not have before it ("privacy.doc_series": a document number such as
+# "FT 2026-183"), and words that are never a place ("privacy.locality_not"). Full patterns, one per entry.
+
+
+def _or(concept: str) -> str:
+    return "".join(f"|{w}" for w in pack_words(f"privacy.{concept}"))
+
+
+@cache
+def _patterns(concept: str, flags: int = 0) -> tuple[re.Pattern[str], ...]:
+    return tuple(re.compile(p, flags) for p in pack_words(f"privacy.{concept}"))
+
+
+def _national_phones() -> tuple[re.Pattern[str], ...]:
+    return _patterns("national_phone")
+
+
+def _streets() -> tuple[re.Pattern[str], ...]:
+    return _patterns("street", re.IGNORECASE)
+
+
+def _postal_codes() -> tuple[re.Pattern[str], ...]:
+    return _patterns("postal")
+
+
+_POSTAL_LABEL = LazyPattern(lambda: rf"(?i)(?:{pack_alternatives('privacy.postal_label')})\s*:?\s*$")
 # Document series codes (uppercase) and number labels right before "2026-183".
-_DOC_SERIES = re.compile(
-    r"(?:\b(?:FT|FR|FS|NC|ND|RC|FA|GT|OR)|(?i:\b(?:no|nº|n\.º|ref)\.?)|#)[ \t]*$"
-)
-_LOCALITY_NOT = re.compile(
-    r"(?i)^\s*(?:total|iva|vat|nif|data|date|eur|valor|invoice|fatura|factura)\b"
-)
+_DOC_SERIES = LazyPattern(lambda: (
+    rf"(?:\b(?:{pack_alternatives('privacy.doc_series')})|(?i:\b(?:no|nº|n\.º|ref)\.?)|#)[ \t]*$"
+))
+_LOCALITY_NOT = LazyPattern(lambda: (
+    rf"(?i)^\s*(?:total|iva|vat|nif|data|date|eur|valor|invoice|factura{_or('locality_not')})\b"
+))
 _EN_STREET = re.compile(
     r"(?<![\w])\d{1,5}[A-Za-z]?,?[ \t]+(?:[A-Z][\w'.-]*[ \t]+){1,4}"
     r"(?:Street|St|Road|Rd|Avenue|Ave|Lane|Ln|Drive|Dr|Boulevard|Blvd|Court|Ct|Place|Pl|"
@@ -470,24 +480,25 @@ _US_STATE_ZIP = re.compile(rf"(?<=, )(?:{_US_STATES})[ ]+\d{{5}}(?:-\d{{4}})?(?!
 
 
 def _find_addresses(text: str) -> Iterable[tuple[int, int]]:
-    for pattern in (_PT_STREET, _EN_STREET, _UK_POSTCODE, _US_STATE_ZIP):
+    for pattern in (*_streets(), _EN_STREET, _UK_POSTCODE, _US_STATE_ZIP):
         yield from (m.span() for m in pattern.finditer(text))
-    for m in _PT_POSTAL.finditer(text):
-        span = _pt_postal_span(text, m)
-        if span:
-            yield span
+    for postal in _postal_codes():
+        for m in postal.finditer(text):
+            span = _postal_span(text, m)
+            if span:
+                yield span
 
 
-def _pt_postal_span(text: str, m: re.Match[str]) -> tuple[int, int] | None:
-    """A PT postal code needs a locality after it or a 'Código Postal' label."""
+def _postal_span(text: str, m: re.Match[str]) -> tuple[int, int] | None:
+    """A postal code needs a locality after it or a label ('Código Postal') before it."""
     before = text[max(0, m.start() - 20) : m.start()]
     if _DOC_SERIES.search(before):
         return None
     locality = m.group("locality")
     if locality and not _LOCALITY_NOT.match(locality):
         return m.span()
-    if _PT_POSTAL_LABEL.search(before):
-        return m.start(), m.start() + 8
+    if _POSTAL_LABEL.search(before):
+        return m.start("code"), m.end("code")
     return None
 
 

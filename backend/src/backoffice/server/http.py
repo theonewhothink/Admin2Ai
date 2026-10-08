@@ -589,9 +589,9 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
         principal, refresh = await _signed_in(request, owner=True)
         body = await _json(request)
         if not str(body.get("taxId") or "").strip():
-            spain = str(body.get("country") or "").strip().upper() == "ES"
-            raise AuthError(400, "bad_request", "I need the company's NIF or CIF. It has 9 characters." if spain
-                            else "I need the company's NIF. It has 9 digits.")
+            from backoffice.countries import tax_id_hint
+
+            raise AuthError(400, "bad_request", f"I need the company's {tax_id_hint(body.get('country'))}")
         status, out = await run_in_threadpool(manager.add_company, principal.tenant.id, principal.user.id, body)
         return _reply(status, out, refresh=(refresh, _token(request)[0]))
 
@@ -1345,7 +1345,10 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
         if found.tax_ids:
             limit = inv.companies_for(found.tax_ids, companies)
             if not limit:
-                return 409, {"error": "conflict", "message": "This invitation is for the company with NIF "
+                from backoffice.countries import pack_text
+
+                return 409, {"error": "conflict", "message": "This invitation is for the company with "
+                             f"{pack_text('invitations.tax_id_name', 'tax number')} "
                              f"{', '.join(found.tax_ids)}. Add that company first, then accept."}
         elif isinstance(chosen, list) and chosen:
             known = [c for c, _ in companies]

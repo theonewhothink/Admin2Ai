@@ -6,6 +6,7 @@ import re
 from collections.abc import Collection, Mapping, Sequence
 from datetime import date
 from decimal import Decimal
+from types import MappingProxyType
 
 from backoffice.countries.base import (
     BankFeePolicy,
@@ -30,6 +31,7 @@ from . import banking_words, documents, holidays, nif, obligations, qr, text_fie
 from . import vat as es_vat
 
 # One amount in euros and cents as Spain writes it ("1.492,30", "64,10", "12.50"), and nothing else.
+_NO_WORDS: Mapping[str, tuple[str, ...]] = MappingProxyType({})
 _ONE_AMOUNT = re.compile(r"-?(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2}|-?\d+\.\d{2}")
 
 
@@ -44,6 +46,7 @@ class SpainPack:
     # Lines that start with these words are never the supplier's name.
     title_words = ("factura", "nif", "cif", "fecha", "ticket", "invoice", "numero", "nº", "n.º", "abono",
                    "albaran", "presupuesto", "recibo")
+    tax_id_hint = "NIF or CIF. It has 9 characters."
 
     @property
     def document_types(self) -> Mapping[str, NativeDocumentType]:
@@ -102,6 +105,14 @@ class SpainPack:
 
     def obligation_vocabulary(self) -> Mapping[str, tuple[str, ...]]:
         return obligations.VOCABULARY
+
+    def vocabulary(self) -> Mapping[str, tuple[str, ...]]:
+        """None of its own yet: the core's readers still hold their Spanish words."""
+        return _NO_WORDS
+
+    def supplier_letters(self) -> None:
+        """None yet: requests to Spanish suppliers are written in English."""
+        return None
 
     def bank_wording(self) -> BankWording:
         """How Spanish bank statements word taxes, fees, salaries, loans, grants and local tourist taxes."""

@@ -16,8 +16,9 @@ The cash box
     as money in (never silently absorbed). :func:`cash_box_period` adds up one period and says it in one
     plain line.
 
-Pure Python, no I/O. Money is Decimal. The layouts and words are conventions from Portuguese and English
-tills, not verified against every till software's export (verified_as_of: never).
+Pure Python, no I/O. Money is Decimal. The layouts and words are conventions from English tills and, in the
+country packs ("tills.*", backoffice.countries.wording), Portuguese ones, not verified against every till
+software's export (verified_as_of: never).
 """
 
 from __future__ import annotations
@@ -27,8 +28,10 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from decimal import Decimal
+from functools import cache
 
 from backoffice._reading import amounts, column, csv_rows, first_date, money, tax_ids
+from backoffice.countries import PACK_WORDS, LazyPattern, pack_alternatives, spliced
 from backoffice.learning.keys import fold
 from backoffice.learning.plain import day_month, format_money, join_and
 
@@ -40,32 +43,41 @@ MONTHS = ("January", "February", "March", "April", "May", "June", "July", "Augus
 
 # --------------------------------------------------------------------------- till reports
 
-_TITLE = re.compile(
-    r"(?<![a-z])(?:relatorio\s+(?:z|de\s+fecho|diario\s+de\s+vendas)|fecho\s+(?:de\s+|do\s+)?(?:caixa|dia)|"
+# A country's own till words ("Relatório Z", "Fecho de caixa", "Multibanco", "Numerário") are in its pack
+# (backoffice.countries.wording): "tills.<concept>", regular-expression alternatives over folded text.
+_TITLE = LazyPattern(lambda: (
+    rf"(?<![a-z])(?:{pack_alternatives('tills.title')}|"
     r"z[\s-]?report|end[\s-]+of[\s-]+day\s+report|daily\s+takings\s+report|informe\s+z|cierre\s+de\s+caja)"
-    r"(?![a-z])")
-_NUMBER = re.compile(r"(?<![a-z])(?:relatorio\s+z|z[\s-]?report|informe\s+z|fecho(?:\s+de\s+caixa)?|z)\s*"
-                     r"(?:n\.?\s*[ºo°]?\.?|no\.?|#|numero|number)?\s*[:.]?\s*(\d{1,8})(?![\d/.-])")
-_OTHER = re.compile(r"(?<![a-z])(?:mb\s?way|outros|other|vales?|vouchers?|cheques?|transferencias?)(?![a-z])")
-_CARD = re.compile(r"(?<![a-z])(?:multibanco|mb|cartao|cartoes|cards?|tpa|visa|mastercard|amex|debito|credito)"
-                   r"(?![a-z])")
-_CASH = re.compile(r"(?<![a-z])(?:numerario|dinheiro|cash|efectivo|especie)(?![a-z])")
-_TOTAL = re.compile(r"(?<![a-z])(?:total|vendas\s+(?:brutas|totais)|takings|gross\s+sales)(?![a-z])")
-_SKIP = re.compile(r"(?<![a-z])(?:iva|vat|imposto|tax|base|troco|change|devolucoes|refunds?|descontos?|"
-                   r"discounts?|anulacoes|voids?|fundo\s+(?:de\s+)?caixa|float|abertura|opening)(?![a-z])")
-_DATE_LINE = re.compile(r"^\s*(?:data|date|dia|day)(?:\s+(?:do\s+)?(?:fecho|report|relatorio))?\b")
+    r"(?![a-z])"))
+_NUMBER = LazyPattern(lambda: (rf"(?<![a-z])(?:{pack_alternatives('tills.number')}|z[\s-]?report|informe\s+z|z)\s*"
+                               r"(?:n\.?\s*[ºo°]?\.?|no\.?|#|numero|number)?\s*[:.]?\s*(\d{1,8})(?![\d/.-])"))
+_OTHER = LazyPattern(lambda: (rf"(?<![a-z])(?:{pack_alternatives('tills.other')}|other|vales?|vouchers?|cheques?|"
+                              r"transferencias?)(?![a-z])"))
+_CARD = LazyPattern(lambda: (rf"(?<![a-z])(?:{pack_alternatives('tills.card')}|cards?|visa|mastercard|amex|debito|"
+                             r"credito)(?![a-z])"))
+_CASH = LazyPattern(lambda: rf"(?<![a-z])(?:{pack_alternatives('tills.cash')}|cash|efectivo|especie)(?![a-z])")
+_TOTAL = LazyPattern(lambda: rf"(?<![a-z])(?:total|{pack_alternatives('tills.total')}|takings|gross\s+sales)(?![a-z])")
+_SKIP = LazyPattern(lambda: (rf"(?<![a-z])(?:iva|vat|{pack_alternatives('tills.skip')}|tax|base|change|refunds?|"
+                             r"discounts?|voids?|float|abertura|opening)(?![a-z])"))
+_DATE_LINE = LazyPattern(lambda: (rf"^\s*(?:data|date|dia|day)(?:\s+(?:{pack_alternatives('tills.date_suffix')}|"
+                                   r"report))?\b"))
 
+# CSV header cells by role (folded words, tried in order), with a pack's own where it has them ("tills.csv:<role>").
+_P = PACK_WORDS
 _CSV = {
-    "date": ("data", "date", "dia", "day", "data fecho", "data do fecho", "business date", "fecho"),
-    "number": ("z", "n z", "no z", "n o z", "numero z", "z number", "z no", "report", "report no",
-               "relatorio", "n relatorio", "numero"),
-    "cash": ("numerario", "dinheiro", "cash", "efectivo", "total numerario", "cash sales"),
-    "card": ("multibanco", "mb", "cartao", "cartoes", "card", "cards", "tpa", "card sales", "total multibanco",
-             "cartao multibanco"),
-    "other": ("outros", "other", "mb way", "mbway", "vales", "vouchers"),
-    "total": ("total", "total vendas", "vendas", "total sales", "takings", "total geral", "gross sales"),
-    "tax_id": ("nif", "contribuinte", "tax id", "vat number", "nipc"),
+    "date": ("data", "date", "dia", "day", _P, "business date", _P),
+    "number": ("z", "n z", "no z", "n o z", "numero z", "z number", "z no", "report", "report no", _P, "numero"),
+    "cash": (_P, "cash", "efectivo", _P, "cash sales"),
+    "card": (_P, "card", "cards", _P, "card sales", _P),
+    "other": (_P, "other", _P, "vales", "vouchers"),
+    "total": ("total", _P, "total sales", "takings", _P, "gross sales"),
+    "tax_id": ("nif", _P, "tax id", "vat number", _P),
 }
+
+
+@cache
+def _csv_aliases() -> dict[str, tuple[str, ...]]:
+    return {role: spliced(f"tills.csv:{role}", aliases) for role, aliases in _CSV.items()}
 
 
 @dataclass(frozen=True)
@@ -197,7 +209,7 @@ def _from_lines(lines: Sequence[str], folded: Sequence[str], offset: int) -> Til
 
 
 def _from_csv(header: list[str], rows: list[list[str]]) -> list[TillDay]:
-    col = {role: column(header, aliases) for role, aliases in _CSV.items()}
+    col = {role: column(header, aliases) for role, aliases in _csv_aliases().items()}
     if col["date"] is None or col["cash"] is None or col["card"] is None:
         return []
 

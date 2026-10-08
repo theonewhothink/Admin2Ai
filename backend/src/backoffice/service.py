@@ -422,9 +422,9 @@ class BackOfficeService:
         company from its name and VAT number, with the EU VAT register's details offered when a client is set."""
         b = body or {}
         if not str(b.get("taxId") or "").strip():
-            spain = str(b.get("country") or "").strip().upper() == "ES"
-            raise ServiceError(400, "I need the company's NIF or CIF. It has 9 characters." if spain
-                               else "I need the company's NIF. It has 9 digits.")
+            from backoffice.countries import tax_id_hint
+
+            raise ServiceError(400, f"I need the company's {tax_id_hint(b.get('country'))}")
         return self.add_company(b.get("name"), b.get("taxId"), b.get("legalName") or None, b.get("address") or None,
                                 b.get("sector") or None, b.get("country") or None)
 

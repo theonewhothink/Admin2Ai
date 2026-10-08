@@ -158,8 +158,9 @@ class CostCenterIdentifiers(BaseModel):
 API_NAMES = {"tax_ids": "taxIds"}
 
 
+# Kinds of cost center that are a property (a pack adds its own words: "cost_centers.property_kinds").
 PROPERTY_KINDS = frozenset({"property", "apartment", "flat", "unit", "house", "building", "villa", "room",
-                            "studio", "imovel", "apartamento", "fracao", "moradia", "predio", "casa"})
+                            "studio"})
 
 
 class CostCenter(BaseModel):
@@ -211,9 +212,11 @@ class CostCenter(BaseModel):
     @property
     def is_property(self) -> bool:
         """A property, apartment, house ... (its owner gets a statement)."""
+        from backoffice.countries import pack_words
         from backoffice.learning.keys import fold
 
-        return fold(self.kind) in PROPERTY_KINDS
+        kind = fold(self.kind)
+        return kind in PROPERTY_KINDS or kind in pack_words("cost_centers.property_kinds")
 
     @field_validator("name")
     @classmethod

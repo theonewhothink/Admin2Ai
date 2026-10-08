@@ -39,8 +39,10 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from functools import cache
 from typing import Any
 
+from backoffice.countries import LazyPattern, pack_alternatives, pack_words
 from backoffice.domain.models import DocumentType, EvidenceFormat, VatPart
 from backoffice.extraction.invoicelines import read_invoice_details, read_priced_lines
 from backoffice.learning import counterparty_key, display_name, fold, format_money
@@ -79,29 +81,36 @@ _PLAIN_RATES = frozenset({0, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 16, 17, 18, 19, 2
 
 # ---------------------------------------------------------------------------------------------------- units
 
-# Units as printed (folded, without a final dot) -> the unit a price is kept in.
-_UNITS: dict[str, str] = {}
-for _unit, _words in (
-    ("kg", "kg kgs kilo kilos quilo quilos kilograma kilogramas kilogramo kilogramos kilogram kilograms"),
-    ("g", "g gr grs grama gramas gramo gramos gram grams"),
+# Units as printed (folded, without a final dot) -> the unit a price is kept in. A pack adds its own words
+# ("line_prices.unit:<unit>", plain: Portugal's "caixa", "garrafa"), see _units().
+_UNIT_WORDS: tuple[tuple[str, str], ...] = (
+    ("kg", "kg kgs kilo kilos kilogramo kilogramos kilogram kilograms"),
+    ("g", "g gr grs gramo gramos gram grams"),
     ("ton", "ton tons tonelada toneladas tonne tonnes"),
     ("l", "l lt lts ltr litro litros litre litres liter liters"),
     ("ml", "ml"),
     ("cl", "cl"),
-    ("unit", "un und uni unid unids unidade unidades unidad ud uds unit units pc pcs pz pza pce each ea"),
-    ("box", "cx caixa caixas caja cajas box boxes ctn"),
+    ("unit", "un und uni unid unids unidad ud uds unit units pc pcs pz pza pce each ea"),
+    ("box", "caja cajas box boxes ctn"),
     ("bag", "sc saco sacos saca bag bags"),
     ("m", "m mt mts metro metros metre metres meter meters"),
     ("m2", "m2"),
     ("m3", "m3"),
     ("hour", "h hr hrs hora horas hour hours"),
-    ("dozen", "dz duzia duzias docena docenas dozen"),
-    ("pack", "emb embalagem pack packs pk paq paquete"),
-    ("bottle", "gf garrafa garrafas botella botellas bottle bottles"),
+    ("dozen", "docena docenas dozen"),
+    ("pack", "pack packs pk paq paquete"),
+    ("bottle", "botella botellas bottle bottles"),
     ("can", "lata latas can cans"),
-):
-    for _word in _words.split():
-        _UNITS[_word] = _unit
+)
+
+
+@cache
+def _units() -> dict[str, str]:
+    out: dict[str, str] = {}
+    for unit, words in _UNIT_WORDS:
+        for word in (*words.split(), *pack_words(f"line_prices.unit:{unit}")):
+            out[word] = unit
+    return out
 
 # UN/ECE Recommendation 20 unit codes an e-invoice uses -> the same units.
 _UNIT_CODES = {"KGM": "kg", "GRM": "g", "TNE": "ton", "LTR": "l", "MLT": "ml", "CLT": "cl", "H87": "unit",
@@ -120,43 +129,58 @@ _PER = {"kg": "per kg", "l": "per litre", "unit": "per unit", "box": "per box", 
 _PACK = re.compile(r"(?<![\w.,])(?:(\d{1,3})\s?x\s?)?(\d+(?:[.,]\d+)?)\s?(kgs?|grs?|g|lts?|l|ml|cl)(?![\w])")
 _PACK_UNITS = {"kg": "kg", "kgs": "kg", "g": "g", "gr": "g", "grs": "g", "l": "l", "lt": "l", "lts": "l",
                "ml": "ml", "cl": "cl"}
-# Words that say how a product is packed, not what it is.
-_PACKING = frozenset(set(_UNITS) - {"m", "h"}) | {"x", "embalado", "embalada", "granel", "avulso", "pacote",
-                                                   "paquete", "fardo", "fardos", "palete", "pallet"}
-_STOP = frozenset("de do da dos das del la el los las y e com con with and of the para for a o em en in".split())
+# Words that say how a product is packed, not what it is (and a pack's: "line_prices.packing").
+_PACKING_WORDS = frozenset({"x", "granel", "paquete", "fardo", "fardos", "pallet"})
+_STOP_WORDS = frozenset("de del la el los las y con with and of the para for a en in".split())  # + "line_prices.stop"
 
-# The same raw material in the owner's words and on a Portuguese, Spanish or English invoice.
+# The same raw material in the owner's words and on a Spanish or English invoice; a pack adds its own words for
+# it ("line_prices.material:<concept>": Portugal's "farinha").
 _CONCEPTS: dict[str, tuple[str, ...]] = {
-    "flour": ("flour", "farinha", "harina"),
-    "sugar": ("sugar", "acucar", "azucar"),
-    "butter": ("butter", "manteiga", "mantequilla"),
-    "milk": ("milk", "leite", "leche"),
-    "eggs": ("egg", "eggs", "ovo", "ovos", "huevo", "huevos"),
-    "yeast": ("yeast", "fermento", "levedura", "levadura"),
+    "flour": ("flour", "harina"),
+    "sugar": ("sugar", "azucar"),
+    "butter": ("butter", "mantequilla"),
+    "milk": ("milk", "leche"),
+    "eggs": ("egg", "eggs", "huevo", "huevos"),
+    "yeast": ("yeast", "levadura"),
     "salt": ("salt", "sal"),
-    "oil": ("oil", "oleo", "aceite", "azeite"),
+    "oil": ("oil", "aceite"),
     "coffee": ("coffee", "cafe"),
-    "cheese": ("cheese", "queijo", "queso"),
-    "cream": ("cream", "natas", "nata"),
-    "chocolate": ("chocolate", "cacau", "cacao", "cocoa"),
+    "cheese": ("cheese", "queso"),
+    "cream": ("cream", "nata"),
+    "chocolate": ("chocolate", "cacao", "cocoa"),
     "rice": ("rice", "arroz"),
     "meat": ("meat", "carne"),
-    "chicken": ("chicken", "frango", "pollo"),
-    "fish": ("fish", "peixe", "pescado"),
+    "chicken": ("chicken", "pollo"),
+    "fish": ("fish", "pescado"),
     "tomatoes": ("tomato", "tomatoes", "tomate", "tomates"),
-    "potatoes": ("potato", "potatoes", "batata", "batatas", "patata", "patatas"),
-    "onions": ("onion", "onions", "cebola", "cebolas", "cebolla", "cebollas"),
-    "almonds": ("almond", "almonds", "amendoa", "amendoas", "almendra", "almendras"),
-    "wine": ("wine", "vinho", "vino"),
-    "beer": ("beer", "cerveja", "cerveza"),
+    "potatoes": ("potato", "potatoes", "patata", "patatas"),
+    "onions": ("onion", "onions", "cebolla", "cebollas"),
+    "almonds": ("almond", "almonds", "almendra", "almendras"),
+    "wine": ("wine", "vino"),
+    "beer": ("beer", "cerveza"),
     "water": ("water", "agua"),
     "diesel": ("diesel", "gasoleo", "gasoil"),
     "petrol": ("petrol", "gasoline", "gasolina"),
     "paper": ("paper", "papel"),
-    "cement": ("cement", "cimento", "cemento"),
-    "steel": ("steel", "aco", "acero"),
+    "cement": ("cement", "cemento"),
+    "steel": ("steel", "acero"),
 }
-_CONCEPT_OF = {word: concept for concept, words in _CONCEPTS.items() for word in words}
+
+
+@cache
+def _packing() -> frozenset[str]:
+    return frozenset(set(_units()) - {"m", "h"}) | _PACKING_WORDS | frozenset(pack_words("line_prices.packing"))
+
+
+@cache
+def _stop() -> frozenset[str]:
+    return _STOP_WORDS | frozenset(pack_words("line_prices.stop"))
+
+
+@cache
+def _concept_of() -> dict[str, str]:
+    return {word: concept for concept, words in _CONCEPTS.items()
+            for word in (*words, *pack_words(f"line_prices.material:{concept}"))}
 
 
 # ---------------------------------------------------------------------------------------------------- results
@@ -357,13 +381,14 @@ def _cell(token: str, mark: str) -> _Cell | None:
     if found is not None:
         return _Cell("num", found[0], found[1], raw=token)
     attached = _ATTACHED.match(t)
-    if attached and attached.group(2) in _UNITS:
+    units = _units()
+    if attached and attached.group(2) in units:
         value = parse_number(attached.group(1), mark)
         if value is not None:
-            return _Cell("num", value[0], value[1], unit=_UNITS[attached.group(2)], raw=token)
+            return _Cell("num", value[0], value[1], unit=units[attached.group(2)], raw=token)
     word = t.rstrip(".")
-    if word in _UNITS and word not in ("t", "u"):
-        return _Cell("unit", unit=_UNITS[word], raw=token)
+    if word in units and word not in ("t", "u"):
+        return _Cell("unit", unit=units[word], raw=token)
     return None
 
 
@@ -495,23 +520,30 @@ def _settle(readings: list[_Row], columns: Mapping[str, int] | None) -> _Row | N
     return _Row(base.tokens, base.quantity, base.unit, base.price, None, False, None, base.total)
 
 
-# A table's header: which columns it has, in which order ("Código Descrição Qtd Un Preço IVA Total").
+# A table's header: which columns it has, in which order ("Code Description Qty Unit Price VAT Total"; a pack's
+# own words for each column: "line_prices.head:<column>", Portugal's "Código Descrição Qtd Un Preço IVA Total").
 _HEAD_WORDS = {
-    "code": r"codigo|cod|ref|referencia|reference|code|sku|artigo n|art",
-    "desc": r"descricao|designacao|descripcion|description|produto|producto|product|concepto|servico|item|artigo|articulo",
-    "qty": r"qtd|qtde|quant|quantidade|qty|quantity|cant|cantidad|uds|unidades",
-    "price": r"preco|precio|price|p\s?unit|pr\s?unit|pu|valor unit|v\s?unit|unit price|rate|pvp",
-    "total": r"total|valor|importe|amount|montante|liquido",
-    "vat": r"iva|vat|igic|tax|imposto|impuesto|taxa",
-    "disc": r"desc|desconto|dto|descuento|discount|disc",
+    "code": r"cod|ref|referencia|reference|code|sku",
+    "desc": r"descripcion|description|producto|product|concepto|item|articulo",
+    "qty": r"qty|quantity|cant|cantidad|uds|unidades",
+    "price": r"precio|price|p\s?unit|pr\s?unit|pu|valor unit|v\s?unit|unit price|rate|pvp",
+    "total": r"total|valor|importe|amount",
+    "vat": r"iva|vat|igic|tax|impuesto",
+    "disc": r"desc|dto|descuento|discount|disc",
 }
+
+
+@cache
+def _head_patterns() -> dict[str, re.Pattern[str]]:
+    return {name: re.compile(rf"\b(?:{pack_alternatives(f'line_prices.head:{name}')}|{pattern})\b")
+            for name, pattern in _HEAD_WORDS.items()}
 
 
 def _header(line: str) -> dict[str, int] | None:
     t = re.sub(r"[^a-z ]+", " ", fold(line))
     found: dict[str, int] = {}
-    for name, pattern in _HEAD_WORDS.items():
-        m = re.search(rf"\b(?:{pattern})\b", t)
+    for name, pattern in _head_patterns().items():
+        m = pattern.search(t)
         if m is not None:
             found[name] = m.start()
     if {"qty", "price"} <= set(found) and ("desc" in found or "code" in found) and len(found) >= 3:
@@ -571,10 +603,10 @@ def read_text_lines(text: str) -> tuple[PriceLine, ...]:
 # ---------------------------------------------------------------------------------------------------- totals
 
 
-_BASE_LABEL = re.compile(r"\b(?:base tributavel|base de incidencia|incidencia|base imponible|base imp|taxable amount|"
-                         r"taxable|net amount|net|base|subtotal|valor liquido|total liquido|total sem iva|"
-                         r"sin iva|excl(?:uding)? vat|ex vat)\b")
-_VAT_LABEL = re.compile(r"\b(?:iva|vat|igic|tax|imposto|impuesto)\b")
+_BASE_LABEL = LazyPattern(lambda: (rf"\b(?:{pack_alternatives('line_prices.base_label')}|base imponible|base imp|"
+                                   r"taxable amount|taxable|net amount|net|base|subtotal|sin iva|excl(?:uding)? vat|"
+                                   r"ex vat)\b"))
+_VAT_LABEL = LazyPattern(lambda: rf"\b(?:iva|vat|igic|tax|{pack_alternatives('line_prices.vat_label')}|impuesto)\b")
 _RATE = re.compile(r"(?<![\d.,])(\d{1,2}(?:[.,]\d{1,2})?)\s*%")
 _AMOUNT = re.compile(r"(?<![\w.,])[+-]?\d[\d.,]*\d|(?<![\w.,])\d(?![\w.,])")
 
@@ -718,14 +750,15 @@ def product_key(description: str) -> str:
     """'Farinha de Trigo T65 (saco 25 kg)' -> 'farinha trigo t65': what the product is, not how it is packed."""
     folded = _PACK.sub(" ", fold(description))
     words = [w for w in re.split(r"[^a-z0-9]+", folded) if w]
-    return " ".join(w for w in words if w not in _STOP and w not in _PACKING)
+    stop, packing = _stop(), _packing()
+    return " ".join(w for w in words if w not in stop and w not in packing)
 
 
 def product_concepts(text: str) -> set[str]:
     """The raw materials a text names, in any of the three languages ("flour" and "farinha" are both flour)."""
     out: set[str] = set()
     for word in re.split(r"[^a-z]+", fold(text)):
-        concept = _CONCEPT_OF.get(word) or (_CONCEPT_OF.get(word[:-1]) if word.endswith("s") else None)
+        concept = _concept_of().get(word) or (_concept_of().get(word[:-1]) if word.endswith("s") else None)
         if concept:
             out.add(concept)
     return out

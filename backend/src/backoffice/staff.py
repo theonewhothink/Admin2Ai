@@ -37,6 +37,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
+from backoffice.countries import pack_words
 from backoffice.domain.lifecycle import Stage
 from backoffice.domain.models import DocumentType, Quality, TransactionKind
 from backoffice.fraud import normalize_iban
@@ -701,7 +702,7 @@ class StaffAgent(_Agent):
         likely = [r for r in repo.transactions.values() if doc.id in r.likely_document_ids]
         if likely:
             return likely[0]
-        shop = set(_words(doc.document.supplier_name)) - {"lda", "sa", "unipessoal", "s", "a"}
+        shop = set(_words(doc.document.supplier_name)) - {"sa", "s", "a", *pack_words("staff.legal_forms")}
         found = []
         for rec in sorted(repo.transactions.values(), key=lambda r: r.id):
             if rec.tx.amount >= 0 or rec.document_ids or rec.private or rec.claim_ids or not self.fits(rec, doc):

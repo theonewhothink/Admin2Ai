@@ -24,6 +24,8 @@ from backoffice.countries.base import (
 from backoffice.domain.models import DocumentType, ExtractionMethod, VatPart
 
 from . import atcud, banking_words, documents, holidays, nif, qr, text_fields
+from . import letters as pt_letters
+from . import vocabulary as pt_vocabulary
 from . import calendar as pt_calendar
 from . import obligations as pt_obligations
 from . import vat as pt_vat
@@ -43,6 +45,7 @@ class PortugalPack:
     language = "pt"
     # Lines that start with these words are never the supplier's name.
     title_words = ("nif", "fatura", "invoice", "data", "atcud")
+    tax_id_hint = "NIF. It has 9 digits."
 
     @property
     def document_types(self) -> Mapping[str, NativeDocumentType]:
@@ -137,6 +140,14 @@ class PortugalPack:
         """What Portuguese letters say (Autoridade Tributária, Segurança Social, "data limite de pagamento",
         "comprovativo de entrega"...), read with the core's English (backoffice.closure.obligations)."""
         return pt_obligations.VOCABULARY
+
+    def vocabulary(self) -> Mapping[str, tuple[str, ...]]:
+        """Portuguese words for the core's readers and writers, by concept (:mod:`.vocabulary`)."""
+        return pt_vocabulary.VOCABULARY
+
+    def supplier_letters(self) -> pt_letters.PortugueseLetters:
+        """Requests to suppliers in Portuguese (:mod:`.letters`)."""
+        return pt_letters.LETTERS
 
     def bank_wording(self) -> BankWording:
         """How Portuguese bank statements word taxes, fees, salaries, loans, grants and the tourist tax."""

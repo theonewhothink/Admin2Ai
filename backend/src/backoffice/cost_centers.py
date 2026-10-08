@@ -26,7 +26,6 @@ jargon (§36).
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date
@@ -34,6 +33,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import TYPE_CHECKING, Any
 
 from backoffice.closure import Month
+from backoffice.countries import LazyPattern, pack_alternatives
 from backoffice.domain.cost_centers import DEFAULT_KIND, CostCenter
 from backoffice.domain.lifecycle import Stage
 from backoffice.domain.models import CostAllocation
@@ -444,9 +444,10 @@ class CostCenterViews:
         return f"{center.label}{when}: {', '.join(parts)}.{tail}"
 
 
-# Money received for a property that is its rent (or a stay's price), by the bank line's words (folded text).
-_RENT = re.compile(r"(?<![a-z])(?:renda|rendas|rent|rental|aluguer|arrendamento|alojamento|booking|airbnb|"
-                   r"estadia|reserva|hospede|guest|stay)(?![a-z])")
+# Money received for a property that is its rent (or a stay's price), by the bank line's words (folded text; a
+# pack's own in "cost_centers.rent").
+_RENT = LazyPattern(lambda: (rf"(?<![a-z])(?:{pack_alternatives('cost_centers.rent')}|rent|rental|booking|airbnb|"
+                             r"guest|stay)(?![a-z])"))
 
 
 def _pct(value: Decimal | None) -> str:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from functools import cache
 
 __all__ = [
     "EU_VAT_PREFIXES",
@@ -38,10 +39,17 @@ _PROCESSORS = frozenset(
 # a missed merge is safer than merging two different counterparties.
 _LEGAL_FORMS = frozenset(
     {
-        "lda", "limitada", "unipessoal", "sa", "sgps", "ltd", "limited", "inc", "llc",
+        "limitada", "sa", "ltd", "limited", "inc", "llc",
         "gmbh", "ag", "sl", "slu", "bv", "nv", "plc", "srl", "sas", "sarl",
     }
-)  # fmt: skip
+)  # fmt: skip  (and a pack's own: "keys.legal_forms", Portugal's "Lda.", "Unipessoal", "SGPS")
+
+
+@cache
+def _legal_forms() -> frozenset[str]:
+    from backoffice.countries import pack_words
+
+    return _LEGAL_FORMS | frozenset(pack_words("keys.legal_forms"))
 
 # EU VAT number prefixes (ISO 3166 alpha-2, except Greece "EL" and Northern Ireland "XI"),
 # plus non-EU countries whose VAT numbers commonly carry an ISO prefix on invoices.
@@ -97,7 +105,7 @@ def counterparty_key(name: str | None) -> str | None:
     text = _merchant_part(fold(name))
     text = re.sub(r"(?<=\b\w)\.(?=\w\b)", "", text)  # "s.a." -> "sa."
     words = [w for w in _NON_WORD.sub(" ", text).split() if not _HAS_DIGIT.search(w)]
-    while len(words) > 1 and words[-1] in _LEGAL_FORMS:
+    while len(words) > 1 and words[-1] in _legal_forms():
         words.pop()
     return " ".join(words) or None
 
@@ -127,11 +135,15 @@ def match_key(value: str | None) -> str | None:
 
 
 _CUT = re.compile(r"\s+[-–—|]\s+|,")
-_LEGAL_TAIL = re.compile(
-    r"(?:\s+(?:" + "|".join(sorted(_LEGAL_FORMS, key=len, reverse=True)) + r")\.?)+\s*$",
-    re.IGNORECASE,
-)
-_LEGAL_TAIL_DOTTED = re.compile(r"\s+(?:S\.\s?A\.?|L\.?d\.?a\.?)\s*$", re.IGNORECASE)
+@cache
+def _legal_tails() -> tuple[re.Pattern[str], re.Pattern[str]]:
+    """A dotted legal form at the end of a name ("S.A."; a pack's own: "keys.legal_form_dotted"), and any."""
+    from backoffice.countries import pack_words
+
+    dotted = "".join(f"|{w}" for w in pack_words("keys.legal_form_dotted"))
+    return (re.compile(rf"\s+(?:S\.\s?A\.?{dotted})\s*$", re.IGNORECASE),
+            re.compile(r"(?:\s+(?:" + "|".join(sorted(_legal_forms(), key=len, reverse=True)) + r")\.?)+\s*$",
+                       re.IGNORECASE))
 
 
 def display_name(name: str | None, fallback: str = "This supplier") -> str:
@@ -146,7 +158,7 @@ def display_name(name: str | None, fallback: str = "This supplier") -> str:
         head, _, tail = text.partition("*")
         text = tail if head.strip().casefold() in _PROCESSORS else head
     text = _CUT.split(text, maxsplit=1)[0].strip() or text.strip()
-    for pattern in (_LEGAL_TAIL_DOTTED, _LEGAL_TAIL):
+    for pattern in _legal_tails():
         shorter = pattern.sub("", text).strip()
         text = shorter or text
     words = [w for w in text.split() if not _HAS_DIGIT.search(w)] or text.split()

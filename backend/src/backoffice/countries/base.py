@@ -433,10 +433,24 @@ class CompanyPack(CountryPack, Protocol):
     monthly accountant package goes on one, backoffice.package_delivery). ``document_code`` is the
     unique code the country's rules print on each fiscal document (Portugal's ATCUD), which proves two
     copies are the same document when their numbers could not be read (backoffice.captures).
+    ``vocabulary`` is the country's own words for the core's other readers and writers (till reports, fraud
+    phrases, the owner's chat, bank lines ...), by concept: see :mod:`backoffice.countries.wording`.
+    ``supplier_letters`` words the core's requests to suppliers in the country's language (None: English).
+    ``tax_id_hint`` names the company's tax number and its length for the owner ("NIF. It has 9 digits.").
     """
 
     language: str
     title_words: tuple[str, ...]
+    tax_id_hint: str
+
+    def vocabulary(self) -> Mapping[str, tuple[str, ...]]:
+        """The country's own words for the core's readers and writers, by concept (backoffice.countries.wording)."""
+        ...
+
+    def supplier_letters(self) -> Any:
+        """How a request to a supplier is worded in the country's language (backoffice.missing.chase), or None
+        when the core's English is used."""
+        ...
 
     def read_text(
         self,
@@ -526,6 +540,19 @@ def company_pack(country: str) -> CompanyPack:
     if not isinstance(pack, CompanyPack):
         raise UnknownCountryError(f"the {pack.country_code} pack cannot run a company yet")
     return pack
+
+
+# Where a company is set up unless it says otherwise: the first market (§49, §63).
+DEFAULT_COUNTRY = "PT"
+
+
+def tax_id_hint(country: str | None) -> str:
+    """What the owner is asked for when a company of ``country`` comes without its tax number: its pack's
+    ``tax_id_hint`` ("NIF. It has 9 digits."), the default country's for a country no pack runs."""
+    try:
+        return company_pack(str(country or DEFAULT_COUNTRY)).tax_id_hint
+    except UnknownCountryError:
+        return company_pack(DEFAULT_COUNTRY).tax_id_hint
 
 
 def company_countries() -> tuple[str, ...]:

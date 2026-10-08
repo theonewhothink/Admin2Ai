@@ -17,13 +17,21 @@ Nothing here reaches the network or the clock: the same evidence gives the same 
 
 from __future__ import annotations
 
-import re
 import unicodedata
 from collections.abc import Mapping
 from datetime import date
 from typing import Any
 
-from backoffice.countries import CountryPackError, LearnedProfile, TaxProfile, TaxSignal, company_pack
+from backoffice.countries import (
+    CountryPackError,
+    LazyPattern,
+    LearnedProfile,
+    TaxProfile,
+    TaxSignal,
+    company_pack,
+    pack_alternatives,
+    pack_words,
+)
 
 __all__ = ["FIELDS", "describe", "learned", "parse_setting", "profile", "settings_profile", "signals"]
 
@@ -146,23 +154,43 @@ def _fold(text: str) -> str:
     return " ".join("".join(c for c in decomposed if not unicodedata.combining(c)).split())
 
 
-_NO = r"(?:no|without|sem|nao\s+tem|has\s+no|have\s+no|does\s+not\s+have|doesn't\s+have|nao\s+faz|does\s+not\s+make)"
-_VAT = re.compile(r"(?<![a-z])(?:vat|iva)(?![a-z])")
-_MONTHLY = re.compile(r"(?<![a-z])(?:monthly|every\s+month|each\s+month|mensal|mensalmente)(?![a-z])")
-_QUARTERLY = re.compile(r"(?<![a-z])(?:quarterly|every\s+quarter|each\s+quarter|trimestral|trimestralmente)(?![a-z])")
-_EXEMPT = re.compile(r"(?<![a-z])(?:exempt|isento|isenta|isencao)(?![a-z])")
-_STAFF = r"(?:employees?|staff|salaries|workers|trabalhadores|funcionarios|salarios)"
-_EMPLOYEES = re.compile(rf"(?<![a-z])(?:has|have|with|employs|pays|tem|com|paga)\s+(?:\w+\s+){{0,2}}{_STAFF}"
-                        r"(?![a-z])")
-_NO_EMPLOYEES = re.compile(rf"(?<![a-z]){_NO}\s+(?:\w+\s+){{0,2}}{_STAFF}(?![a-z])")
+# The core's English; a pack's own words are in "tax_profiles.<concept>" (Portugal's "IVA mensal", "não tem
+# trabalhadores", "pagamentos por conta", "Modelo 10"), regular-expression alternatives over folded text.
+
+
+def _or(concept: str) -> str:
+    return "".join(f"|{w}" for w in pack_words(f"tax_profiles.{concept}"))
+
+
+def _no() -> str:
+    return rf"(?:no|without|has\s+no|have\s+no|does\s+not\s+have|doesn't\s+have|does\s+not\s+make{_or('no')})"
+
+
+def _staff() -> str:
+    return rf"(?:employees?|staff|salaries|workers{_or('staff')})"
+
+
+def _advance() -> str:
+    return rf"(?:advance\s+payments?{_or('advance')})"
+
+
+_VAT = LazyPattern(lambda: rf"(?<![a-z])(?:vat{_or('vat')})(?![a-z])")
+_MONTHLY = LazyPattern(lambda: rf"(?<![a-z])(?:monthly|every\s+month|each\s+month{_or('monthly')})(?![a-z])")
+_QUARTERLY = LazyPattern(lambda: rf"(?<![a-z])(?:quarterly|every\s+quarter|each\s+quarter{_or('quarterly')})(?![a-z])")
+_EXEMPT = LazyPattern(lambda: rf"(?<![a-z])(?:exempt{_or('exempt')})(?![a-z])")
+_EMPLOYEES = LazyPattern(lambda: (rf"(?<![a-z])(?:has|have|with|employs|pays{_or('has')})\s+(?:\w+\s+){{0,2}}"
+                                  rf"{_staff()}(?![a-z])"))
+_NO_EMPLOYEES = LazyPattern(lambda: rf"(?<![a-z]){_no()}\s+(?:\w+\s+){{0,2}}{_staff()}(?![a-z])")
 # An ordinary accountant rule ("Treat all Uber as Staff training", "EDP always needs an invoice"): never a tax fact.
-_ORDINARY_RULE = re.compile(r"^\s*(?:treat|classify|book|require|ask)\b|(?<![a-z])(?:invoices?|faturas?)(?![a-z])")
-_ADVANCE = re.compile(r"(?<![a-z])(?:advance\s+payments?|pagamentos?\s+por\s+conta)(?![a-z])")
-_NO_ADVANCE = re.compile(rf"(?<![a-z]){_NO}\s+(?:\w+\s+){{0,2}}(?:advance\s+payments?|pagamentos?\s+por\s+conta)"
-                         r"(?![a-z])")
-_OTHER = re.compile(r"(?<![a-z])(?:modelo\s+10|rents?\s+or\s+fees\s+with\s+tax\s+withheld|other\s+income\s+with\s+tax"
-                    r"\s+withheld|withholds\s+tax\s+on\s+(?:rents?|fees))(?![a-z])")
-_NO_OTHER = re.compile(rf"(?<![a-z]){_NO}\s+(?:\w+\s+){{0,2}}modelo\s+10(?![a-z])")
+_ORDINARY_RULE = LazyPattern(lambda: (r"^\s*(?:treat|classify|book|require|ask)\b|(?<![a-z])(?:invoices?"
+                                      rf"{_or('invoice')})(?![a-z])"))
+_ADVANCE = LazyPattern(lambda: rf"(?<![a-z]){_advance()}(?![a-z])")
+_NO_ADVANCE = LazyPattern(lambda: rf"(?<![a-z]){_no()}\s+(?:\w+\s+){{0,2}}{_advance()}(?![a-z])")
+# Rents or fees paid with tax withheld, reported once a year (a pack names its form: "tax_profiles.other_form").
+_OTHER = LazyPattern(lambda: (r"(?<![a-z])(?:rents?\s+or\s+fees\s+with\s+tax\s+withheld|other\s+income\s+with\s+tax"
+                              rf"\s+withheld|withholds\s+tax\s+on\s+(?:rents?|fees){_or('other_form')})(?![a-z])"))
+_NO_OTHER = LazyPattern(lambda: (rf"(?<![a-z]){_no()}\s+(?:\w+\s+){{0,2}}"
+                                 rf"(?:{pack_alternatives('tax_profiles.other_form')})(?![a-z])"))
 
 
 def parse_setting(text: str) -> dict[str, Any] | None:

@@ -23,8 +23,9 @@ Recurring payers
     amount on a rhythm: every month, or once a school term (gaps of two months up to the summer break). A thin
     history is kept as untrusted (AMBER): it describes, it never closes anything.
 
-Pure Python, no I/O. The words and layouts are conventions from Portuguese and English schools, gyms and
-banks, not verified against every software's export (verified_as_of: never).
+Pure Python, no I/O. The words and layouts are conventions from English schools, gyms and banks and, in the
+country packs ("memberships.*", backoffice.countries.wording), Portuguese ones, not verified against every
+software's export (verified_as_of: never).
 """
 
 from __future__ import annotations
@@ -35,17 +36,19 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
+from functools import cache
 from itertools import pairwise
 
 from backoffice._reading import (
-    MONTH_WORDS,
     column,
     csv_rows,
     first_date,
     money,
     month_named,
+    month_words,
     tax_ids,
 )
+from backoffice.countries import PACK_WORDS, LazyPattern, pack_alternatives, pack_words, spliced
 from backoffice.domain.models import Transaction
 from backoffice.learning.keys import counterparty_key, fold
 from backoffice.learning.plain import format_money, ordinal
@@ -64,33 +67,43 @@ TERM_GAP_DAYS = 160  # the longest gap between two terms' payments: across the s
 MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
           "November", "December")
 
+# A receipts list's headings by role (folded words, tried in order), with a pack's own at each of the core's places
+# for them ("memberships.column:<role>", ":2" for the second place ...).
+_P = PACK_WORDS
 _COLUMNS = {
-    "number": ("recibo", "n recibo", "no recibo", "n o recibo", "numero recibo", "numero do recibo", "receipt",
-               "receipt no", "receipt number", "n documento", "documento", "doc", "fatura recibo", "numero"),
-    "date": ("data", "date", "data emissao", "data de emissao", "issue date", "data pagamento", "data do pagamento",
-             "paid on", "payment date", "issued"),
-    "member": ("aluno", "aluna", "socio", "socia", "membro", "utente", "atleta", "cliente", "nome", "student",
-               "member", "customer", "client", "name", "patient"),
-    "payer": ("encarregado de educacao", "encarregado", "pagador", "pago por", "payer", "paid by", "parent",
-              "titular", "responsavel"),
-    "tax_id": ("nif", "contribuinte", "nif cliente", "nif do cliente", "tax id", "vat", "vat number"),
-    "period": ("referente a", "periodo", "mes", "mes de referencia", "mensalidade", "period", "month", "term",
-               "for", "referencia", "descricao", "description"),
-    "amount": ("valor", "montante", "total", "amount", "valor pago", "paid", "amount paid"),
-    "method": ("forma de pagamento", "meio de pagamento", "pagamento", "metodo", "metodo de pagamento",
-               "payment method", "method", "paid with"),
+    "number": (_P, "receipt", "receipt no", "receipt number", _P, "doc", _P),
+    "date": (_P, "date", _P, "issue date", _P, "paid on", "payment date", "issued"),
+    "member": (_P, "student", "member", "customer", "client", "name", "patient"),
+    "payer": (_P, "payer", "paid by", "parent", _P),
+    "tax_id": (_P, "tax id", "vat", "vat number"),
+    "period": (_P, "period", "month", "term", "for", _P, "description"),
+    "amount": (_P, "total", "amount", _P, "paid", "amount paid"),
+    "method": (_P, "payment method", "method", "paid with"),
 }
-_TILL_COLUMNS = ("numerario", "multibanco", "cash", "card", "cartao")
-_TERM = re.compile(r"(?<![a-z0-9])(?:(\d)\s*\.?\s*[ºo°]?\s*(?:periodo|trimestre|semestre|term)|(?:term|periodo)\s*"
-                   r"(\d)|(\d)(?:st|nd|rd|th)\s+term)(?![a-z0-9])")
-_CASH = re.compile(r"(?<![a-z])(?:numerario|dinheiro|cash|efectivo)(?![a-z])")
+_TILL_COLUMNS = ("cash", "card")  # and a pack's ("memberships.till_columns")
+_TERM = LazyPattern(lambda: (
+    r"(?<![a-z0-9])(?:(\d)\s*\.?\s*[ºo°]?\s*"
+    rf"(?:{pack_alternatives('memberships.term')}|term)|"
+    rf"(?:term|{pack_alternatives('memberships.term_lead')})\s*(\d)|(\d)(?:st|nd|rd|th)\s+term)"
+    r"(?![a-z0-9])"))
+_CASH = LazyPattern(lambda: rf"(?<![a-z])(?:{pack_alternatives('memberships.cash')}|cash|efectivo)(?![a-z])")
 
-# A payment going back to its payer because the direct debit was returned (bank words, folded).
-_RETURNED = re.compile(
-    r"(?<![A-Z])(?:DEVOLUCAO|DEVOL\.?|DEV\.?\s+(?:DD|DEB\w*|COBR\w*|SEPA)|DD\s+DEVOLVIDO|DEBITO\s+(?:DIRECTO\s+|"
-    r"DIRETO\s+)?DEVOLVIDO|COBRANCA\s+DEVOLVIDA|RETURNED\s+(?:DIRECT\s+)?DEBIT|DIRECT\s+DEBIT\s+RETURN(?:ED)?|"
-    r"DD\s+RETURN(?:ED)?|UNPAID\s+(?:DIRECT\s+)?DEBIT|ESTORNO|REVERSAL\s+(?:OF\s+)?(?:DD|DIRECT\s+DEBIT)|"
-    r"RECIBO\s+DEVUELTO|IMPAGADO)(?![A-Z])")
+# A payment going back to its payer because the direct debit was returned (bank words, folded; a pack's own in
+# "memberships.returned").
+_RETURNED = LazyPattern(lambda: (
+    rf"(?<![A-Z])(?:{pack_alternatives('memberships.returned')}|RETURNED\s+(?:DIRECT\s+)?DEBIT|"
+    r"DIRECT\s+DEBIT\s+RETURN(?:ED)?|DD\s+RETURN(?:ED)?|UNPAID\s+(?:DIRECT\s+)?DEBIT|"
+    r"REVERSAL\s+(?:OF\s+)?(?:DD|DIRECT\s+DEBIT)|RECIBO\s+DEVUELTO|IMPAGADO)(?![A-Z])"))
+
+
+@cache
+def _columns() -> dict[str, tuple[str, ...]]:
+    return {role: spliced(f"memberships.column:{role}", aliases) for role, aliases in _COLUMNS.items()}
+
+
+@cache
+def _till_columns() -> frozenset[str]:
+    return frozenset((*_TILL_COLUMNS, *pack_words("memberships.till_columns")))
 
 
 @dataclass(frozen=True)
@@ -125,10 +138,11 @@ def period_of(text: str, on: date) -> tuple[str, str]:
 def payment_period(tx: Transaction) -> tuple[str, str]:
     """The period a payment is for: the month its bank line names, else the month it was paid in."""
     text = fold(f"{tx.description} {tx.reference or ''}")
-    words = [w for w in re.findall(r"[a-z]+", text) if w in MONTH_WORDS and len(w) >= 3]
+    months = month_words()
+    words = [w for w in re.findall(r"[a-z]+", text) if w in months and len(w) >= 3]
     named = month_named(text) or (month_named(" ".join(words), default_year=tx.booked_on.year) if words else None)
     if named is None and words:
-        month = MONTH_WORDS[words[0]]
+        month = months[words[0]]
         named = (tx.booked_on.year - (1 if month > tx.booked_on.month + 6 else 0), month)
     year, month = named if named else (tx.booked_on.year, tx.booked_on.month)
     return f"{year:04d}-{month:02d}", f"{MONTHS[month - 1]} {year}"
@@ -140,9 +154,9 @@ def read_receipts_list(text: str) -> list[ReceiptRow]:
     if table is None:
         return []
     header, rows = table
-    if sum(1 for h in header if h in _TILL_COLUMNS) >= 2:
+    if sum(1 for h in header if h in _till_columns()) >= 2:
         return []  # a till report's columns: not a receipts list
-    col = {role: column(header, aliases) for role, aliases in _COLUMNS.items()}
+    col = {role: column(header, aliases) for role, aliases in _columns().items()}
     if col["number"] is None or col["amount"] is None or (col["member"] is None and col["payer"] is None):
         return []
     if col["date"] is None and col["period"] is None:

@@ -15,6 +15,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from backoffice.countries import LazyPattern, pack_alternatives, pack_words
+
 __all__ = ["BillingParty", "read_billing_party"]
 
 
@@ -24,22 +26,34 @@ class BillingParty:
     address: str | None = None
 
 
-_NAME_LABEL = re.compile(
-    r"^\s*(?:dados\s+do\s+)?(?:cliente|adquirente|comprador|destinat[aá]rio|customer|client|bill(?:ed)?\s+to|"
-    r"invoice\s+to|sold\s+to|facturar\s+a|facturado\s+a|faturado\s+a)(?![a-z])(?:\s+(?:name|nome))?\s*(?::|-|–)?\s*"
-    r"(?P<value>.*)$", re.IGNORECASE)
-_ADDRESS_LABEL = re.compile(
-    r"^\s*(?:morada|endere[cç]o|address|billing\s+address|domic[ií]lio|direcci[oó]n)(?:\s+de\s+fatura[cç][aã]o)?"
-    r"\s*:\s*(?P<value>.+)$", re.IGNORECASE)
-_TAX = re.compile(r"(?<![a-z])(?:nif|nipc|n\.?\s?i\.?\s?f\.?|vat(?:\s+(?:no|number))?|contribuinte|tax\s*id|cif)"
-                  r"(?![a-z])", re.IGNORECASE)
-_STREET = re.compile(
-    r"^\s*(?:rua|r\.|av\.?|avenida|pra[cç]a|largo|travessa|tv\.|estrada|alameda|cal[cç]ada|beco|rotunda|"
-    r"urbaniza[cç][aã]o|quinta|street|st\.|road|rd\.|lane|calle|c/|paseo|plaza)(?![a-z])", re.IGNORECASE)
+# English and Spanish labels; a pack's own are in "addressee.<concept>" (Portugal's "Dados do cliente", "Morada de
+# faturação", "Rua", its postal codes "4000-123"), alternatives in any case.
+
+
+def _pt(concept: str) -> str:
+    return pack_alternatives(f"addressee.{concept}")
+
+
+def _or(concept: str) -> str:
+    return "".join(f"|{w}" for w in pack_words(f"addressee.{concept}"))
+
+
+_NAME_LABEL = LazyPattern(lambda: (
+    rf"^\s*(?:{_pt('name_prefix')})?(?:cliente|comprador|destinat[aá]rio|customer|client|bill(?:ed)?\s+to|"
+    rf"invoice\s+to|sold\s+to|facturar\s+a|facturado\s+a{_or('name')})(?![a-z])(?:\s+(?:name{_or('name_word')}))?"
+    r"\s*(?::|-|–)?\s*(?P<value>.*)$"), re.IGNORECASE)
+_ADDRESS_LABEL = LazyPattern(lambda: (
+    rf"^\s*(?:address|billing\s+address|domic[ií]lio|direcci[oó]n{_or('address')})(?:{_pt('address_suffix')})?"
+    r"\s*:\s*(?P<value>.+)$"), re.IGNORECASE)
+_TAX = LazyPattern(lambda: (rf"(?<![a-z])(?:{pack_alternatives('tax_id_label')}|n\.?\s?i\.?\s?f\.?|"
+                            r"vat(?:\s+(?:no|number))?|tax\s*id|cif)(?![a-z])"), re.IGNORECASE)
+_STREET = LazyPattern(lambda: (
+    r"^\s*(?:av\.?|avenida|street|st\.|road|rd\.|lane|calle|c/|paseo|plaza"
+    rf"{_or('street')})(?![a-z])"), re.IGNORECASE)
 _NUMBERED_STREET = re.compile(
     r"^\s*\d+[a-z]?,?\s+.*(?<![a-z])(?:street|st|road|rd|avenue|ave|lane|ln|drive|dr|way|place|square|court|"
     r"boulevard|blvd)(?![a-z])", re.IGNORECASE)
-_POSTAL = re.compile(r"(?<!\d)\d{4}\s*-\s*\d{3}(?!\d)")
+_POSTAL = LazyPattern(lambda: _pt("postal_code"))  # a postal code as the packs' countries write it
 _NOT_A_NAME = re.compile(r"^(?:consumidor\s+final|final\s+consumer)\b", re.IGNORECASE)
 _NOT_A_VALUE = re.compile(r"^(?:id|no\.?|n\.?\s?º|number|code|c[oó]digo|ref\.?|reference)(?![a-z])",
                           re.IGNORECASE)

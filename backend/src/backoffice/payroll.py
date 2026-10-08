@@ -1,8 +1,8 @@
 """Payslips: the evidence a salary needs (§21, checklist J3).
 
 A salary transfer to an employee is proven by that month's payslip for that
-employee ("recibo de vencimento" / payslip), never by the words on the bank line
-alone. :func:`read_payslip` reads a payslip's text (a text file, or the text layer
+employee (a payslip; a pack's own words for one: Portugal's "recibo de vencimento"), never by the words on the
+bank line alone. :func:`read_payslip` reads a payslip's text (a text file, or the text layer
 of a PDF): who it is for (name, tax number, the IBAN the pay goes to), who pays
 (the employer's name and tax number), the month it covers, and the figures:
 gross pay, Social Security and income tax (IRS) withheld, other deductions and
@@ -33,8 +33,10 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
+from functools import cache
 
 from backoffice.closure import Month
+from backoffice.countries import LazyPattern, pack_alternatives, pack_words
 from backoffice.domain.models import Quality, Transaction
 from backoffice.extraction.values import parse_amount, parse_date
 from backoffice.fraud import find_ibans, normalize_iban
@@ -45,33 +47,46 @@ __all__ = ["PAID_WITHIN_DAYS", "Payslip", "SalaryProof", "looks_like_payslip", "
 
 PAID_WITHIN_DAYS = 10  # a salary for September may be paid up to 10 October
 
-_TITLE = re.compile(r"(?<![a-z])(?:recibos?\s+de\s+vencimentos?|recibo\s+de\s+(?:salario|remuneracoes?)|"
-                    r"folha\s+de\s+vencimentos?|payslip|pay\s+slip|salary\s+slip|pay\s+stub|nomina)(?![a-z])")
-_EMPLOYEE = re.compile(r"^\s*(?:nome\s+do\s+(?:trabalhador|funcionario|colaborador)|trabalhador|funcionario|"
-                       r"colaborador|employee(?:\s+name)?|nome)\s*:\s*(?P<v>.+)$")
-_EMPLOYER = re.compile(r"^\s*(?:entidade\s+(?:patronal|empregadora)|empregador|empresa|employer|company)\s*:\s*"
-                       r"(?P<v>.+)$")
-_TAX_ID = re.compile(r"(?<![a-z])(?:nif|nipc|contribuinte|tax\s*id|vat)[^0-9]{0,12}(?P<v>(?:[a-z]{2})?\d[\d ]{7,12}\d)")
-_PERIOD = re.compile(r"^\s*(?:periodo(?:\s+de\s+processamento)?|mes|referente\s+a|pay\s+period|period|month)"
-                     r"\s*:\s*(?P<v>.+)$")
-_DATE = re.compile(r"^\s*(?:data(?:\s+de\s+(?:emissao|pagamento))?|date|payment\s+date|paid\s+on)\s*:\s*(?P<v>.+)$")
+# A country's own payslip words ("recibo de vencimento", "Segurança Social", "IRS") are in its pack:
+# "payroll.<concept>" (backoffice.countries.wording), read with the core's English.
+_TITLE = LazyPattern(lambda: (rf"(?<![a-z])(?:{pack_alternatives('payroll.title')}|payslip|pay\s+slip|salary\s+slip|"
+                              r"pay\s+stub|nomina)(?![a-z])"))
+_EMPLOYEE = LazyPattern(lambda: (rf"^\s*(?:{pack_alternatives('payroll.employee')}|employee(?:\s+name)?)\s*:\s*"
+                                 r"(?P<v>.+)$"))
+_EMPLOYER = LazyPattern(lambda: rf"^\s*(?:{pack_alternatives('payroll.employer')}|employer|company)\s*:\s*(?P<v>.+)$")
+_TAX_ID = LazyPattern(lambda: (rf"(?<![a-z])(?:{pack_alternatives('tax_id_label')}|tax\s*id|vat)[^0-9]{{0,12}}"
+                               r"(?P<v>(?:[a-z]{2})?\d[\d ]{7,12}\d)"))
+_PERIOD = LazyPattern(lambda: (rf"^\s*(?:{pack_alternatives('payroll.period')}|pay\s+period|period|month)"
+                               r"\s*:\s*(?P<v>.+)$"))
+_DATE = LazyPattern(lambda: (rf"^\s*(?:{pack_alternatives('payroll.date')}|date|payment\s+date|paid\s+on)\s*:\s*"
+                             r"(?P<v>.+)$"))
+_TAIL = LazyPattern(lambda: rf"(?i)\s*(?:[-,;|]\s*)?(?:{pack_alternatives('tax_id_label')}|tax\s*id|vat)\b")
 _AMOUNT = re.compile(r"\d{1,3}(?:[. ]\d{3})*,\d{2}|\d+,\d{2}|\d{1,3}(?:,\d{3})*\.\d{2}|\d+\.\d{2}")
 
-_GROSS = ("total iliquido", "remuneracao iliquida", "vencimento iliquido", "total de remuneracoes", "total abonos",
-          "total de abonos", "gross pay", "total gross", "gross salary", "gross")
-_SOCIAL = ("seguranca social", "seg social", "seg. social", "tsu", "social security", "national insurance")
-_INCOME_TAX = ("retencao irs", "retencao de irs", "irs", "retencao na fonte", "income tax", "paye", "withholding")
-_OTHER = ("outros descontos", "other deductions", "quotizacao sindical", "union dues")
-_DEDUCTIONS = ("total de descontos", "total descontos", "total deductions")
-_NET = ("liquido a receber", "valor liquido", "total liquido", "liquido a pagar", "net pay", "net salary",
-        "take home pay", "take-home pay", "amount paid", "liquido")
-
-_MONTH_WORDS = {
-    "janeiro": 1, "fevereiro": 2, "marco": 3, "abril": 4, "maio": 5, "junho": 6, "julho": 7, "agosto": 8,
-    "setembro": 9, "outubro": 10, "novembro": 11, "dezembro": 12,
-    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6, "july": 7, "august": 8,
-    "september": 9, "october": 10, "november": 11, "december": 12,
+# A figure's labels (folded, plain): the core's English and a pack's ("payroll.label:<figure>").
+_LABELS = {
+    "gross": ("gross pay", "total gross", "gross salary", "gross"),
+    "social": ("social security", "national insurance"),
+    "income_tax": ("income tax", "paye", "withholding"),
+    "other": ("other deductions", "union dues"),
+    "deductions": ("total deductions",),
+    "net": ("net pay", "net salary", "take home pay", "take-home pay", "amount paid"),
 }
+_EN_MONTHS = ("january", "february", "march", "april", "may", "june", "july", "august", "september", "october",
+              "november", "december")
+
+
+@cache
+def _labels(figure: str) -> tuple[str, ...]:
+    return (*pack_words(f"payroll.label:{figure}"), *_LABELS[figure])
+
+
+@cache
+def _month_words() -> dict[str, int]:
+    """Full month names (folded) -> month: every pack's ("month:<n>"), then English (the first found wins)."""
+    out = {name: n for n in range(1, 13) for name in pack_words(f"month:{n}")}
+    out.update({name: n for n, name in enumerate(_EN_MONTHS, 1) if name not in out})
+    return out
 
 
 @dataclass(frozen=True)
@@ -155,7 +170,7 @@ def _period(value: str) -> Month | None:
     if m := re.search(r"(?<!\d)(\d{4})\s*[/.-]\s*(\d{1,2})(?!\d)", text):
         year, month = int(m.group(1)), int(m.group(2))
         return Month(year, month) if 1 <= month <= 12 else None
-    for word, number in _MONTH_WORDS.items():
+    for word, number in _month_words().items():
         if re.search(rf"(?<![a-z]){word}(?![a-z])", text) and (y := re.search(r"(?<!\d)(\d{4})(?!\d)", text)):
             return Month(int(y.group(1)), number)
     if m := re.search(r"(\d{1,2}[/.-]\d{1,2}[/.-]\d{4})", text):  # "01/09/2026 - 30/09/2026": the month it ends in
@@ -192,22 +207,22 @@ def read_payslip(text: str) -> Payslip | None:
         if issued is None and (m := _DATE.match(folded)) is not None:
             issued = parse_date(m.group("v").strip(), day_first=True)
     ibans = find_ibans(text or "")
-    net = _labelled(lines, _NET)
+    net = _labelled(lines, _labels("net"))
     if not employee or period is None or net is None or net <= 0:
         return None
     return Payslip(
         employee=employee, period=period, net=net, employee_tax_id=employee_tax,
         employee_iban=normalize_iban(ibans[0]) if ibans else None, employer=employer, employer_tax_id=employer_tax,
-        issued_on=issued, gross=_labelled(lines, _GROSS), social_security=_labelled(lines, _SOCIAL),
-        income_tax=_labelled(lines, _INCOME_TAX), other_deductions=_labelled(lines, _OTHER),
-        total_deductions=_labelled(lines, _DEDUCTIONS),
+        issued_on=issued, gross=_labelled(lines, _labels("gross")), social_security=_labelled(lines, _labels("social")),
+        income_tax=_labelled(lines, _labels("income_tax")), other_deductions=_labelled(lines, _labels("other")),
+        total_deductions=_labelled(lines, _labels("deductions")),
     )
 
 
 def _name(raw: str) -> str | None:
     """The value after the label's colon, as printed, without a tax number that follows it on the same line."""
     value = raw.split(":", 1)[1] if ":" in raw else ""
-    value = re.split(r"(?i)\s*(?:[-,;|]\s*)?(?:nif|nipc|contribuinte|tax\s*id|vat)\b", value, maxsplit=1)[0]
+    value = _TAIL.split(value, maxsplit=1)[0]
     value = " ".join(value.split()).strip(" ,;-|")
     return value or None
 

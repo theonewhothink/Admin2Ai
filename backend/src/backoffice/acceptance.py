@@ -558,9 +558,11 @@ SECTIONS: tuple[tuple[str, str, tuple[Check, ...]], ...] = (
         _c("P1", "Core remains jurisdiction-neutral.", "pass", DEMO, 'Some owner wording in the core is still Portuguese (fraud phrases, tills, understanding).',
            T + "test_acceptance_spain_managers_sensitivity.py::test_the_core_goes_through_each_companys_pack",
            T + "test_acceptance_audit_fixes.py::test_no_module_outside_the_country_packs_imports_the_portuguese_or_spanish_pack_directly"),
-        _c("P2", "Portugal rules isolated in Portugal pack.", "partial", DEMO,
-           "Bank wording, letters, QR codes, amounts, bank fees and the tax calendar are in the packs; Portuguese "
-           "words remain in fraud phrases, tills, the chat's understanding and other core modules.",
+        _c("P2", "Portugal rules isolated in Portugal pack.", "pass", DEMO,
+           "Portugal's words, letters and rules are read through its pack; a guard test finds none left in core "
+           "strings. Words Portuguese shares with Spanish (nif, iva, recibo) and PT as the default country stay.",
+           T + "test_country_pack_isolation.py::test_no_core_module_holds_portuguese_words_outside_the_portugal_pack",
+           T + "test_country_pack_isolation.py::test_the_core_reads_portuguese_only_with_the_portugal_packs_words",
            T + "test_acceptance_audit_fixes.py::test_bank_lines_are_read_with_the_wording_of_their_accounts_companys_pack",
            T + "test_acceptance_audit_fixes.py::test_letters_are_read_with_their_companys_pack_wording_and_portuguese_ones_as_before"),
         _c("P3", "Country-specific VAT rules supported.", "pass", DEMO, "Portugal and Spain.",

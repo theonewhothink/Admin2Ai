@@ -97,8 +97,10 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date
 from decimal import Decimal
+from functools import cache
 from typing import TYPE_CHECKING, Any
 
+from backoffice.countries import PACK_WORDS, LazyPattern, pack_alternatives, spliced
 from backoffice.domain.models import DocumentType, Transaction, TransactionKind
 from backoffice.learning import RuleSubject, counterparty_key, day_month, display_name, fold, format_money
 from backoffice.reconciliation import (
@@ -124,63 +126,66 @@ MONTH_NAMES = ("January", "February", "March", "April", "May", "June", "July", "
 
 @dataclass(frozen=True)
 class Category:
-    """A cost category: how the owner asks for it and what evidence puts a payment in it."""
+    """A cost category: how the owner asks for it and what evidence puts a payment in it.
+
+    The words are the core's English (and brands); a pack adds its own: "spending.asked:<id>" (the owner's words)
+    and "spending.evidence:<id>" (words on invoices, bank lines or merchant names), at each PACK_WORDS of
+    ``evidence_words`` in turn ("<concept>:2" the second ...), so the evidence keeps its order."""
 
     id: str
     label: str
-    asked: tuple[str, ...]  # folded words an owner uses ("phone", "internet")
-    evidence: tuple[str, ...] = ()  # folded words on invoices, bank lines or merchant names
+    owner_words: tuple[str, ...]  # folded words an owner uses ("phone", "internet")
+    evidence_words: tuple[str, ...] = ()  # folded words on invoices, bank lines or merchant names
+
+    @property
+    def asked(self) -> tuple[str, ...]:
+        return _with_pack(f"spending.asked:{self.id}", (*self.owner_words, PACK_WORDS))
+
+    @property
+    def evidence(self) -> tuple[str, ...]:
+        return _with_pack(f"spending.evidence:{self.id}", self.evidence_words)
 
 
+@cache
+def _with_pack(concept: str, words: tuple[str, ...]) -> tuple[str, ...]:
+    return spliced(concept, words)
+
+
+_P = PACK_WORDS
 # Engine kinds first (decided by the expected-evidence engine), then evidence wording.
 # The wording tables are conventions (unverified against live feeds): extend them as data is seen.
 CATEGORIES: tuple[Category, ...] = (
     Category("tax", "Taxes", ("tax", "taxes", "taxation", "tax office", "tax authority", "tax payments",
-                              "impostos", "imposto", "financas", "social security", "seguranca social",
-                              "irs", "irc", "withholding", "retencoes")),
+                              "social security", "withholding")),
     Category("bank_fees", "Bank fees", ("bank fees", "bank fee", "bank charges", "bank charge", "bank costs",
-                                        "fees", "commissions", "comissoes", "account fees", "maintenance fees")),
-    Category("payroll", "Salaries", ("salaries", "salary", "payroll", "wages", "staff costs", "ordenados",
-                                     "salarios", "vencimentos")),
-    Category("loan", "Loan repayments", ("loan", "loans", "loan repayments", "repayments", "emprestimo",
-                                         "emprestimos")),
-    Category("rent", "Rent", ("rent", "rents", "rental", "lease", "landlord", "renda", "rendas", "arrendamento",
-                              "aluguer", "office rent"),
-             ("renda", "rendas", "rent", "arrendamento", "aluguer", "senhorio", "landlord", "lease")),
+                                        "fees", "commissions", "account fees", "maintenance fees")),
+    Category("payroll", "Salaries", ("salaries", "salary", "payroll", "wages", "staff costs")),
+    Category("loan", "Loan repayments", ("loan", "loans", "loan repayments", "repayments")),
+    Category("rent", "Rent", ("rent", "rents", "rental", "lease", "landlord", "office rent"),
+             (_P, "rent", _P, "landlord", "lease")),
     Category("telecom", "Phone and internet", ("telecom", "telecoms", "telco", "phone", "phones", "telephone",
-                                               "mobile", "internet", "broadband", "telemovel", "telecomunicacoes",
-                                               "comunicacoes", "fibre", "fiber"),
-             ("comunicacoes", "telecomunicacoes", "telecom", "internet", "telemovel", "servicos moveis", "fibra",
-              "broadband", "mobile phone", "vodafone", "meo", "nos comunicacoes", "nowo", "digi mobil")),
+                                               "mobile", "internet", "broadband", "fibre", "fiber"),
+             (_P, "telecom", "internet", _P, "broadband", "mobile phone", "vodafone", _P, "digi mobil")),
     Category("energy", "Electricity, gas and water", ("electricity", "energy", "power", "utilities", "utility",
-                                                      "gas", "water", "eletricidade", "electricidade", "energia",
-                                                      "luz", "agua"),
-             ("eletricidade", "electricidade", "electricity", "energia", "energy", "gas natural", "agua",
-              "water", "edp", "galp", "endesa", "iberdrola", "goldenergy", "epal")),
+                                                      "gas", "water"),
+             (_P, "electricity", _P, "energy", "gas natural", _P, "water", "edp", "galp", "endesa", "iberdrola", _P)),
     Category("software", "Software", ("software", "saas", "licences", "licenses", "licence", "license", "apps",
                                       "cloud"),
-             ("software", "saas", "licenca", "licence", "license", "creative cloud", "adobe", "microsoft",
+             ("software", "saas", _P, "licence", "license", "creative cloud", "adobe", "microsoft",
               "google workspace", "notion", "slack", "dropbox", "atlassian", "github", "canva", "zoom",
               "openai", "anthropic")),
     Category("travel", "Travel", ("travel", "trips", "taxi", "taxis", "rides", "transport", "transportation",
-                                  "flights", "flight", "train", "trains", "fuel", "petrol", "parking", "tolls",
-                                  "viagens", "deslocacoes", "combustivel", "portagens"),
-             ("viagem", "viagens", "trip", "taxi", "uber", "bolt", "free now", "ryanair", "easyjet", "tap air",
-              "comboios", "via verde", "portagens", "combustivel", "gasolina", "fuel", "parking",
-              "estacionamento", "airbnb", "booking com", "hotel")),
+                                  "flights", "flight", "train", "trains", "fuel", "petrol", "parking", "tolls"),
+             (_P, "trip", "taxi", "uber", "bolt", "free now", "ryanair", "easyjet", _P, "gasolina", "fuel",
+              "parking", _P, "airbnb", "booking com", "hotel")),
     Category("meals", "Meals", ("meals", "meal", "food", "restaurants", "restaurant", "lunch", "lunches",
-                                "dinner", "dinners", "coffee", "eating out", "refeicoes", "restaurantes",
-                                "almocos", "jantares"),
-             ("restaurante", "restaurant", "pastelaria", "snack bar", "refeicao", "refeicoes", "glovo",
-              "uber eats", "bolt food", "cervejaria", "tasca")),
+                                "dinner", "dinners", "coffee", "eating out"),
+             (_P, "restaurant", _P, "snack bar", _P, "glovo", "uber eats", "bolt food", _P)),
     Category("office", "Office and furniture", ("furniture", "office supplies", "office equipment", "supplies",
-                                                "equipment", "stationery", "moveis", "mobiliario",
-                                                "material de escritorio", "office"),
-             ("moveis e decoracao", "mobiliario", "furniture", "estante", "secretaria", "cadeira",
-              "material de escritorio", "papelaria", "office supplies", "ikea", "staples", "worten")),
-    Category("insurance", "Insurance", ("insurance", "insurances", "seguro", "seguros", "premiums"),
-             ("seguro", "seguros", "insurance", "apolice", "fidelidade", "allianz", "ageas", "tranquilidade",
-              "generali", "zurich", "mapfre")),
+                                                "equipment", "stationery", "office"),
+             (_P, "furniture", _P, "office supplies", "ikea", "staples", _P)),
+    Category("insurance", "Insurance", ("insurance", "insurances", "premiums"),
+             (_P, "insurance", _P, "allianz", "ageas", _P, "generali", "zurich", "mapfre")),
     # What card terminals and sales platforms keep from payouts: only from a matched payout report,
     # never from wording (no evidence words).
     Category("platform_fees", "Payment and platform fees", ("platform fees", "payment fees", "card fees",
@@ -189,7 +194,12 @@ CATEGORIES: tuple[Category, ...] = (
 )
 OTHER = Category("other", "Other costs", ())
 _BY_ID = {c.id: c for c in (*CATEGORIES, OTHER)}
-_EVIDENCE_PHRASES = sorted(((p, c.id) for c in CATEGORIES for p in c.evidence), key=lambda x: -len(x[0]))
+_VAT_WORD = LazyPattern(lambda: rf"\b(?:{pack_alternatives('spending.vat')}|vat)\b")
+
+
+@cache
+def _evidence_phrases() -> list[tuple[str, str]]:
+    return sorted(((p, c.id) for c in CATEGORIES for p in c.evidence), key=lambda x: -len(x[0]))
 
 # Expected evidence (§21) -> what kind of money a payment is.
 _KIND: dict[EvidenceExpectation, str] = {
@@ -518,7 +528,7 @@ class Ledger:
         else:
             return None  # set aside by the owner, or still being read
         text = self._document_text(record)
-        category = next((cat for phrase, cat in _EVIDENCE_PHRASES if _has_phrase(text, phrase)), OTHER.id)
+        category = next((cat for phrase, cat in _evidence_phrases() if _has_phrase(text, phrase)), OTHER.id)
         return Line(
             id=record.id, on=doc.issue_date or record.received_at.date(), amount=abs(doc.gross_amount),
             direction="out", currency=doc.currency, merchant=display_name(doc.supplier_name),
@@ -568,7 +578,7 @@ class Ledger:
         employee = repo.employees.get(claim.employee_id)
         who = employee.name if employee is not None else "an employee"
         text = self._document_text(record) if record is not None else ""
-        category = next((cat for phrase, cat in _EVIDENCE_PHRASES if _has_phrase(text, phrase)), OTHER.id)
+        category = next((cat for phrase, cat in _evidence_phrases() if _has_phrase(text, phrase)), OTHER.id)
         description = {"waiting": f"Paid by {who}, waiting for your OK to pay it back",
                        "approved": f"Paid by {who}, to pay back", "paid": f"Paid by {who}, paid back"}[claim.status]
         return Line(
@@ -753,7 +763,7 @@ class Ledger:
                 doc = repo.documents.get(doc_id)
                 if doc is not None:
                     text += " " + self._document_text(doc)
-        for phrase, cat in _EVIDENCE_PHRASES:
+        for phrase, cat in _evidence_phrases():
             if _has_phrase(text, phrase):
                 return cat
         return OTHER.id
@@ -975,7 +985,7 @@ class Ledger:
                 continue
             (sales if is_sale else purchases).append(entry)
         paid = [x for x in self.select(start=start, end=end, direction="out", company_ids=company_ids)
-                if x.kind == "tax" and re.search(r"\b(?:iva|vat)\b", fold(f"{x.description}"))]
+                if x.kind == "tax" and _VAT_WORD.search(fold(f"{x.description}"))]
         return VatResult(start=start, end=end, purchases=purchases,
                          purchase_vat=sum((p["vat"] for p in purchases), Decimal(0)), sales=sales,
                          sales_vat=sum((s["vat"] for s in sales), Decimal(0)), paid_to_state=paid, pending=pending)

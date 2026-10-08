@@ -25,6 +25,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from backoffice.countries import pack_text, pack_words
+
 __all__ = [
     "HEADLINE",
     "INVITATION_DAYS",
@@ -100,8 +102,8 @@ def clean_invitation(body: object) -> CleanInvitation:
     tax_ids: list[str] = []
     for value in raw[:20]:
         digits = re.sub(r"\D", "", str(value or ""))
-        if len(digits) != 9:
-            raise ValueError("A NIF has 9 digits. Check the company numbers.")
+        if not any(re.fullmatch(shape, digits) for shape in pack_words("invitations.tax_id")):
+            raise ValueError(pack_text("invitations.tax_id_problem", "Check the company tax numbers."))
         if digits not in tax_ids:
             tax_ids.append(digits)
     return CleanInvitation(email=email, client_name=name, tax_ids=tuple(tax_ids), firm=firm)

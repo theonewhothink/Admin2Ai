@@ -27,6 +27,7 @@ import unicodedata
 from collections.abc import Collection, Iterable, Mapping
 from typing import Any
 
+from backoffice.countries import LazyPattern, pack_words
 from backoffice.domain.models import DocumentType
 
 __all__ = ["CATEGORY_WORDS", "KIND_WORDS", "classify", "scrub", "summary_line"]
@@ -43,13 +44,10 @@ KIND_WORDS: Mapping[str, str] = {
 }
 
 # Folded phrases (lower case, no accents). Multi-word on purpose: a single common word ("court",
-# "patient") appears on ordinary invoices too.
+# "patient") appears on ordinary invoices too. A pack adds its own ("sensitivity.<category>": Portugal's
+# "receita médica", "processo judicial", "recibo de vencimento").
 _PHRASES: Mapping[str, tuple[str, ...]] = {
     "medical": (
-        # Portuguese
-        "receita medica", "prescricao medica", "numero de utente", "n.º de utente", "no de utente", "nome do utente",
-        "utente n", "processo clinico", "relatorio medico", "historial clinico", "historia clinica", "dados de saude",
-        "diagnostico", "atestado medico", "boletim de analises", "resultado de analises", "ficha clinica",
         # Spanish
         "receta medica", "informe medico", "datos de salud", "tarjeta sanitaria", "numero de paciente",
         "nombre del paciente", "diagnostico medico",
@@ -58,11 +56,6 @@ _PHRASES: Mapping[str, tuple[str, ...]] = {
         "prescription for", "clinical notes", "diagnosis", "health record", "date of birth and nhs",
     ),
     "legal": (
-        # Portuguese
-        "processo judicial", "processo n.º", "proc. n.º", "peticao inicial", "contestacao", "sentenca",
-        "acordao", "citacao", "sigilo profissional", "segredo de justica", "mandatario judicial", "procuracao forense",
-        "tribunal judicial", "tribunal da relacao", "juizo de", "acao judicial", "parecer juridico",
-        "documento confidencial advogado",
         # Spanish
         "procedimiento judicial", "juzgado de", "demanda judicial", "expediente judicial", "secreto profesional",
         "auto judicial", "sentencia n", "procurador de los tribunales",
@@ -72,10 +65,6 @@ _PHRASES: Mapping[str, tuple[str, ...]] = {
         "legal proceedings",
     ),
     "hr": (
-        # Portuguese
-        "recibo de vencimento", "recibo de salario", "folha de vencimento", "folha de salarios",
-        "contrato de trabalho", "avaliacao de desempenho", "processo disciplinar", "baixa medica",
-        "certificado de incapacidade", "rescisao do contrato de trabalho", "carta de despedimento",
         # Spanish
         "recibo de salarios", "hoja de salario", "nomina de", "nomina mensual", "contrato de trabajo",
         "evaluacion del desempeno", "expediente disciplinario", "baja medica", "carta de despido",
@@ -96,7 +85,8 @@ def _pattern(phrases: Iterable[str]) -> re.Pattern[str]:
     return re.compile(rf"(?<![0-9a-z])(?:{body})(?![a-z])")
 
 
-_PATTERNS = {category: _pattern(phrases) for category, phrases in _PHRASES.items()}
+_PATTERNS = {category: LazyPattern(lambda c=category: _pattern((*_PHRASES[c], *pack_words(f"sensitivity.{c}"))).pattern)
+             for category in _PHRASES}
 
 
 def classify(*texts: str | None, doc_type: DocumentType | None = None) -> str | None:

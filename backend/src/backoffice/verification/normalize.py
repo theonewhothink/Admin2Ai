@@ -34,8 +34,11 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import Enum
+from functools import cache
 from types import MappingProxyType
 from typing import Any
+
+from backoffice.countries import pack_words
 
 from backoffice.domain.models import CriticalField
 
@@ -423,28 +426,47 @@ def normalize_currency(value: object) -> Normalized:
 
 # --------------------------------------------------------------------------- dates
 
-_MONTH_NAMES: dict[int, tuple[str, ...]] = {
-    1: ("january", "jan", "janeiro", "enero", "ene", "janvier", "janv", "gennaio", "gen",
+# Month names and abbreviations by month: English, Spanish, French, Italian, German and Dutch here; a pack's own
+# ("month:<n>", "month_abbr:<n>": Portugal's "setembro", "set") are added by _month_names(). Read as the module's
+# _MONTH_NAMES and MONTHS (built on first use).
+_CORE_MONTH_NAMES: dict[int, tuple[str, ...]] = {
+    1: ("january", "jan", "enero", "ene", "janvier", "janv", "gennaio", "gen",
         "januar", "janner", "januari"),
-    2: ("february", "feb", "fevereiro", "fev", "febrero", "fevrier", "fevr", "febbraio",
+    2: ("february", "feb", "febrero", "fevrier", "fevr", "febbraio",
         "februar", "februari"),
-    3: ("march", "mar", "marco", "marzo", "mars", "marz", "mrz", "maart"),
+    3: ("march", "mar", "marzo", "mars", "marz", "mrz", "maart"),
     4: ("april", "apr", "abril", "abr", "avril", "avr", "aprile"),
-    5: ("may", "maio", "mayo", "mai", "maggio", "mag", "mei"),
-    6: ("june", "jun", "junho", "junio", "juin", "giugno", "giu", "juni"),
-    7: ("july", "jul", "julho", "julio", "juillet", "juil", "luglio", "lug", "juli"),
+    5: ("may", "mayo", "mai", "maggio", "mag", "mei"),
+    6: ("june", "jun", "junio", "juin", "giugno", "giu", "juni"),
+    7: ("july", "jul", "julio", "juillet", "juil", "luglio", "lug", "juli"),
     8: ("august", "aug", "agosto", "ago", "aout", "augustus"),
-    9: ("september", "sep", "sept", "setembro", "set", "septiembre", "septembre",
+    9: ("september", "sep", "sept", "septiembre", "septembre",
         "settembre"),
-    10: ("october", "oct", "outubro", "out", "octubre", "octobre", "ottobre", "ott",
+    10: ("october", "oct", "octubre", "octobre", "ottobre", "ott",
          "oktober", "okt"),
-    11: ("november", "nov", "novembro", "noviembre", "novembre"),
-    12: ("december", "dec", "dezembro", "dez", "diciembre", "dic", "decembre", "dicembre",
+    11: ("november", "nov", "noviembre", "novembre"),
+    12: ("december", "dec", "diciembre", "dic", "decembre", "dicembre",
          "dezember"),
 }  # fmt: skip
-MONTHS: Mapping[str, int] = MappingProxyType(
-    {name: number for number, names in _MONTH_NAMES.items() for name in names}
-)
+
+
+@cache
+def _month_names() -> dict[int, tuple[str, ...]]:
+    return {n: tuple(dict.fromkeys((*names, *pack_words(f"month:{n}"), *pack_words(f"month_abbr:{n}"))))
+            for n, names in _CORE_MONTH_NAMES.items()}
+
+
+@cache
+def _months() -> Mapping[str, int]:
+    return MappingProxyType({name: number for number, names in _month_names().items() for name in names})
+
+
+def __getattr__(name: str) -> Any:
+    if name == "MONTHS":
+        return _months()
+    if name == "_MONTH_NAMES":
+        return _month_names()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 _WEEKDAY = re.compile(
     r"^(?:mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)(?:day|sday|nesday|urday|rsday)?\.?,?\s+"
@@ -533,7 +555,7 @@ def _text_date(text: str, _day_first: bool | None) -> Normalized | None:
         if match is None:
             return None
         month, day, year = match.group(1), match.group(2), match.group(3)
-    number = MONTHS.get(month)
+    number = _months().get(month)
     return _one(_safe_date(_year(year), number, int(day)) if number else None)
 
 
@@ -547,20 +569,18 @@ _TAX_PREFIXES = frozenset(
 )
 _TAX_SUFFIXES = ("MWST", "TVA", "IVA", "MVA")
 # Labels printed in front of the number ("NIF: 503 504 564", "USt-IdNr.
-# DE..."). Longest first; none is a country prefix, so none can eat one.
-_TAX_LABELS = tuple(
-    sorted(
-        "NUMERODECONTRIBUINTE CONTRIBUINTE VATREGNO VATREG VATNUMBER VATNO VATID VAT "
-        "USTIDNR USTID UIDNR NIPC NIF NIE CIF PIVA BTW".split(),
-        key=len,
-        reverse=True,
-    )
-)
+# DE..."; a pack's own: "normalize.tax_label"). Longest first; none is a country prefix, so none can eat one.
+_CORE_TAX_LABELS = "VATREGNO VATREG VATNUMBER VATNO VATID VAT USTIDNR USTID UIDNR NIF NIE CIF PIVA BTW".split()
+
+
+@cache
+def _tax_labels() -> tuple[str, ...]:
+    return tuple(sorted((*pack_words("normalize.tax_label"), *_CORE_TAX_LABELS), key=len, reverse=True))
 _TAX_ID = re.compile(r"[A-Z0-9]{5,15}")
 
 
 def _strip_label(compact: str) -> str:
-    for label in _TAX_LABELS:
+    for label in _tax_labels():
         rest = compact[len(label) :]
         if compact.startswith(label) and any(c.isdigit() for c in rest):
             return rest

@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from html import unescape
 from html.parser import HTMLParser
 
+from backoffice.countries import LazyPattern, pack_words
+
 __all__ = ["MAX_ANCHORS", "Anchor", "HtmlSignals", "analyze_html", "html_to_text", "normalize_space"]
 
 _WS = re.compile(r"\s+")
@@ -47,7 +49,8 @@ _OTP_NAME = re.compile(
     r"|sms[-_ ]?code|c[oó]digo(?![-_ ]?postal)|passcode|token",
     re.IGNORECASE,
 )
-_LOGIN_NAME = re.compile(r"e-?mail|user(name)?|login|utilizador|usuario|usuário|\bnif\b", re.IGNORECASE)
+_LOGIN_NAME = LazyPattern(lambda: (r"e-?mail|user(name)?|login|usuario|\bnif\b"  # a pack's own: "html.login_name"
+                                   + "".join(f"|{w}" for w in pack_words("html.login_name"))), re.IGNORECASE)
 _META_URL = re.compile(r"url\s*=\s*['\"]?([^'\"]+)", re.IGNORECASE)
 _META_DELAY = re.compile(r"\s*(\d{1,9})")
 

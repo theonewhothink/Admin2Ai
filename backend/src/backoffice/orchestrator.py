@@ -80,7 +80,7 @@ import re
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from functools import lru_cache
+from functools import cache, lru_cache
 from types import SimpleNamespace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -126,8 +126,11 @@ from backoffice.countries import (
     CountryPackError,
     FiscalQRError,
     FiscalQRResult,
+    LazyPattern,
     company_countries,
     company_pack,
+    pack_alternatives,
+    pack_words,
 )
 from backoffice.domain.cost_centers import (
     CostCenter,
@@ -3961,7 +3964,7 @@ def _reads_as_accounting_document(text: str) -> bool:
 
     for raw in (text or "").splitlines():
         line = fold(raw)
-        if any(ch.isdigit() for ch in line) and any(pattern.match(line) for _, pattern in _KIND_TITLES):
+        if any(ch.isdigit() for ch in line) and any(pattern.match(line) for _, pattern in _kind_titles()):
             return True
     return False
 
@@ -10844,38 +10847,54 @@ def _text_currency(text: str, source: str, method: ExtractionMethod) -> FieldObs
 
 
 # What a document calls itself, on folded (lower-case, accent-free) text; the most specific name first,
-# so "Fatura pró-forma" is a pro-forma and "Fatura-recibo" an invoice-receipt, not an invoice (§50).
-_FATURA = r"(?:fatura|factura|facture|fattura)"  # Portuguese, Spanish, French, Italian (checklist E9)
+# so "Fatura pró-forma" is a pro-forma and "Fatura-recibo" an invoice-receipt, not an invoice (§50). The names
+# are English, Spanish, French, Italian and German (checklist E9); a pack adds its own: "doc_kind:<kind>" (and
+# "doc_kind:invoice_word", Portugal's "fatura"), regular-expression alternatives (backoffice.countries.wording).
+_INVOICE_SLOT = "{invoice_word}"  # a word for an invoice: filled in by _kind_words()
 _KIND_NAMES: tuple[tuple[DocumentType, str], ...] = (
-    (DocumentType.PRO_FORMA, rf"{_FATURA}\s*[-:]?\s*pro[\s-]*forma|pro[\s-]*forma(?:\s+invoice|[\s-]*rechnung)?"),
-    (DocumentType.QUOTE, r"orcamento|quotation|quote"),
-    (DocumentType.DELIVERY_NOTE, r"guia\s+de\s+(?:remessa|transporte)|delivery\s+note|transport\s+document"),
-    (DocumentType.ORDER_CONFIRMATION,
-     r"confirmacao\s+(?:de|da)\s+encomenda|nota\s+de\s+encomenda|order\s+confirmation|purchase\s+order"),
-    (DocumentType.SUPPLIER_STATEMENT,
-     r"extrato\s+(?:de\s+)?conta[\s-]+corrente|statement\s+of\s+account|supplier\s+statement"),
+    (DocumentType.PRO_FORMA, rf"{_INVOICE_SLOT}\s*[-:]?\s*pro[\s-]*forma|pro[\s-]*forma(?:\s+invoice|[\s-]*rechnung)?"),
+    (DocumentType.QUOTE, r"quotation|quote"),
+    (DocumentType.DELIVERY_NOTE, r"delivery\s+note|transport\s+document"),
+    (DocumentType.ORDER_CONFIRMATION, r"order\s+confirmation|purchase\s+order"),
+    (DocumentType.SUPPLIER_STATEMENT, r"statement\s+of\s+account|supplier\s+statement"),
     (DocumentType.CREDIT_NOTE, r"nota\s+de\s+credito|credit\s+note|facture\s+d.avoir|gutschrift|rechnungskorrektur"
                                r"|nota\s+di\s+credito"),
     (DocumentType.DEBIT_NOTE, r"nota\s+de\s+debito|debit\s+note"),
-    (DocumentType.INVOICE_RECEIPT, rf"{_FATURA}[\s-]+recibo|invoice[\s-]+receipt"),
-    (DocumentType.SIMPLIFIED_INVOICE, rf"{_FATURA}\s+simplificada|simplified\s+invoice"),
-    (DocumentType.INVOICE, rf"{_FATURA}|(?:tax\s+)?invoice|rechnung"),
-    (DocumentType.RECEIPT, r"recibo|receipt|talao(?:\s+de\s+venda)?"),
+    (DocumentType.INVOICE_RECEIPT, rf"{_INVOICE_SLOT}[\s-]+recibo|invoice[\s-]+receipt"),
+    (DocumentType.SIMPLIFIED_INVOICE, rf"{_INVOICE_SLOT}\s+simplificada|simplified\s+invoice"),
+    (DocumentType.INVOICE, rf"{_INVOICE_SLOT}|(?:tax\s+)?invoice|rechnung"),
+    (DocumentType.RECEIPT, r"recibo|receipt"),
 )
-_KIND_TITLES = tuple((kind, re.compile(rf"(?:{words})(?![a-z])")) for kind, words in _KIND_NAMES)
 # Without a title line, only names that invoices do not use when they merely refer to another document
 # ("conforme orçamento", "V/ guia de remessa", "purchase order: PO-12" are common on real invoices).
-_KIND_ANYWHERE = tuple(
-    (kind, re.compile(rf"(?<![a-z])(?:{words})(?![a-z])")) for kind, words in (
-        (DocumentType.PRO_FORMA, rf"{_FATURA}\s*[-:]?\s*pro[\s-]*forma|pro[\s-]*forma\s+invoice|proforma\s+invoice"),
-        (DocumentType.SUPPLIER_STATEMENT, r"extrato\s+(?:de\s+)?conta[\s-]+corrente|statement\s+of\s+account"),
-        (DocumentType.CREDIT_NOTE, r"nota\s+de\s+credito|credit\s+note"),
-        (DocumentType.DEBIT_NOTE, r"nota\s+de\s+debito|debit\s+note"),
-        (DocumentType.INVOICE_RECEIPT, rf"{_FATURA}[\s-]+recibo"),
-        (DocumentType.SIMPLIFIED_INVOICE, rf"{_FATURA}\s+simplificada"),
-        (DocumentType.INVOICE, rf"{_FATURA}|invoice"),
-    )
+_ANYWHERE_NAMES: tuple[tuple[DocumentType, str], ...] = (
+    (DocumentType.PRO_FORMA, rf"{_INVOICE_SLOT}\s*[-:]?\s*pro[\s-]*forma|pro[\s-]*forma\s+invoice|proforma\s+invoice"),
+    (DocumentType.SUPPLIER_STATEMENT, r"statement\s+of\s+account"),
+    (DocumentType.CREDIT_NOTE, r"nota\s+de\s+credito|credit\s+note"),
+    (DocumentType.DEBIT_NOTE, r"nota\s+de\s+debito|debit\s+note"),
+    (DocumentType.INVOICE_RECEIPT, rf"{_INVOICE_SLOT}[\s-]+recibo"),
+    (DocumentType.SIMPLIFIED_INVOICE, rf"{_INVOICE_SLOT}\s+simplificada"),
+    (DocumentType.INVOICE, rf"{_INVOICE_SLOT}|invoice"),
 )
+_ANYWHERE_KINDS = frozenset({DocumentType.SUPPLIER_STATEMENT})  # a pack's names also count anywhere for these
+
+
+def _kind_words(kind: DocumentType, words: str, *, theirs: bool = True) -> str:
+    """``words`` with the invoice word filled in, after a pack's own names for ``kind`` (``theirs``)."""
+    invoice_word = rf"(?:{pack_alternatives('doc_kind:invoice_word')}|factura|facture|fattura)"
+    own = "".join(f"{w}|" for w in pack_words(f"doc_kind:{kind.value}")) if theirs else ""
+    return (own + words).replace(_INVOICE_SLOT, invoice_word)
+
+
+@cache
+def _kind_titles() -> tuple[tuple[DocumentType, re.Pattern[str]], ...]:
+    return tuple((kind, re.compile(rf"(?:{_kind_words(kind, words)})(?![a-z])")) for kind, words in _KIND_NAMES)
+
+
+@cache
+def _kind_anywhere() -> tuple[tuple[DocumentType, re.Pattern[str]], ...]:
+    return tuple((kind, re.compile(rf"(?<![a-z])(?:{_kind_words(kind, words, theirs=kind in _ANYWHERE_KINDS)})"
+                                   r"(?![a-z])")) for kind, words in _ANYWHERE_NAMES)
 
 
 # Spanish names of a credit note ("Factura rectificativa" would otherwise read as an invoice): checked first
@@ -10907,28 +10926,33 @@ def _text_doc_type(text: str, *, foreign: bool = False) -> DocumentType | None:
         return DocumentType.CREDIT_NOTE
     for raw in (text or "").splitlines():
         line = fold(raw)
-        for kind, pattern in _KIND_TITLES:
+        for kind, pattern in _kind_titles():
             if pattern.match(line):
                 return kind
     folded = fold(text or "")
-    for kind, pattern in _KIND_ANYWHERE:
+    for kind, pattern in _kind_anywhere():
         if pattern.search(folded):
             return kind
     return None
 
 
-# The invoice a credit note corrects: "referente à fatura FT 2026/183", "Ref. FT A/123",
-# "Documento de origem: FT 2026/183", "Invoice reference: FT 2026/183".
-_INVOICE_REFERENCE = re.compile(
-    r"(?<![a-z])(?:referente|relativ[ao]|respeitante|correspondente|retifica|rectifica|anula|corrige)"
-    r"\s+(?:(?:[àa]o?|da|do|de)\s+)?"
-    r"(?:(?:fatura|factura|invoice)(?:[\s-]+recibo|\s+simplificada)?\s+)?(?:(?:n\.?\s*[ºo°]\.?|nr\.?|no\.)\s*)?"
-    r"(?P<a>(?:[a-z]{1,4}\s+)?[^\s/,;:()]{1,40}/\d{1,12})(?![\d/])"
-    r"|(?<![a-z])(?:ref(?:er[êe]ncia|\.)?|documento\s+de\s+origem|doc\.?\s+(?:de\s+)?origem|invoice\s+reference"
-    r"|original\s+invoice)\s*[:.]?\s*(?:(?:fatura|factura|invoice)\s+)?(?:(?:n\.?\s*[ºo°]\.?|nr\.?|no\.)\s*)?"
-    r"(?P<b>(?:FT|FR|FS|ND|VD)\s+[^\s/,;:()]{1,40}/\d{1,12})(?![\d/])",
-    re.IGNORECASE,
-)
+# The invoice a credit note corrects: "Ref. ...", "Invoice reference: FT 2026/183"; a pack's own words in
+# "invoice_reference.<concept>" (Portugal's "referente à fatura FT 2026/183", "Documento de origem", its series).
+def _invoice_reference() -> str:
+    def alt(concept: str) -> str:
+        return pack_alternatives(f"invoice_reference.{concept}")
+
+    invoice = rf"(?:{alt('invoice_word')}|factura|invoice)"
+    return (rf"(?<![a-z])(?:{alt('verb')})"
+            rf"\s+(?:(?:{alt('preposition')})\s+)?"
+            rf"(?:{invoice}(?:[\s-]+recibo|\s+simplificada)?\s+)?(?:(?:n\.?\s*[ºo°]\.?|nr\.?|no\.)\s*)?"
+            r"(?P<a>(?:[a-z]{1,4}\s+)?[^\s/,;:()]{1,40}/\d{1,12})(?![\d/])"
+            rf"|(?<![a-z])(?:ref(?:er[êe]ncia|\.)?|{alt('origin')}|invoice\s+reference"
+            rf"|original\s+invoice)\s*[:.]?\s*(?:{invoice}\s+)?(?:(?:n\.?\s*[ºo°]\.?|nr\.?|no\.)\s*)?"
+            rf"(?P<b>(?:{alt('series')})\s+[^\s/,;:()]{{1,40}}/\d{{1,12}})(?![\d/])")
+
+
+_INVOICE_REFERENCE = LazyPattern(_invoice_reference, re.IGNORECASE)
 
 
 def _referenced_invoice(text: str) -> str | None:
@@ -10940,15 +10964,15 @@ def _referenced_invoice(text: str) -> str | None:
     return None
 
 
-# "Pago em numerário", "Dinheiro 20,00", "Paid in cash" — unless the same document also names
-# a card or bank payment (then it does not say cash alone, §19). "Cash & Carry" is a shop name.
-_CASH_WORDS = re.compile(
-    r"(?<![a-z])(?:numerario|(?:pago|pagamento|paga)\s+em\s+dinheiro|dinheiro|paid\s+(?:in\s+)?cash"
-    r"|cash\s+payment|payment\s*(?:method)?\s*:?\s*cash|cash)(?![a-z])")
-_NOT_CASH_WORDS = re.compile(
-    r"(?<![a-z])(?:cartao|card|multibanco|visa|mastercard|maestro|amex|american\s+express|mb\s*way|transferencia"
-    r"|bank\s+transfer|debito\s+direto|direct\s+debit|paypal|apple\s+pay|google\s+pay|tpa)(?![a-z])")
-_CASH_AND_CARRY = re.compile(r"cash\s*(?:&|and|e|n)\s*carry|cash\s*back|petty\s+cash")
+# "Paid in cash" (a pack's own: "cash.paid", Portugal's "Pago em numerário") — unless the same document also names
+# a card or bank payment ("cash.not_cash": then it does not say cash alone, §19). "Cash & Carry" is a shop name.
+_CASH_WORDS = LazyPattern(lambda: (
+    rf"(?<![a-z])(?:{pack_alternatives('cash.paid')}|paid\s+(?:in\s+)?cash"
+    r"|cash\s+payment|payment\s*(?:method)?\s*:?\s*cash|cash)(?![a-z])"))
+_NOT_CASH_WORDS = LazyPattern(lambda: (
+    rf"(?<![a-z])(?:{pack_alternatives('cash.not_cash')}|card|visa|mastercard|maestro|amex|american\s+express"
+    r"|bank\s+transfer|direct\s+debit|paypal|apple\s+pay|google\s+pay)(?![a-z])"))
+_CASH_AND_CARRY = LazyPattern(lambda: rf"cash\s*(?:&|and|n{_pack_or('cash.and')})\s*carry|cash\s*back|petty\s+cash")
 _TEXT_KEPT = 20_000  # characters of a document's text kept for wording checks
 # An accountant's rule about the evidence a counterparty's payments need (J7): "Vodafone never has an invoice".
 _INVOICE_WORD = r"(?:an?\s+)?invoices?"
@@ -10972,15 +10996,21 @@ def _says_paid_in_cash(text: str) -> bool:
     return bool(_CASH_WORDS.search(folded)) and not _NOT_CASH_WORDS.search(folded)
 
 
-_TITLE_WORDS = ("nif", "fatura", "invoice", "data", "atcud")
-_FOREIGN_TITLE_WORDS = (*_TITLE_WORDS, "tax invoice", "factura", "receipt", "recibo", "bill to", "page", "vat ",
-                        "facture", "rechnung", "fattura")
+# A line starting with these is never the supplier's name on a document from abroad (with every pack's own:
+# "foreign_title_words", Portugal's "fatura", "atcud").
+_FOREIGN_TITLE_WORDS = ("nif", "invoice", "data", "tax invoice", "factura", "receipt", "recibo", "bill to", "page",
+                        "vat ", "facture", "rechnung", "fattura")
 
 
-def _first_line(text: str, *, foreign: bool = False, pack: CompanyPack | None = None) -> str | None:
+@cache
+def _foreign_title_words() -> tuple[str, ...]:
+    return (*pack_words("foreign_title_words"), *_FOREIGN_TITLE_WORDS)
+
+
+def _first_line(text: str, *, pack: CompanyPack, foreign: bool = False) -> str | None:
     """The first line that is not a title or a label: the supplier's name. A domestic document skips its
     own country's title words (``pack``), one from abroad the international ones."""
-    words = _FOREIGN_TITLE_WORDS if foreign else (tuple(pack.title_words) if pack is not None else _TITLE_WORDS)
+    words = _foreign_title_words() if foreign else tuple(pack.title_words)
     for line in (text or "").splitlines():
         line = line.strip()
         if line and not line.lower().startswith(words):
@@ -11014,6 +11044,17 @@ _NOT_A_STATEMENT_FIELD = ("invoice_number", "gross_amount", "net_amount", "vat_a
                           "payment_reference", "iban")
 
 
+_STATEMENT_FIELD = LazyPattern(lambda: (r"(?:nif|vat|data|date|periodo|period|cliente|customer"
+                                        rf"{_pack_or('statement.field')})\b"))
+_STATEMENT_TITLE = LazyPattern(lambda: (rf"(?i)\b(?:{_kind_words(DocumentType.SUPPLIER_STATEMENT, '')}"
+                                        r"statement\s+of\s+account|account\s+statement|supplier\s+statement)\b[\s:-]*"))
+_STATEMENT_TAX_ID = LazyPattern(lambda: rf"(?i)\s+(?:NIF|VAT{_pack_or('statement.tax_id_label')})\b")
+
+
+def _pack_or(concept: str) -> str:
+    return "".join(f"|{w}" for w in pack_words(concept))
+
+
 def _statement_issuer(text: str) -> str | None:
     """The first line of a statement that is not its title, a header row or a number (the supplier's name)."""
     from backoffice.learning import fold
@@ -11022,11 +11063,10 @@ def _statement_issuer(text: str) -> str | None:
         cells = [c.strip() for c in re.split(r"[;,\t|]", raw) if c.strip()]
         line = " ".join(cells)
         folded = fold(line)
-        if not line or re.match(r"(?:nif|nipc|vat|data|date|periodo|period|cliente|customer)\b", folded):
+        if not line or _STATEMENT_FIELD.match(folded):
             continue
-        name = re.sub(r"(?i)\b(?:extrato\s+(?:de\s+)?conta[\s-]+corrente|statement\s+of\s+account|account\s+"
-                      r"statement|supplier\s+statement)\b[\s:-]*", "", line).strip(" -:")
-        name = re.split(r"(?i)\s+(?:NIF|NIPC|VAT)\b", name)[0].strip(" -:,")
+        name = _STATEMENT_TITLE.sub("", line).strip(" -:")
+        name = _STATEMENT_TAX_ID.split(name)[0].strip(" -:,")
         if name and re.search(r"[A-Za-z]", name) and not re.search(r"\d{2}[/.-]\d{2}", name):
             return name[:120]
     return None

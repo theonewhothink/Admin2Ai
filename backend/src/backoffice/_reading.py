@@ -1,8 +1,10 @@
 """Small, strict readers shared by the lease, membership and cash modules: money, dates, months, tax numbers.
 
-Portuguese and English conventions ("1.234,56 €", "£1,234.56", "17/09/2026", "17 de setembro de 2026",
-"September 2026", "set/26"). Money always has two decimals, so a date or a tax number is never read as an
-amount. Pure Python; nothing here guesses: a value that cannot be read is None.
+English and Spanish conventions, and the country packs' ("1.234,56 €", "£1,234.56", "17/09/2026", "17 de
+setembro de 2026", "September 2026", "set/26"): a pack's month names ("month:<n>", "month_abbr:<n>") and how its
+tax numbers are written ("tax_ids.pattern") are in the pack (backoffice.countries.wording). Money always has two
+decimals, so a date or a tax number is never read as an amount. Pure Python; nothing here guesses: a value that
+cannot be read is None.
 """
 
 from __future__ import annotations
@@ -13,23 +15,34 @@ import re
 from collections.abc import Sequence
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from functools import cache
 
+from backoffice.countries import pack_words
 from backoffice.learning.keys import fold
 
-__all__ = ["MONTH_WORDS", "amounts", "csv_rows", "first_date", "money", "month_named", "tax_ids"]
+__all__ = ["amounts", "csv_rows", "first_date", "money", "month_named", "month_words", "tax_ids"]
 
-# Folded month names and their usual abbreviations (Portuguese, English, Spanish).
-MONTH_WORDS: dict[str, int] = {}
-for _n, _words in enumerate((
-        ("janeiro", "january", "enero", "jan"), ("fevereiro", "february", "febrero", "fev", "feb"),
-        ("marco", "march", "marzo", "mar"), ("abril", "april", "abr", "apr"), ("maio", "may", "mayo", "mai"),
-        ("junho", "june", "junio", "jun"), ("julho", "july", "julio", "jul"),
-        ("agosto", "august", "ago", "aug"), ("setembro", "september", "septiembre", "set", "sep", "sept"),
-        ("outubro", "october", "octubre", "out", "oct"), ("novembro", "november", "noviembre", "nov"),
-        ("dezembro", "december", "diciembre", "dez", "dec", "dic")), start=1):
-    for _w in _words:
-        MONTH_WORDS[_w] = _n
-_FULL_MONTHS = frozenset(w for w in MONTH_WORDS if len(w) >= 4 or w == "may")
+# Folded month names and their usual abbreviations (English, Spanish; a pack adds its own).
+_MONTHS = (("january", "enero", "jan"), ("february", "febrero", "feb"), ("march", "marzo", "mar"),
+           ("abril", "april", "abr", "apr"), ("may", "mayo"), ("june", "junio", "jun"),
+           ("july", "julio", "jul"), ("agosto", "august", "ago", "aug"),
+           ("september", "septiembre", "sep", "sept"), ("october", "octubre", "oct"),
+           ("november", "noviembre", "nov"), ("december", "diciembre", "dec", "dic"))
+
+
+@cache
+def month_words() -> dict[str, int]:
+    """Every folded month name and usual abbreviation this module reads -> its month (the packs' included)."""
+    out: dict[str, int] = {}
+    for n, words in enumerate(_MONTHS, start=1):
+        for word in (*pack_words(f"month:{n}"), *words, *pack_words(f"month_abbr:{n}")):
+            out[word] = n
+    return out
+
+
+@cache
+def _full_months() -> frozenset[str]:
+    return frozenset(w for w in month_words() if len(w) >= 4 or w == "may")
 
 _CURRENCY = r"(?:€|EUR|£|GBP|\$|USD)"
 _MONEY = re.compile(
@@ -37,10 +50,10 @@ _MONEY = re.compile(
     r"(?P<num>\d{1,3}(?:[.   ]\d{3})+,\d{2}|\d{1,3}(?:,\d{3})+\.\d{2}|\d+[.,]\d{2})"
     rf"(?![.,]?\d)(?!\s?%)\s?{_CURRENCY}?")
 _NUMERIC_DATE = re.compile(r"(?<![\d/.-])(?:(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})|(\d{4})-(\d{2})-(\d{2}))(?![\d/.-])")
-_WORD_DATE = re.compile(r"(?<!\d)(\d{1,2})(?:\.?º|st|nd|rd|th)?\s+(?:de\s+|of\s+)?([a-z]{3,10})\.?,?\s+(?:de\s+)?(\d{4})")
+_WORD_DATE = re.compile(
+    r"(?<!\d)(\d{1,2})(?:\.?º|st|nd|rd|th)?\s+(?:de\s+|of\s+)?([a-z]{3,10})\.?,?\s+(?:de\s+)?(\d{4})")
 _MONTH_YEAR = re.compile(r"(?<![a-z0-9])([a-z]{3,10})\.?\s*(?:de\s+|/|-|\s)\s*(\d{4}|\d{2})(?![\d/])")
 _NUMERIC_MONTH = re.compile(r"(?<![\d/.-])(?:(\d{1,2})[/.-](\d{4})|(\d{4})-(\d{2}))(?![\d/.-])")
-_PT_NIF = re.compile(r"(?<![\dA-Z])(?:PT\s?)?([1-9]\d{8})(?!\d)")
 _GB_VAT = re.compile(r"(?<![A-Z0-9])GB\s?(\d{3}\s?\d{4}\s?\d{2}(?:\s?\d{3})?)(?!\d)")
 # A tax number with a letter in it (a Spanish NIF, NIE or CIF), with an optional country prefix: read through the
 # packs of the countries a company can run in (tax_ids), never on its shape alone.
@@ -92,7 +105,7 @@ def first_date(text: str) -> date | None:
             break
     folded = fold(text or "")
     for m in _WORD_DATE.finditer(folded):
-        month = MONTH_WORDS.get(m.group(2))
+        month = month_words().get(m.group(2))
         day = _safe_date(int(m.group(3)), month, int(m.group(1))) if month else None
         if day is not None:
             found.append((m.start(), day))
@@ -109,25 +122,31 @@ def month_named(text: str, *, default_year: int | None = None) -> tuple[int, int
         if 1 <= month <= 12:
             return year, month
     for m in _MONTH_YEAR.finditer(folded):
-        month = MONTH_WORDS.get(m.group(1))
+        month = month_words().get(m.group(1))
         if month:
             year = int(m.group(2))
             return (2000 + year if year < 100 else year), month
     if default_year is not None:
         for word in re.findall(r"[a-z]+", folded):
-            if word in _FULL_MONTHS:  # a whole month name only: 'out' or 'set' alone are ordinary words
-                return default_year, MONTH_WORDS[word]
+            if word in _full_months():  # a whole month name only: 'out' or 'set' alone are ordinary words
+                return default_year, month_words()[word]
     return None
 
 
 def tax_ids(text: str) -> list[str]:
-    """Tax numbers written in ``text``: Portuguese NIFs (9 digits), the lettered tax numbers of the other countries
-    a company can run in, each kept only when that country's pack checks it (a Spanish NIF, NIE or CIF with its
-    check character: 'B12345674', '12345678Z'; §49), and UK VAT numbers ('GB123456789')."""
-    out = [m.group(1) for m in _PT_NIF.finditer(text or "")]
+    """Tax numbers written in ``text``: those written the way a company country's pack says ("tax_ids.pattern", its
+    first group the number: Portugal's NIFs, 9 digits), the lettered tax numbers of the other countries a company
+    can run in, each kept only when that country's pack checks it (a Spanish NIF, NIE or CIF with its check
+    character: 'B12345674', '12345678Z'; §49), and UK VAT numbers ('GB123456789')."""
+    out = [m.group(1) for pattern in _written_tax_ids() for m in pattern.finditer(text or "")]
     out += _pack_tax_ids(text or "")
     out += ["GB" + re.sub(r"\s", "", m.group(1)) for m in _GB_VAT.finditer(text or "")]
     return list(dict.fromkeys(out))
+
+
+@cache
+def _written_tax_ids() -> tuple[re.Pattern[str], ...]:
+    return tuple(re.compile(p) for p in pack_words("tax_ids.pattern"))
 
 
 def _pack_tax_ids(text: str) -> list[str]:

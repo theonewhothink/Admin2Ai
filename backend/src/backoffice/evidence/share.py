@@ -24,6 +24,7 @@ from enum import Enum
 from typing import Any
 from urllib.parse import urlsplit
 
+from backoffice.countries import LazyPattern, pack_words
 from backoffice.domain.models import EvidenceFormat, SourceKind, utcnow
 
 from .archive import ZipLimits, expand_zip, register_members
@@ -47,9 +48,9 @@ _CANT_READ = "I can't read this kind of file yet."
 _TOO_LARGE = "This file is too large to send."
 _NOTHING = "There was nothing to save."
 
-_SCREENSHOT_NAME = re.compile(
-    r"screenshot|screen shot|captura de ecr[ãa]|captura de pantalla|captura de tela"
-    r"|bildschirmfoto|capture d.[ée]cran|schermata",
+_SCREENSHOT_NAME = LazyPattern(lambda: (  # a pack's own words in "share.screenshot" (Portugal's "captura de ecrã")
+    r"screenshot|screen shot|captura de pantalla|bildschirmfoto|capture d.[ée]cran|schermata"
+    + "".join(f"|{w}" for w in pack_words("share.screenshot"))),
     re.IGNORECASE,
 )
 _URL_ONLY = re.compile(r"^\s*(https?://\S+)\s*$", re.IGNORECASE)

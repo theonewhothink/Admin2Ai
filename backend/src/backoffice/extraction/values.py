@@ -14,6 +14,7 @@ import unicodedata
 from collections.abc import Mapping
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
+from functools import cache
 from types import MappingProxyType
 from typing import Any
 
@@ -195,31 +196,33 @@ def _fold(text: str) -> str:
     return "".join(c for c in decomposed if not unicodedata.combining(c))
 
 
-# English, Portuguese and Spanish month names and common abbreviations.
-_MONTHS: Mapping[str, int] = MappingProxyType(
-    {
-        _fold(name): number
-        for number, names in enumerate(
-            (
-                # English, Portuguese, Spanish, then French, German and Italian (checklist E9).
-                ("jan", "january", "janeiro", "enero", "ene", "janvier", "januar", "jänner", "gennaio"),
-                ("feb", "february", "fev", "fevereiro", "febrero", "février", "februar", "febbraio"),
-                ("mar", "march", "marco", "março", "marzo", "mars", "märz", "maerz"),
-                ("apr", "april", "abr", "abril", "avril", "aprile"),
-                ("may", "mai", "maio", "mayo", "maggio"),
-                ("jun", "june", "junho", "junio", "juin", "juni", "giugno"),
-                ("jul", "july", "julho", "julio", "juillet", "juli", "luglio"),
-                ("aug", "august", "ago", "agosto", "août", "aout"),
-                ("sep", "sept", "september", "set", "setembro", "septiembre", "setiembre", "septembre", "settembre"),
-                ("oct", "october", "out", "outubro", "octubre", "octobre", "oktober", "ottobre"),
-                ("nov", "november", "novembro", "noviembre", "novembre"),
-                ("dec", "december", "dez", "dezembro", "dic", "diciembre", "décembre", "dezember", "dicembre"),
-            ),
-            start=1,
-        )
-        for name in names
-    }
+# Month names and common abbreviations: English, Spanish, then French, German and Italian (checklist E9); a
+# pack's own ("month:<n>", "month_abbr:<n>": Portugal's "setembro") are added on first use (_months).
+_CORE_MONTHS: tuple[tuple[str, ...], ...] = (
+    ("jan", "january", "enero", "ene", "janvier", "januar", "jänner", "gennaio"),
+    ("feb", "february", "febrero", "février", "februar", "febbraio"),
+    ("mar", "march", "marzo", "mars", "märz", "maerz"),
+    ("apr", "april", "abr", "abril", "avril", "aprile"),
+    ("may", "mai", "mayo", "maggio"),
+    ("jun", "june", "junio", "juin", "juni", "giugno"),
+    ("jul", "july", "julio", "juillet", "juli", "luglio"),
+    ("aug", "august", "ago", "agosto", "août", "aout"),
+    ("sep", "sept", "september", "septiembre", "setiembre", "septembre", "settembre"),
+    ("oct", "october", "octubre", "octobre", "oktober", "ottobre"),
+    ("nov", "november", "noviembre", "novembre"),
+    ("dec", "december", "dic", "diciembre", "décembre", "dezember", "dicembre"),
 )
+
+
+@cache
+def _months() -> Mapping[str, int]:
+    from backoffice.countries import pack_words
+
+    return MappingProxyType({
+        _fold(name): number
+        for number, names in enumerate(_CORE_MONTHS, start=1)
+        for name in (*names, *pack_words(f"month:{number}"), *pack_words(f"month_abbr:{number}"))
+    })
 
 _ISO_DATE = re.compile(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[T ].*|Z|[+-]\d{2}:?\d{2})?")
 _COMPACT_DATE = re.compile(r"(\d{4})(\d{2})(\d{2})")
@@ -244,8 +247,8 @@ def parse_date(value: object, *, day_first: bool | None = None) -> date | None:
     """A calendar date, or None when unreadable or ambiguous.
 
     ISO ("2026-09-18", with optional time or zone), compact ("20260918"),
-    numeric day/month/year and English/Portuguese/Spanish month names are
-    accepted. For "05/09/2026" the day order must be known (``day_first``);
+    numeric day/month/year and English, Spanish, French, German and Italian month names (and the packs':
+    Portugal's) are accepted. For "05/09/2026" the day order must be known (``day_first``);
     when it is None only unambiguous numeric dates are accepted.
     """
     if isinstance(value, datetime):
@@ -262,10 +265,10 @@ def parse_date(value: object, *, day_first: bool | None = None) -> date | None:
     if m := _NUMERIC_DATE.fullmatch(s):
         return _numeric_date(int(m[1]), int(m[2]), int(m[3]), day_first)
     if m := _DAY_MONTH_YEAR.fullmatch(s):
-        month = _MONTHS.get(_fold(m[2]))
+        month = _months().get(_fold(m[2]))
         return _safe_date(int(m[3]), month, int(m[1])) if month else None
     if m := _MONTH_DAY_YEAR.fullmatch(s):
-        month = _MONTHS.get(_fold(m[1]))
+        month = _months().get(_fold(m[1]))
         return _safe_date(int(m[3]), month, int(m[2])) if month else None
     return None
 

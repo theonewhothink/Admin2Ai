@@ -14,12 +14,13 @@ whether August is closed?") instead of an answer to another question. Some
 pairs are not really different readings (a question naming an amount and a
 payment is a payment lookup, not spending); :data:`_PREFER` settles those.
 
-Periods understand English and Portuguese month names, "last month", "this
+Periods understand English month names (and the packs': Portugal's "setembro"), "last month", "this
 year", quarters, "between X and Y", "since X", "yesterday", "last week",
 "the last 30 days" and dates such as "21 September" or "21/09/2026". A month
 without a year is the most recent one (in October 2026, "December" is December
 2025). Small typos ("expences", "septmber", "vodaphone") are corrected against
-the words that matter, never against ordinary words.
+the words that matter, never against ordinary words. The words here are English; a country's own (Portugal's
+"quanto gastámos", "ontem", "faturas") are in its pack, "chat.<concept>" (backoffice.countries.wording).
 
 Pure Python standard library plus the engine's own text helpers: it runs in the
 browser build (Pyodide) as well as on the server.
@@ -34,8 +35,10 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
+from functools import cache
 from typing import Any
 
+from backoffice.countries import LazyPattern, pack_alternatives, pack_words
 from backoffice.learning import counterparty_key, day_month, fold
 
 __all__ = ["INTENTS", "Period", "Slots", "Understanding", "Vocabulary", "find_periods", "parse_amount",
@@ -44,27 +47,73 @@ __all__ = ["INTENTS", "Period", "Slots", "Understanding", "Vocabulary", "find_pe
 MONTH_NAMES = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
                "November", "December")
 _EN = tuple(m.lower() for m in MONTH_NAMES)
-_PT = ("janeiro", "fevereiro", "marco", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro",
-       "novembro", "dezembro")
-_MONTH_WORDS: dict[str, int] = {**{m: i for i, m in enumerate(_EN, 1)}, **{m: i for i, m in enumerate(_PT, 1)},
-                                "jan": 1, "feb": 2, "fev": 2, "mar": 3, "apr": 4, "abr": 4, "may": 5, "mai": 5,
-                                "jun": 6, "jul": 7, "aug": 8, "ago": 8, "sep": 9, "sept": 9, "set": 9, "oct": 10,
-                                "out": 10, "nov": 11, "dec": 12, "dez": 12}
-# Also ordinary words ("may I", "money out", "set up", "two months ago", "mar"): a month only in context.
-_AMBIGUOUS = frozenset({"may", "mar", "ago", "set", "out"})
-_MONTH_CONTEXT = frozenset({"in", "for", "of", "during", "since", "until", "till", "from", "to", "and", "between",
-                            "last", "this", "next", "early", "late", "mid", "de", "em", "no", "na", "desde", "ate",
-                            "by", "vs", "versus", "through", "before", "after", "than", "or", "e"})
+_EN_ABBREVIATIONS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7, "aug": 8, "sep": 9,
+                     "sept": 9, "oct": 10, "nov": 11, "dec": 12}
+# Also ordinary words ("may I", "mar"; a pack's: "set up", "money out", "two months ago"): a month only in context.
+_EN_AMBIGUOUS = frozenset({"may", "mar"})
+_EN_MONTH_CONTEXT = frozenset({"in", "for", "of", "during", "since", "until", "till", "from", "to", "and", "between",
+                               "last", "this", "next", "early", "late", "mid", "by", "vs", "versus", "through",
+                               "before", "after", "than", "or"})
 _MONTH_NOUNS = frozenset({"expenses", "spending", "costs", "invoices", "report", "income", "vat", "payments",
                           "bills", "statement", "status", "close"})
-_MON = "|".join(sorted(_MONTH_WORDS, key=len, reverse=True))
-_NUMBER_WORDS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
-                 "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "couple of": 2, "few": 3,
-                 "um": 1, "uma": 1, "dois": 2, "duas": 2, "tres": 3, "seis": 6, "doze": 12}
+_EN_NUMBER_WORDS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+                    "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "couple of": 2, "few": 3}
 _ORDINALS = {"first": 1, "1st": 1, "second": 2, "2nd": 2, "third": 3, "3rd": 3, "fourth": 4, "4th": 4}
 
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 _DOC_NUMBER = re.compile(r"\b[A-Z]{1,4}[\s-]?[A-Z]{0,4}\d{2,4}[/-]\d+\b|\b[A-Z]{2,}-\d{3,}(?:-\d+)*\b")
+
+
+@dataclass(frozen=True)
+class _Words:
+    """The chat's word lists: the core's English with every pack's own words ("chat.<concept>")."""
+
+    months: dict[str, int]  # every month name and abbreviation (folded) -> its month
+    pack_months: frozenset[str]  # the packs' full month names
+    mon: str  # every month word as regular-expression alternatives, longest first
+    ambiguous: frozenset[str]  # month words that are also ordinary words
+    month_context: frozenset[str]
+    numbers: dict[str, int]  # number words -> their value
+    pack_numbers: str  # the packs' number words as regular-expression alternatives ("" when none)
+    units: dict[str, str]  # a pack's word for a unit of time ("meses") -> the unit ("month")
+    keywords: frozenset[str]
+    follow_filler: frozenset[str]
+    stopwords: frozenset[str]
+
+
+@cache
+def _words() -> _Words:
+    months = {m: i for i, m in enumerate(_EN, 1)}
+    pack_months: list[str] = []
+    for n in range(1, 13):
+        for word in pack_words(f"month:{n}"):
+            months[word] = n
+            pack_months.append(word)
+    months.update(_EN_ABBREVIATIONS)
+    for n in range(1, 13):
+        months.update({word: n for word in pack_words(f"month_abbr:{n}")})
+    numbers = dict(_EN_NUMBER_WORDS)
+    pack_numbers: list[str] = []
+    for n in range(1, 13):
+        for word in pack_words(f"chat.number:{n}"):
+            numbers[word] = n
+            pack_numbers.append(word)
+    return _Words(
+        months=months, pack_months=frozenset(pack_months), mon="|".join(sorted(months, key=len, reverse=True)),
+        ambiguous=_EN_AMBIGUOUS | frozenset(pack_words("chat.month_ambiguous")),
+        month_context=_EN_MONTH_CONTEXT | frozenset(pack_words("chat.month_context")),
+        numbers=numbers, pack_numbers="".join(f"|{w}" for w in pack_numbers),
+        units={word: unit for unit in ("day", "week", "month", "year") for word in pack_words(f"chat.unit:{unit}")},
+        keywords=_KEYWORDS | frozenset(_EN) | frozenset(pack_months) | frozenset(pack_words("chat.keywords")),
+        follow_filler=_FOLLOW_FILLER | frozenset(pack_words("chat.follow_filler")),
+        stopwords=_STOPWORDS | frozenset(pack_words("chat.name_stopwords")),
+    )
+
+
+def _pack_or(concept: str) -> str:
+    """The packs' alternatives for ``concept`` after a "|", to close a group of the core's own ("" when none)."""
+    words = pack_words(concept)
+    return "|" + "|".join(words) if words else ""
 
 
 # --------------------------------------------------------------------------- periods
@@ -185,7 +234,7 @@ def _add_months(day: date, months: int) -> date:
 
 
 def _rolling(n: int, unit: str, today: date) -> Period:
-    unit = {"dias": "day", "semanas": "week", "meses": "month", "anos": "year"}.get(unit, unit.rstrip("s"))
+    unit = _words().units.get(unit, unit.rstrip("s"))
     if unit == "day":
         start = today - timedelta(days=n - 1)
     elif unit == "week":
@@ -217,13 +266,13 @@ def _safe_date(year: int, month: int, day: int) -> date | None:
 
 def _month_ok(t: str, start: int, end: int, word: str) -> bool:
     """An ambiguous month word counts only next to a preposition, a number or a money noun."""
-    if word not in _AMBIGUOUS:
+    if word not in _words().ambiguous:
         return True
     before = t[:start].split()
     after = t[end:].split()
     prev = before[-1] if before else ""
     nxt = after[0].strip(".,") if after else ""
-    return prev in _MONTH_CONTEXT or prev.isdigit() or nxt.isdigit() or nxt in _MONTH_NOUNS
+    return prev in _words().month_context or prev.isdigit() or nxt.isdigit() or nxt in _MONTH_NOUNS
 
 
 def find_periods(t: str, today: date) -> tuple[list[Period], list[tuple[int, int]]]:
@@ -239,11 +288,13 @@ def find_periods(t: str, today: date) -> tuple[list[Period], list[tuple[int, int
             atoms.append((a, b, p))
             taken.append((a, b))
 
+    w = _words()
+    of, of_year = _pack_or("chat.of"), pack_alternatives("chat.of")  # "de setembro", "de 2026"
     # Days within one month: "1 to 15 September", "from 1-15 set".
-    for m in re.finditer(rf"\b(?:from\s+|between\s+|de\s+|entre\s+)?(\d{{1,2}})(?:st|nd|rd|th)?\s*(?:-|to|and|until|"
-                         rf"till|a|e|ate)\s*(\d{{1,2}})(?:st|nd|rd|th)?\s+(?:of\s+|de\s+)?({_MON})\b"
-                         rf"(?:,?\s+(?:de\s+)?(\d{{4}}))?", t):
-        mon = _MONTH_WORDS[m[3]]
+    for m in re.finditer(rf"\b(?:from\s+|between\s+{_pack_or('chat.range_from')})?(\d{{1,2}})(?:st|nd|rd|th)?\s*"
+                         rf"(?:-|to|and|until|till{_pack_or('chat.range_to')})\s*(\d{{1,2}})(?:st|nd|rd|th)?\s+"
+                         rf"(?:of\s+{of})?({w.mon})\b(?:,?\s+(?:{of_year})?(\d{{4}}))?", t):
+        mon = w.months[m[3]]
         year = int(m[4]) if m[4] else _recent_year(mon, int(m[1]), today)
         a, b = _safe_date(year, mon, int(m[1])), _safe_date(year, mon, int(m[2]))
         if a and b:
@@ -259,16 +310,16 @@ def find_periods(t: str, today: date) -> tuple[list[Period], list[tuple[int, int
         d = _safe_date(year, int(mon), int(day)) if 1 <= int(mon) <= 12 else None
         add(m.start(), m.end(), _day_period(d, today) if d else None)
     # "21 September 2026", "21st of september", "1 de setembro de 2026".
-    for m in re.finditer(rf"\b(\d{{1,2}})(?:st|nd|rd|th|o)?\s+(?:of\s+|de\s+)?({_MON})\b(?:,?\s+(?:de\s+)?(\d{{4}}))?",
-                         t):
-        mon = _MONTH_WORDS[m[2]]
+    for m in re.finditer(rf"\b(\d{{1,2}})(?:st|nd|rd|th{_pack_or('chat.ordinal')})?\s+(?:of\s+{of})?({w.mon})\b"
+                         rf"(?:,?\s+(?:{of_year})?(\d{{4}}))?", t):
+        mon = w.months[m[2]]
         year = int(m[3]) if m[3] else _recent_year(mon, int(m[1]), today)
         d = _safe_date(year, mon, int(m[1]))
         add(m.start(), m.end(), _day_period(d, today) if d else None)
     # "September 21", "sept 21st, 2026".
-    for m in re.finditer(rf"\b({_MON})\s+(\d{{1,2}})(?:st|nd|rd|th)?\b(?!\s*(?:€|eur|euros?|days?|weeks?|months?|"
+    for m in re.finditer(rf"\b({w.mon})\s+(\d{{1,2}})(?:st|nd|rd|th)?\b(?!\s*(?:€|eur|euros?|days?|weeks?|months?|"
                          rf"years?|payments?))(?:,?\s+(\d{{4}}))?", t):
-        mon = _MONTH_WORDS[m[1]]
+        mon = w.months[m[1]]
         year = int(m[3]) if m[3] else _recent_year(mon, int(m[2]), today)
         d = _safe_date(year, mon, int(m[2]))
         add(m.start(), m.end(), _day_period(d, today) if d else None)
@@ -277,27 +328,32 @@ def find_periods(t: str, today: date) -> tuple[list[Period], list[tuple[int, int
     last_month_end = today.replace(day=1) - timedelta(days=1)
     q_now = (today.month - 1) // 3 + 1
     q_prev = (today.year, q_now - 1) if q_now > 1 else (today.year - 1, 4)
+    units = "".join(f"|{word}" for word in w.units)
     relative: list[tuple[str, Any]] = [
-        (r"\b(?:the )?day before yesterday\b|\banteontem\b", lambda m: _day_period(today - timedelta(days=2), today)),
-        (r"\byesterday\b|\bontem\b", lambda m: _day_period(today - timedelta(days=1), today)),
-        (r"\btoday\b|\bhoje\b", lambda m: _day_period(today, today)),
-        (r"\b(?:this|current) week\b|\besta semana\b", lambda m: _week_period(today, today)),
-        (r"\b(?:last|previous|prior) week\b|\bsemana passada\b",
+        (r"\b(?:the )?day before yesterday\b" + _pack_or("chat.relative:before_yesterday"),
+         lambda m: _day_period(today - timedelta(days=2), today)),
+        (r"\byesterday\b" + _pack_or("chat.relative:yesterday"),
+         lambda m: _day_period(today - timedelta(days=1), today)),
+        (r"\btoday\b" + _pack_or("chat.relative:today"), lambda m: _day_period(today, today)),
+        (r"\b(?:this|current) week\b" + _pack_or("chat.relative:this_week"), lambda m: _week_period(today, today)),
+        (r"\b(?:last|previous|prior) week\b" + _pack_or("chat.relative:last_week"),
          lambda m: _week_period(today - timedelta(days=7), today)),
-        (r"\b(?:this|current) month\b|\beste mes\b|\bmonth to date\b|\bmtd\b", lambda m: this_month),
-        (r"\b(?:last|previous|prior) month\b|\bmes passado\b|\bultimo mes\b|\bmes anterior\b",
+        (r"\b(?:this|current) month\b|\bmonth to date\b|\bmtd\b" + _pack_or("chat.relative:this_month"),
+         lambda m: this_month),
+        (r"\b(?:last|previous|prior) month\b" + _pack_or("chat.relative:last_month"),
          lambda m: _month_period(last_month_end.year, last_month_end.month, today)),
-        (r"\b(?:this|current) quarter\b|\beste trimestre\b", lambda m: _quarter_period(today.year, q_now, today)),
-        (r"\b(?:last|previous|prior) quarter\b|\btrimestre (?:passado|anterior)\b|\bultimo trimestre\b",
+        (r"\b(?:this|current) quarter\b" + _pack_or("chat.relative:this_quarter"),
+         lambda m: _quarter_period(today.year, q_now, today)),
+        (r"\b(?:last|previous|prior) quarter\b" + _pack_or("chat.relative:last_quarter"),
          lambda m: _quarter_period(q_prev[0], q_prev[1], today)),
-        (r"\b(?:this|current) year\b|\beste ano\b|\byear to date\b|\bytd\b|\bso far this year\b",
-         lambda m: _year_period(today.year, today)),
-        (r"\b(?:last|previous|prior) year\b|\bano passado\b|\bano anterior\b",
+        (r"\b(?:this|current) year\b|\byear to date\b|\bytd\b|\bso far this year\b"
+         + _pack_or("chat.relative:this_year"), lambda m: _year_period(today.year, today)),
+        (r"\b(?:last|previous|prior) year\b" + _pack_or("chat.relative:last_year"),
          lambda m: _year_period(today.year - 1, today)),
-        (r"\b(?:(?:over |in )?the )?(?:last|past|previous|ultim[oa]s|nos ultim[oa]s)\s+(\d{1,3}|a|one|two|three|four|"
-         r"five|six|seven|eight|nine|ten|eleven|twelve|couple of|few|um|uma|dois|duas|tres|seis|doze)\s+"
-         r"(days?|weeks?|months?|years?|dias|semanas|meses|anos)\b",
-         lambda m: _rolling(int(m[1]) if m[1].isdigit() else _NUMBER_WORDS[m[1]], m[2], today)),
+        (rf"\b(?:(?:over |in )?the )?(?:last|past|previous{_pack_or('chat.rolling_last')})\s+"
+         rf"(\d{{1,3}}|a|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|couple of|few{w.pack_numbers})\s+"
+         rf"(days?|weeks?|months?|years?{units})\b",
+         lambda m: _rolling(int(m[1]) if m[1].isdigit() else w.numbers[m[1]], m[2], today)),
         (r"\b(?:the )?past (week|month|year)\b", lambda m: _rolling(1, m[1], today)),
     ]
     for pattern, build in relative:
@@ -306,18 +362,19 @@ def find_periods(t: str, today: date) -> tuple[list[Period], list[tuple[int, int
                 add(m.start(), m.end(), build(m))
             except (ValueError, KeyError):
                 continue
-    # Quarters.
+    # Quarters (a pack's: its quarter's number, then its year).
     for m in re.finditer(r"\bq([1-4])\b(?:\s+(?:of\s+)?(\d{4}))?|\b(first|second|third|fourth|1st|2nd|3rd|4th)\s+"
-                         r"quarter\b(?:\s+(?:of\s+)?(\d{4}))?|\b([1-4])(?:o)?\s+trimestre\b(?:\s+(?:de\s+)?(\d{4}))?", t):
-        q = int(m[1] or m[5] or 0) or _ORDINALS[m[3]]
-        yr = m[2] or m[4] or m[6]
+                         r"quarter\b(?:\s+(?:of\s+)?(\d{4}))?" + _pack_or("chat.quarter"), t):
+        theirs = m.groups()[4:]  # the packs' groups, two by two
+        q = int(m[1] or next((g for g in theirs[0::2] if g), None) or 0) or _ORDINALS[m[3]]
+        yr = m[2] or m[4] or next((g for g in theirs[1::2] if g), None)
         year = int(yr) if yr else (today.year if q <= q_now else today.year - 1)
         add(m.start(), m.end(), _quarter_period(year, q, today))
     # Months, with an optional year.
-    for m in re.finditer(rf"\b({_MON})\b\.?(?:\s+(?:of\s+|de\s+)?((?:19|20)\d{{2}})\b)?", t):
+    for m in re.finditer(rf"\b({w.mon})\b\.?(?:\s+(?:of\s+{of})?((?:19|20)\d{{2}})\b)?", t):
         if not _month_ok(t, m.start(1), m.end(1), m[1]):
             continue
-        mon = _MONTH_WORDS[m[1]]
+        mon = w.months[m[1]]
         year = int(m[2]) if m[2] else _recent_year(mon, None, today)
         add(m.start(), m.end(), _month_period(year, mon, today))
     # A year on its own: "in 2025", "2026 expenses".
@@ -377,8 +434,8 @@ def parse_amount(raw: str) -> Decimal | None:
         return None
 
 
-_PAYMENT_WORDS = re.compile(r"\b(?:payments?|paid|pay|invoices?|transfers?|charges?|charged|receipts?|bills?|debits?|"
-                            r"transactions?|pagamentos?|faturas?)\b")
+_PAYMENT_WORDS = LazyPattern(lambda: (r"\b(?:payments?|paid|pay|invoices?|transfers?|charges?|charged|receipts?|bills?|"
+                                      rf"debits?|transactions?{_pack_or('chat.payment_words')})\b"))
 
 
 def _amount(t: str, spans: list[tuple[int, int]]) -> Decimal | None:
@@ -445,7 +502,7 @@ class Vocabulary:
             for alias in s.aliases:
                 variants |= {_clean(alias), counterparty_key(alias) or ""}
             first = _clean(s.name).split(" ")[0] if s.name.strip() else ""
-            if len(first) >= 4 and first not in _STOPWORDS and first not in company_words:
+            if len(first) >= 4 and first not in _words().stopwords and first not in company_words:
                 variants.add(first)
             taken = {v for vs in companies.values() for v in vs}
             suppliers[s.id] = _variants(variants - taken)
@@ -513,8 +570,8 @@ def _find(t: str, table: Mapping[str, tuple[str, ...]], blocked: list[tuple[int,
 
 
 _STOPWORDS = frozenset({"the", "and", "for", "with", "from", "this", "that", "what", "which", "have", "your", "our",
-                        "company", "companies", "business", "supplier", "portugal", "lisboa", "porto", "group",
-                        "services", "service", "global", "new", "best", "good", "real", "home", "shop", "store"})
+                        "company", "companies", "business", "supplier", "group", "services", "service", "global",
+                        "new", "best", "good", "real", "home", "shop", "store"})
 
 _REPLACEMENTS = (
     (r"[’‘`´]", "'"), (r"[“”]", '"'),
@@ -525,18 +582,19 @@ _REPLACEMENTS = (
     (r"(\w)'s\b", r"\1"), (r"(\w)s' ", r"\1s "),
 )
 
-# Words that matter for understanding: small typos are corrected towards these.
+# Words that matter for understanding: small typos are corrected towards these (with the month names and the
+# packs' keywords, see _words).
 _KEYWORDS = frozenset("""
 expenses expense expenditure spending spend spent costs outgoings outflows income revenue received receive
 earned invoices invoice receipts receipt documents document statement statements payments payment subscriptions
-subscription recurring increased increase expensive prices accountant contabilista attention deadlines deadline
+subscription recurring increased increase expensive prices accountant attention deadlines deadline
 upcoming missing without unmatched closed complete completed finished connections connected disconnected
 reconnect suspicious fraud blocked changed summary summarise summarize overview breakdown analyse analyze report
 reports compare compared comparison versus quarter yesterday today tomorrow suppliers supplier companies company
 balance profit forecast budget taxes activity handled happened reminder remind salaries payroll insurance
 software internet electricity furniture travel meals restaurant transfer transfers refund refunds biggest largest
-highest despesas gastos custos faturas recibos pagamentos receitas impostos
-""".split()) | frozenset(_EN) | frozenset(_PT)
+highest
+""".split())
 
 # Ordinary words that look like keywords ("sending" is not "spending"): never "corrected".
 _COMMON = frozenset("""
@@ -578,12 +636,13 @@ def _normalise(text: str) -> str:
 
 
 def _correct(t: str, extra: set[str]) -> str:
-    targets = sorted(_KEYWORDS | extra)
-    known = _KEYWORDS | _COMMON | extra
+    words = _words()
+    targets = sorted(words.keywords | extra)
+    known = words.keywords | _COMMON | extra
 
     def fix(m: re.Match[str]) -> str:
         word = m[0]
-        if len(word) < 5 or word in known or word in _MONTH_WORDS:
+        if len(word) < 5 or word in known or word in words.months:
             return word
         # One slip of the finger, not another word: "weather" is not "water".
         slack = 2 if len(word) >= 10 else 1
@@ -602,51 +661,55 @@ INTENTS = ("spending", "income", "vat", "payment_lookup", "find_document", "repo
            "missing_invoices", "month_status", "needs_me", "deadlines", "subscriptions", "fraud", "connections",
            "accountant", "activity", "overview", "balance", "profit", "forecast")
 
-_DOC = r"(?:invoices?|receipts?|documents?|docs?|bills?|faturas?|recibos?|statements?|letters?|pdfs?|copies|copy)"
-_TAXWORD = r"\b(?:tax|taxes|vat|iva|impostos?|irs|irc|seguranca social|social security|withholding)\b"
+_DOC = "{doc}"  # a document noun: replaced by _doc() in each pattern
+_TAXWORD = LazyPattern(lambda: rf"\b(?:tax|taxes|vat{_pack_or('chat.tax_words')}|social security|withholding)\b")
 
-# (intent, pattern, weight). An intent's score is its best matching weight, plus slot boosts below.
+
+@cache
+def _doc() -> str:
+    return (r"(?:invoices?|receipts?|documents?|docs?|bills?" + _pack_or("chat.document_words")
+            + r"|statements?|letters?|pdfs?|copies|copy)")
+
+
+# (intent, pattern, weight). An intent's score is its best matching weight, plus slot boosts below. A pack adds its
+# own ("chat.cue:<intent>": "<weight> <pattern>").
 _CUES: tuple[tuple[str, str, float], ...] = (
     ("spending", r"\b(?:expenses?|expenditures?|spend|spends|spending|spent|costs?|outgoings?|outflows?|"
-                 r"burn(?:ed|t)?|despesas?|gastos?|gastei|gastamos|gastaram|custos?)\b", 1.0),
+                 r"burn(?:ed|t)?)\b", 1.0),
     ("spending", r"\bmoney (?:out|going out|that went out|leaving)\b|\b(?:went|gone|go|going) out\b", 1.0),
     ("spending", r"\b(?:what|how much)\b.*\b(?:did|have|has|do|does)\b.*\b(?:pay|paid)\b", 0.9),
     ("spending", r"\bhow much\b.*\b(?:on|for)\b", 0.5),
     ("spending", r"\b(?:top|biggest|largest|main|highest)\b.*\b(?:suppliers?|vendors?|costs?|payments?|expenses?)\b",
      1.0),
-    ("spending", r"\bpayments?\b|\bpagamentos\b", 0.5),
-    ("spending", r"\bquanto\b.*\b(?:gast|pag)", 1.0),
+    ("spending", r"\bpayments?\b", 0.5),
     ("spending", r"\bwho did (?:we|i) pay\b|\b(?:paid|pay|spent|spend|cost|costs) (?:us )?the most\b|"
                  r"\b(?:list|show|which|who are|all)\b(?: of)?(?: my| our| the)? (?:suppliers|vendors)\b|"
                  r"\bmy suppliers\b|\baverage\b.*\b(?:spend|spending|costs?|expenses?)\b", 1.0),
-    ("income", r"\b(?:income|revenues?|turnover|sales|earned|earn|earnings|inflows?|receitas?|recebemos|recebido|"
-               r"recebi|vendas|faturacao)\b", 1.0),
+    ("income", r"\b(?:income|revenues?|turnover|sales|earned|earn|earnings|inflows?)\b", 1.0),
     ("income", r"\brefunds?\b|\brefunded\b|\breimburse\w*\b|\bmoney back\b|\bcredit notes?\b", 1.0),
     ("income", r"\b(?:received|receive|got paid|get paid|getting paid|paid us|pay us|came in|come in|coming in|"
                r"money in|incoming)\b", 0.9),
-    ("vat", r"\b(?:vat|iva)\b", 1.1),
+    ("vat", r"\bvat\b", 1.1),
     ("payment_lookup", r"^(?:so |and |but |ok |okay )?(?:did|have|has|was|were)\b.*\b(?:pay|paid|payment|go through|"
                        r"gone through|went through|debited|charged)\b", 1.0),
     ("payment_lookup", r"\bwhen did (?:we|i|you)\b.*\bpay\b|\b(?:last|latest|most recent) payment\b", 1.0),
-    ("payment_lookup", r"\b(?:payments?|charges?|transactions?|debits?|transfers?|pagamentos?)\b", 0.45),
+    ("payment_lookup", r"\b(?:payments?|charges?|transactions?|debits?|transfers?)\b", 0.45),
     ("find_document", rf"\b(?:find|show|get|where|send|forward|download|give|look(?:ing)? for|pull up|share|attach|"
                       rf"open|see|view|fetch|mail|email|need|want)\b.*\b{_DOC}\b", 1.2),
     ("find_document", rf"\b(?:which|what|any)\b.*\b{_DOC}\b.*\b(?:get|got|receive|received|arrive|arrived|come in|"
                       rf"came in)\b", 1.2),
     ("find_document", rf"\b{_DOC}\b", 0.5),
-    ("report", r"\breports?\b|\brelatorios?\b", 1.3),
+    ("report", r"\breports?\b", 1.3),
     ("report", r"\bexport\b", 0.9),
     ("supplier_summary", r"\b(?:summar\w*|overview|breakdown|analy[sz]\w*|check for (?:issues|problems)|"
                          r"anything (?:wrong|odd) with|history with|relationship with|review)\b", 1.3),
     ("missing_invoices", r"\bmissing\b|\bwithout (?:an? |their |its |the )?(?:invoices?|receipts?|documents?)\b|"
                          r"\bno (?:invoices?|receipts?)\b|\blooking for\b|\bunmatched\b|\bnot matched\b|"
                          r"\b(?:have not|not yet) (?:got|received|arrived)\b|\boutstanding (?:invoices?|documents?|"
-                         r"receipts?)\b|\bchas(?:e|ed|ing)\b|\bem falta\b|\bfaltam?\b", 1.0),
-    ("month_status", r"\b(?:closed?|closing|complete|completed|finished|finali[sz]ed|wrapped up|fechad[oa]|fechar|"
-                     r"concluid[oa]|ready)\b", 0.4),
+                         r"receipts?)\b|\bchas(?:e|ed|ing)\b", 1.0),
+    ("month_status", r"\b(?:closed?|closing|complete|completed|finished|finali[sz]ed|wrapped up|ready)\b", 0.4),
     ("month_status", r"\bdone\b", 0.3),
-    ("month_status", r"\bmonth[ -]?end\b|\bmonth close\b|\bclose the month\b|\bclosing the month\b|"
-                     r"\bfecho (?:do|de) mes\b", 1.1),
+    ("month_status", r"\bmonth[ -]?end\b|\bmonth close\b|\bclose the month\b|\bclosing the month\b", 1.1),
     ("month_status", r"\bhow far\b|\bprogress\b|\bstatus of\b|\bhow is\b.*\bgoing\b", 0.5),
     ("month_status", r"\bcan (?:we|i|you) close\b", 1.0),
     ("month_status", r"\bwhy\b.*\b(?:not|still)\b.*\b(?:closed|done|complete|finished|open)\b", 1.1),
@@ -657,23 +720,23 @@ _CUES: tuple[tuple[str, str, float], ...] = (
     ("needs_me", r"\b(?:anything|something|what)\b.*\b(?:i|me)\b.*\b(?:need|have|should|must|got)\b.*\bto do\b", 1.0),
     ("needs_me", r"\bwhat should i do\b|\bto do\b|\bwhat do you need\b|\bdo you need anything\b", 0.9),
     ("needs_me", r"\bbelongs? to\b|\bwhich company\b.*\b(?:does|should|do|did)\b.*\b(?:belong|go)\b", 1.0),
-    ("deadlines", r"\bdue\b|\boverdue\b|\bdeadlines?\b|\bupcoming\b|\bcoming up\b|\bprazos?\b|\bvencimentos?\b|"
+    ("deadlines", r"\bdue\b|\boverdue\b|\bdeadlines?\b|\bupcoming\b|\bcoming up\b|"
                   r"\bnext\b.*\b(?:payments?|bills?|deadlines?|tax)\b", 1.0),
     ("deadlines", r"\b(?:need|have|must|got) to pay\b|\bto be paid\b|\bowe\b|\bbills? to pay\b|"
                   r"\bpay (?:soon|next|this week|next week)\b|\brenew\w*\b", 1.0),
     ("subscriptions", r"\bsubscri\w*\b|\brecurring\b|\bregular (?:costs?|payments?|bills?)\b|"
-                      r"\bmonthly (?:costs?|payments?|bills?|charges?)\b|\bassinaturas?\b", 1.0),
+                      r"\bmonthly (?:costs?|payments?|bills?|charges?)\b", 1.0),
     ("subscriptions", r"\b(?:went|gone|go|going|gone) up\b|\bincreas\w*\b|\bmore expensive\b|\bprice\b|\bprices\b|"
-                      r"\bpricier\b|\baument\w*\b|\bsubiu\b|\bsubiram\b", 1.2),
+                      r"\bpricier\b", 1.2),
     ("fraud", r"\bsafe\b|\blegit\w*\b|\bgenuine\b|\bscam\w*\b", 1.0),
     ("fraud", r"\bfraud\w*\b|\bscams?\b|\bsuspicious\b|\bphishing\b|\bbank details\b|\biban\b|"
               r"\bchanged (?:bank|account|details)\b|\bnew (?:bank account|account number|iban)\b|\bblocked\b|"
-              r"\bon hold\b|\bheld\b|\bred flags?\b|\banything (?:odd|strange|wrong|weird|fishy)\b|\bfraude\b", 1.0),
+              r"\bon hold\b|\bheld\b|\bred flags?\b|\banything (?:odd|strange|wrong|weird|fishy)\b", 1.0),
     ("connections", r"\bconnections?\b|\bconnected\b|\bdisconnected\b|\bsync\w*\b|\breconnect\w*\b|\blinked\b|"
                     r"\bintegrations?\b", 1.0),
     ("connections", r"\b(?:gmail|outlook|email|inbox|bank|banks)\b.*\b(?:working|ok|up to date|reading|online)\b",
      1.0),
-    ("accountant", r"\baccountants?\b|\bcontabilist\w*\b|\bcontabilidade\b|\bbookkeeper\b|\baccounting firm\b", 1.0),
+    ("accountant", r"\baccountants?\b|\bbookkeeper\b|\baccounting firm\b", 1.0),
     ("payment_lookup", r"\b(?:what happened|what is happening|what is going on|going on with|any news|news on|"
                        r"status of|update on)\b", 0.5),
     ("activity", r"\bwhat (?:have|did) you (?:done|do|been doing|handled|collected|found)\b|\bwhat happened\b|"
@@ -683,13 +746,28 @@ _CUES: tuple[tuple[str, str, float], ...] = (
                  r"\boverview\b|\bstatus\b|\bdashboard\b|\bsituation\b|\beverything (?:ok|okay|fine|good|under control)\b|"
                  r"\ball good\b|\bany problems?\b|\bsummary\b", 0.8),
     ("balance", r"\bbalances?\b|\bhow much (?:money|cash) (?:do|have) (?:we|i)\b|\bcash (?:position|on hand|flow)\b|"
-                r"\bsaldo\b|\bin the bank\b", 1.0),
-    ("profit", r"\bprofit\w*\b|\bmargins?\b|\bp ?& ?l\b|\bprofit and loss\b|\bebitda\b|\blucro\b|\bnet income\b|"
+                r"\bin the bank\b", 1.0),
+    ("profit", r"\bprofit\w*\b|\bmargins?\b|\bp ?& ?l\b|\bprofit and loss\b|\bebitda\b|\bnet income\b|"
                r"\bmake money\b|\bmaking money\b", 1.1),
     ("forecast", r"\bforecast\w*\b|\bpredict\w*\b|\bprojection\w*\b|\bbudget\w*\b|\bnext year\b|\bwill we spend\b",
      1.0),
 )
-_COMPILED = tuple((intent, re.compile(p), w) for intent, p, w in _CUES)
+
+
+@cache
+def _compiled() -> tuple[tuple[str, re.Pattern[str], float], ...]:
+    """The core's cues and every pack's, compiled (the document noun filled in). A pack's cue comes right after the
+    core's first cue of the same intent and weight (else its intent's last), so scores keep the same order."""
+    after: dict[int, list[tuple[str, str, float]]] = {}
+    for intent in INTENTS:
+        own = [i for i, cue in enumerate(_CUES) if cue[0] == intent]
+        for entry in pack_words(f"chat.cue:{intent}"):
+            weight_text, _, pattern = entry.partition(" ")
+            weight = float(weight_text)
+            anchor = next((i for i in own if _CUES[i][2] == weight), own[-1] if own else len(_CUES) - 1)
+            after.setdefault(anchor, []).append((intent, pattern, weight))
+    ordered = [c for i, cue in enumerate(_CUES) for c in (cue, *after.get(i, ()))]
+    return tuple((intent, re.compile(p.replace(_DOC, _doc())), w) for intent, p, w in ordered)
 
 # Two readings that are really one question: which one answers it.
 _PREFER: dict[frozenset[str], Any] = {
@@ -779,24 +857,23 @@ class Understanding:
     follow_up: bool = False
 
 
-_GREETING = re.compile(r"^(?:(?:hi|hello|hey|hiya|yo|ola|oi|bom dia|boa tarde|boa noite|good (?:morning|afternoon|"
-                       r"evening|day)|dear|greetings)\b[\s,!.]*(?:there|claude|operator|team)?[\s,!.]*)+")
+_GREETING = LazyPattern(lambda: (rf"^(?:(?:hi|hello|hey|hiya|yo{_pack_or('chat.greeting')}|good (?:morning|afternoon|"
+                                 r"evening|day)|dear|greetings)\b[\s,!.]*(?:there|claude|operator|team)?[\s,!.]*)+"))
 _POLITE = re.compile(r"^(?:(?:please|pls|quick question|question|so|ok|okay|right|well|um|hmm|can you|could you|"
                      r"would you|will you|can i|could i|i want to know|i would like to know|i d like to know|"
                      r"id like to know|i wonder|i am wondering|tell me|let me know|do you know)\b[\s,:]*)+")
 _HELP = re.compile(r"^(?:help|help me|what can you do|what do you do|how does this work|how do you work|"
                    r"what can i ask(?: you)?|what can you help with|what are you|who are you|commands|options|menu)"
                    r"[\s?!.]*$")
-_THANKS = re.compile(r"^(?:(?:thanks?|thank you|thx|ty|cheers|obrigad[oa]|great|perfect|ok|okay|cool|nice|"
-                     r"got it|brilliant|excellent|awesome|super|lovely|good|fine)(?: (?:a lot|so much|very much|"
-                     r"again|for (?:that|this|the help|your help)|you))*[\s!.]*)+$")
+_THANKS = LazyPattern(lambda: (rf"^(?:(?:thanks?|thank you|thx|ty|cheers{_pack_or('chat.thanks')}|great|perfect|ok|"
+                               r"okay|cool|nice|got it|brilliant|excellent|awesome|super|lovely|good|fine)(?: (?:a lot|"
+                               r"so much|very much|again|for (?:that|this|the help|your help)|you))*[\s!.]*)+$"))
 # Words an elliptical follow-up may carry besides names, periods and categories:
-# "and in September?", "what about Company C?", "same for last year", "e em agosto?".
+# "and in September?", "what about Company C?", "same for last year" (a pack's: "e em agosto?").
 _FOLLOW_FILLER = frozenset("""
 and what about how same for also now then in on at of the a an it its that this those these them one ones
 please only just by from to with is are was were did do does was so ok okay again too as well or vs versus
 compared compare than last previous next this past year years month months quarter week weeks day days
-e em no na nos nas de do da dos das para o a os as tambem mesmo e sobre ano mes semana
 """.split())
 
 
@@ -811,12 +888,14 @@ def unrelated_words(text: str, vocab: Vocabulary) -> set[str]:
                           *vocab.cost_centers.values())
              for v in vs for w in v.split()}
     words = re.findall(r"[a-z]+", text)
-    known = _FOLLOW_FILLER | names | set(_EN) | set(_PT) | {m[:3] for m in _EN} | _KEYWORDS
+    lists = _words()
+    known = lists.follow_filler | names | set(_EN) | lists.pack_months | {m[:3] for m in _EN} | lists.keywords
     return {w for w in words if len(w) > 1 and w not in known}
 
 
-_FOLLOW_UP = re.compile(r"^(?:and|what about|how about|and what about|and how about|same for|and for|also|now|"
-                        r"then|e|e em|e no|e na)\b")
+_TO_ACCOUNTANT = LazyPattern(lambda: rf"\bto (?:my|our|the) (?:accountant{_pack_or('chat.accountant')}|bookkeeper)\b")
+_FOLLOW_UP = LazyPattern(lambda: (r"^(?:and|what about|how about|and what about|and how about|same for|and for|"
+                                  rf"also|now|then{_pack_or('chat.follow_up')})\b"))
 
 
 def understand(message: str, vocab: Vocabulary, today: date) -> Understanding:
@@ -837,9 +916,9 @@ def understand(message: str, vocab: Vocabulary, today: date) -> Understanding:
     if not t:
         return Understanding("greeting" if greeted else "unknown", 1.0 if greeted else 0.0, slots, t)
     t = _correct(t, vocab.words())
-    if re.search(r"\bto (?:my|our|the) (?:accountant|contabilista|bookkeeper)\b", t):
+    if _TO_ACCOUNTANT.search(t):
         slots.to_accountant = True
-        t = re.sub(r"\bto (?:my|our|the) (?:accountant|contabilista|bookkeeper)\b", " ", t).strip()
+        t = _TO_ACCOUNTANT.sub(" ", t).strip()
 
     slots.periods, spans = find_periods(t, today)
     blocked = list(spans)
@@ -855,9 +934,9 @@ def understand(message: str, vocab: Vocabulary, today: date) -> Understanding:
     slots.all_companies = bool(re.search(r"\b(?:all|every|each|both|across|all of)\s+(?:of\s+)?(?:my\s+|the\s+|our\s+|"
                                          r"three\s+)?(?:companies|company|businesses|business|entities)\b|"
                                          r"\b(?:per|by) (?:company|business)\b|\boverall\b|\bcombined\b|"
-                                         r"\baltogether\b|\btodas as empresas\b", t))
-    excluded = re.search(r"\b(?:excluding|without|except|not counting|leaving out|apart from|other than|sem)\s+"
-                         r"(?:the\s+)?(.+)$", t)
+                                         r"\baltogether\b" + _pack_or("chat.all_companies"), t))
+    excluded = re.search(r"\b(?:excluding|without|except|not counting|leaving out|apart from|other than"
+                         + _pack_or("chat.excluding") + r")\s+(?:the\s+)?(.+)$", t)
     exclusion_start = excluded.start() if excluded else len(t)
     for a, b, key in _find(t, vocab.categories, blocked):
         if a >= exclusion_start:
@@ -879,13 +958,14 @@ def understand(message: str, vocab: Vocabulary, today: date) -> Understanding:
         slots.group_by = "category"
     elif re.search(r"\b(?:by|per|each)\s+month\b|\bmonth by month\b|\bmonthly breakdown\b", t):
         slots.group_by = "month"
-    slots.average = bool(re.search(r"\baverage\b|\bon average\b|\bper month\b|\ba month\b|\bmonthly average\b|"
-                                   r"\bmedia\b|\bpor mes\b", t))
+    slots.average = bool(re.search(r"\baverage\b|\bon average\b|\bper month\b|\ba month\b|\bmonthly average\b"
+                                   + _pack_or("chat.average"), t))
     slots.compare = bool(re.search(r"\b(?:vs|versus|compar\w*|than|difference|change from|up or down|more or less|"
                                    r"trend|against)\b", t)) or len(slots.periods) > 1
     if top := re.search(r"\btop (\d{1,2}|three|five|ten)\b", t):
-        slots.top = int(top[1]) if top[1].isdigit() else _NUMBER_WORDS[top[1]]
-    if re.search(r"\b(?:received|income|revenue|came in|come in|money in|earned|sales|receitas|recebi\w*)\b", t):
+        slots.top = int(top[1]) if top[1].isdigit() else _words().numbers[top[1]]
+    if re.search(r"\b(?:received|income|revenue|came in|come in|money in|earned|sales" + _pack_or("chat.money_in")
+                 + r")\b", t):
         slots.direction = "in"
     elif re.search(r"\b(?:spent|spend|spending|paid|pay|costs?|expenses?|outgoings?|money out|went out)\b", t):
         slots.direction = "out"
@@ -920,12 +1000,12 @@ def understand(message: str, vocab: Vocabulary, today: date) -> Understanding:
 
 def _score(t: str, s: Slots, vocab: Vocabulary) -> dict[str, float]:
     scores: dict[str, float] = {}
-    for intent, pattern, weight in _COMPILED:
+    for intent, pattern, weight in _compiled():
         if weight > scores.get(intent, 0.0) and pattern.search(t):
             scores[intent] = weight
-    doc_noun = re.search(rf"\b{_DOC}\b", t) is not None
+    doc_noun = re.search(rf"\b{_doc()}\b", t) is not None
     monthish = any(p.grain in ("month", "quarter", "year") for p in s.periods) or \
-        re.search(r"\bmonths?\b|\bmes\b", t) is not None
+        re.search(r"\bmonths?\b" + _pack_or("chat.month_noun"), t) is not None
     weak_spending = scores.get("spending", 1.0) <= 0.5
     if "spending" in scores:
         base = scores["spending"]
@@ -961,7 +1041,7 @@ def _score(t: str, s: Slots, vocab: Vocabulary) -> dict[str, float]:
         scores["missing_invoices"] += 0.3
     if "month_status" in scores and scores["month_status"] < 1.0:
         scores["month_status"] = scores["month_status"] + (0.6 if monthish or s.company_ids else 0.0)
-    if "deadlines" in scores and re.search(_TAXWORD, t):
+    if "deadlines" in scores and _TAXWORD.search(t):
         scores["deadlines"] += 0.3
     if s.supplier_ids and re.search(r"\b(?:what happened|what is happening|what is going on|going on with|any news|"
                                     r"news on|status of|update on)\b", t):

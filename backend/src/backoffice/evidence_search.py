@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
+from backoffice.countries import pack_words
 from backoffice.domain.lifecycle import Stage
 from backoffice.domain.models import Quality, SourceKind
 from backoffice.learning import day_month, display_name, format_money, join_and
@@ -88,8 +89,7 @@ def _weight(result: str) -> int:
 
 
 _WORD = re.compile(r"[a-zà-ÿ]{3,}")
-_COMMON = frozenset({"the", "and", "for", "your", "you", "from", "with", "fwd", "para", "com", "sua", "seu", "dos",
-                     "das", "pdf", "www"})
+_COMMON = frozenset({"the", "and", "for", "your", "you", "from", "with", "fwd", "pdf", "www"})  # + "search.common"
 
 
 def place_of(c: ConnectorState) -> str:
@@ -242,7 +242,8 @@ class SearchAgent(_Agent):
         senders = tuple(s for s, _ in Counter((d.sender or "").lower() for d in docs).most_common(3))
 
         def words(text: str) -> list[str]:
-            return [w for w in _WORD.findall(text.lower()) if w not in _COMMON]
+            common = _COMMON | frozenset(pack_words("search.common"))
+            return [w for w in _WORD.findall(text.lower()) if w not in common]
 
         subjects = [words((d.message_text or "").split("\n", 1)[0]) for d in docs]
         shared = [w for w in dict.fromkeys(subjects[0]) if all(w in s for s in subjects[1:])][:3]

@@ -15,8 +15,8 @@ period is shown with anything unexplained, and a cash deposit closes only on the
 
 from __future__ import annotations
 
-import re
 
+from backoffice.countries import LazyPattern, pack_alternatives
 from backoffice.domain.models import Transaction
 
 from ._text import fold
@@ -27,16 +27,18 @@ WITHDRAWAL = "withdrawal"  # cash taken out at a cash machine
 CASH_BOX = "cash_box"  # money moved to the cash box (petty cash float)
 CASH_DEPOSIT = "cash_deposit"  # cash paid into the bank
 
-_WITHDRAWAL = re.compile(
-    r"(?<![A-Z])(?:LEVANTAMENTO|LEVANT\.?|LEV\.?\s*(?:MB|ATM|NUM\w*|MULTIBANCO)|CASH\s+WITHDRAWAL|"
+# Bank wording (folded, upper case): English and Spanish here, a pack's own in "cash.<kind>" (Portugal's
+# "LEVANTAMENTO", "FUNDO DE MANEIO", "DEPOSITO NUMERARIO").
+_WITHDRAWAL = LazyPattern(lambda: (
+    rf"(?<![A-Z])(?:{pack_alternatives('cash.withdrawal')}|CASH\s+WITHDRAWAL|"
     r"ATM\s+(?:WITHDRAWAL|WDL|CASH)|CASH\s+(?:MACHINE|WDL)|WITHDRAWAL\s+ATM|RETIRADA\s+(?:DE\s+)?EFECTIVO|"
-    r"REINTEGRO(?:\s+CAJERO)?)(?![A-Z])")
-_CASH_BOX = re.compile(
-    r"(?<![A-Z])(?:FUNDO\s+(?:DE\s+)?MANEIO|FUNDO\s+FIXO(?:\s+DE\s+CAIXA)?|CAIXA\s+PEQUENA|PETTY\s+CASH|"
-    r"CASH\s+BOX|CASH\s+FLOAT|REFORCO\s+(?:DE\s+|DO\s+|DA\s+)?(?:CAIXA|FUNDO)|CAJA\s+CHICA)(?![A-Z])")
-_CASH_DEPOSIT = re.compile(
-    r"(?<![A-Z])(?:DEP(?:OSITO|\.)?\s*(?:EM\s+)?(?:NUMERARIO|NUM\.?|DINHEIRO|NOTAS)|CASH\s+DEPOSIT|"
-    r"DEPOSITO\s+(?:DE\s+)?EFECTIVO|INGRESO\s+(?:EN\s+)?EFECTIVO|PAID\s+IN\s+CASH\s+AT)(?![A-Z])")
+    r"REINTEGRO(?:\s+CAJERO)?)(?![A-Z])"))
+_CASH_BOX = LazyPattern(lambda: (
+    rf"(?<![A-Z])(?:{pack_alternatives('cash.cash_box')}|PETTY\s+CASH|CASH\s+BOX|CASH\s+FLOAT|CAJA\s+CHICA)"
+    r"(?![A-Z])"))
+_CASH_DEPOSIT = LazyPattern(lambda: (
+    rf"(?<![A-Z])(?:{pack_alternatives('cash.deposit')}|CASH\s+DEPOSIT|"
+    r"DEPOSITO\s+(?:DE\s+)?EFECTIVO|INGRESO\s+(?:EN\s+)?EFECTIVO|PAID\s+IN\s+CASH\s+AT)(?![A-Z])"))
 
 
 def cash_movement(tx: Transaction) -> str | None:

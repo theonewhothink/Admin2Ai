@@ -61,6 +61,9 @@ from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from functools import cache
+
+from backoffice.countries import PACK_WORDS, pack_words, spliced
 from backoffice.domain.models import ExtractionMethod, FieldObservation
 from backoffice.reconciliation import CARD_TERMINAL, PayoutProvider, provider_by_key, provider_named
 from backoffice.reconciliation._text import format_money
@@ -401,44 +404,46 @@ def _has(found: frozenset[str], aliases: Sequence[str]) -> bool:
     return any(a in found for a in aliases)
 
 
-# Header aliases by role (normalized). Order = preference when several are present.
-_A: dict[str, tuple[str, ...]] = {
-    "provider": ("provider", "platform", "acquirer", "rede", "adquirente", "entidade", "processador", "processor"),
+# Header aliases by role (normalized). Order = preference when several are present. A pack's own headings go at
+# each _P ("settlements.column:<role>", ":2" the second place ...): Portugal's card terminals' "montante bruto".
+_P = PACK_WORDS
+_ALIASES: dict[str, tuple[str, ...]] = {
+    "provider": ("provider", "platform", "acquirer", _P, "processor"),
     "payout_id": ("payout id", "automatic payout id", "payout reference id", "payout reference", "payout number",
                   "payout reference number", "settlement id", "settlement reference", "batch id", "batch number",
-                  "batch", "no lote", "n lote", "numero lote", "numero do lote", "id lote", "lote", "id liquidacao",
-                  "referencia liquidacao", "statement number"),
+                  "batch", _P, "statement number"),
     "payout_date": ("payout date", "automatic payout effective at", "automatic payout effective at utc",
-                    "payout effective at", "date of payout", "paid on", "settlement date", "value date",
-                    "data liquidacao", "data de liquidacao", "data valor", "data credito", "data de credito",
+                    "payout effective at", "date of payout", "paid on", "settlement date", "value date", _P,
                     "payment date", "transfer date", "arrival date"),
-    "currency": ("currency", "moeda", "divisa", "currency code"),
-    "type": ("type", "reporting category", "transaction type", "line type", "tipo", "tipo movimento",
-             "tipo operacao", "tipo de operacao", "kind"),
+    "currency": ("currency", _P, "divisa", "currency code"),
+    "type": ("type", "reporting category", "transaction type", "line type", _P, "kind"),
     "reference": ("reference", "order id", "order code", "order number", "order reference", "reservation number",
                   "booking number", "reservation id", "reference number", "source id", "charge id",
-                  "balance transaction id", "transaction id", "id transacao", "referencia", "numero autorizacao",
-                  "codigo autorizacao", "autorizacao", "authorisation code", "authorization code"),
-    "on": ("date", "order date", "transaction date", "created utc", "created", "data movimento", "data operacao",
-           "data transacao", "data da transacao", "data", "check out", "checkout", "departure", "check in",
-           "arrival"),
+                  "balance transaction id", "transaction id", _P, "authorisation code", "authorization code"),
+    "on": ("date", "order date", "transaction date", "created utc", "created", _P, "check out", "checkout",
+           "departure", "check in", "arrival"),
     "gross": ("gross", "gross amount", "gross sales", "sales incl vat", "sales including vat", "amount", "sales",
               "food sales", "order total", "order value", "total order value", "subtotal", "products price",
-              "total sales", "reservation amount", "room sales", "total amount", "original amount",
-              "montante bruto", "valor bruto", "montante", "valor", "valor transacao", "valor da transacao"),
+              "total sales", "reservation amount", "room sales", "total amount", "original amount", _P),
     "fee": ("fee", "fees", "commission", "commission amount", "commissions", "payments service fee",
             "payment service fee", "payment charge", "transaction fee", "service fee", "uber service fee",
-            "marketplace fee", "glovo commission", "bolt commission", "platform fee", "comissao", "comissoes",
-            "taxa servico", "taxa de servico", "service charge"),
-    "refund": ("refunds", "refund", "refunds incl vat", "customer refunds", "reembolsos"),
+            "marketplace fee", "glovo commission", "bolt commission", "platform fee", _P, "service charge"),
+    "refund": ("refunds", "refund", "refunds incl vat", "customer refunds", _P),
     "chargeback": ("chargebacks", "chargeback", "disputes"),
     "deduction": ("promotions", "promotion paid by partner", "promotions paid by partner", "promotions on items",
                   "partner funded discount", "partner funded promotions", "discounts"),
-    "adjustment": ("adjustments", "adjustment", "other payments", "misc payments", "ajustes", "acertos"),
+    "adjustment": ("adjustments", "adjustment", "other payments", "misc payments", _P),
     "net": ("net", "net amount", "net payout", "total payout", "total to receive", "amount to receive",
-            "payable amount", "payout amount", "earnings", "montante liquido", "valor liquido", "liquido"),
+            "payable amount", "payout amount", "earnings", _P),
     "paid_out": ("paid out",),
 }
+
+
+@cache
+def _aliases() -> dict[str, tuple[str, ...]]:
+    return {role: spliced(f"settlements.column:{role}", words) for role, words in _ALIASES.items()}
+
+
 _SUMMARY: dict[str, tuple[str, ...]] = {
     "gross_sales": ("gross sales", "gross", "sales", "total sales"),
     "fees": ("fees", "fee", "commission", "commissions", "fees and commissions"),
@@ -447,9 +452,6 @@ _SUMMARY: dict[str, tuple[str, ...]] = {
     "adjustments": ("adjustments", "adjustment", "other"),
     "net": ("net", "net amount", "paid out", "payout amount", "net payout"),
 }
-_PT_TERMINAL = ("montante bruto", "valor bruto", "montante liquido", "valor liquido", "comissao", "comissoes",
-                "taxa de servico", "taxa servico", "data liquidacao", "data de liquidacao", "lote", "no lote",
-                "n lote", "numero lote", "numero do lote")
 _DELIVERY = {"uber_eats": ("uber service fee", "marketplace fee", "payout reference id"),
              "glovo": ("glovo commission", "order code", "total to receive", "promotion paid by partner"),
              "bolt_food": ("bolt commission",)}
@@ -464,29 +466,37 @@ class _Layout:
 
 # ------------------------------------------------------------------ generic row layouts
 
-# (whole words in the row type, kind). First hit wins; see _row_kind.
+# (whole words in the row type, kind). First hit wins; see _row_kind. A pack's own words for a kind join the
+# core's last words of that kind ("settlements.kind:<kind>": Portugal's "estorno", "comissão").
 _KIND_WORDS: tuple[tuple[tuple[str, ...], LineKind], ...] = (
     (("payout reversal", "payout failure", "hold", "holds", "release", "currency conversion"), LineKind.ADJUSTMENT),
-    (("payout", "payouts", "withdrawal", "withdraw", "transfer to bank", "liquidacao", "pagamento ao comerciante"),
-     LineKind.PAYOUT),
+    (("payout", "payouts", "withdrawal", "withdraw", "transfer to bank"), LineKind.PAYOUT),
     (("chargeback fee", "dispute fee"), LineKind.FEE),
     (("partial capture reversal",), LineKind.REFUND),
-    (("chargeback", "chargebacks", "dispute", "disputes", "payment reversal", "contestacao", "retrocessao",
-      "disputa"), LineKind.CHARGEBACK),
-    (("refund", "refunds", "refunded", "devolucao", "devolucoes", "estorno", "anulacao", "reembolso"),
-     LineKind.REFUND),
-    (("fee", "fees", "commission", "commissions", "comissao", "comissoes", "tax", "network cost"), LineKind.FEE),
-    (("adjustment", "adjustments", "ajuste", "ajustes", "acerto", "acertos", "correction", "correcao",
-      "promotion", "promotions", "reserve", "reserved", "transfer", "topup", "contribution", "conversion"),
-     LineKind.ADJUSTMENT),
-    (("sale", "sales", "order", "orders", "booking", "reservation", "charge", "payment", "venda", "vendas",
-      "compra", "compras", "pagamento", "purchase"), LineKind.SALE),
+    (("chargeback", "chargebacks", "dispute", "disputes", "payment reversal"), LineKind.CHARGEBACK),
+    (("refund", "refunds", "refunded"), LineKind.REFUND),
+    (("fee", "fees", "commission", "commissions", "tax", "network cost"), LineKind.FEE),
+    (("adjustment", "adjustments", "correction", "promotion", "promotions", "reserve", "reserved", "transfer",
+      "topup", "contribution", "conversion"), LineKind.ADJUSTMENT),
+    (("sale", "sales", "order", "orders", "booking", "reservation", "charge", "payment", "purchase"), LineKind.SALE),
 )
-_TOTAL_ROW = frozenset({"total", "totals", "totais", "grand total", "subtotal", "sum"})
+_TOTAL_ROW = frozenset({"total", "totals", "grand total", "subtotal", "sum"})  # and "settlements.total_row"
+
+
+@cache
+def _kind_words() -> tuple[tuple[tuple[str, ...], LineKind], ...]:
+    last = {kind: i for i, (_, kind) in enumerate(_KIND_WORDS)}
+    return tuple((words + pack_words(f"settlements.kind:{kind.value}") if last[kind] == i else words, kind)
+                 for i, (words, kind) in enumerate(_KIND_WORDS))
+
+
+@cache
+def _total_row() -> frozenset[str]:
+    return _TOTAL_ROW | frozenset(pack_words("settlements.total_row"))
 
 
 def _row_kind(text: str, amount: Decimal | None, *, signed: bool) -> LineKind:
-    for words, kind in _KIND_WORDS:
+    for words, kind in _kind_words():
         if any(re.search(rf"(?<![a-z0-9]){re.escape(w)}(?![a-z0-9])", text) for w in words):
             return kind
     if signed:
@@ -497,7 +507,7 @@ def _row_kind(text: str, amount: Decimal | None, *, signed: bool) -> LineKind:
 def _is_total_row(row: Sequence[str]) -> bool:
     """A totals line at the end of an export: never a sale of its own."""
     first = next((c for c in row if c.strip()), "")
-    return _norm(first) in _TOTAL_ROW
+    return _norm(first) in _total_row()
 
 
 @dataclass(frozen=True)
@@ -520,8 +530,10 @@ class _RowRules:
 
 def _generic(rules: _RowRules) -> Callable[[_Table, str, str], list[_Draft]]:
     def read(table: _Table, filename: str, hint: str) -> list[_Draft]:
-        col = {role: table.column(aliases) for role, aliases in _A.items()}
-        multi = {role: table.columns(_A[role]) for role in ("fee", "refund", "chargeback", "deduction", "adjustment")}
+        aliases = _aliases()
+        col = {role: table.column(words) for role, words in aliases.items()}
+        multi = {role: table.columns(aliases[role])
+                 for role in ("fee", "refund", "chargeback", "deduction", "adjustment")}
         if col["gross"] is None and not multi["fee"] and col["net"] is None:
             return []
         on_order = pay_order = table.date_order
@@ -612,7 +624,7 @@ def _line(rules: _RowRules, kind: LineKind, gross: Decimal, fees: list[Decimal],
 
 
 def _read_summary(table: _Table, filename: str, hint: str) -> list[_Draft]:
-    col = {role: table.column(_A[role]) for role in ("provider", "payout_id", "payout_date", "currency")}
+    col = {role: table.column(_aliases()[role]) for role in ("provider", "payout_id", "payout_date", "currency")}
     figures = {name: table.column(aliases) for name, aliases in _SUMMARY.items()}
     order = table.date_order
     drafts = []
@@ -805,11 +817,14 @@ def _delivery_provider(h: frozenset[str]) -> str | None:
 
 def _is_delivery(h: frozenset[str]) -> bool:
     orders = _has(h, ("order id", "order code", "order number", "order reference"))
-    return orders and _has(h, _A["gross"]) and (_has(h, _A["fee"]) or _has(h, _A["net"]))
+    return orders and _has(h, _aliases()["gross"]) and (_has(h, _aliases()["fee"]) or _has(h, _aliases()["net"]))
 
 
 def _is_terminal(h: frozenset[str]) -> bool:
-    return _has(h, _PT_TERMINAL) and _has(h, _A["gross"]) and (_has(h, _A["fee"]) or _has(h, _A["net"]))
+    # A card terminal's export is recognised by a pack's own headings ("settlements.terminal": Portugal's SIBS).
+    terminal = pack_words("settlements.terminal")
+    aliases = _aliases()
+    return _has(h, terminal) and _has(h, aliases["gross"]) and (_has(h, aliases["fee"]) or _has(h, aliases["net"]))
 
 
 def _is_neutral_lines(h: frozenset[str]) -> bool:

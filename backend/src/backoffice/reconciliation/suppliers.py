@@ -26,9 +26,10 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from enum import Enum
-from functools import lru_cache
+from functools import cache, lru_cache
 from typing import Protocol, runtime_checkable
 
+from backoffice.countries import pack_words
 from backoffice.domain.models import Document, Supplier, Transaction
 
 from ._text import fold, normalize_iban, same_tax_id, tokens
@@ -66,14 +67,17 @@ BRAND_ABBREVIATIONS: dict[str, str] = {
     "MSFT": "MICROSOFT",
 }
 
-# Leading words banks add before the merchant (PT / ES / EN statement wording).
+# The core's words below are English and Spanish (and brands, codes and places); a pack's own are added on use
+# ("suppliers.<table>": Portugal's "PAGAMENTO", "LDA", "LISBOA"), see _table().
+
+# Leading words banks add before the merchant (ES / EN statement wording).
 LEADING_NOISE: frozenset[str] = frozenset(
     {
-        "COMPRA", "COMPRAS", "PAG", "PAGAMENTO", "PAGAMENTOS", "PAGTO", "PAGO",
+        "COMPRA", "COMPRAS", "PAGO",
         "TRF", "TRANSF", "TRANSFERENCIA", "SEPA", "DD", "DEB", "DEBITO", "DIRECTO",
-        "DIRETO", "DIR", "CARD", "CARTAO", "TARJETA", "POS", "TPA", "VISA",
+        "DIR", "CARD", "TARJETA", "POS", "VISA",
         "MASTERCARD", "MC", "MAESTRO", "CONTACTLESS", "PURCHASE", "PAYMENT", "TO",
-        "FROM", "DE", "PARA", "MB", "MBWAY", "ELECTRONICA", "ELETRONICA", "ONLINE",
+        "FROM", "DE", "PARA", "ELECTRONICA", "ONLINE",
         "INTERNET", "SERV", "RECIBO", "ADEUDO",
     }
 )  # fmt: skip
@@ -82,10 +86,6 @@ LEADING_NOISE: frozenset[str] = frozenset(
 STOP_WORDS: frozenset[str] = frozenset(
     {
         "DE",
-        "DA",
-        "DO",
-        "DOS",
-        "DAS",
         "DEL",
         "LA",
         "LE",
@@ -101,9 +101,9 @@ STOP_WORDS: frozenset[str] = frozenset(
 # Legal-form suffixes: never part of a supplier's identity.
 LEGAL_FORMS: frozenset[str] = frozenset(
     {
-        "SA", "LDA", "LTDA", "SL", "SLU", "SAS", "SARL", "SRL", "SPA", "GMBH", "AG",
-        "BV", "NV", "LTD", "LIMITED", "PLC", "INC", "LLC", "CORP", "CO", "UNIPESSOAL",
-        "UNIP", "SGPS", "EIRL", "SNC", "KG", "OY", "AB", "AS", "APS", "SE", "ULC",
+        "SA", "LTDA", "SL", "SLU", "SAS", "SARL", "SRL", "SPA", "GMBH", "AG",
+        "BV", "NV", "LTD", "LIMITED", "PLC", "INC", "LLC", "CORP", "CO",
+        "SNC", "KG", "OY", "AB", "AS", "APS", "SE", "ULC",
         "CIE", "SCA",
     }
 )  # fmt: skip
@@ -120,15 +120,14 @@ COUNTRY_WORDS: frozenset[str] = frozenset(
 # payers type next to a number ('FT 2026/101', 'INV 5531').
 FILLER: frozenset[str] = frozenset(
     {"MKTP", "MKTPLACE", "WWW", "COM", "HELP", "BILL", "BILLING", "TRIP", "REF", "NIF",
-     "FT", "FR", "FS", "NC", "ND", "INV", "INVOICE", "FATURA", "FACTURA", "FACT"}
+     "NC", "ND", "INV", "INVOICE", "FACTURA", "FACT"}
 )  # fmt: skip
 
 # Cities commonly appended to card descriptors in the first markets (§63).
 # Only dropped from the end of a descriptor, never when it is the only word.
 TRAILING_CITIES: frozenset[str] = frozenset(
     {
-        "LISBOA", "LISBON", "PORTO", "OPORTO", "BRAGA", "COIMBRA", "FARO", "FUNCHAL",
-        "AVEIRO", "SETUBAL", "CASCAIS", "OEIRAS", "AMADORA", "SINTRA", "MADRID",
+        "LISBON", "OPORTO", "MADRID",
         "BARCELONA", "VALENCIA", "SEVILLA", "LONDON", "DUBLIN", "LUXEMBOURG",
         "AMSTERDAM", "PARIS", "BERLIN",
     }
@@ -153,6 +152,16 @@ PROCESSOR_ENTITY_WORDS: frozenset[str] = frozenset(
     {"EUROPE", "EMEA", "PAYMENTS", "PAYMENT", "INTERNATIONAL", "INTL", "GLOBAL",
      "SERVICES", "HOLDINGS", "GROUP", "PAYOUT", "PAYOUTS"}
 )  # fmt: skip
+
+
+
+
+@cache
+def _table(name: str) -> frozenset[str]:
+    """One of the tables above with every pack's own words for it ("suppliers.<name>")."""
+    core = {"noise": LEADING_NOISE, "stop": STOP_WORDS, "legal_forms": LEGAL_FORMS, "filler": FILLER,
+            "cities": TRAILING_CITIES}[name]
+    return core | frozenset(pack_words(f"suppliers.{name}"))
 
 
 # --------------------------------------------------------------------------- normalization
@@ -199,7 +208,7 @@ def _normalize_cached(raw: str) -> NormalizedDescriptor:
     cleaned = _clean(merchant)
     if not cleaned and domain:
         cleaned = [_domain_brand(domain)]
-    if all(w in COUNTRY_WORDS or w in TRAILING_CITIES for w in cleaned):
+    if all(w in COUNTRY_WORDS or w in _table("cities") for w in cleaned):
         cleaned = _brand_with_digits(_words(body)) or cleaned
     key = " ".join(cleaned[:MAX_KEY_TOKENS]).lower()
     return NormalizedDescriptor(
@@ -237,7 +246,7 @@ def _merchant_words(body: str) -> tuple[list[str], str | None]:
 
 def _names_a_merchant(words: list[str]) -> bool:
     """True when ``words`` still name someone besides a processor's own entity."""
-    generic = PROCESSOR_ENTITY_WORDS | COUNTRY_WORDS | TRAILING_CITIES
+    generic = PROCESSOR_ENTITY_WORDS | COUNTRY_WORDS | _table("cities")
     return any(w not in generic for w in _clean(words))
 
 
@@ -255,7 +264,7 @@ def _is_processor(words: list[str]) -> bool:
 def _strip_leading_noise(words: list[str]) -> list[str]:
     start = 0
     while start < len(words) and (
-        words[start] in LEADING_NOISE or _is_code(words[start])
+        words[start] in _table("noise") or _is_code(words[start])
     ):
         start += 1
     return words[start:]
@@ -272,11 +281,11 @@ def _clean(words: list[str]) -> list[str]:
         for w in words
         if len(w) > 1
         and not _is_code(w)
-        and w not in LEGAL_FORMS
-        and w not in FILLER
-        and w not in STOP_WORDS
+        and w not in _table("legal_forms")
+        and w not in _table("filler")
+        and w not in _table("stop")
     ]
-    while len(kept) > 1 and (kept[-1] in COUNTRY_WORDS or kept[-1] in TRAILING_CITIES):
+    while len(kept) > 1 and (kept[-1] in COUNTRY_WORDS or kept[-1] in _table("cities")):
         kept.pop()
     return kept
 
@@ -288,12 +297,12 @@ def _brand_with_digits(words: list[str]) -> list[str]:
         for w in words
         if len(w) > 1
         and any(ch.isalpha() for ch in w)
-        and w not in LEGAL_FORMS
-        and w not in FILLER
-        and w not in STOP_WORDS
+        and w not in _table("legal_forms")
+        and w not in _table("filler")
+        and w not in _table("stop")
         and w not in COUNTRY_WORDS
-        and w not in TRAILING_CITIES
-        and w not in LEADING_NOISE
+        and w not in _table("cities")
+        and w not in _table("noise")
         and w not in HARD_PROCESSORS
         and w not in SHORT_PROCESSORS
     ][:1]

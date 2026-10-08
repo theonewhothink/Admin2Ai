@@ -3,7 +3,8 @@
 Event planners, wedding venues and photographers take a deposit when a date is booked; architects,
 recruiters and law firms bill by milestone or take a retainer; builders are paid in stages and their
 client holds part of each invoice back until the work is accepted. This module only *reads* those
-facts from the evidence, in Portuguese and English. It decides nothing: the orchestrator links a
+facts from the evidence, in English and the packs' words (Portugal's "sinal", "caução", "retenção de garantia":
+"deposits.<concept>", backoffice.countries.wording). It decides nothing: the orchestrator links a
 deposit, a part payment or a release only when the evidence proves it (an exact amount, the same
 customer or supplier, a reference), or when the owner confirms it with one tap (§3, §19).
 
@@ -31,7 +32,9 @@ import re
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from functools import cache
 
+from backoffice.countries import LazyPattern, pack_alternatives, pack_text, pack_words
 from backoffice.learning import fold
 
 __all__ = [
@@ -53,60 +56,54 @@ _ZERO = Decimal("0")
 
 # --------------------------------------------------------------------------- wording (folded: lower case, no accents)
 
+# A country's own words for each are in its pack ("deposits.<concept>", backoffice.countries.wording): regular-
+# expression alternatives over folded text, tried with the core's English.
+
+
+def _words(concept: str, english: str, *, flags: int = 0) -> LazyPattern:
+    """A whole-word pattern: the packs' alternatives for ``concept``, then ``english``'s."""
+    return LazyPattern(lambda: rf"(?<![a-z])(?:{pack_alternatives(f'deposits.{concept}')}|{english})(?![a-z])", flags)
+
+
 # A bank line that says the money is paid ahead of the work. "deposito" alone is a cash deposit at a machine.
-_DEPOSIT = re.compile(
-    r"(?<![a-z])(?:sinal|adiantamentos?|adiant|deposit|deposits|reserva|retainer|provisao(?:\s+de\s+fundos)?"
-    r"|down\s*payment|advance\s+payment|prepayment|pre-payment|pagamento\s+antecipado|pago\s+antecipadamente)"
-    r"(?![a-z])")
+_DEPOSIT = _words("deposit", r"deposit|deposits|retainer|down\s*payment|advance\s+payment|prepayment|pre-payment")
 # Paid to a supplier: only words that mean a deposit or advance (a hotel "reserva" paid in full is a purchase).
-_DEPOSIT_OUT = re.compile(
-    r"(?<![a-z])(?:sinal|adiantamentos?|adiant|deposit|deposits|down\s*payment|advance\s+payment|prepayment"
-    r"|pre-payment|pagamento\s+antecipado|pago\s+antecipadamente)(?![a-z])")
+_DEPOSIT_OUT = _words("deposit_out", r"deposit|deposits|down\s*payment|advance\s+payment|prepayment|pre-payment")
 # A refundable security deposit (checklist X9): the customer's money, held until it goes back (car rental,
 # equipment hire, a flat let for the holidays). Never a deposit for the work.
-_SECURITY = re.compile(
-    r"(?<![a-z])(?:caucao|caucoes|caucionamento|security\s+deposits?|damage\s+deposits?|refundable\s+deposits?"
-    r"|deposito\s+(?:de\s+)?(?:garantia|caucao)|depositos\s+de\s+garantia|garantia\s+(?:de\s+)?aluguer)(?![a-z])")
+_SECURITY = _words("security", r"security\s+deposits?|damage\s+deposits?|refundable\s+deposits?")
 # Money out that says it gives such a deposit back.
-_GIVING_BACK = re.compile(r"(?<![a-z])(?:devolucao|devol|devolvida|devolvido|restituicao|reembolso|return|returned"
-                          r"|refund|refunded)(?![a-z])")
+_GIVING_BACK = _words("giving_back", r"return|returned|refund|refunded")
 # Money the owner put in the bank themselves: never a customer's deposit.
-_CASH_IN = re.compile(r"(?<![a-z])(?:numerario|cash\s+deposit|atm|deposito\s+(?:em\s+)?(?:numerario|dinheiro|cheque))"
-                      r"(?![a-z])")
+_CASH_IN = _words("cash_in", r"cash\s+deposit|atm")
 # The quote, proposal or contract a payment names, with its number ("ORC 2026/14", "CONTRATO 2026/7").
-_REFERENCE = re.compile(
-    r"(?<![a-z])(?P<word>orc(?:amento)?|quote|quotation|proposta|proposal|contrato|contract)"
+_REFERENCE = LazyPattern(lambda: (
+    rf"(?<![a-z])(?P<word>{pack_alternatives('deposits.reference')}|quote|quotation|proposal|contract)"
     r"\.?\s*(?:n\.?\s*[oº°]?\.?\s*|no\.?\s*|nr\.?\s*|#\s*)?:?\s*"
-    r"(?P<ref>(?:[a-z]{1,4}[\s-]?)?\d[\w/.-]*)")
-_REFERENCE_WORDS = {"orc": "ORC", "orcamento": "ORC", "quote": "QUOTE", "quotation": "QUOTE", "proposta": "PROPOSTA",
-                    "proposal": "PROPOSAL", "contrato": "CONTRATO", "contract": "CONTRACT"}
+    r"(?P<ref>(?:[a-z]{1,4}[\s-]?)?\d[\w/.-]*)"))
+_REFERENCE_WORDS = {"quote": "QUOTE", "quotation": "QUOTE", "proposal": "PROPOSAL", "contract": "CONTRACT"}
 # Words for the part a customer holds back until the work is accepted (retention money).
-_HELD = re.compile(r"(?<![a-z])(?:retencao|retencoes|retention|holdback|held\s+back|valor\s+retido|retido|retida)"
-                   r"(?![a-z])")
-_GUARANTEE = re.compile(r"(?<![a-z])garantia(?![a-z])")
-_NOT_HELD = re.compile(r"(?<![a-z])(?:na\s+fonte|fonte|irs|irc|withholding|withheld|imposto|tax)(?![a-z])")
-_RELEASE = re.compile(r"(?<![a-z])(?:libert\w*|release\w*|devol\w*|reembols\w*|vence\w*|due|ate|until|paid\s+on|"
-                      r"payable\s+on|a\s+pagar\s+em)(?![a-z])")
+_HELD = _words("held", r"retention|holdback|held\s+back")
+_GUARANTEE = LazyPattern(lambda: rf"(?<![a-z])(?:{pack_alternatives('deposits.guarantee')})(?![a-z])")
+_NOT_HELD = _words("not_held", r"withholding|withheld|tax")
+_RELEASE = _words("release", r"release\w*|due|until|paid\s+on|payable\s+on")
 # A line taking a deposit off: words that name a deposit or advance, and a minus sign or a taking-off word.
-# ("Already paid" / "Já pago" alone describe how the invoice itself was paid: never a deposit.)
-_DEDUCTION = re.compile(
-    r"(?<![a-z])(?:sinal|adiantamentos?|adiant|deposit|deposits|retainer|provisao(?:\s+de\s+fundos)?"
-    r"|down\s*payment|advance(?:\s+payment)?|pagamento\s+antecipado)(?![a-z])")
-_TAKEN_OFF = re.compile(
-    r"(?<![a-z])(?:a\s+deduzir|deduzir|deduzido|deducao|menos|less|minus|recebido|recebida|received|pago|paga|paid"
-    r"|regularizacao|regularizado|deducted|abatido|descontado|taken\s+off)(?![a-z])")
-_DUE = re.compile(
-    r"(?<![a-z])(?:(?:total|valor|montante|saldo)\s+a\s+pagar|a\s+pagar|saldo(?:\s+(?:em\s+divida|final|remanescente))?"
-    r"|(?:valor|montante)\s+em\s+divida|balance\s+(?:due|to\s+pay|remaining|outstanding)"
-    r"|amount\s+(?:due|payable|outstanding)|total\s+due|remaining\s+balance|left\s+to\s+pay|still\s+to\s+pay"
-    r"|due\s+now|now\s+due)(?![a-z])")
-_ADVANCE_TITLE = re.compile(
-    r"\s*(?:(?:fatura|factura)(?:[\s-]+recibo)?\s+(?:de\s+)?(?:adiantamento|sinal)"
+# ("Already paid" alone describes how the invoice itself was paid: never a deposit.)
+_DEDUCTION = _words("deduction", r"deposit|deposits|retainer|down\s*payment|advance(?:\s+payment)?")
+_TAKEN_OFF = _words("taken_off", r"less|minus|received|paid|deducted|taken\s+off")
+_DUE = _words("due", r"balance\s+(?:due|to\s+pay|remaining|outstanding)|amount\s+(?:due|payable|outstanding)"
+                     r"|total\s+due|remaining\s+balance|left\s+to\s+pay|still\s+to\s+pay|due\s+now|now\s+due")
+_ADVANCE_TITLE = LazyPattern(lambda: (
+    rf"\s*(?:{pack_alternatives('deposits.advance_title')}"
     r"|(?:advance|deposit|down\s*payment|prepayment)\s+invoice"
-    r"|invoice\s+for\s+(?:the\s+|an?\s+)?(?:deposit|advance(?:\s+payment)?|down\s*payment))(?![a-z])")
-_CUSTOMER_LINE = re.compile(r"^\s*(?:cliente|customer|client|bill(?:ed)?\s+to|adquirente)\s*[:\-]\s*(?P<name>.+?)\s*$",
-                            re.IGNORECASE)
-_NAME_TAIL = re.compile(r"\s*[,;|]?\s*(?:nif|nipc|vat|tax\s+id|contribuinte)\b.*$", re.IGNORECASE)
+    r"|invoice\s+for\s+(?:the\s+|an?\s+)?(?:deposit|advance(?:\s+payment)?|down\s*payment))(?![a-z])"))
+_CUSTOMER_LINE = LazyPattern(lambda: (rf"^\s*(?:{pack_alternatives('deposits.customer')}|customer|client|"
+                                      r"bill(?:ed)?\s+to)\s*[:\-]\s*(?P<name>.+?)\s*$"),
+                             re.IGNORECASE)
+_NAME_TAIL = LazyPattern(lambda: rf"\s*[,;|]?\s*(?:{pack_alternatives('tax_id_label')}|vat|tax\s+id)\b.*$",
+                         re.IGNORECASE)
+_INVOICE_LINE = LazyPattern(
+    lambda: rf"\s*(?:{pack_alternatives('deposits.invoice_word')}|factura|invoice|nota)(?![a-z])")
 
 # --------------------------------------------------------------------------- numbers and dates
 
@@ -118,16 +115,27 @@ _MONEY = re.compile(
 _PERCENT = re.compile(r"(?<![\d.,])(\d{1,2}(?:[.,]\d{1,2})?)\s*%")
 _NUMBER = re.compile(r"(?<![\w/])([A-Z]{1,4} [A-Za-z0-9-]{0,20}/\d{1,9})(?![\w/])")
 _NUM_DATE = re.compile(r"(?<!\d)(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})(?!\d)|(?<!\d)(\d{4})-(\d{2})-(\d{2})(?!\d)")
-_MONTHS = {"janeiro": 1, "january": 1, "jan": 1, "fevereiro": 2, "february": 2, "feb": 2, "fev": 2, "marco": 3,
-           "march": 3, "mar": 3, "abril": 4, "april": 4, "apr": 4, "abr": 4, "maio": 5, "may": 5, "mai": 5,
-           "junho": 6, "june": 6, "jun": 6, "julho": 7, "july": 7, "jul": 7, "agosto": 8, "august": 8, "aug": 8,
-           "ago": 8, "setembro": 9, "september": 9, "sept": 9, "sep": 9, "set": 9, "outubro": 10, "october": 10,
-           "oct": 10, "out": 10, "novembro": 11, "november": 11, "nov": 11, "dezembro": 12, "december": 12,
-           "dec": 12, "dez": 12}
-_MONTH_WORDS = "|".join(sorted(_MONTHS, key=len, reverse=True))
-_WORD_DATE = re.compile(
-    rf"(?<![a-z0-9])(\d{{1,2}})(?:st|nd|rd|th)?\s+(?:de\s+)?({_MONTH_WORDS})\.?,?\s+(?:de\s+)?(\d{{4}})")
-_US_DATE = re.compile(rf"(?<![a-z])({_MONTH_WORDS})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+(\d{{4}})")
+_EN_MONTHS = {"january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3, "april": 4, "apr": 4, "may": 5,
+              "june": 6, "jun": 6, "july": 7, "jul": 7, "august": 8, "aug": 8, "september": 9, "sept": 9, "sep": 9,
+              "october": 10, "oct": 10, "november": 11, "nov": 11, "december": 12, "dec": 12}
+
+
+@cache
+def _months() -> dict[str, int]:
+    """Month names and abbreviations (folded): English and every pack's ("month:<n>", "month_abbr:<n>")."""
+    out = dict(_EN_MONTHS)
+    for n in range(1, 13):
+        out.update({w: n for w in (*pack_words(f"month:{n}"), *pack_words(f"month_abbr:{n}"))})
+    return out
+
+
+def _month_words() -> str:
+    return "|".join(sorted(_months(), key=len, reverse=True))
+
+
+_WORD_DATE = LazyPattern(lambda: (
+    rf"(?<![a-z0-9])(\d{{1,2}})(?:st|nd|rd|th)?\s+(?:de\s+)?({_month_words()})\.?,?\s+(?:de\s+)?(\d{{4}})"))
+_US_DATE = LazyPattern(lambda: rf"(?<![a-z])({_month_words()})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+(\d{{4}})")
 
 
 def _decimal(text: str) -> Decimal | None:
@@ -166,12 +174,12 @@ def _date(line: str) -> date | None:
             continue
     for m in _WORD_DATE.finditer(folded):
         try:
-            found.append((m.start(), date(int(m.group(3)), _MONTHS[m.group(2)], int(m.group(1)))))
+            found.append((m.start(), date(int(m.group(3)), _months()[m.group(2)], int(m.group(1)))))
         except (ValueError, KeyError):
             continue
     for m in _US_DATE.finditer(folded):
         try:
-            found.append((m.start(), date(int(m.group(3)), _MONTHS[m.group(1)], int(m.group(2)))))
+            found.append((m.start(), date(int(m.group(3)), _months()[m.group(1)], int(m.group(2)))))
         except (ValueError, KeyError):
             continue
     return min(found)[1] if found else None
@@ -208,7 +216,8 @@ def deposit_wording(*texts: str | None, outgoing: bool = False) -> DepositWords 
     reference = None
     m = _REFERENCE.search(folded)
     if m is not None and any(ch.isdigit() for ch in m.group("ref")):
-        word = _REFERENCE_WORDS.get(m.group("word"), m.group("word").upper())
+        word = _REFERENCE_WORDS.get(m.group("word")) or pack_text(f"deposits.reference_label:{m.group('word')}",
+                                                                   m.group("word").upper())
         reference = f"{word} {m.group('ref').upper().rstrip('.-/')}"
     if not said and reference is None:
         return None
@@ -363,7 +372,7 @@ def read_terms(text: str, *, advance: bool = False) -> Terms:
         if _DUE.search(folded):
             due = amount
             continue
-        if advance or re.match(r"\s*(?:fatura|factura|invoice|nota)(?![a-z])", folded):
+        if advance or _INVOICE_LINE.match(folded):
             continue
         if _DEDUCTION.search(folded) and (negative or _TAKEN_OFF.search(folded)):
             number = _NUMBER.search(line)
