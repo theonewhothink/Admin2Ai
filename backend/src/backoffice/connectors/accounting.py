@@ -57,6 +57,7 @@ import httpx
 
 from backoffice.domain.models import utcnow
 
+from .choices import TOConlineCredentials, _toc_url
 from .base import (
     ConnectorError,
     ConnectorKind,
@@ -672,34 +673,7 @@ class MoloniConnector(AccountingConnector):
 # --------------------------------------------------------------------------- TOConline
 
 
-_TOC_HOSTS = (".toconline.pt", ".toconline.com")
 TOCONLINE_DEFAULT_REDIRECT = "https://oauth.pstmn.io/v1/callback"  # TOConline's fixed default (Dados API)
-
-
-def _toc_url(value: str, what: str) -> str:
-    url = (value or "").strip().rstrip("/")
-    parts = urlsplit(url)
-    host = (parts.hostname or "").lower()
-    if parts.scheme != "https" or not any(host.endswith(s) or host == s[1:] for s in _TOC_HOSTS) or "@" in parts.netloc:
-        raise ValueError(f"the TOConline {what} must be an https address at toconline.pt or toconline.com")
-    return url
-
-
-@dataclass(frozen=True)
-class TOConlineCredentials:
-    """The company's API data from TOConline (Empresa > Configurações > Dados API), kept in the vault."""
-
-    client_id: str
-    client_secret: str = field(repr=False)
-    oauth_url: str = ""
-    api_url: str = ""
-
-    def __post_init__(self) -> None:
-        if not self.client_id or not self.client_secret:
-            raise ValueError("TOConline needs the client id and secret from its API data")
-        object.__setattr__(self, "oauth_url", _toc_url(self.oauth_url, "OAuth address"))
-        api = _toc_url(self.api_url, "API address")
-        object.__setattr__(self, "api_url", api[:-4] if api.endswith("/api") else api)
 
 
 class TOConlineTokens:

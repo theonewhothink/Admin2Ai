@@ -41,6 +41,7 @@ import httpx
 
 from backoffice.domain.models import utcnow
 
+from .choices import DRIVE_READONLY_SCOPE, GRAPH_FILES_SCOPE, drive_folder_id
 from .base import (
     ConnectorError,
     ConnectorKind,
@@ -70,8 +71,6 @@ __all__ = [
 ]
 
 GOOGLE_DRIVE_API = "https://www.googleapis.com/drive/v3"
-DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
-GRAPH_FILES_SCOPE = "https://graph.microsoft.com/Files.Read.All"
 
 # What can be evidence: PDFs, photos, e-invoices, text, saved emails.
 _EVIDENCE_TYPES = frozenset({
@@ -183,16 +182,6 @@ def _rfc3339(value: datetime) -> str:
 
 def _extension(name: str) -> str:
     return name.rsplit(".", 1)[-1].lower() if "." in name else ""
-
-
-def drive_folder_id(value: str) -> str:
-    """A Drive folder id from what the owner pasted: the id itself or the folder's link."""
-    text = (value or "").strip()
-    found = re.search(r"/folders/([A-Za-z0-9_-]+)", text) or re.search(r"[?&]id=([A-Za-z0-9_-]+)", text)
-    folder = found.group(1) if found else text
-    if not re.fullmatch(r"[A-Za-z0-9_-]{5,200}", folder):
-        raise ValueError("that does not look like a Drive folder")
-    return folder
 
 
 def _watch_cursor(state: ConnectorState, now: datetime, window: timedelta) -> tuple[datetime, bool]:

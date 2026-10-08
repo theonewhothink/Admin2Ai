@@ -1130,11 +1130,11 @@ class BackOfficeService:
         hint = options.get("signInAs") or (None if kind in ("shared", "delegated") else address)
         scopes: tuple[str, ...] = ()
         if provider == "microsoft" and kind in ("shared", "delegated"):
-            from backoffice.connectors.microsoft import GRAPH_SHARED_MAIL_SCOPE
+            from backoffice.connectors.choices import GRAPH_SHARED_MAIL_SCOPE
 
             scopes = (GRAPH_SHARED_MAIL_SCOPE,)
         if options.get("purpose") == "files":  # Google Drive or OneDrive: the same sign-in, one more read-only scope
-            from backoffice.connectors.cloud_storage import DRIVE_READONLY_SCOPE, GRAPH_FILES_SCOPE
+            from backoffice.connectors.choices import DRIVE_READONLY_SCOPE, GRAPH_FILES_SCOPE
 
             scopes = (DRIVE_READONLY_SCOPE,) if provider == "google" else (GRAPH_FILES_SCOPE,)
         return hint, scopes
@@ -1529,7 +1529,7 @@ class BackOfficeService:
         folder = self._text(body, "folder", "", required=False, limit=300) or None
         drive = self._text(body, "drive", "", required=False, limit=200) or None
         if folder and provider == "google":
-            from backoffice.connectors.cloud_storage import drive_folder_id
+            from backoffice.connectors.choices import drive_folder_id
 
             try:
                 folder = drive_folder_id(folder)
@@ -1606,7 +1606,7 @@ class BackOfficeService:
             fields = {k: body.get(k) for k in ("clientId", "clientSecret", "oauthUrl", "apiUrl")}
             if not all(isinstance(v, str) and v.strip() for v in fields.values()):
                 raise ServiceError(400, "Enter the API data from TOConline (Empresa > Configurações > Dados API).")
-            from backoffice.connectors.accounting import TOConlineCredentials
+            from backoffice.connectors.choices import TOConlineCredentials
 
             try:
                 creds = TOConlineCredentials(str(fields["clientId"]).strip(), str(fields["clientSecret"]).strip(),

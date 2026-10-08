@@ -69,42 +69,61 @@ from .base import (
     record_webhook,
     since_phrase,
 )
-from .gmail import GMAIL_API, GMAIL_READONLY_SCOPE, GmailConfig, GmailConnector, GmailPush
-from .http import AuthorizedHttp
-from .imap import IMAPAuth, IMAPClient, IMAPConfig, IMAPConnector, encode_mailbox_name, imap_date
-from .microsoft import (
-    GRAPH_API,
-    GRAPH_MAIL_SCOPES,
-    GraphAttachment,
-    GraphMailConfig,
-    GraphSubscription,
-    MicrosoftMailConnector,
-)
-from .oauth import (
-    GOOGLE_TOKEN_URL,
-    OAuthClientConfig,
-    OAuthRefresher,
-    OAuthToken,
-    RefreshingTokenProvider,
-    TokenProvider,
-    microsoft_token_url,
-)
-from .open_banking import (
-    GOCARDLESS_API,
-    BankAccessDenied,
-    BankAccountInfo,
-    BankAggregator,
-    BankConsent,
-    BankLink,
-    BankSink,
-    BankSyncConfig,
-    BookedTransaction,
-    ConsentStatus,
-    GoCardlessBankAccountData,
-    OpenBankingConnector,
-    parse_gocardless_transaction,
-    to_transactions,
-)
+# The HTTP connectors (they need httpx) load on first use, so the engine (also in the browser, pydantic only) can
+# import the pure parts of this package (base, choices, mail_search) without them.
+_LAZY = {
+    "GMAIL_API": "gmail",
+    "GMAIL_READONLY_SCOPE": "gmail",
+    "GmailConfig": "gmail",
+    "GmailConnector": "gmail",
+    "GmailPush": "gmail",
+    "AuthorizedHttp": "http",
+    "IMAPAuth": "imap",
+    "IMAPClient": "imap",
+    "IMAPConfig": "imap",
+    "IMAPConnector": "imap",
+    "encode_mailbox_name": "imap",
+    "imap_date": "imap",
+    "GRAPH_API": "microsoft",
+    "GRAPH_MAIL_SCOPES": "microsoft",
+    "GraphAttachment": "microsoft",
+    "GraphMailConfig": "microsoft",
+    "GraphSubscription": "microsoft",
+    "MicrosoftMailConnector": "microsoft",
+    "GOOGLE_TOKEN_URL": "oauth",
+    "OAuthClientConfig": "oauth",
+    "OAuthRefresher": "oauth",
+    "OAuthToken": "oauth",
+    "RefreshingTokenProvider": "oauth",
+    "TokenProvider": "oauth",
+    "microsoft_token_url": "oauth",
+    "GOCARDLESS_API": "open_banking",
+    "BankAccessDenied": "open_banking",
+    "BankAccountInfo": "open_banking",
+    "BankAggregator": "open_banking",
+    "BankConsent": "open_banking",
+    "BankLink": "open_banking",
+    "BankSink": "open_banking",
+    "BankSyncConfig": "open_banking",
+    "BookedTransaction": "open_banking",
+    "ConsentStatus": "open_banking",
+    "GoCardlessBankAccountData": "open_banking",
+    "OpenBankingConnector": "open_banking",
+    "parse_gocardless_transaction": "open_banking",
+    "to_transactions": "open_banking",
+}
+
+
+def __getattr__(name: str) -> object:
+    module = _LAZY.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from importlib import import_module
+
+    value = getattr(import_module(f".{module}", __name__), name)
+    globals()[name] = value
+    return value
+
 
 __all__ = [
     "ActionKind",

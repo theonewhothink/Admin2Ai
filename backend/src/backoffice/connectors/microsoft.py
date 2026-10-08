@@ -46,6 +46,7 @@ import httpx
 
 from backoffice.domain.models import utcnow
 
+from .choices import GRAPH_MAIL_SCOPES, GRAPH_SHARED_MAIL_SCOPE, GRAPH_SHARED_MAIL_SCOPES
 from .base import (
     ConnectorError,
     ConnectorKind,
@@ -81,10 +82,6 @@ __all__ = [
 ]
 
 GRAPH_API = "https://graph.microsoft.com/v1.0"
-GRAPH_MAIL_SCOPES = ("offline_access", "https://graph.microsoft.com/Mail.Read")
-# Reading a shared mailbox (or one the user has full access to) with the signed-in user's delegated access.
-GRAPH_SHARED_MAIL_SCOPE = "https://graph.microsoft.com/Mail.Read.Shared"
-GRAPH_SHARED_MAIL_SCOPES = (*GRAPH_MAIL_SCOPES, GRAPH_SHARED_MAIL_SCOPE)
 _SELECT = "id,receivedDateTime,isDraft,conversationId,internetMessageId,parentFolderId"
 JUNK_FOLDER = "junkemail"  # well-known folder names (Graph mailFolder)
 DELETED_FOLDER = "deleteditems"

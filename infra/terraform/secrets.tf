@@ -69,7 +69,7 @@ locals {
     "google-oauth-client"    = { client_id = "", client_secret = "" }
     "microsoft-oauth-client" = { client_id = "", client_secret = "" }
     "moloni-oauth-client"    = { client_id = "", client_secret = "" } # Moloni developer registration
-    "open-banking"           = { secret_id = "", secret_key = "" } # GoCardless Bank Account Data
+    "open-banking"           = { secret_id = "", secret_key = "" }    # GoCardless Bank Account Data
   }
 
   # Other services the api and sync worker call (SMTP relay, Expo push, Anthropic).
