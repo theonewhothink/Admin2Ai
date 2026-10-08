@@ -62,6 +62,7 @@ from .base import (
     record_webhook,
 )
 from .http import AuthorizedHttp, json_object, object_list, required_str, same_origin
+from .mail_search import MailQuery, graph_search
 from .oauth import TokenProvider
 
 __all__ = [
@@ -324,6 +325,17 @@ class MicrosoftMailConnector:
                 break
         items: list[MailItem] = []
         self._deliver_all(sorted(found, key=lambda m: str(m.get("receivedDateTime") or "")), None, items.append)
+        return items
+
+    def search_messages(self, query: MailQuery) -> list[MailItem]:
+        """Messages matching ``query`` in every folder of the mailbox, the archive included (Graph ``$search`` on
+        ``/messages``, KQL), each as MIME (§22: current and historical email). ``$search`` cannot be combined
+        with ``$filter`` or ``$orderby``, so the date window is part of the KQL; drafts are skipped."""
+        params: dict[str, Any] = {"$search": graph_search(query), "$select": _SELECT, "$top": query.limit}
+        page = self._http.get_json(f"{self.root}/messages", params=params)
+        found = object_list(page, "value", "graph")[: query.limit]
+        items: list[MailItem] = []
+        self._deliver_all(found, None, items.append)
         return items
 
     def list_attachments(self, message_id: str) -> list[GraphAttachment]:

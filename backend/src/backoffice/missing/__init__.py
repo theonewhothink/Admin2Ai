@@ -24,6 +24,13 @@ Chasing — :mod:`.chase`
     ``thread_token(tenant_id, subject_id) -> str``
     ``clean_invoice_number(raw) -> str | None`` (one printable line, header-safe)
 
+Concrete searches — :mod:`.searches`
+    ``MailboxSearch`` (current and historical email), ``RecurringMailSearch`` (the supplier's usual way),
+    ``CloudStorageSearch`` (Drive / OneDrive), ``PortalSearch``, ``AccountingSearch`` (TOConline, Moloni,
+    InvoiceXpress): live, each returns ``FoundFile`` s; ``run_searches(request, searches, clock=)`` asks them in
+    order and notes every attempt. ``RecordedSearch`` + ``run_recorded`` give a recorded result to the
+    autopilot when the engine applies it (backoffice.evidence_search).
+
 Safety: ``run`` refuses (``ValueError``) a company or supplier from another
 tenant, or a company other than the payment's own; a payment with no company
 yet is never chased automatically. Every email header is a single line.
@@ -31,6 +38,22 @@ yet is never chased automatically. Every email header is a single line.
 
 from __future__ import annotations
 
+from .searches import (
+    AccountingSearch,
+    CloudStorageSearch,
+    FoundFile,
+    MailboxSearch,
+    PortalSearch,
+    RecordedSearch,
+    RecurringMailSearch,
+    SearchPattern,
+    SearchRequest,
+    SearchRun,
+    SourceSearch,
+    amount_words,
+    run_recorded,
+    run_searches,
+)
 from .autopilot import (
     MISSING_INVOICE_PROMPT,
     SEARCH_ORDER,
@@ -82,6 +105,20 @@ from .chase import (
 )
 
 __all__ = [
+    "AccountingSearch",
+    "CloudStorageSearch",
+    "FoundFile",
+    "MailboxSearch",
+    "PortalSearch",
+    "RecordedSearch",
+    "RecurringMailSearch",
+    "SearchPattern",
+    "SearchRequest",
+    "SearchRun",
+    "SourceSearch",
+    "amount_words",
+    "run_recorded",
+    "run_searches",
     "MISSING_INVOICE_PROMPT",
     "SEARCH_ORDER",
     "AttemptOutcome",

@@ -64,7 +64,8 @@ READINESS: tuple[ReadinessItem, ...] = (
     ),
     ReadinessItem(
         "email", "Email connection (Gmail, Outlook)", "pending", 65,
-        "Gmail, Outlook and IMAP sync with a 90-day backfill are built. Needs Google and Microsoft app approval.",
+        "Gmail, Outlook, IMAP, Drive, OneDrive and accounting software are built. Needs Google, Microsoft and "
+        "Moloni approval.",
         "connections",
     ),
     ReadinessItem(

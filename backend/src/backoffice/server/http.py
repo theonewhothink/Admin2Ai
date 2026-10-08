@@ -112,7 +112,7 @@ _ROUTE_WORDS = frozenset(
     "onboarding company oauth start callback bank devices v1 healthz readyz internal overview operations "
     "readiness acceptance cost-centers allocate obligations transactions expected-invoices not-coming statement "
     "invitations accept employee employees card-payments expense-claims profile mailboxes seen automation manager "
-    "outlets sensitive access-log billing checkout portal webhook".split())
+    "outlets sensitive access-log billing checkout portal webhook accounting".split())
 # One client company of any business: /api/accountant/clients/<tenant id>~<company id>[/…] (§28, §29).
 _CLIENT_REF = re.compile(r"/api/accountant/clients/(?P<tenant>[A-Za-z0-9][A-Za-z0-9_.-]{0,127})~(?P<company>[^/~]+)"
                          r"(?P<rest>/.*)?")
@@ -312,7 +312,7 @@ def _default_services(config: ServerConfig) -> dict[str, Any]:
         log.warning("vault_not_configured")
     now = lambda: datetime.now(timezone.utc)  # noqa: E731
     authorizer = None
-    apps = {p: a for p in ("google", "microsoft") if (a := app_from_env(p)) is not None}
+    apps = {p: a for p in ("google", "microsoft", "moloni") if (a := app_from_env(p)) is not None}
     if apps and vault is not None and len(config.state_key) >= 32:
         authorizer = OAuthAuthorizer(apps, vault, redirect_uri=f"{config.api_url}/api/oauth/callback",
                                      state_key=config.state_key, nonces=StoreNonces(store, now))
@@ -377,6 +377,12 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
     auth = AuthService(store, manager, rate_key=config.state_key, admin_emails=config.admin_emails, now=now)
     purger = services.get("purger") or purger_from_config(config, services["objects"])
     aggregator_factory = services.get("aggregator")
+    # The accounting software's export (connectors.accounting): Moloni signs in with the server's developer app.
+    from backoffice.connectors.authorize import app_from_env
+
+    export_apps = dict(services.get("oauth_apps") or {})
+    if "moloni" not in export_apps and (moloni := app_from_env("moloni")) is not None:
+        export_apps["moloni"] = moloni
 
     app = FastAPI(title="Back Office", version="1.0.0", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.config = config
@@ -812,6 +818,58 @@ def build_production_app(config: ServerConfig, **overrides: Any) -> FastAPI:
             return _error(400, "bad_request", "Use dates like 2026-09-30.")
         return Response(data, media_type="application/zip",
                         headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+    # ----------------------------------------------------------------- the accounting software's month (export)
+
+    @app.get("/api/accounting/{connection_id}/export")
+    @_guarded
+    async def accounting_export(connection_id: str, request: Request) -> Response:
+        """``?month=2026-09``: the month as the company's accounting software has it (connectors.accounting): its
+        documents' PDFs and a ledger CSV, as far as its API allows, in one ZIP. For the owner and the company's
+        accountant. Read-only: the software is asked now and nothing is recorded in the business."""
+        principal, _ = await _signed_in(request)
+        if principal.employee_only or principal.manager_only:
+            return _error(403, "forbidden", FORBIDDEN)
+        found = re.fullmatch(r"(\d{4})-(\d{2})", request.query_params.get("month", ""))
+        if found is None or not 1 <= int(found.group(2)) <= 12:
+            return _error(400, "bad_request", "Choose a month like 2026-09.")
+        tenant = principal.tenant.id
+        from .sync import SyncWorker, _connections
+
+        def find(svc: Any) -> tuple[Any, tuple[str, ...]] | None:
+            conn = next((c for c in _connections(tenant, svc, ("accounting",)) if c.id == connection_id), None)
+            return (conn, tuple(svc.repo.connectors[conn.id].company_ids)) if conn is not None else None
+
+        located = await run_in_threadpool(functools.partial(manager.read, tenant, find, what="accounting export"))
+        if located is None:
+            return _error(404, "not_found", "I can't find that accounting software.")
+        conn, companies = located
+        if principal.limited and not set(companies) <= set(principal.companies or ()):
+            return _error(403, "forbidden", FORBIDDEN)
+        worker = SyncWorker(manager, oauth_apps=export_apps, http_client=services.get("http_client"),
+                            search_missing=False)
+
+        def build() -> bytes:
+            meta = manager.vault.metadata(tenant, conn.id) if manager.vault is not None else None
+            if meta is None:
+                raise LookupError("no stored access")
+            connector = worker._connector(conn, meta)
+            return connector.export_month(int(found.group(1)), int(found.group(2))).zip_bytes()
+
+        from backoffice.connectors.base import ConnectorError
+
+        try:
+            data = await run_in_threadpool(build)
+        except ConnectorError as exc:
+            if exc.needs_reconnect:
+                return _error(409, "conflict", f"{conn.name} needs reconnecting before I can export from it.")
+            return _error(502, "unavailable", f"{conn.name} did not answer. Try again in a few minutes.")
+        except Exception:  # noqa: BLE001 - no stored access, or this server cannot reach that software
+            log.warning("accounting_export_unavailable", extra={"tenant": tenant})
+            return _error(503, "unavailable", f"I can't export from {conn.name} on this server yet.")
+        name = re.sub(r"[^0-9A-Za-z_-]+", "-", f"{conn.name}-{found.group(0)}")
+        return Response(data, media_type="application/zip",
+                        headers={"Content-Disposition": f'attachment; filename="{name}.zip"'})
 
     # ----------------------------------------------------------------- uploads
 

@@ -161,6 +161,8 @@ locals {
     BACKOFFICE_GOOGLE_CLIENT_SECRET    = "${aws_secretsmanager_secret.connector["google-oauth-client"].arn}:client_secret::"
     BACKOFFICE_MICROSOFT_CLIENT_ID     = "${aws_secretsmanager_secret.connector["microsoft-oauth-client"].arn}:client_id::"
     BACKOFFICE_MICROSOFT_CLIENT_SECRET = "${aws_secretsmanager_secret.connector["microsoft-oauth-client"].arn}:client_secret::"
+    BACKOFFICE_MOLONI_CLIENT_ID        = "${aws_secretsmanager_secret.connector["moloni-oauth-client"].arn}:client_id::"
+    BACKOFFICE_MOLONI_CLIENT_SECRET    = "${aws_secretsmanager_secret.connector["moloni-oauth-client"].arn}:client_secret::"
     GOCARDLESS_SECRET_ID               = "${aws_secretsmanager_secret.connector["open-banking"].arn}:secret_id::"
     GOCARDLESS_SECRET_KEY              = "${aws_secretsmanager_secret.connector["open-banking"].arn}:secret_key::"
     BACKOFFICE_SMTP_HOST               = "${aws_secretsmanager_secret.integration["smtp"].arn}:host::"

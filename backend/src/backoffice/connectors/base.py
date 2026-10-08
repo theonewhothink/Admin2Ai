@@ -114,6 +114,8 @@ class ConnectorKind(str, Enum):
     IMAP = "imap"
     OPEN_BANKING = "open_banking"
     SUPPLIER_PORTAL = "supplier_portal"
+    CLOUD_STORAGE = "cloud_storage"  # Google Drive, OneDrive / SharePoint (connectors.cloud_storage)
+    ACCOUNTING = "accounting"  # TOConline, Moloni, InvoiceXpress (connectors.accounting)
 
 
 SOURCE_KIND: dict[ConnectorKind, SourceKind] = {
@@ -122,6 +124,8 @@ SOURCE_KIND: dict[ConnectorKind, SourceKind] = {
     ConnectorKind.IMAP: SourceKind.EMAIL,
     ConnectorKind.OPEN_BANKING: SourceKind.BANK,
     ConnectorKind.SUPPLIER_PORTAL: SourceKind.SUPPLIER_PORTAL,
+    ConnectorKind.CLOUD_STORAGE: SourceKind.CLOUD_STORAGE,
+    ConnectorKind.ACCOUNTING: SourceKind.ACCOUNTING_SYSTEM,
 }
 
 _DEFAULT_NAMES = {
@@ -130,6 +134,8 @@ _DEFAULT_NAMES = {
     ConnectorKind.IMAP: "Your email",
     ConnectorKind.OPEN_BANKING: "Your bank",
     ConnectorKind.SUPPLIER_PORTAL: "The supplier portal",
+    ConnectorKind.CLOUD_STORAGE: "Your files",
+    ConnectorKind.ACCOUNTING: "Your accounting software",
 }
 
 
@@ -407,6 +413,9 @@ DEFAULT_POLICIES: dict[ConnectorKind, HealthPolicy] = {
     ConnectorKind.IMAP: HealthPolicy(timedelta(hours=6), timedelta(hours=48)),
     ConnectorKind.OPEN_BANKING: HealthPolicy(timedelta(hours=36), timedelta(days=4), settle=timedelta(days=5)),
     ConnectorKind.SUPPLIER_PORTAL: HealthPolicy(timedelta(days=3), timedelta(days=10)),
+    ConnectorKind.CLOUD_STORAGE: HealthPolicy(timedelta(hours=12), timedelta(days=2)),
+    # Accounting software books documents days after they happen: a period is covered once a sync ran a day past it.
+    ConnectorKind.ACCOUNTING: HealthPolicy(timedelta(hours=12), timedelta(days=2), settle=timedelta(days=1)),
 }
 
 
@@ -508,6 +517,8 @@ _SUBJECTS = {
     SourceKind.EMAIL: ("Your email", False),
     SourceKind.BANK: ("Your bank account", False),
     SourceKind.SUPPLIER_PORTAL: ("Your invoices from this supplier", True),
+    SourceKind.CLOUD_STORAGE: ("Your files", True),
+    SourceKind.ACCOUNTING_SYSTEM: ("Your accounting software", False),
 }
 
 

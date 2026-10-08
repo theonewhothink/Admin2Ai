@@ -45,6 +45,9 @@ class OAuthApp:
     token_url: str = ""
     scopes: tuple[str, ...] = ()
     extra: tuple[tuple[str, str], ...] = ()
+    # How the code is exchanged: "post" (form body, RFC 6749) or "get" (query string: Moloni's /grant/).
+    token_method: str = "post"
+    pkce: bool = True  # Moloni's documented flow has no PKCE
 
 
 PROVIDERS: dict[str, dict[str, Any]] = {
@@ -60,6 +63,16 @@ PROVIDERS: dict[str, dict[str, Any]] = {
         "token_url": "https://login.microsoftonline.com/common/oauth2/v2.0/token",
         "scopes": ("openid", "email", "offline_access", "https://graph.microsoft.com/Mail.Read"),
         "extra": (("response_mode", "query"),),
+    },
+    # Moloni (accounting software, connectors.accounting): a developer registration at moloni.pt gives the client
+    # id (Developer ID) and secret; its redirect URI is <BACKOFFICE_API_URL>/api/oauth/callback.
+    "moloni": {
+        "authorize_url": "https://www.moloni.pt/ac/root/oauth/",
+        "token_url": "https://api.moloni.pt/v1/grant/",
+        "scopes": (),
+        "extra": (),
+        "token_method": "get",
+        "pkce": False,
     },
 }
 
@@ -149,11 +162,14 @@ class OAuthAuthorizer:
         payload = {"p": provider, "t": tenant_id, "c": connection_id, "n": nonce, "e": expires}
         body = _b64(json.dumps(payload, separators=(",", ":")).encode())
         state = f"{body}.{_b64(hmac.new(self._key, body.encode(), hashlib.sha256).digest())}"
-        params = {
-            "client_id": app.client_id, "redirect_uri": self._redirect, "response_type": "code",
-            "scope": " ".join(dict.fromkeys((*app.scopes, *scopes))), "state": state, "code_challenge": challenge,
-            "code_challenge_method": "S256", **dict(app.extra),
-        }
+        params = {"client_id": app.client_id, "redirect_uri": self._redirect, "response_type": "code"}
+        scope = " ".join(dict.fromkeys((*app.scopes, *scopes)))
+        if scope:
+            params["scope"] = scope
+        params["state"] = state
+        if app.pkce:
+            params.update({"code_challenge": challenge, "code_challenge_method": "S256"})
+        params.update(dict(app.extra))
         if login_hint:
             params["login_hint"] = login_hint
         return f"{app.authorize_url}?{urlencode(params)}"
@@ -188,9 +204,14 @@ class OAuthAuthorizer:
             http = httpx.Client(timeout=20.0)
         form = {
             "grant_type": "authorization_code", "code": code, "redirect_uri": self._redirect,
-            "client_id": app.client_id, "client_secret": app.client_secret, "code_verifier": verifier,
+            "client_id": app.client_id, "client_secret": app.client_secret,
         }
-        response = http.post(app.token_url, data=form, headers={"Accept": "application/json"})
+        if app.pkce:
+            form["code_verifier"] = verifier
+        if app.token_method == "get":  # Moloni: GET /grant/ with the query string (its documented flow)
+            response = http.get(app.token_url, params=form, headers={"Accept": "application/json"})
+        else:
+            response = http.post(app.token_url, data=form, headers={"Accept": "application/json"})
         if response.status_code != 200:
             raise AuthorizationError("the provider refused the sign-in")
         token = response.json()

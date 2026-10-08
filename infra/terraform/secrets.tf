@@ -68,6 +68,7 @@ locals {
   connector_secret_fields = {
     "google-oauth-client"    = { client_id = "", client_secret = "" }
     "microsoft-oauth-client" = { client_id = "", client_secret = "" }
+    "moloni-oauth-client"    = { client_id = "", client_secret = "" } # Moloni developer registration
     "open-banking"           = { secret_id = "", secret_key = "" } # GoCardless Bank Account Data
   }
 

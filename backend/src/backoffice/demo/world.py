@@ -241,6 +241,9 @@ def build() -> Orchestrator:
     them, and nothing ever leaves the demo.
     """
     repo = Repository(tenant_id=TENANT, owner=OWNER, now=START)
+    # The demo's story is frozen on 2 October and its simulated supplier never answers: no reminders, so the
+    # demo shows exactly what it always showed (backoffice.supplier_follow_up runs for real businesses).
+    repo.chase_reminders = None
     _setup(repo)
     orchestrator = Orchestrator(repo)
     orchestrator.transport = SimulatedOutbox()

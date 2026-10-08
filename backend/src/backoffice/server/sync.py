@@ -32,7 +32,13 @@ backoffice.server.worker`` repeats it):
    "Gmail needs reconnecting" and sends one push notification (§47–48). A
    connection that has not synced for a day despite retries is shown the same
    way; the month can never close green while it is stale.
-6. **Erasures.** Accounts erased since the last pass still have their files:
+6. **Cloud storage and accounting software.** A folder the owner chose in Google Drive or OneDrive is read for
+   new files (``sync.files``); the accounting software (TOConline, Moloni, InvoiceXpress) for the company's own
+   sales documents (``sync.accounting``), each with its PDF, read before the event. Both keep the §47 state, so a
+   stopped sync shows like a mailbox's; a month never closes green while the accounting software stopped syncing.
+7. **Searching before asking.** Every missing document is searched for in each place the business connected
+   (server/search.py) before any supplier is asked for it (§22); each round is one ``search.recorded`` event.
+8. **Erasures.** Accounts erased since the last pass still have their files:
    the worker removes them, in AWS as the evidence-deletion role
    (server/erasure.py), and marks each erasure record purged.
 
@@ -64,7 +70,17 @@ LINKS_PER_PASS = 10  # waiting invoice links opened per tenant and pass
 # 6 hours); after 3 days without an answer the engine gets the invoice another way (orchestrator).
 LINK_BACKOFF_BASE = timedelta(minutes=15)
 LINK_BACKOFF_MAX = timedelta(hours=6)
-_KINDS = {"google": "gmail", "microsoft": "microsoft", "imap": "imap", "open_banking": "open_banking"}
+_KINDS = {"google": "gmail", "microsoft": "microsoft", "imap": "imap", "open_banking": "open_banking",
+          "invoicexpress": "accounting", "moloni": "accounting", "toconline": "accounting"}
+
+
+def _kind_of(connection_kind: str, provider: str) -> str | None:
+    """The connector state's kind for a connection: a Google sign-in reads Gmail or Drive, by what it was for."""
+    if connection_kind == "files":
+        return "cloud_storage" if provider in ("google", "microsoft") else None
+    if connection_kind == "accounting":
+        return "accounting" if provider in ("invoicexpress", "moloni", "toconline") else None
+    return _KINDS.get(provider)
 
 
 class _Gone(Exception):
@@ -87,6 +103,10 @@ class PassReport:
     erasures: list[str] = field(default_factory=list)  # erased businesses whose files were purged
     thread_messages: int = 0  # earlier messages of a thread fetched because a reply pointed at them
     links: int = 0  # waiting invoice links opened and settled
+    files: int = 0  # new files read from watched cloud storage folders
+    documents: int = 0  # the company's own documents read from its accounting software
+    searches: int = 0  # missing documents searched for in the connected places (§22)
+    found: int = 0  # ... found there
 
 
 @dataclass(frozen=True)
@@ -102,6 +122,9 @@ class _Connection:
     # Whose mailbox it reads (checklist O2): "shared" or "delegated" (Microsoft 365 through /users/{address}; a
     # Google mailbox delegated to the signed-in account), "alias" (Gmail: only mail delivered to the address).
     mailbox: str = "own"
+    # What the owner chose for it (no secrets): a watched folder or SharePoint library (cloud storage), the
+    # accounting software's account name, the company's tax number (to find it in Moloni).
+    options: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def key(self) -> str:
@@ -135,6 +158,8 @@ class SyncWorker:
         backoff_base: timedelta = timedelta(minutes=1),
         backoff_max: timedelta = timedelta(hours=1),
         purger: Any = None,
+        portal_factory: Callable[[str, Any], Any] | None = None,
+        search_missing: bool = True,
     ) -> None:
         self.manager = manager
         self.purger = purger  # server/erasure.py: finishes account erasures (None: not this worker's job)
@@ -154,6 +179,10 @@ class SyncWorker:
         # connection -> (vault record version, token provider): an access token lives an hour, so it is
         # reused across syncs; a new sign-in (a new vault version) starts a new provider.
         self._tokens: dict[str, tuple[int, Any]] = {}
+        # Searching every connected place for missing documents before any supplier is asked (§22).
+        from .search import MissingSearches
+
+        self.searches = MissingSearches(self, portal_factory=portal_factory) if search_missing else None
 
     def now(self) -> datetime:
         return self.manager.now().astimezone(timezone.utc)
@@ -230,6 +259,8 @@ class SyncWorker:
         for connection in self.manager.read(tenant_id, lambda svc: _connections(tenant_id, svc), what="sync plan"):
             self._sync(connection, report)
         self._follow_links(tenant_id, report)
+        if self.searches is not None:
+            self.searches.run(tenant_id, report)
         return report
 
     # ----------------------------------------------------------------- links that wait (§9)
@@ -266,9 +297,11 @@ class SyncWorker:
             report.retrying.append(c.key)
             return
         meta = self.vault.metadata(c.tenant_id, c.id) if self.vault is not None else None
-        if meta is None or meta.provider not in _KINDS:  # nothing to sign in with (added by hand, or pending)
+        if meta is None or _kind_of(c.kind, meta.provider) is None:  # nothing to sign in with (by hand, or pending)
             report.skipped.append(c.key)
             return
+        if c.kind == "files" and not c.options.get("folder"):
+            return  # searched for missing documents only: no folder to watch
         state = self._state(c, meta.provider)
         if c.kind == "email" and meta.expires_at is not None and state.auth_expires_at != meta.expires_at:
             # An OAuth grant with a stated end: the state the sync records carries it (the owner is reminded, R4).
@@ -293,6 +326,10 @@ class SyncWorker:
             return
         if c.kind == "email":
             outcome = self._sync_mail(c, connector, state, now, report)
+        elif c.kind == "files":
+            outcome = self._sync_files(c, connector, state, now, report)
+        elif c.kind == "accounting":
+            outcome = self._sync_accounting(c, connector, state, now, report)
         else:
             outcome = self._sync_bank(c, connector, state, now, report)
         if c.key in self._tokens:  # a rotated refresh token was saved: remember the vault's new version
@@ -397,6 +434,50 @@ class SyncWorker:
         flush(outcome.state.model_dump(mode="json") if outcome.ok else None)
         return outcome
 
+    def _sync_files(self, c: _Connection, connector: Any, state: Any, now: datetime, report: PassReport) -> Any:
+        """New files in the watched folder (Google Drive, OneDrive), in batches of events."""
+        batch: list[Any] = []
+
+        def flush(final_state: Any = None) -> None:
+            if not batch and final_state is None:
+                return
+            status, _ = self.manager.record_files(c.tenant_id, c.id, list(batch), final_state)
+            if status == 404:
+                raise _Gone(c.key)
+            report.files += len(batch)
+            batch.clear()
+
+        def sink(download: Any) -> None:
+            batch.append(download)
+            if len(batch) >= self.mail_batch:
+                flush()
+
+        outcome = connector.watch(state, sink, now=now)
+        flush(outcome.state.model_dump(mode="json") if outcome.ok else None)
+        return outcome
+
+    def _sync_accounting(self, c: _Connection, connector: Any, state: Any, now: datetime, report: PassReport) -> Any:
+        """The company's own sales documents from its accounting software, in batches of events."""
+        batch: list[Any] = []
+
+        def flush(final_state: Any = None) -> None:
+            if not batch and final_state is None:
+                return
+            status, _ = self.manager.record_accounting(c.tenant_id, c.id, list(batch), final_state)
+            if status == 404:
+                raise _Gone(c.key)
+            report.documents += len(batch)
+            batch.clear()
+
+        def sink(document: Any) -> None:
+            batch.append(document)
+            if len(batch) >= self.mail_batch:
+                flush()
+
+        outcome = connector.sync(state, sink, now=now)
+        flush(outcome.state.model_dump(mode="json") if outcome.ok else None)
+        return outcome
+
     def _failed(self, c: _Connection, outcome: Any, now: datetime, report: PassReport) -> None:
         error = outcome.error
         state = outcome.state.model_dump(mode="json")
@@ -425,7 +506,7 @@ class SyncWorker:
     def _state(self, c: _Connection, provider: str) -> Any:
         from backoffice.connectors.base import ConnectorKind, ConnectorState
 
-        kind = ConnectorKind(_KINDS[provider])
+        kind = ConnectorKind(_kind_of(c.kind, provider) or _KINDS[provider])
         if c.saved:
             try:
                 saved = ConnectorState.model_validate(dict(c.saved))
@@ -442,10 +523,34 @@ class SyncWorker:
         every = max(self.interval, BANK_MIN_INTERVAL) if c.kind == "bank" else self.interval
         return now - state.last_successful_sync >= every
 
+    def search_connector(self, c: _Connection) -> tuple[Any, str]:
+        """The connector of a searchable connection, for the missing-document searches (server/search.py), with
+        the provider's name. Raises what building it raises (no sign-in: the attempt is noted as failed)."""
+        meta = self.vault.metadata(c.tenant_id, c.id) if self.vault is not None else None
+        if meta is None or _kind_of(c.kind, meta.provider) is None:
+            from backoffice.connectors.base import ReconnectRequired
+
+            raise ReconnectRequired("search_no_sign_in")
+        connector = self._connector(c, meta)
+        if c.kind == "email" and meta.provider == "google":
+            return connector, "gmail"
+        return connector, str(meta.provider)
+
+    def saved_state(self, c: _Connection) -> dict[str, Any]:
+        """The connection's sync state marked as needing the owner (a sign-in refused while searching)."""
+        from backoffice.connectors.base import ReconnectRequired, record_failure
+
+        meta = self.vault.metadata(c.tenant_id, c.id) if self.vault is not None else None
+        state = self._state(c, meta.provider if meta is not None else "google")
+        state = record_failure(state, at=self.now(), error=ReconnectRequired("search_sign_in_refused"))
+        return state.model_dump(mode="json")
+
     def _connector(self, c: _Connection, meta: Any) -> Any:
         provider = meta.provider
         if provider == "open_banking":
             return self._bank_connector(c)
+        if c.kind == "accounting":
+            return self._accounting_connector(c, meta)
         if provider == "imap":
             from backoffice.connectors.imap import IMAPAuth, IMAPConfig, IMAPConnector
 
@@ -478,10 +583,23 @@ class SyncWorker:
             if not self.vault.open(c.tenant_id, c.id).get("refresh_token"):
                 raise ReconnectRequired(f"{provider}_no_refresh_token")
             scopes = (GRAPH_SHARED_MAIL_SCOPES if shared else GRAPH_MAIL_SCOPES) if provider == "microsoft" else ()
+            if c.kind == "files" and provider == "microsoft":
+                from backoffice.connectors.cloud_storage import GRAPH_FILES_SCOPE
+
+                scopes = ("offline_access", GRAPH_FILES_SCOPE)
             refresher = OAuthRefresher(OAuthClientConfig(app.client_id, app.client_secret, app.token_url, scopes=scopes),
                                        client=self.http_client, provider=provider, clock=self.now)
-            tokens = self.vault.token_provider(c.tenant_id, c.id, refresher)  # rotations are saved in the vault
+            # Rotations are saved in the vault; expiry is judged on this worker's clock, as the refresher stamps it.
+            tokens = self.vault.token_provider(c.tenant_id, c.id, refresher, clock=self.now)
             self._tokens[c.key] = (meta.version, tokens)
+        if c.kind == "files":
+            from backoffice.connectors.cloud_storage import CloudStorageConfig, GoogleDriveConnector, OneDriveConnector
+
+            files = CloudStorageConfig(folder=c.options.get("folder") or None, history_window=self.history,
+                                       drive=str(c.options.get("drive") or "me/drive"))
+            if provider == "google":
+                return GoogleDriveConnector(tokens, client=self.http_client, config=files, clock=self.now)
+            return OneDriveConnector(tokens, client=self.http_client, config=files, clock=self.now)
         if provider == "google":
             from backoffice.connectors.gmail import GmailConfig, GmailConnector
 
@@ -515,19 +633,83 @@ class SyncWorker:
                                     config=BankSyncConfig(history_window=self.history), clock=self.now)
 
 
+def _accounting_connector_for(worker: SyncWorker, c: _Connection, meta: Any) -> Any:
+    """InvoiceXpress (the customer's API key), Moloni (OAuth with the server's developer app) or TOConline (the
+    company's own API data), from the vault (connectors.accounting)."""
+    from backoffice.connectors import accounting as A
+
+    secret = worker.vault.open(c.tenant_id, c.id)
+    history = worker.history
+    if meta.provider == "invoicexpress":
+        connector: Any = A.InvoiceXpressConnector(str(secret.get("account") or c.options.get("account") or ""),
+                                                  str(secret.get("api_key") or ""), client=worker.http_client,
+                                                  clock=worker.now)
+    elif meta.provider == "toconline":
+        creds = A.TOConlineCredentials(str(secret.get("client_id") or ""), str(secret.get("client_secret") or ""),
+                                       str(secret.get("oauth_url") or ""), str(secret.get("api_url") or ""))
+        cached = worker._tokens.get(c.key)
+        if cached is not None and cached[0] == meta.version:
+            tokens = cached[1]
+        else:
+            def rotate(token: Any) -> None:
+                worker.vault.update(c.tenant_id, c.id, {"refresh_token": token.refresh_token})
+
+            tokens = A.TOConlineTokens(creds, refresh_token=secret.get("refresh_token") or None,
+                                       client=worker.http_client, on_rotate=rotate, clock=worker.now)
+            worker._tokens[c.key] = (meta.version, tokens)
+        connector = A.TOConlineConnector(tokens, creds.api_url, client=worker.http_client, clock=worker.now)
+    else:
+        app = worker.oauth_apps.get("moloni")
+        if app is None:
+            raise _Unconfigured("moloni_oauth_app_missing")
+        cached = worker._tokens.get(c.key)
+        if cached is not None and cached[0] == meta.version:
+            tokens = cached[1]
+        else:
+            if not secret.get("refresh_token"):
+                from backoffice.connectors.base import ReconnectRequired
+
+                raise ReconnectRequired("moloni_no_refresh_token")
+            refresher = A.MoloniRefresher(app.client_id, app.client_secret, client=worker.http_client,
+                                          clock=worker.now)
+            tokens = worker.vault.token_provider(c.tenant_id, c.id, refresher, clock=worker.now)
+            worker._tokens[c.key] = (meta.version, tokens)
+        connector = A.MoloniConnector(tokens, company_tax_id=c.options.get("taxId") or None,
+                                      client=worker.http_client, clock=worker.now)
+    connector.history_window = history
+    return connector
+
+
+SyncWorker._accounting_connector = _accounting_connector_for  # type: ignore[attr-defined]
+
+
 class _Unconfigured(Exception):
     """This server cannot sync that connection (no OAuth app, no GoCardless keys): engineering, not the owner."""
 
 
-def _connections(tenant_id: str, svc: Any) -> list[_Connection]:
-    """The tenant's real mailbox and bank connections (read-only)."""
+_OPTIONS = ("folder", "drive", "account")
+
+
+def _connections(tenant_id: str, svc: Any, kinds: tuple[str, ...] = ("email", "bank", "files", "accounting")
+                 ) -> list[_Connection]:
+    """The tenant's real connections: mailboxes, banks, cloud storage, accounting software (read-only)."""
     repo = svc.repo
     ibans = {a.iban: a.id for a in repo.accounts.values() if a.iban}
     out = []
     for c in repo.connectors.values():
-        if c.kind not in ("email", "bank") or (svc.sign_in.get(c.id) or {}).get("pending"):
+        info = svc.sign_in.get(c.id) or {}
+        if c.kind not in kinds or info.get("pending"):
             continue
+        options = {k: str(info[k]) for k in _OPTIONS if info.get(k)}
+        if c.kind == "accounting" and c.company_ids and c.company_ids[0] in repo.companies:
+            options["taxId"] = repo.companies[c.company_ids[0]].tax_id
         out.append(_Connection(tenant_id, c.id, c.kind, c.name, c.account, c.healthy,
                                svc.sync_states.get(c.id), ibans if c.kind == "bank" else {},
-                               str((svc.sign_in.get(c.id) or {}).get("mailbox") or "own")))
+                               str(info.get("mailbox") or "own"), options))
     return out
+
+
+def _searchable_connections(tenant_id: str, svc: Any) -> list[_Connection]:
+    """The connections the missing-document searches may use (read-only)."""
+    searchable = {c.id for c in svc.repo.connectors.values() if c.searchable}
+    return [c for c in _connections(tenant_id, svc, ("email", "files", "accounting")) if c.id in searchable]

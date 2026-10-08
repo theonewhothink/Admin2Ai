@@ -90,7 +90,8 @@ _SLUG = re.compile(r"[^a-z0-9]+")
 _PLAIN_QUESTIONS = ("company", "cash", "obligation", "refund", "obligation_company", "statement", "recharge",
                     "part", "deposit", "deposit_refund", "deposit_kept", "chargeback",
                     "receipt", "expense_claim", "retake", "same_document",
-                    "lease", "till", "member")  # leasing (X24), till reports (X5), receipts lists (X12)
+                    "lease", "till", "member",  # leasing (X24), till reports (X5), receipts lists (X12)
+                    "supplier_invoice")  # a supplier who has not sent the invoice after the reminders (K8)
 # Open payments proven without a document: their plan still shows in the month (I7, X9).
 _PLANNED_RULES = frozenset({"chargeback", "chargeback_won", "security_deposit"})
 _ISSUER_NAMES = {"tax_authority": "Tax office", "social_security": "Social Security", "bank": "Your bank",
@@ -579,7 +580,8 @@ class BackOfficeService:
         now = self._now()
         notices = {n["id"]: n for n in self.access_notices()}
         out = []
-        kind_source = {"email": SourceKind.EMAIL, "bank": SourceKind.BANK, "accountant": SourceKind.ACCOUNTANT}
+        kind_source = {"email": SourceKind.EMAIL, "bank": SourceKind.BANK, "accountant": SourceKind.ACCOUNTANT,
+                       "files": SourceKind.CLOUD_STORAGE, "accounting": SourceKind.ACCOUNTING_SYSTEM}
         for c in self.repo.connectors.values():
             entry: dict[str, Any] = {
                 "id": c.id, "name": c.name, "kind": c.kind, "account": c.account,
@@ -602,9 +604,9 @@ class BackOfficeService:
         info = self.sign_in.get(c.id) or {}
         provider = info.get("provider")
         out: dict[str, Any] = {}
-        if c.kind == "email" and provider in ("google", "microsoft"):
+        if (c.kind in ("email", "files") and provider in ("google", "microsoft")) or provider == "moloni":
             out["action"] = f"Sign in to {c.name} again"
-        elif c.kind in ("email", "bank"):
+        elif c.kind in ("email", "bank", "accounting"):
             out["action"] = "Try again"
         waiting_for_owner = (self.sync_states.get(c.id) or {}).get("reconnect_required")
         if info.get("reconnecting") and not info.get("pending") and not waiting_for_owner:
@@ -650,8 +652,9 @@ class BackOfficeService:
         """
         info = dict(self.sign_in.get(c.id) or {})
         provider = info.get("provider")
-        if c.kind == "email" and provider in ("google", "microsoft"):
-            label = "Google" if provider == "google" else "Microsoft"
+        if (c.kind in ("email", "files") and provider in ("google", "microsoft")) or \
+                (c.kind == "accounting" and provider == "moloni"):
+            label = {"google": "Google", "microsoft": "Microsoft", "moloni": "Moloni"}[str(provider)]
             url = None
             if self.authorizer is not None:
                 hint, scopes = self.consent_request(provider, c.account, info)
@@ -667,7 +670,7 @@ class BackOfficeService:
             self.orchestrator.log("closure", "connector_sign_in_started", subject_id=c.id)
             return {"ok": True, "authorizeUrl": url, "message": f"Sign in to {c.name} again to reconnect {c.account}.",
                     "connection": self._connection(c.id)}
-        if c.kind not in ("email", "bank"):
+        if c.kind not in ("email", "bank", "accounting"):
             raise ServiceError(409, "This connection does not need reconnecting.")
         self._clear_reconnect(c.id)
         self.sign_in[c.id] = {**info, "reconnecting": True}
@@ -675,6 +678,9 @@ class BackOfficeService:
         if c.kind == "email":
             message = (f"I'll try {c.account} again with its saved app password. It shows as connected once it has "
                        "synced. If the password changed, remove the mailbox in Sources and add it again.")
+        elif c.kind == "accounting":
+            message = (f"I'll try {c.name} again with the access you gave me. It shows as connected once it has "
+                       f"synced. If you changed that access in {c.name}, remove it in Sources and add it again.")
         else:
             message = (f"I'll try {c.name} again. It shows as connected once it has synced. If your bank asks you "
                        "to approve access again, link it again in Sources.")
@@ -741,6 +747,12 @@ class BackOfficeService:
             ("accountant", "Accountant", "Receives the monthly package and asks questions here.",
              [{"id": c["id"], "name": c["name"], "company": "All companies", "detail": c["account"],
                "status": c["status"], "lastSyncedAt": c.get("lastSyncedAt")} for c in conn("accountant")]),
+            ("files", "Cloud storage", "Searched for missing invoices; a folder you choose is read as files arrive.",
+             [{"id": c["id"], "name": c["name"], "company": "All companies", "detail": c["account"],
+               "status": c["status"], "lastSyncedAt": c.get("lastSyncedAt")} for c in conn("files")]),
+            ("accounting", "Accounting software", "Your invoices there, and the documents I look for.",
+             [{"id": c["id"], "name": c["name"], "company": c["account"], "detail": c["account"],
+               "status": c["status"], "lastSyncedAt": c.get("lastSyncedAt")} for c in conn("accounting")]),
             ("suppliers", "Suppliers", "Recognised from invoices and payments.", suppliers),
             ("insurance", "Insurance", "Policies found in email and payments. I watch the renewal dates.",
              rel("insurance")),
@@ -758,7 +770,9 @@ class BackOfficeService:
                         "Demo connection: no real sign-in was made."
                 if label:
                     item["signIn"] = label
-        return {"groups": [{"id": g, "title": t, "description": d, "items": items} for g, t, d, items in groups],
+        # Cloud storage and accounting software are shown once something is connected there (older screens unchanged).
+        return {"groups": [{"id": g, "title": t, "description": d, "items": items} for g, t, d, items in groups
+                           if items or g not in ("files", "accounting")],
                 "companies": [{"id": cid, "name": n} for cid, n in names.items()]}
 
     # ----------------------------------------------------------------- Adding and removing sources
@@ -806,6 +820,8 @@ class BackOfficeService:
             until = _as_date(info["access_until"])
             return (f"Signed in. This sign-in ends on {until.day} {until.strftime('%B %Y')}. "
                     "I will remind you a week before.")
+        if info.get("purpose") == "accounting" and info.get("provider") in ("invoicexpress", "toconline"):
+            return "Connected with the API access you gave. It is kept safely and never shown again."
         if info.get("stored") and kind in ("shared", "delegated", "alias"):
             who = f" as {info['signInAs']}" if info.get("signInAs") else ""
             read = "only the mail sent to this address" if kind == "alias" else "this mailbox with your access"
@@ -822,10 +838,11 @@ class BackOfficeService:
             "email": self._add_email, "bank": self._add_bank, "card": self._add_card, "supplier": self._add_supplier,
             "insurance": self._add_relationship, "investment": self._add_relationship,
             "loan": self._add_relationship, "government": self._add_relationship,
+            "files": self._add_files, "accounting": self._add_accounting,
         }.get(kind if isinstance(kind, str) else "")
         if handler is None:
-            raise ServiceError(400, "I can add email, bank accounts, cards, suppliers, insurance, investments, "
-                                    "loans and government offices.")
+            raise ServiceError(400, "I can add email, bank accounts, cards, cloud storage, accounting software, "
+                                    "suppliers, insurance, investments, loans and government offices.")
         result = handler(body)
         self.orchestrator.setup_step(f"source:{kind}")
         self.orchestrator.log("discovery", "source_added", subject_id=result["id"], values={"kind": kind})
@@ -872,7 +889,8 @@ class BackOfficeService:
         self.repo.add_connector(ConnectorState(
             id=cid, name=name, kind="email", account=address, company_ids=company_ids, healthy=not pending,
             covered_from=now - timedelta(days=90) if simulated else None,
-            covered_until=now if simulated else None, last_synced_at=now if simulated else None))
+            covered_until=now if simulated else None, last_synced_at=now if simulated else None,
+            searchable=self.real_sources and secret_stored))
         self.sign_in[cid] = {"provider": provider, "stored": secret_stored, "pending": pending, **options}
         if simulated:
             self.orchestrator.milestone("email_connected")
@@ -932,12 +950,18 @@ class BackOfficeService:
         """(login hint, extra scopes) for signing in to read this mailbox (O2). A shared or delegated Microsoft
         mailbox needs Mail.Read.Shared; the account that signs in is the owner's own, never the shared mailbox."""
         kind = options.get("mailbox", "own")
+        if options.get("purpose") == "accounting":
+            return None, ()  # Moloni: its own sign-in, no extra scopes
         hint = options.get("signInAs") or (None if kind in ("shared", "delegated") else address)
         scopes: tuple[str, ...] = ()
         if provider == "microsoft" and kind in ("shared", "delegated"):
             from backoffice.connectors.microsoft import GRAPH_SHARED_MAIL_SCOPE
 
             scopes = (GRAPH_SHARED_MAIL_SCOPE,)
+        if options.get("purpose") == "files":  # Google Drive or OneDrive: the same sign-in, one more read-only scope
+            from backoffice.connectors.cloud_storage import DRIVE_READONLY_SCOPE, GRAPH_FILES_SCOPE
+
+            scopes = (DRIVE_READONLY_SCOPE,) if provider == "google" else (GRAPH_FILES_SCOPE,)
         return hint, scopes
 
     def _add_bank(self, body: Mapping[str, Any], *, consent_until: date | None = None) -> dict[str, Any]:
@@ -1174,6 +1198,225 @@ class BackOfficeService:
         self.repo.relationships.append(Relationship(rid, kind, name, company, detail or "Added by you",
                                                     "Added by you", renews_on=renews_on))
         return {"id": rid, "message": f"Done. I will watch for {name}."}
+
+    # ----------------------------------------------------------------- Cloud storage and accounting software
+
+    def _begin_sign_in(self, provider: str, cid: str, hint: str | None, scopes: tuple[str, ...]) -> str | None:
+        if self.authorizer is None or provider not in getattr(self.authorizer, "providers", (provider,)):
+            return None
+        try:
+            return self.authorizer.begin(provider, self.repo.tenant_id, cid, login_hint=hint,
+                                         **({"scopes": scopes} if scopes else {}))
+        except Exception:  # noqa: BLE001 - the provider's sign-in is not available: said plainly below
+            return None
+
+    def _add_files(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Google Drive or OneDrive / SharePoint, searched for missing documents (§22) and, when the owner picks one,
+        a folder watched for new files. The same Google or Microsoft sign-in as a mailbox, with one more read-only
+        scope (drive.readonly, Files.Read.All)."""
+        provider = body.get("provider") or "google"
+        if provider not in ("google", "microsoft"):
+            raise ServiceError(400, "Choose Google Drive or OneDrive.")
+        name = "Google Drive" if provider == "google" else "OneDrive"
+        address = self._text(body, "address", f"Which account holds your {name}?").lower()
+        if not _EMAIL.match(address):
+            raise ServiceError(400, "That doesn't look like an email address.")
+        if any(c.kind == "files" and c.account.lower() == address and c.name == name
+               for c in self.repo.connectors.values()):
+            raise ServiceError(409, f"{name} for {address} is already connected.")
+        folder = self._text(body, "folder", "", required=False, limit=300) or None
+        drive = self._text(body, "drive", "", required=False, limit=200) or None
+        if folder and provider == "google":
+            from backoffice.connectors.cloud_storage import drive_folder_id
+
+            try:
+                folder = drive_folder_id(folder)
+            except ValueError:
+                raise ServiceError(400, "Paste the folder's link from Google Drive.") from None
+        if drive and (provider != "microsoft" or not re.fullmatch(
+                r"me/drive|drives/[A-Za-z0-9!_.-]+|sites/[A-Za-z0-9,._-]+/drive", drive)):
+            raise ServiceError(400, "That SharePoint library address doesn't look right.")
+        company = self._company(body.get("companyId"), required=False)
+        cid = self._slug("files", f"{provider} {address}")
+        options: dict[str, Any] = {"provider": provider, "purpose": "files"}
+        if folder:
+            options["folder"] = folder
+        if drive:
+            options["drive"] = drive
+        hint, scopes = self.consent_request(provider, address, options)
+        authorize_url = self._begin_sign_in(provider, cid, hint, scopes)
+        if self.real_sources and authorize_url is None:
+            label = "Google" if provider == "google" else "Microsoft"
+            raise ServiceError(503, f"{label} sign-in is not set up on this server yet, so I can't connect {name}.")
+        now = self._now()
+        pending = authorize_url is not None
+        simulated = not self.real_sources
+        self.repo.add_connector(ConnectorState(
+            id=cid, name=name, kind="files", account=address,
+            company_ids=(company,) if company else tuple(self.repo.companies), healthy=not pending,
+            covered_from=now - timedelta(days=90) if simulated else None, covered_until=now if simulated else None,
+            last_synced_at=now if simulated else None))
+        self.sign_in[cid] = {**options, "pending": pending, "stored": False}
+        out: dict[str, Any] = {"id": cid}
+        if pending:
+            out["authorizeUrl"] = authorize_url
+            out["message"] = f"Almost done. Sign in so I can search your {name} for missing invoices."
+        else:
+            out["message"] = f"Done. I will search your {name} for missing invoices."
+        return out
+
+    _ACCOUNTING = {"invoicexpress": "InvoiceXpress", "moloni": "Moloni", "toconline": "TOConline"}
+
+    def _add_accounting(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """The company's accounting software: TOConline, Moloni or InvoiceXpress (§50). It is read for missing
+        documents and the company's own invoices; its health counts like a mailbox's (§47).
+
+        InvoiceXpress: ``{account, apiKey}`` (the customer's own API key). TOConline: ``{clientId, clientSecret,
+        oauthUrl, apiUrl}`` (Empresa > Configurações > Dados API). Moloni: a sign-in at Moloni (OAuth). Keys and
+        secrets go to the vault only, never into the business's record."""
+        provider = body.get("provider")
+        if provider not in self._ACCOUNTING:
+            raise ServiceError(400, "Choose TOConline, Moloni or InvoiceXpress.")
+        name = self._ACCOUNTING[str(provider)]
+        if len(self.repo.companies) > 1 or body.get("companyId"):
+            company = self._company(body.get("companyId"))
+        elif self.repo.companies:
+            company = next(iter(self.repo.companies))
+        else:
+            raise ServiceError(400, "Add your company first.")
+        assert company is not None
+        if any(c.kind == "accounting" and c.name == name and company in c.company_ids
+               for c in self.repo.connectors.values()):
+            raise ServiceError(409, f"{name} is already connected for {self._company_name(company)}.")
+        cid = self._slug("accounting", f"{provider} {company}")
+        secret: dict[str, Any] = {}
+        options: dict[str, Any] = {"provider": provider, "purpose": "accounting"}
+        if provider == "invoicexpress":
+            account = self._text(body, "account", "Your InvoiceXpress account name, as in its web address.", limit=63)
+            account = account.lower()
+            if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", account):
+                raise ServiceError(400, "The account name is the first part of your InvoiceXpress address.")
+            key = body.get("apiKey")
+            if not isinstance(key, str) or not key.strip():
+                raise ServiceError(400, "Enter the API key from your InvoiceXpress account settings.")
+            secret, options["account"] = {"account": account, "api_key": key.strip()}, account
+        elif provider == "toconline":
+            fields = {k: body.get(k) for k in ("clientId", "clientSecret", "oauthUrl", "apiUrl")}
+            if not all(isinstance(v, str) and v.strip() for v in fields.values()):
+                raise ServiceError(400, "Enter the API data from TOConline (Empresa > Configurações > Dados API).")
+            from backoffice.connectors.accounting import TOConlineCredentials
+
+            try:
+                creds = TOConlineCredentials(str(fields["clientId"]).strip(), str(fields["clientSecret"]).strip(),
+                                             str(fields["oauthUrl"]), str(fields["apiUrl"]))
+            except ValueError:
+                raise ServiceError(400, "Those TOConline addresses don't look right: copy them from its API data.") \
+                    from None
+            secret = {"client_id": creds.client_id, "client_secret": creds.client_secret,
+                      "oauth_url": creds.oauth_url, "api_url": creds.api_url}
+        authorize_url = None
+        if provider == "moloni":
+            authorize_url = self._begin_sign_in("moloni", cid, None, ())
+            if self.real_sources and authorize_url is None:
+                raise ServiceError(503, "Moloni sign-in is not set up on this server yet, so I can't connect it.")
+        stored = False
+        if secret and self.vault is not None:
+            self.vault.store(self.repo.tenant_id, cid, str(provider), secret)
+            stored = True
+        if self.real_sources and secret and not stored:
+            raise ServiceError(503, f"I can't keep the {name} access safely on this server yet.")
+        now = self._now()
+        pending = authorize_url is not None
+        simulated = not self.real_sources
+        entity = self.repo.companies[company]
+        self.repo.add_connector(ConnectorState(
+            id=cid, name=name, kind="accounting", account=entity.name, company_ids=(company,), healthy=not pending,
+            covered_from=now - timedelta(days=90) if simulated else None, covered_until=now if simulated else None,
+            last_synced_at=now if simulated else None, searchable=self.real_sources and stored))
+        self.sign_in[cid] = {**options, "pending": pending, "stored": stored}
+        out: dict[str, Any] = {"id": cid}
+        if pending:
+            out["authorizeUrl"] = authorize_url
+            out["message"] = f"Almost done. Sign in to {name} so I can read {entity.name}'s documents there."
+        else:
+            out["message"] = f"Done. I will read {entity.name}'s documents in {name}."
+            self.orchestrator.activity(now, "checked", f"Connected {name} for {entity.name}.", company)
+        return out
+
+    # ----------------------------------------------------------------- searching before asking (§22)
+
+    def search_requests(self) -> list[dict[str, Any]]:
+        """The missing documents to search for now (the sync worker asks, server/search.py). Read-only."""
+        return self.orchestrator.search.requests(self._now())
+
+    def record_search(self, subject_id: str, round_number: int, attempts: Sequence[Mapping[str, Any]],
+                      files: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        """One recorded round of searching for a missing document (the event ``search.recorded``): the files found,
+        each with where it came from, go through the pipeline; nothing found, the supplier request follows."""
+        from backoffice.missing import FoundFile, SearchSource
+
+        found = []
+        for f in files:
+            data = f.get("data")
+            try:
+                source = SearchSource(str(f.get("source")))
+            except ValueError:
+                continue
+            if not isinstance(data, (bytes, bytearray)) or not data:
+                continue
+            provenance = f.get("provenance") if isinstance(f.get("provenance"), Mapping) else {}
+            found.append(FoundFile(source, str(f.get("place") or ""), bytes(data), f.get("filename") or None,
+                                   f.get("contentType") or None, dict(provenance)))
+        try:
+            result = self.orchestrator.search.record(subject_id, int(round_number), list(attempts), found,
+                                                     self._now())
+        except KeyError:
+            raise ServiceError(404, "I can't find that payment.") from None
+        return result
+
+    def sync_files(self, connection_id: str, files: Sequence[Mapping[str, Any]],
+                   state: Mapping[str, Any] | None) -> dict[str, Any]:
+        """New files in the folder the owner chose to watch (Google Drive, OneDrive), each with its provenance, then
+        (last batch) what the folder sync remembers (§47: last sync, failures, coverage)."""
+        c = self.repo.connectors.get(connection_id)
+        if c is None or c.kind != "files":
+            raise ServiceError(404, "I can't find that cloud storage connection.")
+        self._ingest_connected(files, SourceKind.CLOUD_STORAGE, "files")
+        if state is not None:
+            self._synced(c, state)
+            self.orchestrator.log("discovery", "connector_synced", subject_id=c.id, values={"files": len(files)})
+            self.orchestrator.run()
+        return {"ok": True, "files": len(files)}
+
+    def sync_accounting(self, connection_id: str, files: Sequence[Mapping[str, Any]],
+                        state: Mapping[str, Any] | None) -> dict[str, Any]:
+        """The company's own sales documents read from its accounting software since the last sync (they prove money
+        in and refunds given), then what that sync remembers: its health counts like a mailbox's (§47)."""
+        c = self.repo.connectors.get(connection_id)
+        if c is None or c.kind != "accounting":
+            raise ServiceError(404, "I can't find that accounting software connection.")
+        self._ingest_connected(files, SourceKind.ACCOUNTING_SYSTEM, "accounting")
+        if state is not None:
+            days = self._synced(c, state)
+            if days is not None:
+                self.orchestrator.activity(self._now(), "checked", f"Read {c.name} for {c.account}: the last {days} "
+                                           "days are in.", c.company_ids[0] if c.company_ids else None)
+            self.orchestrator.log("discovery", "connector_synced", subject_id=c.id, values={"documents": len(files)})
+            self.orchestrator.run()
+        return {"ok": True, "documents": len(files)}
+
+    def _ingest_connected(self, files: Sequence[Mapping[str, Any]], kind: SourceKind, origin: str) -> None:
+        keys = ("source", "provider", "fileId", "name", "path", "modifiedAt", "webUrl", "documentId", "direction",
+                "type", "number", "date")
+        for f in files:
+            data = f.get("data")
+            if not isinstance(data, (bytes, bytearray)) or not data:
+                continue
+            provenance = f.get("provenance") if isinstance(f.get("provenance"), Mapping) else {}
+            context = {k: v for k, v in provenance.items() if k in keys and (v is None or isinstance(v, (str, int)))}
+            self.orchestrator.ingest_file(bytes(data), filename=f.get("filename") or None,
+                                          content_type=f.get("contentType") or None, source_kind=kind,
+                                          origin=origin, run=False, context=context)
 
     # ----------------------------------------------------------------- Chat operator
 
@@ -1503,6 +1746,9 @@ class BackOfficeService:
             "headline": rec.match_headline, "why": [r.replace(": ", " ", 1) for r in rec.match_why],
             "history": self._history(item), "chain": self._chain(tx_id=rec.id), "evidenceIds": [rec.evidence_id],
         }
+        searched = self.orchestrator.search.view(rec.id)
+        if searched is not None:  # where it was searched for before anyone was asked (§22), and what came of it
+            out["search"] = searched
         if not item.is_done and needs_document and not rec.document_ids:
             out["nextStep"] = self.orchestrator.missing.plan(rec)
             if rec.tx.amount < 0:  # one tap teaches it for every later payment (J7): POST .../evidence {need}
@@ -2040,6 +2286,8 @@ class BackOfficeService:
         if access_until is not None:
             info["access_until"] = access_until
         self.sign_in[connection_id] = {**info, "pending": False, "stored": True}
+        # A real sign-in can be searched for missing documents (§22): the mailbox, the files, the accounting software.
+        c.searchable = self.real_sources
         if c.kind == "email" and not reconnecting:
             self.orchestrator.milestone("email_connected")
             if self.real_sources and not (self.sync_states.get(connection_id) or {}).get("last_successful_sync"):
@@ -3077,7 +3325,8 @@ class BackOfficeService:
                         "deposit": "deposit to confirm", "deposit_refund": "deposit given back?",
                         "deposit_kept": "security deposit kept?", "chargeback": "disputed card payment",
                         "lease": "leasing payment to confirm", "till": "till report to check",
-                        "member": "which company"}.get(n.kind, "one answer")
+                        "member": "which company",
+                        "supplier_invoice": "invoice still missing"}.get(n.kind, "one answer")
                 evidence.append({"label": f"{item['merchant']} · {what}", "id": f"needs:{n.id}"})
             elif n.kind == "cost_center":
                 rec = self.repo.transactions[n.subject_id]
@@ -3552,7 +3801,11 @@ class BackOfficeService:
     def _recon_why(self, rec: TxRecord) -> list[str]:
         """The "Why?" of a payment's reconciliation (§54), in plain words."""
         if rec.document_ids:
-            return [r.replace(": ", " ", 1) for r in rec.match_why]
+            why = [r.replace(": ", " ", 1) for r in rec.match_why]
+            search = self.orchestrator.search.view(rec.id)
+            if search is not None and search["status"] == "found" and search["foundIn"]:
+                why.append(f"Found in {search['foundIn']} on {search['when']}, before asking the supplier.")
+            return why
         if rec.proof_evidence_ids:
             return self._tax_reasons(rec)
         if rec.id in self.repo.chargebacks and rec.match_why:  # a disputed card payment and what it is linked to
