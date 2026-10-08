@@ -204,14 +204,37 @@ def pre_fetch(fetcher: Any, urls: Sequence[str], put_file: PutFile, *, limit: in
     return recorded, files
 
 
+_OFF = ("off", "0", "false", "no")
+
+
 def link_fetcher_from_env() -> Any:
     """The live link fetcher (§9): on unless ``BACKOFFICE_LINK_FETCHING=off``.
 
     Safety is not configurable here: http(s) only, no private or metadata
     addresses after DNS, every redirect re-checked, one total deadline.
+    A page that only shows the invoice with JavaScript is opened in the
+    isolated browser (:func:`link_browser_from_env`).
     """
-    if os.environ.get("BACKOFFICE_LINK_FETCHING", "on").strip().lower() in ("off", "0", "false", "no"):
+    if os.environ.get("BACKOFFICE_LINK_FETCHING", "on").strip().lower() in _OFF:
         return None
     from backoffice.evidence.links import LinkFetcher, UrlSafety
 
-    return LinkFetcher(UrlSafety())
+    return LinkFetcher(UrlSafety(), browser=link_browser_from_env())
+
+
+def link_browser_from_env() -> Any:
+    """Chromium for script-only invoice pages (§9 step 4), or None.
+
+    ``BACKOFFICE_LINK_BROWSER``: ``auto`` (default) uses it whenever Playwright is installed, ``off`` never.
+    Each link gets a fresh browser and an empty context in its own worker process, killed at its deadline
+    (``PlaywrightBrowserSession``); without it such a page is kept as the HTML that was fetched.
+    """
+    if os.environ.get("BACKOFFICE_LINK_BROWSER", "auto").strip().lower() in _OFF:
+        return None
+    import importlib.util
+
+    if importlib.util.find_spec("playwright") is None:
+        return None
+    from backoffice.evidence.links import PlaywrightBrowserSession
+
+    return PlaywrightBrowserSession()

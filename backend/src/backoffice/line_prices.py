@@ -34,9 +34,12 @@ what was read from each document is only cached. Pure standard library: it runs 
 
 from __future__ import annotations
 
+import bisect
+import itertools
 import re
+import statistics
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
@@ -58,6 +61,7 @@ __all__ = [
     "product_concepts",
     "product_key",
     "rate_parts_from_text",
+    "read_table_lines",
     "read_text_lines",
     "summarise",
     "threshold_words",
@@ -181,7 +185,7 @@ class InvoiceLines:
     """The lines of one invoice that add up to its net (or gross) at each VAT rate."""
 
     lines: tuple[PriceLine, ...]
-    source: str  # "e-invoice" | "text"
+    source: str  # "e-invoice" | "text" | "table" (a photographed or scanned page, read by its columns)
     check: str  # plain: how they add up
 
 
@@ -568,6 +572,304 @@ def read_text_lines(text: str) -> tuple[PriceLine, ...]:
     return tuple(out)
 
 
+# ---------------------------------------------------------------------------------------------------- page tables
+
+
+# What a column's heading says it holds (folded, letters only; the longest heading wins: "valor unit" is a price,
+# "valor" a line total). "gross" is a line total with VAT, "vat_amount" the VAT of each line: neither is read.
+_COLUMN_WORDS: dict[str, str] = {
+    **_HEAD_WORDS,
+    "unit": r"un|und|unid|unidade|unidad|um|u m|uom|unit|units",
+    "vat_amount": r"valor iva|montante iva|vat amount|tax amount|importe iva|cuota iva|cuota",
+    "gross": r"total c iva|total com iva|valor c iva|total incl vat|total inc vat|gross|total con iva|pvp total",
+}
+_TEXT_COLUMNS = frozenset({"code", "desc"})
+_PRICED_COLUMNS = ("qty", "price", "total")
+# A row that starts like this is under the table: its totals, VAT summary, charges outside the lines.
+_TABLE_END = re.compile(r"^(?:sub ?total|total|totais|base|iva|vat|net|taxable|portes|transporte|envio|shipping|"
+                        r"delivery|carriage|resumo|summary|importe|valor total|descontos?|discount|amount due|"
+                        r"balance|saldo|a pagar|to pay)\b")
+
+
+@dataclass(frozen=True)
+class _Column:
+    kind: str
+    x0: float
+    x1: float
+
+
+@dataclass(frozen=True)
+class _Token:
+    text: str
+    x0: float
+    x1: float
+
+    @property
+    def centre(self) -> float:
+        return (self.x0 + self.x1) / 2
+
+
+def _letters(text: str) -> str:
+    """``text`` folded character by character (same length), anything but a letter as a space."""
+    out = []
+    for ch in text:
+        folded = fold(ch)
+        out.append(folded[0] if folded and folded[0].isalpha() else " ")
+    return "".join(out)
+
+
+def _tokens(word: Any) -> list[_Token]:
+    """The whitespace-separated parts of one located word, each placed in proportion to its characters."""
+    text = word.text
+    per = (word.x1 - word.x0) / max(1, len(text))
+    return [_Token(m.group(), word.x0 + m.start() * per, word.x0 + m.end() * per)
+            for m in re.finditer(r"\S+", text)]
+
+
+def _table_columns(row: Any) -> tuple[list[_Column], float] | None:
+    """The columns a heading row names, left to right, and its character width; None when it is no heading.
+
+    One located word may hold several headings ("Un. Preço unit.", when the engine read them as one run):
+    each starts where its heading starts. A heading split in two ("Preço" / "unit.") is joined again.
+    """
+    columns: list[_Column] = []
+    widths: list[float] = []
+    words: list[str] = []  # each column's own heading text, folded
+    for word in row.words:
+        letters = _letters(word.text)
+        per = (word.x1 - word.x0) / max(1, len(word.text))
+        widths.append(per)
+        found = [(m.start(), m.end(), kind) for kind, pattern in _COLUMN_WORDS.items()
+                 for m in re.finditer(rf"\b(?:{pattern})\b", letters)]
+        chosen: list[tuple[int, int, str]] = []
+        for start, end, kind in sorted(found, key=lambda f: (f[0] - f[1], f[0])):
+            if all(end <= a or start >= b for a, b, _ in chosen):
+                chosen.append((start, end, kind))
+        chosen.sort()
+        if not chosen:
+            if columns and word.x0 - columns[-1].x1 < 2.5 * per:  # "(€)", "%": part of the heading before
+                columns[-1] = _Column(columns[-1].kind, columns[-1].x0, word.x1)
+            continue
+        for i, (start, _, kind) in enumerate(chosen):
+            stop = chosen[i + 1][0] if i + 1 < len(chosen) else len(word.text)
+            columns.append(_Column(kind, word.x0 + start * per, word.x0 + stop * per))
+            words.append(" ".join(letters[start:stop].split()))
+    if not columns:
+        return None
+    char = statistics.median(widths)
+    merged: list[_Column] = []
+    last_heading = ""
+    for column, heading in zip(columns, words):
+        if merged and column.x0 - merged[-1].x1 < 2.5 * char:
+            last = merged[-1]
+            kind = None
+            if column.kind == last.kind:
+                kind = last.kind  # "Taxa" "IVA"
+            elif last.kind in ("price", "total") and column.kind == "unit":
+                kind = "price"  # "Preço" "unit.", "Valor" "unit."
+            elif last.kind == "unit" and column.kind == "price" and last_heading == "unit":
+                kind = "price"  # "Unit" "price" (an abbreviated "Un." before "Preço" is its own column)
+            elif last.kind == "total" and column.kind == "vat":
+                kind = "vat_amount"  # "Valor" "IVA"
+            if kind is not None:
+                merged[-1] = _Column(kind, last.x0, column.x1)
+                last_heading = heading
+                continue
+        merged.append(column)
+        last_heading = heading
+    kinds = [c.kind for c in merged]
+    if len(set(kinds)) != len(kinds):
+        return None  # two columns of one kind: which is which would be a guess
+    if not ({"qty", "price"} <= set(kinds) and {"total", "gross"} & set(kinds) and _TEXT_COLUMNS & set(kinds)):
+        return None
+    return merged, char
+
+
+def _bounds(columns: list[_Column], char: float) -> list[float]:
+    """Where one column ends and the next begins, along the line.
+
+    Descriptions are written from the left and run long, numbers are aligned under (or right-aligned to) their
+    heading: the edge between a text column and a number column sits just before the number column's heading.
+    """
+    out = []
+    for left, right in itertools.pairwise(columns):
+        gap = max(0.0, right.x0 - left.x1)
+        if left.kind in _TEXT_COLUMNS and right.kind in _TEXT_COLUMNS:
+            out.append(right.x0 - char)
+        elif left.kind in _TEXT_COLUMNS:
+            out.append(right.x0 - min(0.5 * gap, 3 * char))
+        elif right.kind in _TEXT_COLUMNS:
+            out.append(left.x1 + min(0.5 * gap, 3 * char))
+        else:
+            out.append((left.x1 + right.x0) / 2)
+    return out
+
+
+def _numeric(token: str, mark: str) -> bool:
+    """A number or a percentage as printed (not a unit word or a currency sign on its own)."""
+    cell = _cell(token, mark)
+    return cell is not None and cell.kind in ("num", "pct")
+
+
+def _amount(tokens: Sequence[str], mark: str) -> tuple[Decimal, int] | None:
+    """One number from the tokens of one cell: "1 036,80" read as two runs is one amount; currency aside."""
+    parts = [t.strip("€$£") for t in tokens if fold(t) not in _CURRENCY_TOKENS]
+    parts = [t for t in parts if t]
+    return parse_number("".join(parts), mark) if parts else None
+
+
+@dataclass
+class _TableRow:
+    top: int
+    bottom: int
+    cells: dict[str, list[str]]
+
+
+def _place_row(row: Any, columns: list[_Column], bounds: list[float], mark: str) -> _TableRow:
+    """Each token of ``row`` under its column; description that runs on past its column's edge stays text."""
+    placed: list[tuple[_Token, int]] = []
+    for word in row.words:
+        for token in _tokens(word):
+            placed.append((token, bisect.bisect_right(bounds, token.centre)))
+    placed.sort(key=lambda p: p[0].x0)
+    text_at = max((i for i, c in enumerate(columns) if c.kind in _TEXT_COLUMNS), default=None)
+    if text_at is not None:  # plain words in a number column, before anything a cell holds: the description ran on
+        for k, (token, at) in enumerate(placed):
+            if columns[at].kind in _TEXT_COLUMNS:
+                continue
+            if _cell(token.text, mark) is not None or token.text in ("-", "—", "–"):
+                break  # a number, a percentage, a unit or a currency sign
+            placed[k] = (token, text_at)
+    cells: dict[str, list[str]] = {}
+    for token, at in placed:
+        cells.setdefault(columns[at].kind, []).append(token.text)
+    return _TableRow(row.top, row.bottom, cells)
+
+
+class _Refused(Exception):
+    """A row of a table whose own numbers do not hold: the whole table is refused (never guessed)."""
+
+
+def _priced_line(cells: Mapping[str, list[str]], mark: str, total_kind: str) -> PriceLine:
+    """One line from its cells, when quantity × unit price (less any discount) is its total; else _Refused."""
+    qty_cells = [c for c in (_cell(t, mark) for t in cells.get("qty", ())) if c is not None and c.kind != "skip"]
+    numbers = [c for c in qty_cells if c.kind == "num"]
+    units = [c.unit for c in qty_cells if c.kind == "unit"] + [c.unit for c in numbers if c.unit]
+    if not numbers or any(c.kind == "pct" for c in qty_cells):
+        raise _Refused("quantity")
+    quantity = (_amount([c.raw for c in numbers], mark) or (None, 0))[0] if len(numbers) > 1 else numbers[0].value
+    printed_unit = " ".join(cells.get("unit", ())).strip()
+    if printed_unit:
+        units.append(_UNITS.get(fold(printed_unit).rstrip(".")))
+        if units[-1] is None:
+            raise _Refused("unit")
+    if len(set(units)) > 1:
+        raise _Refused("unit")
+    price = _amount(cells.get("price", ()), mark)
+    total = _amount(cells.get(total_kind, ()), mark)
+    if quantity is None or price is None or total is None or quantity <= 0 or price[0] <= 0 or total[0] <= 0:
+        raise _Refused("numbers")
+    rate: Decimal | None = None
+    vat = [t for t in cells.get("vat", ()) if t not in ("%",)]
+    if vat:
+        found = parse_number("".join(vat).rstrip("%").strip(), mark)
+        if found is None or not _ZERO <= found[0] <= 30:
+            raise _Refused("vat")
+        rate = found[0].normalize()
+    gross = quantity * price[0]
+    readings = []
+    discount_text = "".join(t for t in cells.get("disc", ()) if t not in ("-", "—", "–"))
+    if discount_text:
+        found = parse_number(discount_text.rstrip("%"), mark)
+        if found is None:
+            raise _Refused("discount")
+        readings.append(gross * (Decimal(100) - found[0]) / Decimal(100))
+        if not discount_text.endswith("%"):
+            readings.append(gross - found[0])
+    else:
+        readings.append(gross)
+    if not any(abs(net - total[0]) <= _tolerance(quantity, price[1]) for net in readings):
+        raise _Refused("arithmetic")
+    description = " ".join(cells.get("desc", ())).strip(" -:;|")
+    code = " ".join(cells.get("code", ())).strip() or None
+    if sum(ch.isalpha() for ch in description) < 2:
+        if code is None:
+            raise _Refused("description")
+        description = code
+    return PriceLine(description=description, quantity=quantity, unit=units[0] if units else None,
+                     unit_price=total[0] / quantity, net=total[0], vat_rate=rate,
+                     code=code.upper() if code else None)
+
+
+def read_table_lines(rows: Sequence[Any], mark: str = ",") -> tuple[PriceLine, ...] | None:
+    """The lines of the priced table on a photographed or scanned page, read from where each word sits.
+
+    ``rows`` are the page's printed lines with their located words (``ReadOutcome.word_rows``). A table is a
+    heading row naming at least a description (or code), a quantity, a unit price and a line total; every
+    word below it is placed under its heading's column, numbers are read in the document's own format
+    (``mark``), and every row must hold on its own: quantity × unit price, less a printed discount, is its line
+    total to the rounding of the price. A description on two lines is one line. The table ends at its totals.
+
+    None when there is no such table (the text is read instead); an empty tuple when there is one but a row
+    does not hold: then the table is refused whole, never guessed. Whether the lines add up to the invoice's
+    net or gross at each VAT rate is checked by :func:`check_lines`.
+    """
+    found_table = False
+    lines: list[PriceLine] = []
+    by_page: dict[int, list[Any]] = {}
+    for row in rows:
+        by_page.setdefault(row.page, []).append(row)
+    for page_rows in by_page.values():
+        head_at = None
+        for i, row in enumerate(page_rows):
+            head = _table_columns(row)
+            if head is not None:
+                head_at, (columns, char) = i, head
+                break
+        if head_at is None:
+            continue
+        bounds = _bounds(columns, char)
+        kinds = {c.kind for c in columns}
+        total_kind = "total" if "total" in kinds else "gross"
+        body: list[PriceLine] = []
+        previous: _TableRow | None = None
+        heights: list[int] = []
+        for row in page_rows[head_at + 1:]:
+            placed = _place_row(row, columns, bounds, mark)
+            height = statistics.median(heights) if heights else row.height
+            if previous is not None and row.top - previous.bottom > 2.5 * height:
+                break  # a gap: the table is over
+            priced = [k for k in _PRICED_COLUMNS
+                      if any(_numeric(t, mark) for t in placed.cells.get(k if k != "total" else total_kind, ()))]
+            if len(priced) < len(_PRICED_COLUMNS) and _TABLE_END.match(fold(row.text)):
+                break  # its totals ("Base tributável (23%): ...", "Portes: ..."), not a line
+            text_only = not priced and not any(k not in _TEXT_COLUMNS for k in placed.cells)
+            if text_only:
+                if body and previous is not None and row.top - previous.bottom <= 1.2 * height:
+                    words = " ".join(placed.cells.get("desc", []) + placed.cells.get("code", []))
+                    last = body[-1]
+                    body[-1] = replace(last, description=f"{last.description} {words}".strip())
+                    previous = placed
+                    continue
+                if body:
+                    break
+                continue  # a second heading line or a section title before the first line
+            if len(priced) < len(_PRICED_COLUMNS):
+                if body:
+                    return ()  # a row with some of its numbers: a misread or a charge we cannot read
+                continue
+            try:
+                body.append(_priced_line(placed.cells, mark, total_kind))
+            except _Refused:
+                return ()
+            heights.append(row.height)
+            previous = placed
+        if body:
+            found_table = True
+            lines += body
+    return tuple(lines) if found_table else None
+
+
 # ---------------------------------------------------------------------------------------------------- totals
 
 
@@ -779,6 +1081,20 @@ class LinePrices:
                 return xml
         return None
 
+    def _page_table(self, record: Any, mark: str) -> tuple[PriceLine, ...] | None:
+        """The table lines of the record's photographed or scanned pages (:func:`read_table_lines`), file by file;
+        None when no page shows a priced table, empty when one of them does not hold."""
+        found: list[PriceLine] | None = None
+        for evidence_id in record.evidence_ids:
+            rows = getattr(self.o.repo.reads.get(evidence_id), "word_rows", ()) or ()
+            table = read_table_lines(rows, mark) if rows else None
+            if table is None:
+                continue
+            if not table:
+                return ()
+            found = [*(found or []), *table]
+        return tuple(found) if found is not None else None
+
     def _read(self, record: Any) -> InvoiceLines | None:
         doc = record.document
         if record.sales or doc.doc_type not in _PRICED or doc.gross_amount is None or doc.gross_amount <= 0:
@@ -795,6 +1111,15 @@ class LinePrices:
                 checked = check_lines(lines, parts or self.o.cost_centers.vat_parts(record, None))
                 return InvoiceLines(checked[0], "e-invoice", checked[1]) if checked else None
         text = record.text or ""
+        table = self._page_table(record, _decimal_mark(text))
+        if table is not None:
+            # A photographed or scanned table, read by its columns: used only when every row holds and the lines
+            # add up to the invoice's own totals; otherwise the invoice has no lines (never guessed).
+            for parts in (self.o.cost_centers.vat_parts(record, None), rate_parts_from_text(text, gross)):
+                checked = check_lines(table, parts) if table else None
+                if checked:
+                    return InvoiceLines(checked[0], "table", checked[1])
+            return None
         lines = read_text_lines(text)
         if not lines:
             return None

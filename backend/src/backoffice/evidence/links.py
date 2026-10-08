@@ -314,22 +314,42 @@ class BrowserSession(Protocol):
 
 @dataclass(frozen=True)
 class PlaywrightConfig:
+    """Picklable settings of one render (the worker process rebuilds everything from these).
+
+    ``resolver`` is the DNS the request guard checks addresses with (None: the
+    system's); ``proxy`` sends every request the browser makes through an
+    egress proxy (``http://host:port``), e.g. one that refuses private ranges
+    as a second line of defence.
+    """
+
     safety: UrlSafetyConfig = field(default_factory=UrlSafetyConfig)
     headless: bool = True
     locale: str = "pt-PT"
     user_agent: str | None = None
     max_download_bytes: int = 25 * 1024 * 1024
     screenshot: bool = True
+    resolver: Resolver | None = None
+    proxy: str | None = None
 
 
 class PlaywrightBrowserSession:
-    """Chromium via Playwright, in a fresh context per render (§44 isolated workers).
+    """Chromium via Playwright: one fresh browser and context per link (§9 step 4, §44 isolated workers).
 
-    With ``isolate_process`` (default) each render runs in a separate spawned
-    process that is killed on timeout, so a hostile page cannot outlive its
-    job. Every request the page makes is checked by :class:`UrlSafety`.
-    DNS inside Chromium is not pinned; run workers in a network namespace
-    without access to private ranges as the second line of defence.
+    Every render launches its own Chromium with a new, empty context, closed
+    when the render ends: no cookie, local or session storage, cache, service
+    worker or download is ever shared between two links, nor between two
+    businesses. With ``isolate_process`` (default) each render also runs in a
+    separate spawned process that is killed on timeout, so a hostile page
+    cannot outlive its job.
+
+    The link itself and every request the page makes are checked by
+    :class:`UrlSafety` (http(s) only, no private, loopback, link-local or
+    metadata address after DNS); WebSockets, which bypass request routing,
+    are refused, and so are service workers. ``file:`` and other local URLs
+    are never opened. Downloads are captured (up to ``max_download_bytes``)
+    and handed back as evidence. DNS inside Chromium is not pinned to the
+    checked address; run workers without a route to private ranges (or
+    through ``PlaywrightConfig.proxy``) as the second line of defence.
     """
 
     def __init__(
@@ -358,18 +378,28 @@ def _render_with_playwright(url: str, config: PlaywrightConfig, timeout_s: float
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
         raise BrowserUnavailable("playwright is not installed") from exc
-    safety = UrlSafety(config.safety)
+    safety = UrlSafety(config.safety, resolver=config.resolver)
+    check = safety.check(url)
+    if not check.safe:  # file:, a private address, ...: never opened, not even by the browser
+        raise BrowserError(f"unsafe url: {check.reason.value if check.reason else 'unsafe'}")
+    launch: dict[str, Any] = {"headless": config.headless, "args": ["--disable-dev-shm-usage"]}
+    if config.proxy:
+        launch["proxy"] = {"server": config.proxy}
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=config.headless, args=["--disable-dev-shm-usage"])
+        browser = pw.chromium.launch(**launch)
         try:
+            # A new browser and an empty context for every link: nothing carries over (class docstring).
             context = browser.new_context(
                 accept_downloads=True, locale=config.locale, user_agent=config.user_agent,
                 service_workers="block",
             )
+            context.set_default_timeout(timeout_s * 1000)
             context.route("**/*", lambda route: _guard_route(route, safety))
+            context.route_web_socket(re.compile(r".*"), lambda socket: socket.close())  # never connected
             page = context.new_page()
             downloads: list[Any] = []
-            page.on("download", downloads.append)
+            # A function of our own: Playwright tags handlers, which a bound builtin cannot carry.
+            page.on("download", lambda download: downloads.append(download))
             status = None
             try:
                 response = page.goto(url, wait_until="networkidle", timeout=timeout_s * 1000)

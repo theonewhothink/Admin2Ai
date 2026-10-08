@@ -41,6 +41,7 @@ from ..base import (
     OCRPage,
     OCRResponseError,
     OCRResult,
+    OCRWord,
     PageImage,
     as_pages,
     ensure_supported,
@@ -201,7 +202,9 @@ def _page(result: Any, number: int, width: int, height: int) -> OCRPage:
     shapes = [geometry(list(b.polygon)) for b in found]
     layout = infer_layout([s[0] for s in shapes], [s[1] for s in shapes], width=width)
     lines = tuple(
-        OCRLine(text=row.text, bbox=to_bbox(row.box, number), confidence=row.confidence, angle=row.angle)
+        OCRLine(text=row.text, bbox=to_bbox(row.box, number), confidence=row.confidence, angle=row.angle,
+                words=tuple(OCRWord(text=m.text, bbox=to_bbox(m.box, number), confidence=m.confidence)
+                            for m in row.members))  # each box the engine found: a table's cells (§13)
         for row in join_rows(found)
     )
     return OCRPage(number=number, width=width, height=height, lines=lines, layout=layout)

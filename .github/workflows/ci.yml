@@ -32,12 +32,21 @@ jobs:
       - name: Install
         run: pip install -e "./backend[dev,ocr-local,qr]"
 
+      # A real Chromium for the isolated link browser (the "browser" extra): each invoice
+      # link in a fresh browser, no shared cookies or storage, no private addresses
+      # (tests/test_ingest_links_browser.py).
+      - name: Install Chromium for the link browser
+        run: |
+          pip install "playwright==1.56.0"
+          python -m playwright install --with-deps chromium
+
       # The runner image ships PostgreSQL server binaries: the database tests
       # start a throwaway cluster (pgvector-only tests skip; the sql job runs them).
       - name: Test
         working-directory: backend
         env:
           BACKOFFICE_REQUIRE_LOCAL_OCR: "1" # the photographed-receipt tests must run, never skip
+          BACKOFFICE_REQUIRE_BROWSER: "1" # the real-browser tests must run, never skip
         run: python -m pytest -q
 
   web:

@@ -147,6 +147,14 @@ def test_ci_uses_the_requested_runtimes() -> None:
     assert 'pip install -e "./backend[dev,ocr-local,qr]"' in backend  # the real OCR model runs in CI
 
 
+def test_ci_runs_the_isolated_browser_tests_with_a_real_chromium() -> None:
+    steps = yaml.safe_load(CI.read_text())["jobs"]["backend"]["steps"]
+    script = "\n".join(step.get("run", "") for step in steps)
+    assert "playwright install --with-deps chromium" in script  # tests/test_ingest_links_browser.py
+    [test] = [step for step in steps if step.get("name") == "Test"]
+    assert test["env"]["BACKOFFICE_REQUIRE_BROWSER"] == "1"  # a skipped real-browser test fails the build
+
+
 # --------------------------------------------------------------------------- Terraform
 
 

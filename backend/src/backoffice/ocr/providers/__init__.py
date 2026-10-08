@@ -33,7 +33,13 @@ from .fake import FakeOCRProvider
 from .paddle_vl import PaddleOCRVLConfig, PaddleOCRVLProvider
 from .ppocr import InProcessPaddleOCR, PPOCRConfig, PPOCRv6Provider, PPOCRVariant
 from .rapid import LocalOCRConfig, LocalOCRProvider, local_ocr_available
-from .unlimited import DEFAULT_TRANSCRIBE_PROMPT, Rasterizer, UnlimitedOCRConfig, UnlimitedOCRProvider
+from .unlimited import (
+    DEFAULT_TRANSCRIBE_PROMPT,
+    PdfPageRasterizer,
+    Rasterizer,
+    UnlimitedOCRConfig,
+    UnlimitedOCRProvider,
+)
 
 __all__ = [
     "CLAUDE_VISION",
@@ -54,6 +60,7 @@ __all__ = [
     "PPOCRv6Provider",
     "PaddleOCRVLConfig",
     "PaddleOCRVLProvider",
+    "PdfPageRasterizer",
     "Rasterizer",
     "RedactedInput",
     "Redactor",
