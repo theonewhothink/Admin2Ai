@@ -64,6 +64,7 @@ from .base import (
     record_webhook,
 )
 from .http import AuthorizedHttp, json_object, object_list, required_str, retry_after_seconds
+from .mail_search import MailQuery, gmail_query
 from .oauth import TokenProvider
 
 __all__ = ["GMAIL_API", "GMAIL_READONLY_SCOPE", "GmailConfig", "GmailConnector", "GmailPush"]
@@ -303,6 +304,20 @@ class GmailConnector:
         item = self.fetch_raw(message_id)
         if item is not None and self._delivered_to_alias(item.raw):
             sink(item)
+
+    def search_messages(self, query: MailQuery) -> list[MailItem]:
+        """Messages matching ``query`` anywhere in the mailbox (every label, archived mail included), newest
+        first, each as ``format=raw`` (§22: current and historical email). Drafts and chats are never searched;
+        spam and trash only when the connection opted in. An alias connection searches only the alias's mail."""
+        params: dict[str, Any] = {"q": self._scoped(gmail_query(query)), "maxResults": query.limit,
+                                  "includeSpamTrash": str(self.config.include_spam_trash).lower()}
+        page = self._http.get_json(f"{self.base_url}/messages", params=params)
+        items: list[MailItem] = []
+        for message in object_list(page, "messages", "gmail")[: query.limit]:
+            item = self.fetch_raw(required_str(message, "id", "gmail"))
+            if item is not None and self._wanted(item.labels) and self._delivered_to_alias(item.raw):
+                items.append(item)
+        return items
 
     def thread_messages(self, thread_id: str) -> list[MailItem]:
         """Every message of one thread (``threads.get``), oldest first, each as ``format=raw``.

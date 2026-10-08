@@ -27,6 +27,9 @@ is never chased automatically: whose tax number to send would be a guess (§19).
 
 The per-source timeout covers the search *and* the verification of its
 results, so neither a hung connector nor a hung check can stall the plan.
+``timeout_seconds=None`` runs without one: searches whose results were already
+fetched (a recorded search, ``missing.searches.RecordedSearch``) never wait, and
+the plan then runs without an event loop (``missing.searches.run_recorded``).
 
 Callers decide beforehand that the transaction expects evidence at all
 (§21 expected-evidence engine). Searches, verification and authorization are
@@ -279,11 +282,11 @@ class MissingEvidenceAutopilot:
         *,
         authorize: Authorize,
         verifier: Verifier | None = None,
-        timeout_seconds: float = 30.0,
+        timeout_seconds: float | None = 30.0,
         clock: Callable[[], datetime] = utcnow,
         message_id_domain: str = "mail.backoffice.invalid",
     ) -> None:
-        if timeout_seconds <= 0:
+        if timeout_seconds is not None and timeout_seconds <= 0:
             raise ValueError("timeout must be positive")
         rank = {source: i for i, source in enumerate(SEARCH_ORDER)}
         indexed = list(enumerate(searches))
@@ -355,7 +358,10 @@ class MissingEvidenceAutopilot:
         for search in self._searches:
             started = self._clock()
             try:
-                graded = await asyncio.wait_for(self._look(search, query), timeout=self._timeout)
+                if self._timeout is None:
+                    graded = await self._look(search, query)
+                else:
+                    graded = await asyncio.wait_for(self._look(search, query), timeout=self._timeout)
             except TimeoutError:
                 state.incomplete = True
                 state.attempts.append(self._attempt(search.source, started, AttemptOutcome.TIMED_OUT))

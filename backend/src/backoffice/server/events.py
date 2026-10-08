@@ -63,7 +63,7 @@ READABLE_VERSIONS = frozenset({1, 2})  # formats this build reads (1: no "dv", m
 DIGEST_VERSION = 1  # the state digest new events record (see DIGESTS)
 GENESIS_PREFIX = "backoffice.events.v1:"  # part of the chain (and of migration 0007): never changes
 FILE_FIELDS = ("dataBase64", "data_base64")
-SECRET_FIELDS = ("password",)
+SECRET_FIELDS = ("password", "apiKey", "clientSecret")  # an IMAP app password, an accounting API key / secret
 REDACTED = "$redacted"
 OBJECT = "$object"
 

@@ -253,6 +253,14 @@ def bank_row(data: Mapping[str, Any]) -> Any:
                    currency=str(data.get("currency") or "EUR"), cardholder=data.get("cardholder") or None)
 
 
+def _read_keys(tenant_id: str, files: Sequence[tuple[Any, ...]]) -> set[str]:
+    """The SHA-256 of every PDF or photo inside these files (the readings an event needs to keep)."""
+    from .reads import readable_files, sha
+
+    return {sha(blob) for data, filename, mime in (f[:3] for f in files)
+            for _, blob, _ in readable_files(tenant_id, data, filename=filename, mime_type=mime)}
+
+
 def _error(exc: ServiceError) -> tuple[int, dict[str, Any]]:
     return exc.status, {"error": _SERVICE_CODES.get(exc.status, "error"), "message": exc.message}
 
@@ -814,9 +822,28 @@ class TenantManager:
             c = svc.repo.connectors.get(reconnect.group(1))
             options = dict(svc.sign_in.get(c.id) or {}) if c is not None else {}
             provider = options.get("provider")
-            if c is None or c.kind != "email" or provider not in ("google", "microsoft"):
+            if c is None or not ((c.kind in ("email", "files") and provider in ("google", "microsoft"))
+                                 or (c.kind == "accounting" and provider == "moloni")):
                 return None
             cid, address = c.id, c.account.strip().lower()
+        elif path == "/api/sources" and body.get("kind") == "files":
+            # Google Drive or OneDrive: the same sign-in as a mailbox, one more read-only scope (connectors.cloud_storage)
+            provider = body.get("provider") or "google"
+            address = body.get("address")
+            if provider not in ("google", "microsoft") or not isinstance(address, str) or not address.strip():
+                return None
+            address = address.strip().lower()
+            cid = rt.service._slug("files", f"{provider} {address}")
+            options = {"provider": provider, "purpose": "files"}
+        elif path == "/api/sources" and body.get("kind") == "accounting" and body.get("provider") == "moloni":
+            svc = rt.service
+            company = body.get("companyId") or (next(iter(svc.repo.companies)) if len(svc.repo.companies) == 1
+                                                else None)
+            if not isinstance(company, str) or company not in svc.repo.companies:
+                return None  # the request itself is refused when it applies
+            provider, address = "moloni", ""
+            cid = svc._slug("accounting", f"moloni {company}")
+            options = {"provider": provider, "purpose": "accounting"}
         elif path == "/api/sources" and body.get("kind") == "email":
             provider = body.get("provider") or "google"
             address = body.get("address")
@@ -964,6 +991,66 @@ class TenantManager:
         with self.open(tenant_id) as rt:
             return self.record(rt, "sync.failed", {"connectionId": connection_id, "state": dict(state),
                                                    "reconnect": bool(reconnect)}, "system:sync", self.live_env())
+
+    # ----------------------------------------------------------------- searches and synced files (server/search.py)
+
+    def record_search(self, tenant_id: str, run: Any) -> tuple[int, dict[str, Any]]:
+        """One round of searching for a missing document (missing.searches.SearchRun) as one event. Everything
+        external happened already: the places were searched live; here the files are read (OCR) and their links
+        opened before the event is recorded, files that are clearly about something else are left out, and the
+        event keeps the rest (bytes in the object store) with every attempt (§22)."""
+        from .search import triage
+
+        request = run.request
+        with self.open(tenant_id) as rt:
+            env = self.live_env()
+            files = list(run.files)
+            reads = pre_read(rt.service, self.reader, [(f.data, f.filename, f.content_type) for f in files])
+            kept, attempts = triage(rt.service.repo.tenant_id, request, files, run.attempts, reads)
+            refs = [self.put_file(tenant_id, f.data, env) for f in kept]
+            data: dict[str, Any] = {
+                "subjectId": request.subject_id, "round": request.round, "attempts": attempts,
+                "files": [{OBJECT: ref, "source": f.source.value, "place": f.place, "filename": f.filename,
+                           "contentType": f.content_type, "provenance": dict(f.provenance)}
+                          for ref, f in zip(refs, kept, strict=True)],
+                "env": self._facts()}
+            uploads = [(f.data, f.filename, f.content_type) for f in kept]
+            links, fetched = self._fetch_links(rt, links_in_files(tenant_id, uploads), env)  # §9: before the event
+            if links:
+                data["links"] = links
+            reads = {**reads, **pre_read(rt.service, self.reader, fetched)}
+            wanted = _read_keys(tenant_id, [*uploads, *fetched])
+            reads = {k: v for k, v in reads.items() if k in wanted}
+            if reads:
+                data["reads"] = reads
+            return self.record(rt, "search.recorded", data, "system:search", env)
+
+    def record_files(self, tenant_id: str, connection_id: str, downloads: Sequence[Any],
+                     state: Mapping[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        """New files in a watched folder (connectors.cloud_storage.CloudDownload) and, on the last batch, the folder
+        sync's new state, as one event; PDFs and photos read before it is recorded."""
+        return self._record_synced_files(tenant_id, "sync.files", connection_id, downloads, state)
+
+    def record_accounting(self, tenant_id: str, connection_id: str, files: Sequence[Any],
+                          state: Mapping[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        """The company's own documents read from its accounting software (connectors.accounting.AccountingFile) and,
+        on the last batch, that sync's new state, as one event; their PDFs read before it is recorded."""
+        return self._record_synced_files(tenant_id, "sync.accounting", connection_id, files, state)
+
+    def _record_synced_files(self, tenant_id: str, kind: str, connection_id: str, files: Sequence[Any],
+                             state: Mapping[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        with self.open(tenant_id) as rt:
+            env = self.live_env()
+            refs = [self.put_file(tenant_id, f.data, env) for f in files]
+            data: dict[str, Any] = {
+                "connectionId": connection_id, "state": dict(state) if state is not None else None,
+                "files": [{OBJECT: ref, "filename": f.filename, "contentType": f.content_type,
+                           "provenance": dict(f.provenance())} for ref, f in zip(refs, files, strict=True)],
+                "env": self._facts()}
+            reads = pre_read(rt.service, self.reader, [(f.data, f.filename, f.content_type) for f in files])
+            if reads:
+                data["reads"] = reads
+            return self.record(rt, kind, data, "system:sync", env)
 
     def chat(self, tenant_id: str, actor: str, body: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
         message = body.get("message")
@@ -1202,6 +1289,34 @@ def _sync_failed(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) ->
                                        reconnect=bool(d.get("reconnect")))
 
 
+def _recorded_files(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> list[dict[str, Any]]:
+    """The files an event recorded, back with their bytes (from the object store) and what it said about each."""
+    out = []
+    for f in event.data.get("files") or []:
+        if isinstance(f, Mapping) and isinstance(f.get(OBJECT), Mapping):
+            out.append({**{k: v for k, v in f.items() if k != OBJECT}, "data": m.get_file(rt.tenant_id, f[OBJECT], env)})
+    return out
+
+
+def _search_recorded(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
+    """A round of searching for a missing document, done before this event was recorded (server/search.py)."""
+    d = event.data
+    attempts = [a for a in d.get("attempts") or [] if isinstance(a, Mapping)]
+    return 200, rt.service.record_search(str(d.get("subjectId") or ""), int(d.get("round") or 0), attempts,
+                                         _recorded_files(m, rt, event, env))
+
+
+def _sync_files(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
+    d = event.data
+    return 200, rt.service.sync_files(str(d.get("connectionId")), _recorded_files(m, rt, event, env), d.get("state"))
+
+
+def _sync_accounting(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
+    d = event.data
+    return 200, rt.service.sync_accounting(str(d.get("connectionId")), _recorded_files(m, rt, event, env),
+                                           d.get("state"))
+
+
 def _links_fetched(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
     """Waiting links, opened before this event was recorded: read through the recording (never opened here)."""
     return 200, rt.service.follow_links([str(u) for u in event.data.get("urls") or []])
@@ -1250,6 +1365,9 @@ _HANDLERS: dict[str, Handler] = {
     "sync.bank": _sync_bank,
     "sync.failed": _sync_failed,
     "links.fetched": _links_fetched,
+    "search.recorded": _search_recorded,
+    "sync.files": _sync_files,
+    "sync.accounting": _sync_accounting,
     "tick": _tick,
     "outbox.send": _outbox_send,
     "void": _void,

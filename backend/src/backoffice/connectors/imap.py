@@ -41,6 +41,7 @@ from .base import (
     record_failure,
     record_success,
 )
+from .mail_search import MailQuery, imap_criteria
 
 __all__ = ["IMAPAuth", "IMAPClient", "IMAPConfig", "IMAPConnector", "encode_mailbox_name", "imap_date"]
 
@@ -236,6 +237,26 @@ class IMAPConnector:
         except ConnectorError as exc:
             return SyncOutcome(record_failure(state, at=now, error=exc), counted.count, error=exc)
         return SyncOutcome(record_backfill(state, gap), counted.count)
+
+    def search_messages(self, query: MailQuery) -> list[MailItem]:
+        """Messages matching ``query`` in each configured mailbox (``UID SEARCH``, read-only, ``BODY.PEEK``), the
+        newest first (§22: current and historical email). The window has day granularity, as IMAP's SEARCH."""
+        criteria = imap_criteria(query)
+        found: list[MailItem] = []
+        client = self._connect()
+        try:
+            for mailbox in self.config.mailboxes:
+                if self._open(client, mailbox) is None:
+                    continue
+                uids = sorted(self._search(client, *criteria), reverse=True)[: query.limit - len(found)]
+                if uids:
+                    self._fetch(client, mailbox, uids, found.append)
+                if len(found) >= query.limit:
+                    break
+        finally:
+            _logout(client)
+        return sorted(found, key=lambda m: m.received_at or datetime.min.replace(tzinfo=timezone.utc),
+                      reverse=True)[: query.limit]
 
     # ----------------------------------------------------------------- session
 

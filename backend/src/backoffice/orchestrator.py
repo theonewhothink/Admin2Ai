@@ -274,8 +274,10 @@ from backoffice.payroll import Payslip, person_name, read_payslip, salary_proof
 from backoffice.missing import (
     ChaseFacts,
     ChaseMessage,
+    ChaseThread,
     LinkChaseFacts,
     RecurringChaseFacts,
+    ReminderPolicy,
     StatementItem,
     activity_line,
     choose_language,
@@ -394,6 +396,7 @@ MESSAGE_ID_DOMAIN = "backoffice.example"  # right-hand side of the Message-IDs o
 # email is sent: switched off in the owner's settings meanwhile, what was written but not sent is held back.
 GATED_MESSAGES: Mapping[str, ActionKind] = {
     "supplier_request": ActionKind.SUPPLIER_INVOICE_REQUEST,
+    "supplier_reminder": ActionKind.SUPPLIER_INVOICE_REQUEST,
     "link_request": ActionKind.SUPPLIER_INVOICE_REQUEST,
     "expected_invoice_request": ActionKind.SUPPLIER_INVOICE_REQUEST,
     "statement_request": ActionKind.SUPPLIER_INVOICE_REQUEST,
@@ -524,13 +527,16 @@ class ConnectorState:
 
     id: str
     name: str
-    kind: str  # "email" | "bank" | "accountant"
+    kind: str  # "email" | "bank" | "accountant" | "files" (Drive, OneDrive) | "accounting" (TOConline, Moloni, ...)
     account: str
     company_ids: tuple[str, ...]
     healthy: bool
     covered_from: datetime | None
     covered_until: datetime | None
     last_synced_at: datetime | None
+    # A real connection that can be searched for a missing document (§22, backoffice.evidence_search): a signed-in
+    # mailbox, Google Drive or OneDrive, the accounting software. The demo's simulated connections cannot.
+    searchable: bool = False
 
 
 @dataclass(frozen=True)
@@ -1013,6 +1019,20 @@ class ChaseRecord:
     outbox_id: str = ""
     sent_at: datetime | None = None
     link_id: str | None = None  # asked because the invoice link in the supplier's email no longer works
+    # After it went out (backoffice.supplier_follow_up): its thread (only what a transport accepted), the reminders
+    # written in it, the supplier's replies (evidence ids) and the documents they gave, and where it stands:
+    # "asking" | "escalated" (the owner's one line) | "owner" (they will upload it) | "received" (closed on it).
+    thread: ChaseThread | None = None
+    reminders: list[ChaseMessage] = field(default_factory=list)
+    reminder_outbox_ids: list[str] = field(default_factory=list)
+    replies: list[str] = field(default_factory=list)
+    replied_at: datetime | None = None
+    offered: list[str] = field(default_factory=list)
+    status: str = "asking"
+    needs_id: str | None = None
+    escalated_at: datetime | None = None
+    received_at: datetime | None = None
+    rounds: int = 0  # times the owner said "ask again"
 
     @property
     def sent(self) -> bool:
@@ -1267,6 +1287,12 @@ class Repository:
         self.retentions: dict[str, RetentionRecord] = {}
         self.statements: dict[str, StatementRecord] = {}  # suppliers' account statements, by their document id
         self.chases: dict[str, ChaseRecord] = {}
+        # Reminders to a supplier asked for a missing invoice (backoffice.supplier_follow_up): their cadence, or
+        # None for none (the demo's frozen story, whose simulated supplier never answers).
+        self.chase_reminders: ReminderPolicy | None = ReminderPolicy()
+        # Searches for missing documents in the places the business connected, by payment (or usual invoice) id
+        # (backoffice.evidence_search): what was searched, when, and what it gave (§22).
+        self.evidence_searches: dict[str, Any] = {}
         # Emails the back office wrote itself, in the order written; each is "sent" only once a transport took it.
         self.outbox: dict[str, OutgoingMessage] = {}
         self.accountant_questions: dict[str, AccountantQuestion] = {}
@@ -1507,7 +1533,10 @@ class Repository:
         return sorted((m for m in found if m is not None), key=lambda m: (m.year, m.month), reverse=True)
 
     def connectors_for(self, company_id: str) -> list[ConnectorState]:
-        return [c for c in self.connectors.values() if c.kind in ("email", "bank") and company_id in c.company_ids]
+        """The connections a month needs fully synced to close (§47): mailboxes, banks and the accounting software
+        (a month never shows green while one of them stopped syncing)."""
+        return [c for c in self.connectors.values()
+                if c.kind in ("email", "bank", "accounting") and company_id in c.company_ids]
 
     # ----------------------------------------------------------------- accountants (§28, §51)
 
@@ -1662,9 +1691,10 @@ class DiscoveryAgent(_Agent):
     name = "discovery"
 
     def file(self, data: bytes, *, filename: str | None, content_type: str | None, source_kind: SourceKind,
-             at: datetime) -> ShareOutcome:
+             at: datetime, context: Mapping[str, Any] | None = None) -> ShareOutcome:
         outcome = self.repo.intake.ingest_file(
             self.repo.tenant_id, data, filename=filename, mime_type=content_type, source_kind=source_kind, at=at,
+            context=context,
         )
         self.log("register", evidence_ids=[r.evidence.id for r in outcome.registrations],
                  values={"route": outcome.route.value, "filename": filename or ""})
@@ -3936,19 +3966,27 @@ class MissingEvidenceAgent(_Agent):
         if rec.decision is not None and rec.decision.expectation is EvidenceExpectation.PAYROLL:
             return self.o.payroll.plan(rec, amount, who, when)
         chase = self.repo.chases.get(rec.id)
+        # Where it was searched for before anyone was asked (§22, backoffice.evidence_search), said first.
+        searched = self.o.search.searched_sentence(rec.id)
+
+        def after_search(line: str) -> str:
+            return f"{searched} {line}" if searched else line
+
         link = self.repo.broken_links.get(chase.link_id or "") if chase is not None else None
         if chase is not None and link is not None:  # the invoice link in its email no longer works
-            return link.asked_line if chase.sent else link.waiting_line
+            return after_search(link.asked_line if chase.sent else link.waiting_line)
         if chase is not None and chase.sent:
-            return (f"I asked {who} for the invoice for the {amount} payment on {when}. "
-                    "Suppliers usually reply within a few days.")
+            # What actually happened in its thread since: a reply, reminders, the owner's answer (supplier_follow_up).
+            return after_search(self.o.follow_up.plan(rec, chase) or (
+                f"I asked {who} for the invoice for the {amount} payment on {when}. "
+                "Suppliers usually reply within a few days."))
         written = self.repo.outbox.get(chase.outbox_id) if chase is not None else None
         if written is not None and self.o.held_back(written):
-            return (f"I wrote to {who} asking for the invoice for the {amount} payment on {when}, but asking "
-                    "suppliers for invoices is switched off, so I have not sent it.")
+            return after_search(f"I wrote to {who} asking for the invoice for the {amount} payment on {when}, but "
+                                "asking suppliers for invoices is switched off, so I have not sent it.")
         if chase is not None:
-            return (f"I wrote to {who} asking for the invoice for the {amount} payment on {when}. "
-                    "It is waiting to be sent.")
+            return after_search(f"I wrote to {who} asking for the invoice for the {amount} payment on {when}. "
+                                "It is waiting to be sent.")
         if rec.likely_document_ids:
             return f"I found a likely document for the {amount} payment to {who} on {when} and I'm confirming it."
         if rec.supporting_document_ids:
@@ -3956,6 +3994,15 @@ class MissingEvidenceAgent(_Agent):
             kind = _DOC_LABELS.get(doc.document.doc_type, "document").lower() if doc else "document"
             return (f"I have the {kind} for the {amount} payment to {who} on {when}. It is not an invoice, "
                     "so I'm still looking for the invoice.")
+        if rec.missing_since is not None:
+            what = "the invoice" if rec.decision is not None and rec.decision.provider.value == "supplier" \
+                else "the document"
+            pending = self.o.search.pending_sentence(rec.id, rec.company_id, f"{what} for the {amount} payment to "
+                                                                             f"{who} on {when}")
+            if pending is not None:  # searched first in every place the business connected; nobody asked before
+                return pending
+            if searched:
+                return f"{searched} I will match {what} as soon as it arrives."
         if rec.decision is not None and rec.decision.provider.value == "owner":
             return f"The {amount} payment to {who} on {when} is waiting for its receipt. I will match it when it arrives."
         if rec.decision is not None and rec.decision.rule == "grant":  # checklist X30
@@ -4034,6 +4081,8 @@ class MissingEvidenceAgent(_Agent):
             if any(b.status == "requested" and b.tx_id is None and b.supplier_id == supplier.id
                    and b.company_id == company.id for b in self.repo.broken_links.values()):
                 continue  # already asked for the invoice behind a link that no longer works: not twice
+            if self.o.search.waiting(rec.id, rec.company_id):
+                continue  # every place the business connected is searched first (§22): no request before
             if self._write_chase(rec, supplier, company, now) is not None:
                 written.append(rec.id)
         return written
@@ -4100,6 +4149,14 @@ class MissingEvidenceAgent(_Agent):
                 company = repo.companies.get(rec.tx.entity_id or "")
                 if company is None:
                     record.note = "I'm waiting to know which of your companies the payment is for before I ask."
+                    continue
+                if self.o.search.waiting(rec.id, rec.company_id):
+                    if rec.missing_since is None:  # its invoice is missing now: searched for at once (§22)
+                        rec.missing_since = now.astimezone(TZ).date()
+                        self.repo.closure_log.append(ClosureActivity(
+                            kind=ClosureKind.MISSING_DOCUMENT_DETECTED, at=now, entity_id=rec.company_id,
+                            subject_id=rec.id, period=Month.of(rec.tx.booked_on)))
+                    record.note = "I'm searching the places you connected for it before I ask."
                     continue
                 chase = self._write_chase(rec, supplier, company, now, link=record)
                 if chase is None:
@@ -4191,6 +4248,7 @@ class MissingEvidenceAgent(_Agent):
         """A transport accepted the request: now the supplier has been asked (§22, month summary)."""
         rec = self.repo.transactions[chase.tx_id]
         chase.sent_at = at
+        self.o.follow_up.started(chase, at)  # its thread: the supplier's reply and the reminders follow it
         if chase.link_id and chase.link_id in self.repo.broken_links:
             self.repo.broken_links[chase.link_id].sent_at = at
         self.repo.closure_log.append(ClosureActivity(
@@ -4354,6 +4412,8 @@ class MissingEvidenceAgent(_Agent):
             company = repo.companies.get(record.company_id)
             if supplier is None or not supplier.contact_email or company is None:
                 continue
+            if self.o.search.waiting(record.id, record.company_id):
+                continue  # searched for first, in every place the business connected (§22)
             decision = authorize(ActionKind.SUPPLIER_INVOICE_REQUEST, repo.policy, ActionContext(
                 tenant_id=repo.tenant_id, entity_id=company.id, subject_id=record.id))
             self.log("authorize_chase", subject_id=record.id,
@@ -4397,10 +4457,15 @@ class MissingEvidenceAgent(_Agent):
         if record.status == "not_coming":
             return f"You told me the {name} invoice for {month} is not coming."
         notice = self.current_notice(record)
+        searched = self.o.search.searched_sentence(record.id)  # §22: where it was searched for first
+        notice = f"{notice} {searched}" if searched else notice
         if record.sent:
             return f"{notice} I asked {name} for it."
         if record.message is not None:
             return f"{notice} I wrote to {name} asking for it. It is waiting to be sent."
+        pending = self.o.search.pending_sentence(record.id, record.company_id, "it")
+        if pending is not None:
+            return f"{notice} {pending}"
         return f"{notice} I will match it when it arrives."
 
 
@@ -7297,6 +7362,12 @@ class Orchestrator:
         from backoffice.line_prices import LinePrices  # prices on invoice lines, read from the documents (X20)
 
         self.line_prices = LinePrices(self)
+        # Searching every connected place before asking a supplier (§22), and the supplier's reply or silence after.
+        from backoffice.evidence_search import SearchAgent
+        from backoffice.supplier_follow_up import SupplierFollowUp
+
+        self.search = SearchAgent(self)
+        self.follow_up = SupplierFollowUp(self)
         self._activity_seq = 0
         # What sends the emails the back office writes itself (backoffice.mailer): the demo's simulated
         # outbox, or None. With None they wait in ``repo.outbox``; the production server sends each one
@@ -7412,6 +7483,8 @@ class Orchestrator:
                  response={"simulated": is_simulated(transport)})
         if message.kind == "supplier_request" and message.subject_id in self.repo.chases:
             self.missing.sent(self.repo.chases[message.subject_id], at)
+        elif message.kind in self.follow_up.MESSAGE_KINDS:
+            self.follow_up.sent_reminder(message, at)
         elif message.kind == "link_request" and message.subject_id in self.repo.broken_links:
             self.missing.sent_link_request(self.repo.broken_links[message.subject_id], at)
         elif message.kind == "expected_invoice_request" and message.subject_id in self.repo.expected_invoices:
@@ -7458,6 +7531,8 @@ class Orchestrator:
                 if (link := self.repo.broken_links.get(chase.link_id or "")) is not None:
                     text = link.waiting_line
                 evidence = [rec.evidence_id]
+            elif message.kind in self.follow_up.MESSAGE_KINDS:
+                text, evidence = self.follow_up.waiting_line(message)
             elif message.kind == "link_request" and (link := self.repo.broken_links.get(message.subject_id)):
                 text = link.waiting_line
                 evidence = [link.email_evidence_id] if link.email_evidence_id else []
@@ -7507,16 +7582,18 @@ class Orchestrator:
 
     def ingest_file(self, data: bytes, *, filename: str | None = None, content_type: str | None = None,
                     source_kind: SourceKind = SourceKind.UPLOAD, at: datetime | None = None,
-                    origin: str = "upload", run: bool = True) -> IngestReport:
+                    origin: str = "upload", run: bool = True,
+                    context: Mapping[str, Any] | None = None) -> IngestReport:
         """One file arrives. ``run=False``: read it but let the caller say more about it before the agents
-        run (an employee's receipt paid with their own money is an expense claim, never the company's)."""
+        run (an employee's receipt paid with their own money is an expense claim, never the company's).
+        ``context``: where it came from, kept with this arrival (§55: a file found in Drive, its id and path)."""
         at = self.repo.clock.advance_to(at) if at else self.repo.clock.now()
-        if (filename or "").lower().endswith(".csv") or (content_type or "").startswith("text/csv"):
+        if context is None and ((filename or "").lower().endswith(".csv") or (content_type or "").startswith("text/csv")):
             rows = _parse_bank_csv(data)
             if rows is not None:
                 return self.ingest_bank(rows, at=at)
         outcome = self.discovery.file(data, filename=filename, content_type=content_type,
-                                      source_kind=source_kind, at=at)
+                                      source_kind=source_kind, at=at, context=context)
         report = self._process_outcome(outcome, at=at, origin=origin)
         if run:
             self.run(at)
@@ -7879,6 +7956,8 @@ class Orchestrator:
             return
         # An employee answering my request for a card receipt (backoffice.staff): matched by its thread.
         reply = self.staff.reply_to(parsed, message_id, at)
+        # A supplier answering my request for a missing invoice (backoffice.supplier_follow_up), by its thread too.
+        supplier_reply = self.follow_up.reply_to(parsed, message_id, at) if reply is None else None
         first_document = len(report.document_ids)
         groups: list[list[_Part]] = []
         hint = f"{parsed.sender_domain or ''} {parsed.subject}"  # names the provider when the report does not
@@ -7925,6 +8004,8 @@ class Orchestrator:
             self._process_email(nested, at=at, origin=origin, report=report)
         if reply is not None:
             self.staff.replied(reply, report.document_ids[first_document:], at)
+        if supplier_reply is not None:
+            self.follow_up.replied(supplier_reply, report.document_ids[first_document:], at)
 
     def _email_facts(self, parsed: Any, message_id: str) -> _EmailFacts:
         """Who sent an email, its readable words (the HTML body turned into text when it has no plain one)."""
@@ -8122,8 +8203,9 @@ class Orchestrator:
         company = self.repo.item_company(item)
         who = display_name(document.supplier_name)
         kind = _DOC_LABELS.get(document.doc_type, "document").lower()
-        source = {"email": "your email", "scan": "your phone", "share": "something you shared"}.get(
-            origin, "your upload")
+        source = {"email": "your email", "scan": "your phone", "share": "something you shared",
+                  "files": "your cloud storage", "accounting": "your accounting software",
+                  "portal": "the supplier's website"}.get(origin, "your upload")
         number = f" {document.invoice_number}" if document.invoice_number else ""
         if record.supporting:
             self.activity(at, "collected", f"Collected the {who} {kind} from {source}. It is not an invoice, so I keep "
@@ -8807,6 +8889,7 @@ class Orchestrator:
             for m in matches:
                 self._reverify_with_bank(m)
             moved += self.staff.link_receipts()  # a receipt an employee sent for a payment on their card
+            moved += self.follow_up.link_replies()  # an invoice a supplier sent in reply to my request
             moved += self._match_customer_refunds()
             moved += self._settle_partial_refunds(now)
             proven = self.obligations.prove()
@@ -8827,6 +8910,8 @@ class Orchestrator:
         linked = self.missing.chase_broken_links(now)  # invoice links that no longer work: nothing without one
         report.chased = [*(r for b in linked if (r := self.repo.broken_links[b].tx_id)), *self.missing.chase_all(now)]
         self.missing.chase_expected(now)
+        self.follow_up.settle(now)  # a request whose payment closed on its document is done
+        self.follow_up.remind(now)  # no invoice yet: a reminder in the same thread, then the owner's one line
         self.staff.follow_up(now)  # receipts asked from cardholders, reminders, expense claims to approve
         self.payroll.request_missing(now)  # missing payslips, from whoever runs payroll (J3)
         self.accountant.answer_all(now)
@@ -9814,7 +9899,7 @@ class Orchestrator:
             # Checked before anything is recorded: a split that doesn't add up changes nothing.
             chosen = self._cost_center_choice(needs, option_id, split)
         elif needs.kind in ("statement", "recharge", "chargeback", *_STAGED_QUESTIONS, *self.staff.NEEDS_KINDS,
-                            *self.book_questions(), *self.captures.NEEDS_KINDS) and \
+                            *self.book_questions(), *self.captures.NEEDS_KINDS, *self.follow_up.NEEDS_KINDS) and \
                 option_id not in {o.id for o in needs.options}:
             raise ValueError("not one of the options")
         answer_ev = self._record_answer(needs, option_id, now, split=split if needs.kind == "cost_center" else None)
@@ -9845,6 +9930,8 @@ class Orchestrator:
             outcome = self.staged.answer(needs, option_id, answer_ev, now)
         elif needs.kind in self.staff.NEEDS_KINDS:
             outcome = self.staff.answer(needs, option_id, answer_ev, now)
+        elif needs.kind in self.follow_up.NEEDS_KINDS:
+            outcome = self.follow_up.answer(needs, option_id, answer_ev, now)
         elif needs.kind == "chargeback":
             outcome = self.chargebacks.answer(needs, option_id, answer_ev, now)
         elif needs.kind in self.book_questions():

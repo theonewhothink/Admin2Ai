@@ -54,7 +54,7 @@ def build_worker(config: ServerConfig, services: dict[str, Any] | None = None) -
     manager = build_manager(config, services)
     apps = services.get("oauth_apps")
     if apps is None:
-        apps = {p: a for p in ("google", "microsoft") if (a := app_from_env(p)) is not None}
+        apps = {p: a for p in ("google", "microsoft", "moloni") if (a := app_from_env(p)) is not None}
     return SyncWorker(manager, vault=services.get("vault"), aggregator_factory=services.get("aggregator"),
                       oauth_apps=apps, http_client=services.get("http_client"),
                       imap_factory=services.get("imap_factory"),
