@@ -103,7 +103,9 @@
 }
 
 .doneText {
-  font-size: 20px;
+  font-size: 18px;
+  line-height: 1.4;
+  text-align: center;
   font-weight: 600;
   letter-spacing: -0.02em;
 }
@@ -218,6 +220,44 @@
   background: var(--ink);
   color: var(--on-ink);
   box-shadow: none;
+}
+
+/* Split it between several (a cost shared by jobs, properties, vehicles) */
+.split {
+  display: grid;
+  gap: var(--s-2);
+  padding: var(--s-2);
+  border-radius: 12px;
+  background: var(--surface-muted);
+  animation: reveal var(--t-slow) var(--ease);
+}
+
+@media (min-width: 720px) {
+  .split {
+    max-width: 520px;
+  }
+}
+
+.splitHead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s-1);
+}
+
+.splitHead :global(.segmented) {
+  background: var(--surface);
+}
+
+.splitHead :global(.segmented [aria-pressed="true"]) {
+  background: var(--ink);
+  color: var(--on-ink);
+}
+
+.splitLabel {
+  font-size: 15px;
+  font-weight: 550;
+  overflow-wrap: anywhere;
 }
 
 /* Confirm area slides open once a choice is made */

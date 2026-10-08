@@ -37,6 +37,7 @@ import type {
   NeedsYouItem,
   Pipeline,
   SourcesData,
+  SplitPart,
 } from "./types";
 
 const TIMEOUT_MS = 4000;
@@ -336,7 +337,8 @@ async function engineWrite(path: string, body: unknown): Promise<AnswerResult> {
   try {
     const reply = await engineRequest("POST", path, body);
     const message = isRecord(reply.body) && typeof reply.body.message === "string" ? reply.body.message : undefined;
-    return { ok: reply.status === 200, message };
+    const learned = isRecord(reply.body) && typeof reply.body.learned === "string" ? reply.body.learned : undefined;
+    return { ok: reply.status === 200, message, ...(learned ? { learned } : {}) };
   } catch (err) {
     warn(path, err);
     return { ok: false };
@@ -352,21 +354,29 @@ async function toBase64(file: Blob): Promise<string> {
   return btoa(binary);
 }
 
+/** A file as the JSON upload routes take it (expense claims, a deadline's proof). */
+export async function filePayload(file: File): Promise<{ filename: string; contentType: string | null; dataBase64: string }> {
+  return { filename: file.name, contentType: file.type || null, dataBase64: await toBase64(file) };
+}
+
 /**
- * Record the owner's answer to a needs-you item.
+ * Record the owner's answer to a needs-you item. `split` is the "Split it between several" answer:
+ * an amount or a percentage per cost center, which must add up exactly (the engine says so plainly
+ * when they don't).
  * Phase 0: without a reachable backend the answer is accepted locally.
  */
-export async function answerNeedsYou(id: string, optionId: string, remember: boolean): Promise<AnswerResult> {
+export async function answerNeedsYou(id: string, optionId: string, remember: boolean, split?: SplitPart[]): Promise<AnswerResult> {
+  const answer = { option_id: optionId, remember, ...(split ? { split } : {}) };
   if (browserEngine) {
-    return engineWrite(`/api/needs-you/${encodeURIComponent(id)}/answer`, { option_id: optionId, remember });
+    return engineWrite(`/api/needs-you/${encodeURIComponent(id)}/answer`, answer);
   }
   if (production) {
-    const { ok, message } = await productionWrite(`/api/needs-you/${encodeURIComponent(id)}/answer`, {
+    const { ok, message, body } = await productionWrite(`/api/needs-you/${encodeURIComponent(id)}/answer`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ option_id: optionId, remember }),
+      body: JSON.stringify(answer),
     });
-    return { ok, message };
+    return { ok, message, ...(ok && typeof body.learned === "string" ? { learned: body.learned } : {}) };
   }
   if (!hasApi) {
     await pause(450);
@@ -377,7 +387,7 @@ export async function answerNeedsYou(id: string, optionId: string, remember: boo
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ option_id: optionId, remember }),
+      body: JSON.stringify(answer),
     },
     () => ({ ok: true }),
     () => ({ ok: true }),
@@ -581,6 +591,11 @@ export async function getAccountantFirm(): Promise<{ name: string; person: strin
 export function openEvidence(href: string): Promise<string | null> {
   if (!liveData) return Promise.resolve("Connect the backend to open the originals.");
   return download(href);
+}
+
+/** Open one original by its evidence id (a bank line, a document, an email). Null, or a plain error message. */
+export function openOriginal(evidenceId: string): Promise<string | null> {
+  return openEvidence(`/api/evidence/${encodeURIComponent(evidenceId)}/file`);
 }
 
 /** Teach a rule for one client (`path` is the client's `links.rules`). `label` is the rule in plain words. */

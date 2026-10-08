@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { CostCenters } from "@/components/companies/CostCenters";
 import { MonthView } from "@/components/companies/MonthView";
 import styles from "@/components/companies/companies.module.css";
 import { CompanyStatus } from "@/components/CompanyStatus";
@@ -52,14 +53,17 @@ export function CompanyView({
         </div>
       </nav>
 
-      {month ? (
-        <MonthView month={month} />
-      ) : (
-        <div className="card card-pad">
-          <p className="h3">Nothing to show for {formatMonth(monthKey)} yet.</p>
-          <p className="muted">I start a month as soon as its first transaction arrives.</p>
-        </div>
-      )}
+      <div className="stack-6">
+        {month ? (
+          <MonthView month={month} />
+        ) : (
+          <div className="card card-pad">
+            <p className="h3">Nothing to show for {formatMonth(monthKey)} yet.</p>
+            <p className="muted">I start a month as soon as its first transaction arrives.</p>
+          </div>
+        )}
+        <CostCenters companyId={company.id} />
+      </div>
     </div>
   );
 }

@@ -6,6 +6,7 @@ import { Headline, NeedsTile } from "@/components/home/HomeLive";
 import styles from "@/components/home/home.module.css";
 import { Icon } from "@/components/Icon";
 import { Dot, Progress } from "@/components/ui";
+import { liveData } from "@/lib/api";
 import type { HomeData } from "@/lib/types";
 import { staleConnections } from "@/lib/data";
 import { formatDayShort } from "@/lib/format";
@@ -97,7 +98,14 @@ export function HomeView({ home, needsIds, demoStale }: { home: HomeData; needsI
                 <h2 id="coming-up-h" className="h2">
                   Coming up
                 </h2>
-                {nextDue ? <span className="meta">Next on {formatDayShort(nextDue.due)}</span> : null}
+                {liveData ? (
+                  <Link href="/deadlines" className="link-quiet">
+                    All deadlines
+                    <Icon name="chevronRight" size={16} />
+                  </Link>
+                ) : nextDue ? (
+                  <span className="meta">Next on {formatDayShort(nextDue.due)}</span>
+                ) : null}
               </div>
               <ul className="card list">
                 {home.dueSoon.map((d) => {

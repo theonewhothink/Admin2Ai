@@ -5,7 +5,8 @@ import { Icon } from "@/components/Icon";
 import { Bullets, Disclosure } from "@/components/ui";
 import { answerNeedsYou } from "@/lib/api";
 import { formatDay, formatMoney } from "@/lib/format";
-import type { NeedsYouApprovalItem, NeedsYouChoiceItem, NeedsYouItem } from "@/lib/types";
+import type { NeedsYouApprovalItem, NeedsYouChoiceItem, NeedsYouItem, SplitPart } from "@/lib/types";
+import { SplitEditor, splitReady, type SplitDraft } from "./SplitEditor";
 import styles from "./needs.module.css";
 
 type Phase = "open" | "sending" | "done" | "leaving";
@@ -21,7 +22,7 @@ const LEAVE_MS = 240;
 function useResolution(onResolved: () => void, serverMessage = false) {
   const [phase, setPhase] = useState<Phase>("open");
   const [message, setMessage] = useState("");
-  const [failed, setFailed] = useState(false);
+  const [failed, setFailed] = useState<string | null>(null);
 
   useEffect(() => {
     if (phase === "done") {
@@ -34,15 +35,19 @@ function useResolution(onResolved: () => void, serverMessage = false) {
     }
   }, [phase, onResolved]);
 
-  const submit = async (id: string, optionId: string, remember: boolean, doneMessage: string) => {
-    setFailed(false);
+  const submit = async (id: string, optionId: string, remember: boolean, doneMessage: string, split?: SplitPart[]) => {
+    setFailed(null);
     setPhase("sending");
-    const res = await answerNeedsYou(id, optionId, remember);
+    const res = await answerNeedsYou(id, optionId, remember, split);
     if (res.ok) {
-      setMessage(serverMessage && res.message ? res.message : doneMessage);
+      const said = serverMessage && res.message ? res.message : doneMessage;
+      // The engine's own words say what really happened; "I will remember this." only when it learned a rule.
+      setMessage(serverMessage && res.message && res.learned ? `${said} I will remember this.` : said);
       setPhase("done");
     } else {
-      setFailed(true);
+      // The engine's plain reason when it gave one ("These amounts add up to €60.00, but the total is €64.10."),
+      // otherwise a calm retry line.
+      setFailed(res.message ?? "I couldn’t save that just now. Please try again in a moment.");
       setPhase("open");
     }
   };
@@ -114,12 +119,12 @@ function Header({ item, companyName, detail }: { item: NeedsYouItem; companyName
         <h2 id={`${item.id}-title`} className={styles.merchant}>
           {item.merchant}
         </h2>
-        <div className={`${styles.amount} num`}>{formatMoney(item.amount, item.currency)}</div>
+        {item.amount !== null && item.amount !== undefined ? (
+          <div className={`${styles.amount} num`}>{formatMoney(item.amount, item.currency)}</div>
+        ) : null}
       </div>
       <p className="meta">
-        {formatDay(item.date)}
-        {detail ? ` · ${detail}` : ""}
-        {companyName ? ` · ${companyName}` : ""}
+        {[item.date ? formatDay(item.date) : null, detail, companyName].filter(Boolean).join(" · ")}
       </p>
     </header>
   );
@@ -140,17 +145,20 @@ function ChoiceCard({ item, companyName, onResolved }: CardProps<NeedsYouChoiceI
   const [optionId, setOptionId] = useState<string | null>(null);
   const [subId, setSubId] = useState<string | null>(null);
   const [remember, setRemember] = useState(item.remember?.defaultChecked ?? true);
-  const { phase, message, failed, submit } = useResolution(onResolved);
+  const [draft, setDraft] = useState<SplitDraft>({ mode: "amount", values: {} });
+  const { phase, message, failed, submit } = useResolution(onResolved, true);
 
+  const splitting = Boolean(item.split) && optionId === item.split?.optionId;
   const option = item.options.find((o) => o.id === optionId) ?? null;
   const sub = option?.choices?.find((c) => c.id === subId) ?? null;
   const needsSub = Boolean(option?.choices?.length);
-  const ready = option !== null && (!needsSub || sub !== null);
-  const finalId = sub?.id ?? option?.id ?? "";
+  const ready = splitting ? splitReady(item.split!, draft) : option !== null && (!needsSub || sub !== null);
+  const finalId = splitting ? item.split!.optionId : (sub?.id ?? option?.id ?? "");
   const finalLabel = sub?.label ?? option?.label ?? "";
 
   const rememberText = (() => {
     if (!item.remember || !ready) return "";
+    if (splitting) return "Always split it like this";
     const override = item.remember.overrides?.[finalId];
     return override ?? item.remember.template.replace("{choice}", finalLabel);
   })();
@@ -158,7 +166,13 @@ function ChoiceCard({ item, companyName, onResolved }: CardProps<NeedsYouChoiceI
   const confirm = () => {
     if (!ready || phase !== "open") return;
     const keep = Boolean(item.remember) && remember;
-    void submit(item.id, finalId, keep, keep ? "Done. I will remember this." : "Done.");
+    const parts: SplitPart[] | undefined = splitting
+      ? item.split!.costCenters.map((c) => {
+          const value = (draft.values[c.id] ?? "").trim().replace(",", ".");
+          return draft.mode === "percent" ? { costCenterId: c.id, percent: value } : { costCenterId: c.id, amount: value };
+        })
+      : undefined;
+    void submit(item.id, finalId, keep, keep ? "Done. I will remember this." : "Done.", parts);
   };
 
   return (
@@ -185,7 +199,7 @@ function ChoiceCard({ item, companyName, onResolved }: CardProps<NeedsYouChoiceI
                 {o.label}
               </label>
               {o.choices && optionId === o.id ? (
-                <div className={styles.subChoices} role="radiogroup" aria-label="Which company?">
+                <div className={styles.subChoices} role="radiogroup" aria-label={o.label}>
                   {o.choices.map((c) => (
                     <button
                       key={c.id}
@@ -202,10 +216,32 @@ function ChoiceCard({ item, companyName, onResolved }: CardProps<NeedsYouChoiceI
               ) : null}
             </div>
           ))}
+          {item.split ? (
+            <div className={styles.optionWrap}>
+              <label className="choice">
+                <input
+                  type="radio"
+                  name={groupName}
+                  value={item.split.optionId}
+                  checked={splitting}
+                  onChange={() => {
+                    setOptionId(item.split!.optionId);
+                    setSubId(null);
+                  }}
+                />
+                <span className="radio-mark" aria-hidden="true" />
+                {item.split.label}
+              </label>
+            </div>
+          ) : null}
         </div>
       </fieldset>
 
-      <div className={styles.confirmArea} data-visible={ready}>
+      {splitting && item.split ? (
+        <SplitEditor split={item.split} currency={item.currency} draft={draft} onChange={setDraft} itemId={item.id} />
+      ) : null}
+
+      <div className={styles.confirmArea} data-visible={splitting || ready}>
         <div className={styles.confirmInner}>
           {item.remember && ready ? (
             <label className="checkbox">
@@ -221,7 +257,11 @@ function ChoiceCard({ item, companyName, onResolved }: CardProps<NeedsYouChoiceI
         </div>
       </div>
 
-      {failed ? <p className={styles.retry}>I couldn’t save that just now. Please try again in a moment.</p> : null}
+      {failed ? (
+        <p className={styles.retry} role="alert">
+          {failed}
+        </p>
+      ) : null}
 
       <WhyBlock why={item.why} />
     </Shell>
@@ -294,7 +334,11 @@ function ApprovalCard({ item, companyName, onResolved }: CardProps<NeedsYouAppro
         </div>
       )}
 
-      {failed ? <p className={styles.retry}>I couldn’t save that just now. Please try again in a moment.</p> : null}
+      {failed ? (
+        <p className={styles.retry} role="alert">
+          {failed}
+        </p>
+      ) : null}
 
       <WhyBlock why={item.why} />
     </Shell>

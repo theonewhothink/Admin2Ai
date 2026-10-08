@@ -1,0 +1,621 @@
+/* Shared by the detail pages (a job, a document, a payment) and the settings pages (people, plan, deadlines). */
+
+.back {
+  margin-bottom: var(--s-3);
+}
+
+.head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--s-2) var(--s-3);
+  margin-bottom: var(--s-4);
+}
+
+.headMain {
+  display: grid;
+  gap: var(--s-1);
+  min-width: 0;
+}
+
+.title {
+  font-size: clamp(28px, 5vw, 36px);
+  line-height: 1.1;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  overflow-wrap: anywhere;
+}
+
+.bigAmount {
+  font-size: clamp(28px, 5vw, 36px);
+  line-height: 1.1;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  white-space: nowrap;
+}
+
+.pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-1);
+}
+
+.stack {
+  display: grid;
+  gap: var(--s-6);
+}
+
+.section {
+  display: grid;
+  gap: var(--s-2);
+  min-width: 0;
+}
+
+.section > :global(.section-head) {
+  margin-bottom: 0;
+  flex-wrap: wrap;
+}
+
+/* Label / value pairs */
+.facts {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--s-2) var(--s-3);
+}
+
+@media (min-width: 720px) {
+  .facts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.fact {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.fact dt {
+  font-size: 14px;
+  color: var(--text-2);
+}
+
+.fact dd {
+  font-size: 16px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+/* Money tiles */
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--s-1);
+}
+
+@media (min-width: 720px) {
+  .tiles {
+    gap: var(--s-2);
+  }
+}
+
+.tile {
+  display: grid;
+  gap: 6px;
+  padding: var(--s-2);
+  min-width: 0;
+}
+
+@media (min-width: 720px) {
+  .tile {
+    padding: var(--s-3);
+  }
+}
+
+.tileLabel {
+  font-size: 14px;
+  color: var(--text-2);
+}
+
+.tileValue {
+  font-size: clamp(18px, 4vw, 26px);
+  line-height: 1.15;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  overflow-wrap: anywhere;
+}
+
+/* Rows inside a card list */
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-3);
+  min-height: 64px;
+}
+
+a.row {
+  transition: background-color var(--t-fast) var(--ease);
+}
+
+a.row:hover {
+  background: var(--surface-muted);
+}
+
+.rowBlock {
+  display: grid;
+  gap: var(--s-1);
+  padding: var(--s-2) var(--s-3);
+}
+
+.rowLine {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+}
+
+.rowIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: var(--surface-muted);
+  color: var(--text-2);
+  flex-shrink: 0;
+}
+
+.rowMain {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.rowTitle {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.rowAmount {
+  font-weight: 600;
+  white-space: nowrap;
+  text-align: right;
+}
+
+.rowSub {
+  display: block;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-2);
+}
+
+.chevron {
+  color: var(--text-3);
+  flex-shrink: 0;
+}
+
+.indent {
+  padding-left: 52px;
+}
+
+@media (max-width: 519px) {
+  .indent {
+    padding-left: 0;
+  }
+}
+
+/* Originals */
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-1);
+}
+
+.chipWrap {
+  display: inline-grid;
+  gap: 4px;
+  max-width: 100%;
+}
+
+.chipWrap :global(.chip) {
+  max-width: 100%;
+}
+
+.chipText {
+  overflow-wrap: anywhere;
+}
+
+.chipError {
+  font-size: 14px;
+}
+
+/* Open items */
+.openList {
+  display: grid;
+  gap: 14px;
+}
+
+.openList > li {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+}
+
+.openList > li > :first-child {
+  margin-top: 9px;
+}
+
+.openText {
+  display: grid;
+  gap: var(--s-1);
+  min-width: 0;
+  flex: 1;
+  font-size: 16px;
+  line-height: 1.55;
+}
+
+.plainList {
+  display: grid;
+  gap: 8px;
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+/* Chains: invoice -> payment -> credit note -> refund */
+.chain {
+  display: grid;
+  counter-reset: step;
+}
+
+.chainItem + .chainItem {
+  border-top: 1px solid var(--line);
+}
+
+.chainItem[aria-current="step"] {
+  background: var(--surface-muted);
+}
+
+.chainItem:first-child,
+.chainItem:first-child .chainRow {
+  border-top-left-radius: var(--r-card);
+  border-top-right-radius: var(--r-card);
+}
+
+.chainItem:last-child,
+.chainItem:last-child .chainRow {
+  border-bottom-left-radius: var(--r-card);
+  border-bottom-right-radius: var(--r-card);
+}
+
+.chainRow {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-3);
+  min-height: 60px;
+}
+
+a.chainRow:hover {
+  background: var(--surface-muted);
+}
+
+.chainMain {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+/* History */
+.timeline {
+  display: grid;
+  gap: var(--s-2);
+  padding: var(--s-3);
+}
+
+.timeline > li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: var(--s-2);
+}
+
+.timelineDot {
+  width: 10px;
+  height: 10px;
+  margin-top: 7px;
+  border-radius: 50%;
+  background: var(--text-3);
+}
+
+.timelineDot[data-stage="closed"],
+.timelineDot[data-stage="not_required"] {
+  background: var(--good-dot);
+}
+
+.timelineDot[data-stage="conflict"] {
+  background: var(--risk-dot);
+}
+
+.timelineDot[data-stage="needs_owner"] {
+  background: var(--attention-dot);
+}
+
+.timelineMain {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+@media (max-width: 519px) {
+  .timeline > li {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .timeline > li > :last-child {
+    grid-column: 2;
+  }
+}
+
+/* Forms and actions */
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-1);
+}
+
+@media (max-width: 519px) {
+  .actions > :global(.btn) {
+    flex: 1 1 100%;
+    white-space: normal;
+  }
+}
+
+.form {
+  display: grid;
+  gap: var(--s-2);
+}
+
+.fields {
+  display: grid;
+  gap: var(--s-2);
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr));
+}
+
+.field {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  min-width: 0;
+}
+
+.field :global(.label) {
+  margin-bottom: 0;
+}
+
+.hint {
+  font-size: 14px;
+  color: var(--text-2);
+}
+
+.resultEmpty {
+  display: none;
+}
+
+.resultOk {
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+.resultFail {
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--attention);
+}
+
+/* Switches (settings) */
+.switchRow {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-3);
+}
+
+.switchText {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.switchLabel {
+  font-weight: 600;
+}
+
+.switch {
+  position: relative;
+  flex-shrink: 0;
+  width: 48px;
+  height: 28px;
+  margin-top: 2px;
+  border-radius: var(--r-pill);
+  background: rgba(17, 19, 24, 0.16);
+  transition: background-color var(--t) var(--ease);
+}
+
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.2);
+  transition: transform var(--t) var(--ease);
+}
+
+.switch[aria-checked="true"] {
+  background: var(--ink);
+}
+
+.switch[aria-checked="true"]::after {
+  transform: translateX(20px);
+}
+
+.switch:disabled {
+  opacity: 0.5;
+}
+
+.switch:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.perCompany {
+  display: grid;
+  gap: var(--s-1);
+  padding: 0 var(--s-3) var(--s-2);
+}
+
+/* Settings links */
+.linkRow {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-3);
+  min-height: 64px;
+  transition: background-color var(--t-fast) var(--ease);
+}
+
+.linkRow:hover {
+  background: var(--surface-muted);
+}
+
+/* Plans */
+.plans {
+  display: grid;
+  gap: var(--s-2);
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 240px), 1fr));
+}
+
+.plan {
+  display: grid;
+  align-content: start;
+  gap: var(--s-1);
+  padding: var(--s-3);
+}
+
+.plan[data-current="true"] {
+  box-shadow: inset 0 0 0 1.5px var(--text);
+}
+
+.planName {
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+
+.planPrice {
+  font-size: 15px;
+  font-weight: 550;
+}
+
+.planAction {
+  margin-top: var(--s-1);
+}
+
+.usage {
+  display: grid;
+  gap: var(--s-2);
+}
+
+.usageRow {
+  display: grid;
+  gap: 6px;
+}
+
+.usageLine {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--s-2);
+  font-size: 15px;
+}
+
+/* Split editor (Needs you) */
+.splitRows {
+  display: grid;
+  gap: var(--s-1);
+}
+
+.splitRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 140px;
+  align-items: center;
+  gap: var(--s-2);
+}
+
+@media (max-width: 419px) {
+  .splitRow {
+    grid-template-columns: minmax(0, 1fr) 112px;
+  }
+}
+
+.splitInput {
+  position: relative;
+}
+
+.splitInput :global(.input) {
+  padding-right: 34px;
+  text-align: right;
+}
+
+.splitUnit {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-2);
+  font-size: 15px;
+  pointer-events: none;
+}
+
+.splitTotal {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--s-2);
+  padding-top: var(--s-1);
+  border-top: 1px solid var(--line);
+  font-size: 15px;
+}
+
+.months {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.statementNet {
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.whyBlock {
+  border-top: 1px solid var(--line);
+}
+
+/* A next step with its clock, wrapping beside the icon */
+.nextStep {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: var(--text-2);
+}
+
+.nextStep > svg {
+  flex-shrink: 0;
+  margin-top: 3px;
+}
