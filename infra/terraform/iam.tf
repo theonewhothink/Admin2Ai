@@ -1,13 +1,15 @@
 # Least privilege (§52): each workload gets only what its code calls.
-#   api     read/write originals (never delete), enqueue ingest, publish events,
-#           seal and open owners' sign-ins (vault key)
+#   api     read/write originals (never delete), seal and open owners' sign-ins
+#           (vault key)
 #   sync    read/write originals, the vault key (mailbox and bank sync); may
 #           assume the deletion role to finish an owner-confirmed account erasure
-#   worker  the same as api minus the vault, plus consume queues; may assume the deletion role
+#   worker  the same as api minus the vault; may assume the deletion role
 #   ocr     no AWS permissions at all (receives bytes over HTTP from the worker)
 #   evidence-deletion  delete object versions and bypass GOVERNANCE retention,
 #           assumable only by the worker (after hard approval, §25) and the sync
 #           worker (files of an account the owner erased, §52)
+# Background work queues live in PostgreSQL (server/jobs.py, migration 0016): no
+# role needs a queue service.
 # Execution roles (image pull, logs, injected secrets) live in the ECS module.
 
 data "aws_iam_policy_document" "ecs_tasks_trust" {
@@ -37,7 +39,7 @@ resource "aws_iam_role" "worker" {
   assume_role_policy = data.aws_iam_policy_document.ecs_tasks_trust.json
 }
 
-# Shared by api and worker: originals in, originals out, events published.
+# Shared by api and worker: originals in, originals out.
 data "aws_iam_policy_document" "app_common" {
   statement {
     sid       = "EvidenceReadWrite"
@@ -55,18 +57,6 @@ data "aws_iam_policy_document" "app_common" {
     sid       = "EvidenceKey"
     actions   = ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"]
     resources = [aws_kms_key.evidence.arn]
-  }
-
-  statement {
-    sid       = "PublishDomainEvents"
-    actions   = ["events:PutEvents"]
-    resources = [aws_cloudwatch_event_bus.main.arn]
-  }
-
-  statement {
-    sid       = "MessagingKey"
-    actions   = ["kms:Decrypt", "kms:GenerateDataKey"]
-    resources = [aws_kms_key.messaging.arn]
   }
 
   statement {
@@ -153,30 +143,7 @@ resource "aws_iam_role_policy" "vault_key" {
   policy   = data.aws_iam_policy_document.vault_key.json
 }
 
-data "aws_iam_policy_document" "api_queues" {
-  statement {
-    sid       = "EnqueueIngest"
-    actions   = ["sqs:SendMessage", "sqs:GetQueueAttributes", "sqs:GetQueueUrl"]
-    resources = [aws_sqs_queue.main["ingest"].arn]
-  }
-}
-
-resource "aws_iam_role_policy" "api_queues" {
-  name   = "queues"
-  role   = aws_iam_role.api.id
-  policy = data.aws_iam_policy_document.api_queues.json
-}
-
-data "aws_iam_policy_document" "worker_queues" {
-  statement {
-    sid = "ConsumeWorkQueues"
-    actions = [
-      "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility",
-      "sqs:GetQueueAttributes", "sqs:GetQueueUrl", "sqs:SendMessage",
-    ]
-    resources = [for q in aws_sqs_queue.main : q.arn]
-  }
-
+data "aws_iam_policy_document" "worker_deletion" {
   statement {
     sid       = "UseTheDeletionRoleAfterHardApproval"
     actions   = ["sts:AssumeRole"]
@@ -184,10 +151,10 @@ data "aws_iam_policy_document" "worker_queues" {
   }
 }
 
-resource "aws_iam_role_policy" "worker_queues" {
-  name   = "queues"
+resource "aws_iam_role_policy" "worker_deletion" {
+  name   = "evidence-deletion"
   role   = aws_iam_role.worker.id
-  policy = data.aws_iam_policy_document.worker_queues.json
+  policy = data.aws_iam_policy_document.worker_deletion.json
 }
 
 # --------------------------------------------------------------------------- evidence deletion

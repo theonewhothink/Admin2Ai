@@ -139,7 +139,7 @@ resource "aws_vpc_endpoint" "s3" {
 
 locals {
   interface_endpoints = var.enable_interface_endpoints ? toset([
-    "ecr.api", "ecr.dkr", "logs", "secretsmanager", "kms", "sqs", "events", "sts",
+    "ecr.api", "ecr.dkr", "logs", "secretsmanager", "kms", "sts",
   ]) : toset([])
 }
 

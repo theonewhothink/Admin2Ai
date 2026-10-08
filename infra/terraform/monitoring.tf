@@ -59,11 +59,6 @@ resource "aws_sns_topic_subscription" "alarm_email" {
 locals {
   alarm_actions = [aws_sns_topic.alarms.arn]
 
-  dead_letter_queues = merge(
-    { for k, q in aws_sqs_queue.dlq : k => q.name },
-    { events = aws_sqs_queue.events_dlq.name },
-  )
-
   running_services = {
     api    = module.api.service_name
     worker = module.worker.service_name
@@ -72,39 +67,36 @@ locals {
   }
 }
 
-# --------------------------------------------------------------------------- queues
+# --------------------------------------------------------------------------- background jobs
 
-# Any message in a dead-letter queue is work that did not happen.
-resource "aws_cloudwatch_metric_alarm" "dlq_not_empty" {
-  for_each            = local.dead_letter_queues
-  alarm_name          = "${local.name}-${each.key}-dlq-not-empty"
-  alarm_description   = "Messages are waiting in the ${each.key} dead-letter queue."
-  namespace           = "AWS/SQS"
-  metric_name         = "ApproximateNumberOfMessagesVisible"
-  dimensions          = { QueueName = each.value }
-  statistic           = "Maximum"
+# The durable work queue lives in PostgreSQL next to each business's event log
+# (backend/src/backoffice/server/jobs.py, migration 0016). A job that failed
+# every attempt is parked as a dead letter (listed on the team's dashboard) and
+# the sync worker logs one "job_dead_lettered" line for it: any is work that
+# did not happen.
+resource "aws_cloudwatch_log_metric_filter" "dead_letter_jobs" {
+  name           = "${local.name}-dead-letter-jobs"
+  log_group_name = module.sync.log_group_name
+  pattern        = "{ $.msg = \"job_dead_lettered\" }"
+
+  metric_transformation {
+    name          = "DeadLetterJobs"
+    namespace     = "${var.project}/${var.environment}"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "dead_letter_jobs" {
+  alarm_name          = "${local.name}-dead-letter-jobs"
+  alarm_description   = "A background job failed every attempt and is parked as a dead letter."
+  namespace           = "${var.project}/${var.environment}"
+  metric_name         = aws_cloudwatch_log_metric_filter.dead_letter_jobs.metric_transformation[0].name
+  statistic           = "Sum"
   period              = 300
   evaluation_periods  = 1
   comparison_operator = "GreaterThanThreshold"
   threshold           = 0
-  treat_missing_data  = "notBreaching"
-  alarm_actions       = local.alarm_actions
-  ok_actions          = local.alarm_actions
-}
-
-# Work queues falling behind (oldest message older than one hour).
-resource "aws_cloudwatch_metric_alarm" "queue_backlog" {
-  for_each            = aws_sqs_queue.main
-  alarm_name          = "${local.name}-${each.key}-queue-backlog"
-  alarm_description   = "The ${each.key} queue has had a message waiting for over an hour."
-  namespace           = "AWS/SQS"
-  metric_name         = "ApproximateAgeOfOldestMessage"
-  dimensions          = { QueueName = each.value.name }
-  statistic           = "Maximum"
-  period              = 300
-  evaluation_periods  = 2
-  comparison_operator = "GreaterThanThreshold"
-  threshold           = 3600
   treat_missing_data  = "notBreaching"
   alarm_actions       = local.alarm_actions
   ok_actions          = local.alarm_actions

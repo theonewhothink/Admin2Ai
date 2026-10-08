@@ -24,7 +24,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone, tzinfo
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
 from enum import Enum
 from fractions import Fraction
@@ -80,6 +80,7 @@ TAX_OBLIGATION_KINDS: frozenset[ObligationKind] = frozenset(
 )
 # Tracked subject: a recurring supplier invoice that is overdue (§23). Missing until it arrives.
 EXPECTED_INVOICE = "expected_invoice"
+_MICROSECOND = timedelta(microseconds=1)
 
 
 # --------------------------------------------------------------------------- inputs
@@ -142,6 +143,9 @@ class ItemState(str, Enum):
 class BlockerKind(str, Enum):
     NO_SOURCES = "no_sources"
     CONNECTOR = "connector"
+    # A connector catching up on days it missed (a known gap inside its window), or days its provider no longer
+    # serves: the month stays open, never green, until they are read (§47).
+    CATCHING_UP = "catching_up"
     NEEDS_OWNER = "needs_owner"
     CONFLICT = "conflict"
     OBLIGATION = "obligation"
@@ -355,7 +359,38 @@ def _connector_blockers(
         blocker = _connector_blocker(connector, month, start, end, now, tz)
         if blocker is not None:
             blockers.append(blocker)
+            continue
+        blocker = _gap_blocker(connector, start, end, now, tz)
+        if blocker is not None:
+            blockers.append(blocker)
     return blockers
+
+
+def _gap_blocker(c: ConnectorCoverage, start: datetime, end: datetime, now: datetime, tz: tzinfo) -> Blocker | None:
+    """Days inside the connector's window it has not read yet and that touch the month (``gaps`` on the
+    connector, optional: (start, end, reachable)). A mailbox catches up on them by itself; days a bank no longer
+    serves need a statement from the owner."""
+    gaps = [g for g in getattr(c, "gaps", ()) or () if g[0] < end and start < g[1]]
+    if not gaps:
+        return None
+    kind = getattr(c, "kind", "")
+    account = getattr(c, "account", "") or c.name
+    missing = [g for g in gaps if len(g) > 2 and not g[2]]
+    if missing:
+        first = min(g[0] for g in missing).astimezone(tz).date()
+        last = (max(g[1] for g in missing) - _MICROSECOND).astimezone(tz).date()
+        today = now.astimezone(tz).date()
+        when = (f"on {day_month(first, today)}" if first == last
+                else f"from {day_month(first, today)} to {day_month(last, today)}")
+        return Blocker(BlockerKind.CATCHING_UP,
+                       f"{c.name} no longer shares the payments {when} with me. Send me a bank statement for "
+                       "those days so I can close the month.",
+                       needs_owner=True, refs=(c.name,))
+    seconds = sum((g[1] - g[0]).total_seconds() for g in gaps)
+    days = max(1, int(seconds / 86400 + 0.5))  # whole days, as the owner counts them
+    what = "email" if kind == "email" else "payments" if kind == "bank" else "documents"
+    return Blocker(BlockerKind.CATCHING_UP, f"Catching up on {count_phrase(days, 'day')} of {what} from {account}.",
+                   refs=(c.name,))
 
 
 def _connector_blocker(

@@ -333,6 +333,14 @@ class GmailConnector:
         expires = _epoch_ms(payload["expiration"], "gmail_bad_expiration") if payload.get("expiration") else None
         return record_webhook(state, webhook_state=WebhookState.ACTIVE, expires_at=expires)
 
+    def mailbox_address(self) -> str:
+        """The watched mailbox's own address (``users.getProfile``): what Gmail's push notifications name."""
+        profile = self._http.get_json(f"{self.base_url}/profile")
+        address = str(profile.get("emailAddress") or "").strip().lower()
+        if not address:
+            raise ProviderError("gmail_profile_without_address")
+        return address
+
     def stop_watch(self, state: ConnectorState) -> ConnectorState:
         self._http.request("POST", f"{self.base_url}/stop")
         return record_webhook(state, webhook_state=WebhookState.NOT_USED)

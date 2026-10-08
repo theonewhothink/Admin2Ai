@@ -14,12 +14,13 @@ connection never carries one request's scope into the next.
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,7 @@ from .store import (
     Device,
     IndexOp,
     Invitation,
+    Job,
     SeqConflict,
     Session,
     StoredEvent,
@@ -35,6 +37,7 @@ from .store import (
     StoreUnavailable,
     Tenant,
     User,
+    WebhookRoute,
 )
 
 __all__ = ["PostgresCredentialStore", "PostgresStore", "db_package"]
@@ -555,6 +558,137 @@ class PostgresStore:
     def mark_objects_purged(self, tenant_id: str, at: datetime) -> None:
         with self._tx(tenant=tenant_id) as cur:
             cur.execute("UPDATE tenant_erasures SET objects_purged_at = %s WHERE tenant_id = %s", (at, tenant_id))
+
+    # ----------------------------------------------------------------- the durable work queue (0016)
+
+    _JOB_COLUMNS = ("id, tenant_id, kind, dedupe_key, payload, state, attempts, max_attempts, run_after, created_at, "
+                    "updated_at, last_error")
+
+    @staticmethod
+    def _job(row: Any) -> Job:
+        (jid, tenant, kind, key, payload, state, attempts, max_attempts, run_after, created, updated, error) = row
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        return Job(int(jid), str(tenant), str(kind), str(key), dict(payload or {}), str(state), int(attempts),
+                   int(max_attempts), run_after, created, updated, error)
+
+    @contextmanager
+    def _scheduler(self) -> Iterator[Any]:
+        """A transaction as backoffice_scheduler: the one role that works the queue across businesses."""
+        psycopg = _psycopg()
+        try:
+            with self._tx() as cur:
+                cur.execute(f"SET LOCAL ROLE {self._db.SCHEDULER_ROLE}")
+                yield cur
+        except psycopg.errors.InsufficientPrivilege:
+            raise StoreError(f"the database login is not a member of {self._db.SCHEDULER_ROLE}") from None
+
+    def enqueue_job(self, tenant_id: str, kind: str, key: str, payload: Mapping[str, Any], *, run_after: datetime,
+                    max_attempts: int = 5) -> bool:
+        with self._tx(tenant=tenant_id) as cur:
+            cur.execute("INSERT INTO jobs (tenant_id, kind, dedupe_key, payload, run_after, max_attempts, created_at, "
+                        "updated_at) VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s) "
+                        "ON CONFLICT (tenant_id, kind, dedupe_key) WHERE state = 'queued' DO NOTHING RETURNING id",
+                        (tenant_id, kind, key, json.dumps(dict(payload), sort_keys=True), run_after, max_attempts,
+                         run_after, run_after))
+            return cur.fetchone() is not None
+
+    def claim_jobs(self, now: datetime, *, limit: int, lease: timedelta) -> list[Job]:
+        with self._scheduler() as cur:
+            cur.execute("UPDATE jobs SET state = 'running', attempts = attempts + 1, locked_until = %s, "
+                        "updated_at = %s WHERE id IN (SELECT id FROM jobs "
+                        "WHERE (state = 'queued' AND run_after <= %s) OR (state = 'running' AND locked_until < %s) "
+                        f"ORDER BY run_after, id LIMIT %s FOR UPDATE SKIP LOCKED) RETURNING {self._JOB_COLUMNS}",
+                        (now + lease, now, now, now, max(0, int(limit))))
+            return sorted((self._job(r) for r in cur.fetchall()), key=lambda j: (j.run_after, j.id))
+
+    def finish_job(self, job_id: int, at: datetime) -> None:
+        with self._scheduler() as cur:
+            cur.execute("UPDATE jobs SET state = 'done', locked_until = NULL, updated_at = %s, finished_at = %s "
+                        "WHERE id = %s", (at, at, job_id))
+
+    def retry_job(self, job_id: int, at: datetime, *, run_after: datetime, error: str) -> None:
+        psycopg = _psycopg()
+        try:
+            with self._scheduler() as cur:
+                cur.execute("UPDATE jobs SET state = 'queued', run_after = %s, locked_until = NULL, last_error = %s, "
+                            "updated_at = %s WHERE id = %s", (run_after, error[:200], at, job_id))
+        except psycopg.errors.UniqueViolation:  # the same job was queued again meanwhile: that one does the work
+            with self._scheduler() as cur:
+                cur.execute("UPDATE jobs SET state = 'done', locked_until = NULL, last_error = %s, updated_at = %s, "
+                            "finished_at = %s WHERE id = %s", (error[:200], at, at, job_id))
+
+    def bury_job(self, job_id: int, at: datetime, *, error: str) -> None:
+        with self._scheduler() as cur:
+            cur.execute("UPDATE jobs SET state = 'dead', locked_until = NULL, last_error = %s, updated_at = %s, "
+                        "finished_at = %s WHERE id = %s", (error[:200], at, at, job_id))
+
+    def dead_jobs(self, limit: int = 100) -> list[Job]:
+        with self._scheduler() as cur:
+            cur.execute(f"SELECT {self._JOB_COLUMNS} FROM jobs WHERE state = 'dead' ORDER BY updated_at DESC, id DESC "
+                        "LIMIT %s", (max(0, int(limit)),))
+            return [self._job(r) for r in cur.fetchall()]
+
+    def prune_jobs(self, before: datetime) -> int:
+        with self._scheduler() as cur:
+            cur.execute("DELETE FROM jobs WHERE state = 'done' AND updated_at < %s", (before,))
+            return int(cur.rowcount or 0)
+
+    # ----------------------------------------------------------------- push notifications (0016)
+
+    _ROUTE_COLUMNS = ("provider, route_key, tenant_id, connection_id, secret_hash, expires_at, last_notified_at, "
+                      "created_at")
+
+    @staticmethod
+    def _route(row: Any) -> WebhookRoute:
+        provider, key, tenant, connection, secret, expires, notified, created = row
+        return WebhookRoute(str(provider), str(key), str(tenant), str(connection), str(secret or ""), expires,
+                            notified, created)
+
+    def save_webhook_route(self, route: WebhookRoute) -> None:
+        at = route.created_at or datetime.now().astimezone()
+        with self._tx(tenant=route.tenant_id) as cur:
+            cur.execute("DELETE FROM webhook_routes WHERE tenant_id = %s AND connection_id = %s AND provider = %s "
+                        "AND route_key <> %s", (route.tenant_id, route.connection_id, route.provider, route.key))
+            cur.execute(f"INSERT INTO webhook_routes ({self._ROUTE_COLUMNS}, updated_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                        "ON CONFLICT (provider, route_key, tenant_id, connection_id) DO UPDATE SET "
+                        "secret_hash = EXCLUDED.secret_hash, expires_at = EXCLUDED.expires_at, "
+                        "updated_at = EXCLUDED.updated_at",
+                        (route.provider, route.key, route.tenant_id, route.connection_id, route.secret_hash or None,
+                         route.expires_at, route.last_notified_at, at, at))
+
+    def webhook_routes(self, provider: str, key: str) -> list[WebhookRoute]:
+        with self._tx(settings={self._db.WEBHOOK_ROUTE_SETTING: f"{provider}:{key}"}) as cur:
+            cur.execute(f"SELECT {self._ROUTE_COLUMNS} FROM webhook_routes WHERE provider = %s AND route_key = %s "
+                        "ORDER BY tenant_id, connection_id", (provider, key))
+            return [self._route(r) for r in cur.fetchall()]
+
+    def connection_webhook(self, tenant_id: str, connection_id: str) -> WebhookRoute | None:
+        with self._tx(tenant=tenant_id) as cur:
+            cur.execute(f"SELECT {self._ROUTE_COLUMNS} FROM webhook_routes WHERE tenant_id = %s AND connection_id = %s "
+                        "ORDER BY updated_at DESC LIMIT 1", (tenant_id, connection_id))
+            row = cur.fetchone()
+            return self._route(row) if row else None
+
+    def accept_notification(self, route: WebhookRoute, notification_id: str, at: datetime, expires_at: datetime, *,
+                            kind: str, key: str, payload: Mapping[str, Any]) -> bool:
+        """Receipt, the route's last notification time and the job, in one transaction (a duplicate: nothing)."""
+        with self._tx(tenant=route.tenant_id) as cur:
+            cur.execute("DELETE FROM webhook_receipts WHERE tenant_id = %s AND expires_at < %s", (route.tenant_id, at))
+            cur.execute("INSERT INTO webhook_receipts (tenant_id, provider, notification_id, received_at, expires_at) "
+                        "VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING RETURNING 1",
+                        (route.tenant_id, route.provider, notification_id, at, expires_at))
+            if cur.fetchone() is None:
+                return False
+            cur.execute("UPDATE webhook_routes SET last_notified_at = greatest(coalesce(last_notified_at, %s), %s) "
+                        "WHERE provider = %s AND route_key = %s AND tenant_id = %s AND connection_id = %s",
+                        (at, at, route.provider, route.key, route.tenant_id, route.connection_id))
+            cur.execute("INSERT INTO jobs (tenant_id, kind, dedupe_key, payload, run_after, max_attempts, created_at, "
+                        "updated_at) VALUES (%s, %s, %s, %s::jsonb, %s, 5, %s, %s) "
+                        "ON CONFLICT (tenant_id, kind, dedupe_key) WHERE state = 'queued' DO NOTHING",
+                        (route.tenant_id, kind, key, json.dumps(dict(payload), sort_keys=True), at, at, at))
+            return True
 
 
 class PostgresCredentialStore:

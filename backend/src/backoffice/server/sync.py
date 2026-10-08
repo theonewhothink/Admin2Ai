@@ -35,23 +35,54 @@ backoffice.server.worker`` repeats it):
 6. **Erasures.** Accounts erased since the last pass still have their files:
    the worker removes them, in AWS as the evidence-deletion role
    (server/erasure.py), and marks each erasure record purged.
+7. **Push notifications** (server/webhooks.py, server/jobs.py). Each pass first
+   works the durable job queue: a push from Gmail or Microsoft Graph queued
+   "read this mailbox now", so it is read at once, from its cursor, whatever
+   its schedule. The worker creates each mailbox's push subscription (a Gmail
+   watch, 7 days; a Graph subscription, about 3 days) and renews it before it
+   ends (``sync.webhook`` events keep its state). While push works, polling
+   drops to once an hour, as a safety net. **Webhook loss:** when a poll finds
+   mail that arrived more than ten minutes ago that no notification announced,
+   the subscription is recorded as lost, re-created, and the mailbox is polled
+   every few minutes until a notification arrives again.
+8. **Backfill.** Days a connection knows it missed (a known gap: history that
+   expired, a mailbox back after a long outage, a delta the provider dropped)
+   are re-read on the next pass, a week at a time (bounded), recorded as
+   ``sync.mail``/``sync.bank`` events marked ``backfill``, each carrying what is
+   left of the gap (resumable). Messages are read before they are recorded, as
+   in any sync. While a gap is open its months say "Catching up on 3 days of
+   email from …" and never turn green; days a bank no longer serves stay open
+   until the owner sends a statement for them.
+9. **Bank accounts nobody added.** Payments for an account the consent covers
+   but the business has not added (opened later, or removed) are delivered
+   under ``iban:<IBAN>`` and kept by the engine, which asks the owner where the
+   account belongs (checklist S8). Each row carries the bank's own transaction
+   id, so a payment is one payment however the bank words it later.
+10. **Supplier websites** (server/portals.py): signed in to once a day; a
+   one-time code is asked from the owner, and the retrieval resumes once they
+   enter it.
 
 The worker never sends email, moves money or approves anything.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import logging
+import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from .jobs import SUBSCRIPTION_RENEW, SYNC_CONNECTION, JobRunner, RetryLater
 from .runtime import ReplayDiverged, TenantManager, TenantNotFound
-from .store import StoreError, StoreUnavailable
+from .store import Job, StoreError, StoreUnavailable, WebhookRoute
 
-__all__ = ["BANK_MIN_INTERVAL", "LINKS_PER_PASS", "PassReport", "STALE_AFTER", "SyncWorker", "transaction_row"]
+__all__ = ["BACKFILL_CHUNK", "BANK_MIN_INTERVAL", "GMAIL_RENEW_BEFORE", "GRAPH_LIFETIME", "GRAPH_RENEW_BEFORE",
+           "LINKS_PER_PASS", "LOSS_GRACE", "LOST_INTERVAL", "PUSH_POLL_INTERVAL", "PassReport", "PushSettings",
+           "STALE_AFTER", "SyncWorker", "transaction_row"]
 
 log = logging.getLogger("backoffice.server.sync")
 
@@ -64,7 +95,29 @@ LINKS_PER_PASS = 10  # waiting invoice links opened per tenant and pass
 # 6 hours); after 3 days without an answer the engine gets the invoice another way (orchestrator).
 LINK_BACKOFF_BASE = timedelta(minutes=15)
 LINK_BACKOFF_MAX = timedelta(hours=6)
-_KINDS = {"google": "gmail", "microsoft": "microsoft", "imap": "imap", "open_banking": "open_banking"}
+_KINDS = {"google": "gmail", "microsoft": "microsoft", "imap": "imap", "open_banking": "open_banking",
+          "portal": "supplier_portal"}
+# Push (§47): a mailbox whose push works is still polled hourly (a safety net); one whose push was lost is polled
+# every few minutes until a notification arrives again. Mail that arrived this long ago and that no notification
+# announced means the push was lost.
+PUSH_POLL_INTERVAL = timedelta(hours=1)
+LOST_INTERVAL = timedelta(minutes=5)
+LOSS_GRACE = timedelta(minutes=10)
+GMAIL_RENEW_BEFORE = timedelta(days=1)  # a Gmail watch lasts 7 days; Google asks for a renewal every day
+GRAPH_LIFETIME = timedelta(minutes=4200)  # Graph caps mail subscriptions at 4230 minutes (about 3 days)
+GRAPH_RENEW_BEFORE = timedelta(hours=12)
+BACKFILL_CHUNK = timedelta(days=7)  # days of a mailbox's gap re-read per pass (bounded, resumable)
+
+
+@dataclass(frozen=True)
+class PushSettings:
+    """Where providers push (None: that provider stays on polling). Gmail: the Pub/Sub topic its watch publishes
+    to (the subscription pushes to /api/webhooks/gmail). Graph: the public URLs of /api/webhooks/microsoft and its
+    lifecycle endpoint."""
+
+    gmail_topic: str | None = None
+    graph_url: str | None = None
+    graph_lifecycle_url: str | None = None
 
 
 class _Gone(Exception):
@@ -87,6 +140,13 @@ class PassReport:
     erasures: list[str] = field(default_factory=list)  # erased businesses whose files were purged
     thread_messages: int = 0  # earlier messages of a thread fetched because a reply pointed at them
     links: int = 0  # waiting invoice links opened and settled
+    jobs_done: list[int] = field(default_factory=list)  # queued jobs (push notifications) done this pass
+    jobs_retried: list[int] = field(default_factory=list)
+    jobs_dead: list[int] = field(default_factory=list)  # parked as dead letters this pass
+    subscribed: list[str] = field(default_factory=list)  # push subscriptions created or renewed
+    webhook_lost: list[str] = field(default_factory=list)  # a poll found mail no notification announced
+    backfilled: list[str] = field(default_factory=list)  # a chunk of a known gap re-read
+    codes: list[str] = field(default_factory=list)  # supplier websites that asked the owner for a code
 
 
 @dataclass(frozen=True)
@@ -102,18 +162,31 @@ class _Connection:
     # Whose mailbox it reads (checklist O2): "shared" or "delegated" (Microsoft 365 through /users/{address}; a
     # Google mailbox delegated to the signed-in account), "alias" (Gmail: only mail delivered to the address).
     mailbox: str = "own"
+    sign_in: Mapping[str, Any] = field(default_factory=dict)  # the engine's sign-in state (a code awaited...)
 
     @property
     def key(self) -> str:
         return f"{self.tenant_id}/{self.id}"
 
 
-def transaction_row(tx: Any) -> dict[str, Any]:
-    """A connector's :class:`~backoffice.domain.models.Transaction` as the JSON of the engine's BankRow."""
-    return {"bank_id": tx.id, "account_id": tx.account_id, "booked_on": tx.booked_on.isoformat(),
-            "amount": str(tx.amount), "currency": tx.currency, "counterparty": tx.counterparty,
-            "description": tx.description, "kind": tx.kind.value, "card_last4": tx.card_last4,
-            "counterparty_iban": tx.counterparty_iban, "reference": tx.reference}
+def transaction_row(tx: Any, *, bank_tx_id: str | None = None) -> dict[str, Any]:
+    """A connector's :class:`~backoffice.domain.models.Transaction` as the JSON of the engine's BankRow.
+    ``bank_tx_id``: the bank's own id for it (deduplication keys on it)."""
+    row = {"bank_id": tx.id, "account_id": tx.account_id, "booked_on": tx.booked_on.isoformat(),
+           "amount": str(tx.amount), "currency": tx.currency, "counterparty": tx.counterparty,
+           "description": tx.description, "kind": tx.kind.value, "card_last4": tx.card_last4,
+           "counterparty_iban": tx.counterparty_iban, "reference": tx.reference}
+    if bank_tx_id:
+        row["bank_tx_id"] = bank_tx_id
+    return row
+
+
+def _unknown_account(iban: str | None, provider_id: str) -> str:
+    """Where payments of an account the business has not added are delivered (kept by the engine, S8)."""
+    from backoffice.fraud import normalize_iban
+    from backoffice.service import UNKNOWN_BANK_ACCOUNT, UNKNOWN_IBAN
+
+    return f"{UNKNOWN_IBAN}{normalize_iban(iban)}" if iban else f"{UNKNOWN_BANK_ACCOUNT}{provider_id}"
 
 
 class SyncWorker:
@@ -135,6 +208,11 @@ class SyncWorker:
         backoff_base: timedelta = timedelta(minutes=1),
         backoff_max: timedelta = timedelta(hours=1),
         purger: Any = None,
+        push: PushSettings | None = None,
+        portals: Any = None,
+        push_interval: timedelta = PUSH_POLL_INTERVAL,
+        lost_interval: timedelta = LOST_INTERVAL,
+        backfill_chunk: timedelta = BACKFILL_CHUNK,
     ) -> None:
         self.manager = manager
         self.purger = purger  # server/erasure.py: finishes account erasures (None: not this worker's job)
@@ -154,6 +232,14 @@ class SyncWorker:
         # connection -> (vault record version, token provider): an access token lives an hour, so it is
         # reused across syncs; a new sign-in (a new vault version) starts a new provider.
         self._tokens: dict[str, tuple[int, Any]] = {}
+        self.push = push or PushSettings()
+        self.portals = portals  # server/portals.py PortalWorker, or None (supplier websites not read here)
+        self.push_interval = max(interval, push_interval)
+        self.lost_interval = min(interval, lost_interval)
+        self.backfill_chunk = backfill_chunk
+        self.jobs = JobRunner(self.store, {SYNC_CONNECTION: self._job_sync, SUBSCRIPTION_RENEW: self._job_renew},
+                              now=self.now)
+        self._report: PassReport | None = None
 
     def now(self) -> datetime:
         return self.manager.now().astimezone(timezone.utc)
@@ -163,6 +249,7 @@ class SyncWorker:
     def run_once(self, should_stop: Callable[[], bool] | None = None) -> PassReport:
         report = PassReport()
         self.complete_erasures(report)
+        self.run_jobs(report, should_stop)
         try:
             tenant_ids = self.store.tenant_ids()
         except StoreError:
@@ -220,6 +307,74 @@ class SyncWorker:
             report.erasures.append(tenant_id)
             log.info("erasure_completed", extra={"tenant": tenant_id, "rows": removed})
 
+    # ----------------------------------------------------------------- the durable queue (server/jobs.py)
+
+    def run_jobs(self, report: PassReport | None = None, should_stop: Callable[[], bool] | None = None) -> PassReport:
+        """Work the queue: syncs a push asked for, subscriptions a provider asked to renew."""
+        report = report if report is not None else PassReport()
+        self._report = report
+        try:
+            done = self.jobs.run_due(should_stop)
+        finally:
+            self._report = None
+        report.jobs_done += done.done
+        report.jobs_retried += done.retried
+        report.jobs_dead += done.dead
+        return report
+
+    def _job_connection(self, job: Job) -> _Connection | None:
+        cid = str(job.payload.get("connectionId") or "")
+        try:
+            found = self.manager.read(job.tenant_id, lambda svc: _connections(job.tenant_id, svc), what="job plan")
+        except TenantNotFound:
+            return None  # erased meanwhile: nothing left to do
+        except (ReplayDiverged, StoreUnavailable) as exc:
+            raise RetryLater(type(exc).__name__) from None
+        return next((c for c in found if c.id == cid), None)
+
+    def _job_sync(self, job: Job) -> None:
+        """A push said this mailbox changed (or that notifications were missed): read it now, from its cursor."""
+        c = self._job_connection(job)
+        if c is None:
+            return  # removed meanwhile
+        notified = job.payload.get("notifiedAt")
+        at = datetime.fromisoformat(notified) if isinstance(notified, str) and notified else self.now()
+        report = self._report or PassReport()
+        try:
+            outcome = self._sync(c, report, push_at=at, reason=str(job.payload.get("reason") or "push"))
+        except (TenantNotFound, _Gone):
+            return
+        except (ReplayDiverged, StoreUnavailable) as exc:
+            raise RetryLater(type(exc).__name__) from None
+        if outcome is not None and not outcome.ok and not outcome.error.needs_reconnect:
+            retry = outcome.error.retry_after
+            raise RetryLater(outcome.error.code, retry_after=timedelta(seconds=float(retry)) if retry else None)
+
+    def _job_renew(self, job: Job) -> None:
+        """The provider asked to renew a subscription (or said it is gone): renewed or re-created now."""
+        c = self._job_connection(job)
+        if c is None or c.kind != "email":
+            return
+        meta = self.vault.metadata(c.tenant_id, c.id) if self.vault is not None else None
+        if meta is None or meta.provider not in ("google", "microsoft"):
+            return
+        from backoffice.connectors.base import ConnectorError, WebhookState, record_webhook
+
+        state = self._state(c, meta.provider)
+        if job.payload.get("reason") == "subscriptionRemoved":
+            state = record_webhook(state, webhook_state=WebhookState.EXPIRED)
+        try:
+            connector = self._connector(c, meta)
+        except _Unconfigured:
+            return
+        except ConnectorError as exc:
+            if exc.needs_reconnect:
+                return  # the owner reconnects first; the next sync subscribes again
+            raise RetryLater(exc.code) from None
+        report = self._report or PassReport()
+        if self._ensure_push(c, connector, meta, state, self.now(), report, force=True) is None:
+            raise RetryLater("subscribe_failed")
+
     def sync_tenant(self, tenant_id: str, report: PassReport | None = None) -> PassReport:
         report = report if report is not None else PassReport()
         with self.manager.open(tenant_id) as rt:
@@ -259,56 +414,81 @@ class SyncWorker:
 
     # ----------------------------------------------------------------- one connection
 
-    def _sync(self, c: _Connection, report: PassReport) -> None:
+    def _sync(self, c: _Connection, report: PassReport, *, push_at: datetime | None = None,
+              reason: str | None = None) -> Any:
+        """Sync one connection when it is due (or now: ``push_at``, a push said it changed). Returns the outcome,
+        or None when nothing was tried (not due, waiting for the owner, nothing to sign in with)."""
         now = self.now()
         retry = self._retry.get(c.key)
-        if retry is not None and retry[1] > now:
+        if push_at is None and retry is not None and retry[1] > now:
             report.retrying.append(c.key)
-            return
+            return None
         meta = self.vault.metadata(c.tenant_id, c.id) if self.vault is not None else None
         if meta is None or meta.provider not in _KINDS:  # nothing to sign in with (added by hand, or pending)
             report.skipped.append(c.key)
-            return
+            return None
+        if c.kind == "portal":
+            return self._sync_portal(c, meta, now, report)
         state = self._state(c, meta.provider)
         if c.kind == "email" and meta.expires_at is not None and state.auth_expires_at != meta.expires_at:
             # An OAuth grant with a stated end: the state the sync records carries it (the owner is reminded, R4).
             state = state.model_copy(update={"auth_expires_at": meta.expires_at})
         if state.reconnect_required:  # waiting for the owner to reconnect (they were told)
             report.skipped.append(c.key)
-            return
-        if not self._due(c, state, now):
-            return
-        from backoffice.connectors.base import ConnectorError, SyncOutcome, TransientError, record_failure
+            return None
+        from backoffice.connectors.base import ConnectorError, SyncOutcome, TransientError, record_event, record_failure
         from backoffice.connectors.vault import VaultError
 
+        if push_at is not None:  # the push is the event (§47); a push after a loss confirms push works again
+            state = record_event(state, at=min(push_at, now))
+            lost = state.webhook_lost_at
+            if lost is not None and state.last_event_at and state.last_event_at > lost:
+                state = state.model_copy(update={"webhook_lost_at": None})
+            if reason == "missed":  # the provider lost notifications: read now, then polled more often until a
+                state = state.model_copy(update={"webhook_lost_at": now})  # notification arrives again
+        known_gaps = set(state.known_gaps)  # gaps known before this pass: backfilled now (new ones next pass)
+        due = push_at is not None or self._due(c, state, now)
+        if not due and not (c.kind == "email" and self._gaps_to_read(state, known_gaps)):
+            return None
         try:
             connector = self._connector(c, meta)
         except _Unconfigured as exc:
             log.warning("sync_not_configured", extra={"tenant": c.tenant_id, "reason": str(exc)})
             report.skipped.append(c.key)
-            return
+            return None
         except (ConnectorError, VaultError) as exc:  # no refresh token, bank lookup failed, vault unreachable
             error = exc if isinstance(exc, ConnectorError) else TransientError("vault_unavailable")
-            self._failed(c, SyncOutcome(record_failure(state, at=now, error=error), 0, error=error), now, report)
-            return
-        if c.kind == "email":
-            outcome = self._sync_mail(c, connector, state, now, report)
-        else:
-            outcome = self._sync_bank(c, connector, state, now, report)
-        if c.key in self._tokens:  # a rotated refresh token was saved: remember the vault's new version
+            outcome = SyncOutcome(record_failure(state, at=now, error=error), 0, error=error)
+            self._failed(c, outcome, now, report)
+            return outcome
+        outcome = None
+        if due:
+            if c.kind == "email":
+                outcome = self._sync_mail(c, connector, state, now, report, polled=push_at is None)
+            else:
+                outcome = self._sync_bank(c, connector, state, now, report)
+            if c.key in self._tokens:  # a rotated refresh token was saved: remember the vault's new version
+                if not outcome.ok:
+                    self._tokens.pop(c.key, None)  # start from the vault again next time
+                elif (after := self.vault.metadata(c.tenant_id, c.id)) is not None:
+                    self._tokens[c.key] = (after.version, self._tokens[c.key][1])
             if not outcome.ok:
-                self._tokens.pop(c.key, None)  # start from the vault again next time
-            elif (after := self.vault.metadata(c.tenant_id, c.id)) is not None:
-                self._tokens[c.key] = (after.version, self._tokens[c.key][1])
-        if outcome.ok:
+                self._failed(c, outcome, now, report)
+                return outcome
             self._retry.pop(c.key, None)
             report.synced.append(c.key)
-        else:
-            self._failed(c, outcome, now, report)
+            state = outcome.state
+        if c.kind == "email":
+            pushed = self._ensure_push(c, connector, meta, state, now, report)
+            state = pushed if pushed is not None else state
+        self._backfill(c, connector, state, known_gaps, now, report)
+        return outcome if outcome is not None else SyncOutcome(state, 0)
 
-    def _sync_mail(self, c: _Connection, connector: Any, state: Any, now: datetime, report: PassReport) -> Any:
+    def _sync_mail(self, c: _Connection, connector: Any, state: Any, now: datetime, report: PassReport, *,
+                   polled: bool = True) -> Any:
         batch: list[bytes] = []
         seen: set[str] = set()  # messages in this sync (by SHA-256): a thread's messages are sent once
+        arrived: list[datetime] = []  # when each delivered message reached the mailbox (webhook loss)
 
         def flush(final_state: Any = None) -> None:
             if not batch and final_state is None:
@@ -324,6 +504,8 @@ class SyncWorker:
             if digest in seen:
                 return  # already in this sync, as the earlier message of a thread
             seen.add(digest)
+            if item.received_at is not None:
+                arrived.append(item.received_at)
             earlier = self._earlier_in_thread(c, connector, item, seen)
             report.thread_messages += len(earlier)
             batch.extend(earlier)  # the earlier message first, then the reply that points at it
@@ -332,8 +514,190 @@ class SyncWorker:
                 flush()
 
         outcome = connector.sync(state, sink, now=now)
+        if outcome.ok and polled:
+            outcome = dataclasses.replace(outcome, state=self._detect_loss(c, state, outcome.state, arrived, now,
+                                                                           report))
         flush(outcome.state.model_dump(mode="json") if outcome.ok else None)  # a failure keeps what arrived
         return outcome
+
+    # ----------------------------------------------------------------- push subscriptions (§47)
+
+    def _detect_loss(self, c: _Connection, before: Any, after: Any, arrived: list[datetime], now: datetime,
+                     report: PassReport) -> Any:
+        """A poll found mail that arrived a while ago, after the subscription started and after the last
+        notification, that no notification announced: the push was lost. Recorded; re-subscribed next."""
+        from backoffice.connectors.base import WebhookState, record_webhook_lost
+
+        if before.webhook_state is not WebhookState.ACTIVE or before.webhook_since is None:
+            return after
+        try:
+            route = self.store.connection_webhook(c.tenant_id, c.id)
+        except StoreError:
+            route = None
+        notified = [t for t in (before.last_event_at, route.last_notified_at if route else None) if t is not None]
+        floor = max([before.webhook_since, *notified])
+        late = [t for t in arrived if floor < t <= now - LOSS_GRACE]
+        if not late:
+            return after
+        report.webhook_lost.append(c.key)
+        log.warning("webhook_lost", extra={"tenant": c.tenant_id, "messages": len(late)})
+        return record_webhook_lost(after, at=now)
+
+    def _ensure_push(self, c: _Connection, connector: Any, meta: Any, state: Any, now: datetime, report: PassReport,
+                     *, force: bool = False) -> Any:
+        """Create or renew the mailbox's push subscription before it ends; re-create one that failed or was lost.
+        Returns the new state (recorded as ``sync.webhook``), or None when nothing changed or it could not be done
+        (polling goes on as usual)."""
+        from backoffice.connectors.base import ConnectorError, WebhookState
+
+        provider = meta.provider
+        if provider == "google" and not self.push.gmail_topic:
+            return None
+        if provider == "microsoft" and not self.push.graph_url:
+            return None
+        if provider not in ("google", "microsoft"):
+            return None
+        active = state.webhook_state is WebhookState.ACTIVE and state.webhook_expires_at is not None
+        renew_before = GMAIL_RENEW_BEFORE if provider == "google" else GRAPH_RENEW_BEFORE
+        if active and not force and state.webhook_expires_at - now > renew_before:
+            return None
+        live = active and state.webhook_expires_at > now
+        try:
+            if provider == "google":
+                new = connector.start_watch(state, self.push.gmail_topic)
+                address = connector.mailbox_address()
+                route = WebhookRoute("gmail", address, c.tenant_id, c.id, "", new.webhook_expires_at, None, now)
+                new = new.model_copy(update={"webhook_since": state.webhook_since if live and state.webhook_since
+                                             else now})
+            else:
+                new, route = self._graph_subscription(c, connector, state, now, live)
+            self.store.save_webhook_route(route)
+        except ConnectorError as exc:
+            log.warning("push_subscribe_failed", extra={"tenant": c.tenant_id, "reason": exc.code})
+            return None
+        except StoreError:
+            log.warning("push_route_unavailable", extra={"tenant": c.tenant_id})
+            return None
+        status, _ = self.manager.record_webhook_state(c.tenant_id, c.id, new.model_dump(mode="json"))
+        if status == 404:
+            raise _Gone(c.key)
+        report.subscribed.append(c.key)
+        return new
+
+    def _graph_subscription(self, c: _Connection, connector: Any, state: Any, now: datetime,
+                            live: bool) -> tuple[Any, WebhookRoute]:
+        from backoffice.connectors.base import ConnectorError
+
+        from .webhooks import client_state_hash
+
+        if live and state.subscription_id:
+            try:
+                new = connector.renew_subscription(state, state.subscription_id, lifetime=GRAPH_LIFETIME, now=now)
+                route = self.store.connection_webhook(c.tenant_id, c.id)
+                if route is not None and route.key == state.subscription_id:
+                    return new, dataclasses.replace(route, expires_at=new.webhook_expires_at)
+            except ConnectorError:
+                pass  # gone at Microsoft: a new subscription below
+        secret = secrets.token_urlsafe(32)  # Graph echoes it with every notification; only its hash is kept
+        new, subscription = connector.create_subscription(
+            state, notification_url=self.push.graph_url, client_state=secret, lifetime=GRAPH_LIFETIME,
+            lifecycle_url=self.push.graph_lifecycle_url, now=now)
+        new = new.model_copy(update={"subscription_id": subscription.subscription_id, "webhook_since": now})
+        route = WebhookRoute("microsoft", subscription.subscription_id, c.tenant_id, c.id, client_state_hash(secret),
+                             subscription.expires_at, None, now)
+        return new, route
+
+    # ----------------------------------------------------------------- backfill (§47)
+
+    @staticmethod
+    def _gaps_to_read(state: Any, known: set[Any]) -> list[Any]:
+        """Known gaps a backfill can still close, known before this pass, oldest first."""
+        return sorted((g for g in state.known_gaps if g in known and g not in state.unreachable_gaps),
+                      key=lambda g: (g.start, g.end))
+
+    def _backfill(self, c: _Connection, connector: Any, state: Any, known: set[Any], now: datetime,
+                  report: PassReport) -> None:
+        """Re-read the oldest known gap: a mailbox a week at a time, a bank in one go (it says itself what it no
+        longer serves). Recorded with what is left of the gap, so the next pass resumes there."""
+        from backoffice.connectors.base import TimeRange, record_backfill_progress
+
+        gaps = self._gaps_to_read(state, known)
+        if not gaps or not hasattr(connector, "backfill"):
+            return
+        gap = gaps[0]
+        window = gap
+        if c.kind == "email" and gap.end - gap.start > self.backfill_chunk:
+            window = TimeRange(start=gap.start, end=gap.start + self.backfill_chunk)
+        marker = {"start": window.start.isoformat(), "end": window.end.isoformat()}
+        if c.kind == "email":
+            batch: list[bytes] = []
+
+            def flush(final_state: Any = None) -> None:
+                if not batch and final_state is None:
+                    return
+                status, _ = self.manager.record_mail(c.tenant_id, c.id, list(batch), final_state, backfill=marker)
+                if status == 404:
+                    raise _Gone(c.key)
+                report.messages += len(batch)
+                batch.clear()
+
+            def sink(item: Any) -> None:
+                batch.append(item.raw)
+                if len(batch) >= self.mail_batch:
+                    flush()
+
+            outcome = connector.backfill(state, window, sink, now=now)
+            if not outcome.ok:  # kept as it was: the next pass tries the same days again
+                log.warning("backfill_failed", extra={"tenant": c.tenant_id, "reason": outcome.error.code})
+                flush()
+                return
+            new = outcome.state
+            if window != gap:
+                new = record_backfill_progress(new, gap, window.end)
+            flush(new.model_dump(mode="json"))
+        else:
+            rows: list[dict[str, Any]] = []
+            outcome = connector.backfill(state, window,
+                                         lambda tx: rows.append(transaction_row(
+                                             tx, bank_tx_id=getattr(connector, "bank_ids", {}).get(tx.id))),
+                                         now=now)
+            if not outcome.ok:
+                log.warning("backfill_failed", extra={"tenant": c.tenant_id, "reason": outcome.error.code})
+                return
+            status, _ = self.manager.record_bank(c.tenant_id, c.id, rows, outcome.state.model_dump(mode="json"),
+                                                 backfill=marker)
+            if status == 404:
+                raise _Gone(c.key)
+            report.rows += len(rows)
+        report.backfilled.append(c.key)
+        log.info("backfill_done", extra={"tenant": c.tenant_id, "connections": 1})
+
+    # ----------------------------------------------------------------- supplier websites (server/portals.py)
+
+    def _sync_portal(self, c: _Connection, meta: Any, now: datetime, report: PassReport) -> Any:
+        if self.portals is None or meta.provider != "portal":
+            report.skipped.append(c.key)
+            return None
+        state = self._state(c, "portal")
+        if state.reconnect_required or not self.portals.due(state, c.sign_in, now):
+            return None
+        try:
+            outcome = self.portals.sync(c.tenant_id, c.id)
+        except (TenantNotFound, ReplayDiverged, StoreUnavailable, _Gone):
+            raise
+        except Exception:  # an adapter bug never stops the other connections
+            log.exception("portal_failed", extra={"tenant": c.tenant_id})
+            report.errors += 1
+            return None
+        if outcome is None:
+            report.skipped.append(c.key)
+        elif outcome.challenge is not None:
+            report.codes.append(c.key)
+        elif outcome.outcome.ok:
+            report.synced.append(c.key)
+        else:
+            report.retrying.append(c.key)
+        return outcome.outcome if outcome is not None else None
 
     def _earlier_in_thread(self, c: _Connection, connector: Any, item: Any, seen: set[str]) -> list[bytes]:
         """A reply pointing at an invoice sent earlier in its thread ("see the invoice I sent on the 3rd"):
@@ -389,12 +753,19 @@ class SyncWorker:
             batch.clear()
 
         def sink(tx: Any) -> None:
-            batch.append(transaction_row(tx))
+            batch.append(transaction_row(tx, bank_tx_id=getattr(connector, "bank_ids", {}).get(tx.id)))
             if len(batch) >= self.bank_batch:
                 flush()
 
         outcome = connector.sync(state, sink, now=now)
         flush(outcome.state.model_dump(mode="json") if outcome.ok else None)
+        discovered = getattr(connector, "discovered", None)
+        if discovered:  # accounts the consent covers that were not known yet: remembered with the consent
+            try:
+                accounts = dict(self.vault.open(c.tenant_id, c.id).get("accounts") or {})
+                self.vault.update(c.tenant_id, c.id, {"accounts": {**accounts, **discovered}})
+            except Exception:  # remembered next time instead
+                log.warning("bank_accounts_not_saved", extra={"tenant": c.tenant_id})
         return outcome
 
     def _failed(self, c: _Connection, outcome: Any, now: datetime, report: PassReport) -> None:
@@ -439,8 +810,24 @@ class SyncWorker:
     def _due(self, c: _Connection, state: Any, now: datetime) -> bool:
         if state.last_successful_sync is None:
             return True
-        every = max(self.interval, BANK_MIN_INTERVAL) if c.kind == "bank" else self.interval
+        if c.kind == "bank":
+            every = max(self.interval, BANK_MIN_INTERVAL)
+        else:
+            every = self._mail_interval(state, now)
         return now - state.last_successful_sync >= every
+
+    def _mail_interval(self, state: Any, now: datetime) -> timedelta:
+        """Hourly while push works (a safety net); every few minutes after a loss, until a push arrives again."""
+        from backoffice.connectors.base import WebhookState
+
+        lost = state.webhook_lost_at is not None and not (state.last_event_at and
+                                                          state.last_event_at > state.webhook_lost_at)
+        if lost:
+            return self.lost_interval
+        if state.webhook_state is WebhookState.ACTIVE and state.webhook_expires_at is not None and \
+                state.webhook_expires_at > now:
+            return self.push_interval
+        return self.interval
 
     def _connector(self, c: _Connection, meta: Any) -> Any:
         provider = meta.provider
@@ -480,7 +867,8 @@ class SyncWorker:
             scopes = (GRAPH_SHARED_MAIL_SCOPES if shared else GRAPH_MAIL_SCOPES) if provider == "microsoft" else ()
             refresher = OAuthRefresher(OAuthClientConfig(app.client_id, app.client_secret, app.token_url, scopes=scopes),
                                        client=self.http_client, provider=provider, clock=self.now)
-            tokens = self.vault.token_provider(c.tenant_id, c.id, refresher)  # rotations are saved in the vault
+            # Rotations are saved in the vault; lifetimes are judged on this worker's clock.
+            tokens = self.vault.token_provider(c.tenant_id, c.id, refresher, clock=self.now)
             self._tokens[c.key] = (meta.version, tokens)
         if provider == "google":
             from backoffice.connectors.gmail import GmailConfig, GmailConnector
@@ -509,10 +897,15 @@ class SyncWorker:
             consent = aggregator.consent(requisition)
             accounts = {a: info.iban for a in consent.account_ids if (info := aggregator.account(a)).iban}
             self.vault.update(c.tenant_id, c.id, {"accounts": accounts})
-        mapping = {provider_id: c.ibans[normalize_iban(iban)] for provider_id, iban in accounts.items()
-                   if iban and normalize_iban(iban) in c.ibans}
+        # Every account the consent covers: ours by its IBAN, else kept under "iban:<IBAN>" until the owner says
+        # where it belongs (never dropped, S8). One the consent gained later is looked up while syncing.
+        mapping = {provider_id: c.ibans.get(normalize_iban(iban)) if iban else None
+                   for provider_id, iban in accounts.items()}
+        mapping = {provider_id: ours or _unknown_account(accounts.get(provider_id), provider_id)
+                   for provider_id, ours in mapping.items()}
         return OpenBankingConnector(aggregator, requisition, account_ids=mapping,
-                                    config=BankSyncConfig(history_window=self.history), clock=self.now)
+                                    config=BankSyncConfig(history_window=self.history), clock=self.now,
+                                    unknown_account=_unknown_account)
 
 
 class _Unconfigured(Exception):
@@ -525,9 +918,10 @@ def _connections(tenant_id: str, svc: Any) -> list[_Connection]:
     ibans = {a.iban: a.id for a in repo.accounts.values() if a.iban}
     out = []
     for c in repo.connectors.values():
-        if c.kind not in ("email", "bank") or (svc.sign_in.get(c.id) or {}).get("pending"):
+        if c.kind not in ("email", "bank", "portal") or (svc.sign_in.get(c.id) or {}).get("pending"):
             continue
+        info = dict(svc.sign_in.get(c.id) or {})
         out.append(_Connection(tenant_id, c.id, c.kind, c.name, c.account, c.healthy,
                                svc.sync_states.get(c.id), ibans if c.kind == "bank" else {},
-                               str((svc.sign_in.get(c.id) or {}).get("mailbox") or "own")))
+                               str(info.get("mailbox") or "own"), info))
     return out

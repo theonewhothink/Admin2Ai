@@ -9,6 +9,8 @@ Only six things ever notify:
   given until a stated day): once per end date, a week before (checklist R4);
 * a supplier's site that needs the owner to sign in (or a code) before the
   invoice behind its link can be fetched (§9: "Supplier X needs authentication.");
+  and a supplier's website that sent the owner a one-time code to enter
+  ("Vodafone needs a sign-in code.", once per code request);
 * a month that closed;
 * a payment for the business's plan that did not go through (backoffice.billing).
 
@@ -59,6 +61,7 @@ class Facts:
     sign_ins: frozenset[str] = frozenset()  # invoice links whose site asks the owner to sign in
     payment_failed: str | None = None  # the day a payment for the plan failed (backoffice.billing), until it goes through
     renewals: frozenset[str] = frozenset()  # "<connection>:<end date>": access ending within a week, noted (R4)
+    codes: frozenset[str] = frozenset()  # "<connection>:<asked at>": a website awaiting a sign-in code (C6)
 
 
 def facts(svc: Any) -> Facts:
@@ -71,6 +74,9 @@ def facts(svc: Any) -> Facts:
         payment_failed=_payment_failed(svc),
         renewals=frozenset(f"{cid}:{info['warned']}" for cid, info in (getattr(svc, "sign_in", None) or {}).items()
                            if isinstance(info, dict) and info.get("warned")),
+        codes=frozenset(f"{cid}:{info['code'].get('asked')}"
+                        for cid, info in (getattr(svc, "sign_in", None) or {}).items()
+                        if isinstance(info, dict) and isinstance(info.get("code"), dict) and info["code"]),
     )
 
 
@@ -109,6 +115,13 @@ def messages_for(svc: Any, before: Facts, after: Facts) -> list[PushMessage]:
         notice = notices.get(key.rsplit(":", 1)[0])
         if notice is not None:  # once per end date: the push that a week-before reminder promises
             out.append(PushMessage("Access ends soon", notice["note"], f"/needs-you#renew_{notice['id']}"))
+    for key in sorted(after.codes - before.codes):
+        connector = repo.connectors.get(key.split(":", 1)[0])
+        if connector is not None:  # the push the Needs-you item "Vodafone needs a sign-in code" comes with
+            from backoffice.connectors.portals import code_prompt
+
+            out.append(PushMessage("Sign-in code needed", code_prompt(connector.name),
+                                   f"/needs-you#code_{connector.id}"))
     for url in sorted(after.sign_ins - before.sign_ins):
         link = repo.links_seen.get(url)
         if link is not None and link.message:

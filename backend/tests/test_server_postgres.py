@@ -137,15 +137,23 @@ def test_ready_when_migrated(store: PostgresStore) -> None:
 # --------------------------------------------------------------------------- isolation (§52)
 
 
-def _account(tmp_path: Path, store: PostgresStore, email: str, **kwargs: object) -> tuple[object, dict]:
-    h = harness(tmp_path, store=store)
+def _account(tmp_path: Path, store: PostgresStore, email: str, *, now: object = None,
+             **kwargs: object) -> tuple[object, dict]:
+    h = harness(tmp_path, store=store, **({"now": now} if now is not None else {}))
     return h, signup(h.client, email, **kwargs)  # type: ignore[arg-type]
 
 
 def test_row_level_security_on_the_new_tables(tmp_path: Path, database: dict, store: PostgresStore) -> None:
+    from _server_support import FakeClock
+
+    from backoffice.orchestrator import TZ
+
     db: PsqlExecutor = database["db"]
-    h, a = _account(tmp_path, store, f"a-{uuid.uuid4().hex[:6]}@example.pt")
-    _, b = _account(tmp_path / "b", store, f"b-{uuid.uuid4().hex[:6]}@example.pt", tax_id=NIF_B)
+    # Sign-in attempts older than a day are visible to anyone (the database's own clock, expired_visible): the
+    # attempts these sign-ups record must be recent by that clock, not by the tests' fixed date.
+    h, a = _account(tmp_path, store, f"a-{uuid.uuid4().hex[:6]}@example.pt", now=FakeClock(datetime.now(TZ)))
+    _, b = _account(tmp_path / "b", store, f"b-{uuid.uuid4().hex[:6]}@example.pt", tax_id=NIF_B,
+                    now=FakeClock(datetime.now(TZ)))
     ta, tb = a["tenant"]["id"], b["tenant"]["id"]
     ua = a["user"]["id"]
     # tenant scope: each business sees only its own events

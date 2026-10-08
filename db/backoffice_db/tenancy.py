@@ -38,6 +38,7 @@ __all__ = [
     "SETTING_SQL",
     "TENANT_SETTING",
     "USER_SETTING",
+    "WEBHOOK_ROUTE_SETTING",
     "scope_params",
     "scope_sql",
     "setting_params",
@@ -56,9 +57,10 @@ RATE_SUBJECTS_SETTING = "app.rate_subjects"  # login_attempts of these keyed has
 API_KEY_SETTING = "app.api_key_hash"  # accountant_api_keys row of the key presented (its SHA-256)
 INVITE_SETTING = "app.invite_hash"  # accountant_invitations row of the token presented (its SHA-256, 0011)
 BILLING_CUSTOMER_SETTING = "app.billing_customer"  # billing_customers row of the customer a webhook names (0015)
+WEBHOOK_ROUTE_SETTING = "app.webhook_route"  # webhook_routes rows of '<provider>:<key>' a push names (0016)
 ERASURE_SETTING = "backoffice.tenant_erasure"  # the tenant being erased in this transaction (§52)
 IDENTITY_SETTINGS = (LOGIN_EMAIL_SETTING, SESSION_SETTING, RATE_SUBJECTS_SETTING, API_KEY_SETTING, INVITE_SETTING,
-                     BILLING_CUSTOMER_SETTING, ERASURE_SETTING)
+                     BILLING_CUSTOMER_SETTING, WEBHOOK_ROUTE_SETTING, ERASURE_SETTING)
 SETTING_SQL = "SELECT set_config(%s, %s, true)"
 
 APP_ROLE = "backoffice_app"  # api and worker: DML under RLS

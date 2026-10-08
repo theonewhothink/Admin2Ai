@@ -88,7 +88,7 @@ variable "single_nat_gateway" {
 }
 
 variable "enable_interface_endpoints" {
-  description = "Private VPC endpoints for ECR, logs, Secrets Manager, KMS, SQS, EventBridge and STS."
+  description = "Private VPC endpoints for ECR, logs, Secrets Manager, KMS and STS."
   type        = bool
   default     = true
 }

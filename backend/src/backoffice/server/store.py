@@ -10,16 +10,18 @@ email, append-only hash-chained events, erasure only with its record.
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
-from typing import Protocol
+from typing import Any, Protocol
 
 __all__ = [
     "AccountExists",
     "Device",
     "IndexOp",
     "Invitation",
+    "JOB_STATES",
+    "Job",
     "MemoryStore",
     "SeqConflict",
     "Session",
@@ -29,6 +31,7 @@ __all__ = [
     "StoredEvent",
     "Tenant",
     "User",
+    "WebhookRoute",
 ]
 
 # An employee (backoffice.staff) may only upload receipts and read their own open card payments (auth.py);
@@ -132,6 +135,41 @@ class IndexOp:
     at: datetime | None = None
 
 
+JOB_STATES = ("queued", "running", "done", "dead")
+
+
+@dataclass(frozen=True)
+class Job:
+    """One piece of work in the durable queue (0016, server/jobs.py). ``payload`` holds ids only."""
+
+    id: int
+    tenant_id: str
+    kind: str  # "sync.connection" | "subscription.renew"
+    key: str  # one queued job per (tenant, kind, key)
+    payload: Mapping[str, Any]
+    state: str  # JOB_STATES
+    attempts: int
+    max_attempts: int
+    run_after: datetime
+    created_at: datetime
+    updated_at: datetime
+    last_error: str | None = None
+
+
+@dataclass(frozen=True)
+class WebhookRoute:
+    """Which business and connection a push notification names (0016)."""
+
+    provider: str  # "gmail" | "microsoft"
+    key: str  # Gmail: the mailbox address; Microsoft Graph: the subscription id
+    tenant_id: str
+    connection_id: str
+    secret_hash: str = ""  # SHA-256 of a Graph subscription's clientState
+    expires_at: datetime | None = None
+    last_notified_at: datetime | None = None
+    created_at: datetime | None = None
+
+
 class Store(Protocol):
     # health
     def ping(self) -> None: ...
@@ -199,6 +237,24 @@ class Store(Protocol):
     # erased businesses whose files are still to purge (the sync worker completes them)
     def pending_erasures(self) -> list[str]: ...
 
+    # the durable work queue (0016, server/jobs.py): enqueued under the business's scope, claimed, retried and
+    # buried by the sync worker as the scheduler
+    def enqueue_job(self, tenant_id: str, kind: str, key: str, payload: Mapping[str, Any], *, run_after: datetime,
+                    max_attempts: int = 5) -> bool: ...
+    def claim_jobs(self, now: datetime, *, limit: int, lease: timedelta) -> list[Job]: ...
+    def finish_job(self, job_id: int, at: datetime) -> None: ...
+    def retry_job(self, job_id: int, at: datetime, *, run_after: datetime, error: str) -> None: ...
+    def bury_job(self, job_id: int, at: datetime, *, error: str) -> None: ...
+    def dead_jobs(self, limit: int = 100) -> list[Job]: ...
+    def prune_jobs(self, before: datetime) -> int: ...
+
+    # push notifications (0016, server/webhooks.py)
+    def save_webhook_route(self, route: WebhookRoute) -> None: ...
+    def webhook_routes(self, provider: str, key: str) -> list[WebhookRoute]: ...
+    def connection_webhook(self, tenant_id: str, connection_id: str) -> WebhookRoute | None: ...
+    def accept_notification(self, route: WebhookRoute, notification_id: str, at: datetime, expires_at: datetime, *,
+                            kind: str, key: str, payload: Mapping[str, Any]) -> bool: ...
+
 
 # --------------------------------------------------------------------------- in memory
 
@@ -230,6 +286,10 @@ class _Data:
     manager_scopes: dict[tuple[str, str], tuple[str, tuple[str, ...]]] = field(default_factory=dict)
     invitations: dict[str, Invitation] = field(default_factory=dict)  # token hash -> invitation
     billing_customers: dict[str, str] = field(default_factory=dict)  # payment provider customer id -> tenant
+    jobs: dict[int, Job] = field(default_factory=dict)
+    job_seq: int = 0
+    webhook_routes: dict[tuple[str, str, str, str], WebhookRoute] = field(default_factory=dict)
+    webhook_receipts: dict[tuple[str, str, str], datetime] = field(default_factory=dict)  # -> expires at
 
 
 class MemoryStore:
@@ -238,6 +298,7 @@ class MemoryStore:
     def __init__(self) -> None:
         self._d = _Data()
         self._lock = threading.RLock()
+        self._leases: dict[int, datetime] = {}  # running job -> when its worker's lease ends
         self.available = True  # tests flip this to simulate an outage
 
     def _up(self) -> None:
@@ -571,6 +632,9 @@ class MemoryStore:
             self._d.api_keys = {h: v for h, v in self._d.api_keys.items() if v[0] != tenant_id}
             self._d.billing_customers = {c: t for c, t in self._d.billing_customers.items() if t != tenant_id}
             self._d.nonces = {k: v for k, v in self._d.nonces.items() if k[0] != tenant_id}
+            self._d.jobs = {i: j for i, j in self._d.jobs.items() if j.tenant_id != tenant_id}
+            self._d.webhook_routes = {k: r for k, r in self._d.webhook_routes.items() if r.tenant_id != tenant_id}
+            self._d.webhook_receipts = {k: v for k, v in self._d.webhook_receipts.items() if k[0] != tenant_id}
             self._d.tenants.pop(tenant_id, None)
             if not any(u == user_id for _, u, _ in self._d.memberships):
                 self._d.invitations = {h: i for h, i in self._d.invitations.items() if i.inviter_user_id != user_id}
@@ -597,6 +661,137 @@ class MemoryStore:
 
     def erasure(self, tenant_id: str) -> _Erasure | None:
         return self._d.erasures.get(tenant_id)
+
+    # ----------------------------------------------------------------- the durable work queue (0016)
+
+    def enqueue_job(self, tenant_id: str, kind: str, key: str, payload: Mapping[str, Any], *, run_after: datetime,
+                    max_attempts: int = 5) -> bool:
+        """Queue one job; False when the same (tenant, kind, key) is already queued (the bursts coalesce)."""
+        self._up()
+        with self._lock:
+            if tenant_id not in self._d.tenants:
+                raise StoreError("unknown tenant")
+            if any(j.tenant_id == tenant_id and j.kind == kind and j.key == key and j.state == "queued"
+                   for j in self._d.jobs.values()):
+                return False
+            self._d.job_seq += 1
+            job = Job(self._d.job_seq, tenant_id, kind, key, dict(payload), "queued", 0, max_attempts, run_after,
+                      run_after, run_after)
+            self._d.jobs[job.id] = job
+            return True
+
+    def claim_jobs(self, now: datetime, *, limit: int, lease: timedelta) -> list[Job]:
+        """Due jobs (and running ones whose worker went away), oldest first, each counted as one more attempt."""
+        self._up()
+        with self._lock:
+            due = sorted((j for j in self._d.jobs.values()
+                          if (j.state == "queued" and j.run_after <= now) or
+                          (j.state == "running" and self._leases.get(j.id, now) < now)),
+                         key=lambda j: (j.run_after, j.id))[:max(0, limit)]
+            out = []
+            for j in due:
+                claimed = replace(j, state="running", attempts=j.attempts + 1, updated_at=now)
+                self._d.jobs[j.id] = claimed
+                self._leases[j.id] = now + lease
+                out.append(claimed)
+            return out
+
+    def finish_job(self, job_id: int, at: datetime) -> None:
+        self._up()
+        with self._lock:
+            job = self._d.jobs.get(job_id)
+            if job is not None:
+                self._d.jobs[job_id] = replace(job, state="done", updated_at=at)
+                self._leases.pop(job_id, None)
+
+    def retry_job(self, job_id: int, at: datetime, *, run_after: datetime, error: str) -> None:
+        """Back in the queue after ``run_after``; merged into an identical job queued meanwhile."""
+        self._up()
+        with self._lock:
+            job = self._d.jobs.get(job_id)
+            if job is None:
+                return
+            twin = any(j.id != job_id and j.tenant_id == job.tenant_id and j.kind == job.kind and j.key == job.key
+                       and j.state == "queued" for j in self._d.jobs.values())
+            self._d.jobs[job_id] = replace(job, state="done" if twin else "queued", run_after=run_after,
+                                           updated_at=at, last_error=error[:200])
+            self._leases.pop(job_id, None)
+
+    def bury_job(self, job_id: int, at: datetime, *, error: str) -> None:
+        """A dead letter: parked for engineers, never dropped."""
+        self._up()
+        with self._lock:
+            job = self._d.jobs.get(job_id)
+            if job is not None:
+                self._d.jobs[job_id] = replace(job, state="dead", updated_at=at, last_error=error[:200])
+                self._leases.pop(job_id, None)
+
+    def dead_jobs(self, limit: int = 100) -> list[Job]:
+        self._up()
+        with self._lock:
+            return sorted((j for j in self._d.jobs.values() if j.state == "dead"),
+                          key=lambda j: (j.updated_at, j.id), reverse=True)[:limit]
+
+    def prune_jobs(self, before: datetime) -> int:
+        self._up()
+        with self._lock:
+            old = [i for i, j in self._d.jobs.items() if j.state == "done" and j.updated_at < before]
+            for i in old:
+                del self._d.jobs[i]
+            return len(old)
+
+    def jobs(self, tenant_id: str | None = None) -> list[Job]:
+        """Every job (tests)."""
+        with self._lock:
+            return sorted((j for j in self._d.jobs.values() if tenant_id is None or j.tenant_id == tenant_id),
+                          key=lambda j: j.id)
+
+    # ----------------------------------------------------------------- push notifications (0016)
+
+    def save_webhook_route(self, route: WebhookRoute) -> None:
+        """The connection's route (one per provider): replaces the one before (a new Graph subscription id)."""
+        self._up()
+        with self._lock:
+            if route.tenant_id not in self._d.tenants:
+                raise StoreError("unknown tenant")
+            for k, r in list(self._d.webhook_routes.items()):
+                if r.tenant_id == route.tenant_id and r.connection_id == route.connection_id and \
+                        r.provider == route.provider:
+                    del self._d.webhook_routes[k]
+            self._d.webhook_routes[(route.provider, route.key, route.tenant_id, route.connection_id)] = route
+
+    def webhook_routes(self, provider: str, key: str) -> list[WebhookRoute]:
+        self._up()
+        with self._lock:
+            return sorted((r for (p, k, _, _), r in self._d.webhook_routes.items() if p == provider and k == key),
+                          key=lambda r: (r.tenant_id, r.connection_id))
+
+    def connection_webhook(self, tenant_id: str, connection_id: str) -> WebhookRoute | None:
+        self._up()
+        with self._lock:
+            return next((r for r in self._d.webhook_routes.values()
+                         if r.tenant_id == tenant_id and r.connection_id == connection_id), None)
+
+    def accept_notification(self, route: WebhookRoute, notification_id: str, at: datetime, expires_at: datetime, *,
+                            kind: str, key: str, payload: Mapping[str, Any]) -> bool:
+        """One push notification, in one transaction: remembered by its id until ``expires_at``, the route's last
+        notification time moved on, and the job queued. False (nothing done) for a duplicate or a replay."""
+        self._up()
+        with self._lock:
+            receipts = self._d.webhook_receipts
+            for k in [k for k, until in receipts.items() if k[0] == route.tenant_id and until < at]:
+                del receipts[k]
+            seen = (route.tenant_id, route.provider, notification_id)
+            if seen in receipts:
+                return False
+            receipts[seen] = expires_at
+            found_key = (route.provider, route.key, route.tenant_id, route.connection_id)
+            found = self._d.webhook_routes.get(found_key)
+            if found is not None:
+                latest = at if found.last_notified_at is None else max(at, found.last_notified_at)
+                self._d.webhook_routes[found_key] = replace(found, last_notified_at=latest)
+            self.enqueue_job(route.tenant_id, kind, key, payload, run_after=at)
+            return True
 
     # ----------------------------------------------------------------- introspection for tests
 
