@@ -587,6 +587,18 @@ def production() -> None:
         expect(page.get_by_role("heading", name="Connect your email")).to_be_visible()
         href_ok = page.evaluate("document.activeElement.textContent") == "Connect your email"
         check(href_ok, "focus moves to the new step's heading")
+        ninety = page.get_by_role("radio", name=re.compile("^Last 90 days"))
+        twelve = page.get_by_role("radio", name=re.compile("^Last 12 months"))
+        expect(ninety).to_be_checked(timeout=15000)
+        check(not twelve.is_checked(), "the first read is the last 90 days unless the owner chooses more")
+        page.locator("label.choice", has_text="Last 12 months").click()
+        expect(twelve).to_be_checked()
+        expect(page.locator("label.choice", has_text="Last 12 months")).to_be_visible()
+        chose = posts(api, r"/api/settings/reading")
+        check(bool(chose) and json.loads(chose[-1]["body"]) == {"history": "12m"} and chose[-1]["csrf"] == "admin2ai",
+              "choosing 12 months before connecting posts history: 12m")
+        shots(page, "onboarding-email-history")
+        no_sideways_scroll(page, "/onboarding (email)")
         page.get_by_role("button", name="I’ll do this later").click()
         expect(page.get_by_role("heading", name="Connect your bank")).to_be_visible()
         page.get_by_role("button", name="Millennium bcp").click()
@@ -783,6 +795,28 @@ def owner_screens(page: Any, api: MockApi, expect: Any) -> None:
     toggled = posts(api, r"/api/settings/automation")
     check(bool(toggled) and json.loads(toggled[-1]["body"]) == {"monthlyPackage": True} and toggled[-1]["csrf"] == "admin2ai",
           "the switch posts monthlyPackage: true")
+
+    print("reading: spam only when allowed, and how far back, in plain words")
+    spam = page.get_by_role("switch", name="Also look in spam for invoices")
+    expect(spam).to_have_attribute("aria-checked", "false", timeout=15000)
+    expect(page.get_by_text("Sometimes an invoice lands in spam. I look there too, but never in the trash.")).to_be_visible()
+    spam.click()
+    expect(page.get_by_text("Done. I will also look in spam for invoices.")).to_be_visible(timeout=15000)
+    expect(spam).to_have_attribute("aria-checked", "true")
+    toggled = posts(api, r"/api/settings/reading")
+    check(bool(toggled) and json.loads(toggled[-1]["body"]) == {"lookInSpam": True} and toggled[-1]["csrf"] == "admin2ai",
+          "the spam switch posts lookInSpam: true")
+    section = page.locator("section#reading")
+    expect(section.get_by_role("radio", name=re.compile("^Last 90 days"))).to_be_checked()
+    section.locator("label.choice", has_text="Last 12 months").click()
+    expect(page.get_by_text("Done. I will read the last 12 months of what you connect.")).to_be_visible(timeout=15000)
+    expect(section.get_by_role("radio", name=re.compile("^Last 12 months"))).to_be_checked()
+    check(json.loads(posts(api, r"/api/settings/reading")[-1]["body"]) == {"history": "12m"},
+          "choosing 12 months in Settings posts history: 12m")
+    shots(page, "settings-reading")
+    no_sideways_scroll(page, "/settings (reading)")
+    section.locator("label.choice", has_text="Last 90 days").click()  # back to the default for what follows
+    expect(page.get_by_text("Done. I will read the last 90 days of what you connect.")).to_be_visible(timeout=15000)
 
     print("deadlines: who does it, what proves it done, and It is done")
     with api.lock:

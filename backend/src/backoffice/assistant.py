@@ -374,7 +374,12 @@ class Operator:
                 files.append(f)
             elif a["kind"] == "report" and (r := self.reports.get(a["id"])):
                 files.append((r["filename"], "text/csv", r["csv"].encode()))
-        mailer.send(msg.to, msg.subject, msg.body, files)
+        # Answers come back to the owner's mailbox the sync reads, never to the sending address nobody reads.
+        reply_to = self.svc.orchestrator.reply_address()
+        if reply_to:
+            mailer.send(msg.to, msg.subject, msg.body, files, headers={"Reply-To": reply_to})
+        else:
+            mailer.send(msg.to, msg.subject, msg.body, files)
         msg.delivery = f"Sent. {SIMULATED_NOTE}" if is_simulated(mailer) else "Sent."
         msg.status = "sent"
         msg.sent_at = now.isoformat()

@@ -8,6 +8,11 @@ hash) and any hole older than the window becomes a known gap.
 Mailboxes are opened read-only (``EXAMINE``) and bodies fetched with
 ``BODY.PEEK[]``: the owner's messages are never marked as read.
 Auth is a password (app password) or XOAUTH2; an auth refusal means reconnect.
+
+The Junk or Spam folder is read and searched only when the owner allows it
+(``IMAPConfig.include_junk``, checklist B8): the folder the server marks
+``\\Junk`` (RFC 6154), else one with a usual name ("Junk", "Spam", ...). A
+folder marked ``\\Trash`` never is.
 """
 
 from __future__ import annotations
@@ -43,7 +48,8 @@ from .base import (
 )
 from .mail_search import MailQuery, imap_criteria
 
-__all__ = ["IMAPAuth", "IMAPClient", "IMAPConfig", "IMAPConnector", "encode_mailbox_name", "imap_date"]
+__all__ = ["IMAPAuth", "IMAPClient", "IMAPConfig", "IMAPConnector", "decode_mailbox_name", "encode_mailbox_name",
+           "imap_date"]
 
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 _UID = re.compile(rb"\bUID (\d+)")
@@ -82,6 +88,11 @@ class IMAPConfig:
     history_window: timedelta = timedelta(days=90)
     timeout_s: float = 30.0
     batch_size: int = 50
+    # The Junk or Spam folder too, if the mailbox has one (never the trash): the owner's "Also look in spam for
+    # invoices" (checklist B8).
+    include_junk: bool = False
+    junk_names: tuple[str, ...] = ("Junk", "Spam", "Junk E-mail", "Junk Email", "Bulk Mail", "INBOX.Junk",
+                                   "INBOX.Spam", "[Gmail]/Spam")
 
 
 def imap_date(day: date) -> str:
@@ -125,6 +136,50 @@ def encode_mailbox_name(name: str) -> str:
     flush()
     encoded = "".join(out)
     return '"' + encoded.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def decode_mailbox_name(raw: str) -> str:
+    """A mailbox name as the server lists it (modified UTF-7, RFC 3501 §5.1.3), in plain text."""
+    out, i = [], 0
+    while i < len(raw):
+        ch = raw[i]
+        end = raw.find("-", i + 1) if ch == "&" else -1
+        if ch != "&" or end < 0:
+            out.append(ch)
+            i += 1
+            continue
+        chunk = raw[i + 1:end]
+        if not chunk:
+            out.append("&")
+        else:
+            try:
+                padded = chunk.replace(",", "/") + "=" * (-len(chunk) % 4)
+                out.append(base64.b64decode(padded).decode("utf-16-be"))
+            except (ValueError, UnicodeDecodeError):
+                out.append(raw[i:end + 1])
+        i = end + 1
+    return "".join(out)
+
+
+_LIST_LINE = re.compile(rb'^\((?P<flags>[^)]*)\)\s+(?:"(?:[^"\\]|\\.)*"|NIL)\s+(?P<name>.+?)\s*$')
+
+
+def _listed(data: Sequence[Any]) -> list[tuple[frozenset[str], str]]:
+    """``(flags, name)`` of each mailbox in a LIST answer; unreadable lines are left out."""
+    found: list[tuple[frozenset[str], str]] = []
+    for item in data:
+        line = item if isinstance(item, bytes) else item[0] if isinstance(item, tuple) and item else None
+        if not isinstance(line, bytes):
+            continue
+        m = _LIST_LINE.match(line.strip())
+        if not m:
+            continue
+        name = m.group("name").decode("utf-8", "replace")
+        if len(name) >= 2 and name[0] == name[-1] == '"':
+            name = name[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        flags = frozenset(f.lower() for f in m.group("flags").decode("ascii", "replace").split())
+        found.append((flags, decode_mailbox_name(name)))
+    return found
 
 
 def _parse_fetch(data: Sequence[Any]) -> list[tuple[int, datetime | None, bytes]]:
@@ -202,7 +257,7 @@ class IMAPConnector:
             client = self._connect()
             try:
                 new_boxes: dict[str, tuple[int, int]] = {}
-                for mailbox in self.config.mailboxes:
+                for mailbox in self._mailboxes(client):
                     result = self._sync_mailbox(client, mailbox, boxes.get(mailbox), window_start, counted)
                     if result is None:
                         continue
@@ -228,7 +283,7 @@ class IMAPConnector:
         try:
             client = self._connect()
             try:
-                for mailbox in self.config.mailboxes:
+                for mailbox in self._mailboxes(client):
                     if self._open(client, mailbox) is None:
                         continue
                     self._fetch(client, mailbox, self._search(client, *criteria), counted)
@@ -245,7 +300,7 @@ class IMAPConnector:
         found: list[MailItem] = []
         client = self._connect()
         try:
-            for mailbox in self.config.mailboxes:
+            for mailbox in self._mailboxes(client):
                 if self._open(client, mailbox) is None:
                     continue
                 uids = sorted(self._search(client, *criteria), reverse=True)[: query.limit - len(found)]
@@ -281,6 +336,29 @@ class IMAPConnector:
         except OSError:
             raise TransientError("imap_network") from None
         return client
+
+    def _mailboxes(self, client: IMAPClient) -> list[str]:
+        """The mailboxes read: the configured ones, and the Junk or Spam folder when the owner allows it (B8).
+
+        The folder the server marks ``\\Junk`` (RFC 6154 LIST); without one, a listed folder with a usual junk
+        name; a server that cannot list is tried with those names (a missing one is skipped). Never ``\\Trash``."""
+        boxes = list(self.config.mailboxes)
+        if not self.config.include_junk:
+            return boxes
+        listing = getattr(client, "list", None)
+        listed: list[tuple[frozenset[str], str]] | None = None
+        if callable(listing):
+            typ, data = _call(listing)
+            listed = _listed(data) if typ == "OK" else None
+        usual = {n.lower() for n in self.config.junk_names}
+        if listed is None:
+            junk = list(self.config.junk_names)
+        else:
+            usable = [(flags, name) for flags, name in listed
+                      if "\\trash" not in flags and "\\noselect" not in flags]
+            junk = [name for flags, name in usable if "\\junk" in flags] or \
+                [name for _, name in usable if name.lower() in usual]
+        return boxes + [name for name in junk if name not in boxes]
 
     def _open(self, client: IMAPClient, mailbox: str) -> int | None:
         """EXAMINE the mailbox; its UIDVALIDITY, or ``None`` if it does not exist."""

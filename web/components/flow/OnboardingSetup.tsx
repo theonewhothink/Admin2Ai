@@ -6,7 +6,8 @@
  * Accountant, Start, each wired to the real API:
  *
  *   Company     POST /api/onboarding/company {name, taxId}      (more companies)
- *   Email       GET  /api/oauth/start?provider=google|microsoft (full-page consent)
+ *   Email       POST /api/settings/reading {history}           (how far back I read: 90 days or 12 months)
+ *               GET  /api/oauth/start?provider=google|microsoft (full-page consent)
  *   Bank        POST /api/connections/bank/start {institutionId} → redirectUrl
  *   Accountant  POST /api/onboarding/accountant {email, name?}
  *
@@ -19,13 +20,15 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { Field, FormAlert } from "@/components/auth/Field";
 import { Icon } from "@/components/Icon";
+import { useApi } from "@/components/detail/useApi";
 import { useData } from "@/components/live/useData";
-import { addCompany, oauthStartUrl, requireSession, setAccountant, startBankConnection } from "@/lib/account";
+import { HistoryChoice } from "@/components/settings/HistoryChoice";
+import { addCompany, chooseHistory, oauthStartUrl, requireSession, setAccountant, startBankConnection } from "@/lib/account";
 import { getCompanies, getHome } from "@/lib/api";
 import { banks } from "@/lib/banks";
 import { checkNif } from "@/lib/nif";
 import { clearProgress, saveProgress, savedStep, type Leg } from "@/lib/onboarding-progress";
-import type { CompanySummary, Connection } from "@/lib/types";
+import type { CompanySummary, Connection, HistoryChoice as Choice, ReadingData } from "@/lib/types";
 import styles from "./flow.module.css";
 import { ProviderButton, StepHead } from "./OnboardingFlow";
 import { OnboardingReturn } from "./OnboardingReturn";
@@ -311,6 +314,24 @@ function EmailStep({
   onNext,
 }: StepProps & { connection?: Connection; failed: boolean; onConnect: (provider: "google" | "microsoft") => void }) {
   const [leaving, setLeaving] = useState<string | null>(null);
+  // How far back the first read of the email and the bank goes (spec §6): saved before connecting.
+  const reading = useApi<ReadingData>("/api/settings/reading");
+  const [history, setHistory] = useState<Choice | null>(null);
+  const [historyBusy, setHistoryBusy] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const chosen = history ?? reading.data?.history ?? "90d";
+  const choose = async (choice: Choice) => {
+    const before = chosen;
+    setHistory(choice);
+    setHistoryError(null);
+    setHistoryBusy(true);
+    const r = await chooseHistory(choice);
+    setHistoryBusy(false);
+    if (!r.ok) {
+      setHistory(before);
+      setHistoryError(r.message);
+    }
+  };
   const connect = (provider: "google" | "microsoft") => {
     setLeaving(provider);
     onConnect(provider);
@@ -328,6 +349,12 @@ function EmailStep({
         </p>
       ) : null}
       {connection ? <ConnectedLine connection={connection} /> : null}
+      <HistoryChoice value={chosen} disabled={historyBusy || leaving !== null} onChange={(c) => void choose(c)} />
+      {historyError ? (
+        <p className="attention-text" role="alert">
+          {historyError}
+        </p>
+      ) : null}
       <div className="stack-1">
         <ProviderButton
           icon="google"

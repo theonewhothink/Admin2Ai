@@ -3,6 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { Icon, type IconName } from "@/components/Icon";
+import { HistoryChoice } from "@/components/settings/HistoryChoice";
 import { companyLookup, owner } from "@/lib/data";
 import styles from "./flow.module.css";
 
@@ -298,6 +299,7 @@ function CompanyStep({ headingRef, onNext }: StepProps) {
 
 function EmailStep({ headingRef, onNext }: StepProps) {
   const [provider, setProvider] = useState<string | null>(null);
+  const [history, setHistory] = useState<"90d" | "12m">("90d");
   const task = useFakeTask(1100);
   const [imapEmail, setImapEmail] = useState("");
   const [imapPass, setImapPass] = useState("");
@@ -315,6 +317,7 @@ function EmailStep({ headingRef, onNext }: StepProps) {
         title="Connect your email"
         text="I look for invoices, receipts and supplier messages. I never send anything without asking you first."
       />
+      <HistoryChoice value={history} disabled={task.state === "working"} onChange={setHistory} />
       <div className="stack-1">
         <ProviderButton icon="google" label="Google" sub="Gmail or Google Workspace" onClick={() => choose("google")} state={task.state} selected={provider === "google"} />
         <ProviderButton icon="microsoft" label="Microsoft" sub="Outlook or Microsoft 365" onClick={() => choose("microsoft")} state={task.state} selected={provider === "microsoft"} />

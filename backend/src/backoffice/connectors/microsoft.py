@@ -10,6 +10,11 @@
   reference attachments individually when needed.
 * Webhooks: ``/subscriptions`` with a ``clientState`` secret that every
   notification must echo (checked in constant time).
+* Junk and Deleted Items: the Junk Email folder is read (its own delta) and
+  searched only when the owner allows it (``GraphMailConfig.include_junk``,
+  checklist B8); Deleted Items never. Mailbox-wide listings (``/messages``:
+  searches, backfills, conversations) span every folder, so what they return
+  from those folders is left out by its ``parentFolderId``.
 
 Follow-up links are only followed on the Graph origin, so the bearer token is
 never sent anywhere else.
@@ -80,7 +85,9 @@ GRAPH_MAIL_SCOPES = ("offline_access", "https://graph.microsoft.com/Mail.Read")
 # Reading a shared mailbox (or one the user has full access to) with the signed-in user's delegated access.
 GRAPH_SHARED_MAIL_SCOPE = "https://graph.microsoft.com/Mail.Read.Shared"
 GRAPH_SHARED_MAIL_SCOPES = (*GRAPH_MAIL_SCOPES, GRAPH_SHARED_MAIL_SCOPE)
-_SELECT = "id,receivedDateTime,isDraft,conversationId,internetMessageId"
+_SELECT = "id,receivedDateTime,isDraft,conversationId,internetMessageId,parentFolderId"
+JUNK_FOLDER = "junkemail"  # well-known folder names (Graph mailFolder)
+DELETED_FOLDER = "deleteditems"
 _CURSOR_VERSION = 1
 
 
@@ -95,6 +102,8 @@ class GraphMailConfig:
     # A shared mailbox's address (checklist O2): read through /users/{address} with the signed-in user's
     # delegated access instead of /me. None: the signed-in user's own mailbox.
     mailbox: str | None = None
+    # The Junk Email folder too (never Deleted Items): the owner's "Also look in spam for invoices" (checklist B8).
+    include_junk: bool = False
 
 
 @dataclass(frozen=True)
@@ -166,6 +175,7 @@ class MicrosoftMailConnector:
         # Whose mailbox every call reads: the signed-in user's, or a shared one through their delegated access.
         self.user_path = f"users/{quote(mailbox, safe='@')}" if mailbox else "me"
         self.root = f"{self.base_url}/{self.user_path}"
+        self._skipped: frozenset[str] | None = None  # ids of the folders never read (looked up once)
 
     # ----------------------------------------------------------------- sync
 
@@ -254,6 +264,8 @@ class MicrosoftMailConnector:
         for item in items:
             if "@removed" in item or item.get("isDraft"):
                 continue
+            if folder_id is None and self._in_skipped_folder(item):
+                continue  # a mailbox-wide listing: Deleted Items never, Junk Email only when allowed (B8)
             message_id = required_str(item, "id", "graph")
             raw = self.fetch_mime(message_id)
             if raw is not None:
@@ -263,9 +275,25 @@ class MicrosoftMailConnector:
 
     # ----------------------------------------------------------------- folders
 
+    def _in_skipped_folder(self, item: Mapping[str, Any]) -> bool:
+        parent = item.get("parentFolderId")
+        if not parent:
+            return False
+        if self._skipped is None:
+            names = (DELETED_FOLDER,) if self.config.include_junk else (DELETED_FOLDER, JUNK_FOLDER)
+            found: set[str] = set()
+            for name in names:
+                response = self._http.request("GET", f"{self.root}/mailFolders/{name}", params={"$select": "id"},
+                                              allow=(404,))
+                if response.status_code != 404:
+                    found.add(required_str(json_object(response, "graph"), "id", "graph"))
+            self._skipped = frozenset(found)
+        return str(parent) in self._skipped
+
     def _folder_ids(self) -> list[str]:
         ids: dict[str, None] = {}
-        for name in self.config.folders:
+        names = (*self.config.folders, JUNK_FOLDER) if self.config.include_junk else self.config.folders
+        for name in names:
             response = self._http.request("GET", f"{self.root}/mailFolders/{name}",
                                           params={"$select": "id,childFolderCount"}, allow=(404,))
             if response.status_code == 404:
@@ -330,7 +358,8 @@ class MicrosoftMailConnector:
     def search_messages(self, query: MailQuery) -> list[MailItem]:
         """Messages matching ``query`` in every folder of the mailbox, the archive included (Graph ``$search`` on
         ``/messages``, KQL), each as MIME (§22: current and historical email). ``$search`` cannot be combined
-        with ``$filter`` or ``$orderby``, so the date window is part of the KQL; drafts are skipped."""
+        with ``$filter`` or ``$orderby``, so the date window is part of the KQL; drafts are skipped, and so is
+        what is in Deleted Items, or in Junk Email unless the owner allowed it (B8)."""
         params: dict[str, Any] = {"$search": graph_search(query), "$select": _SELECT, "$top": query.limit}
         page = self._http.get_json(f"{self.root}/messages", params=params)
         found = object_list(page, "value", "graph")[: query.limit]

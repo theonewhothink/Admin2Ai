@@ -218,6 +218,9 @@ class BackOfficeService:
         self.real_sources = False
         # What each synced connection remembers between runs (connectors.base.ConnectorState as JSON).
         self.sync_states: dict[str, dict[str, Any]] = {}
+        # Mailboxes and banks reading further back since the owner chose a longer history (checklist A9): connection
+        # id -> the days it now reads back to. Said once in Activity when the older months are in.
+        self.reading_back: dict[str, int] = {}
         # Payments a linked bank sent for an account the business has not added (checklist S8): kept here, by the
         # Needs-you id that asks about them, until the owner adds the account to a company or ignores it.
         self.unknown_accounts: dict[str, dict[str, Any]] = {}
@@ -1030,8 +1033,8 @@ class BackOfficeService:
             self.orchestrator.milestone("email_connected")
             if secret_stored:  # it can read now: the first run waits for its 90 days (§6)
                 self.orchestrator.connection_reading(cid)
-            self.orchestrator.activity(now, "checked", f"Connected {address}. I'm reading the last 90 days now.",
-                                       company if company else None)
+            self.orchestrator.activity(now, "checked", f"Connected {address}. I'm reading the last "
+                                       f"{_period_words(self.history_days())} now.", company if company else None)
         kind = options.get("mailbox", "own")
         if pending and kind in ("shared", "delegated"):
             message = f"Almost done. Sign in with your own account that can open {address}."
@@ -1169,7 +1172,7 @@ class BackOfficeService:
         if not (self.sync_states.get(cid) or {}).get("last_successful_sync"):
             self.orchestrator.connection_reading(cid)  # the first run waits for its 90 days (§6)
         self.orchestrator.activity(now, "checked", f"Connected {bank} for {entity.name}. I'm importing the last "
-                                   "90 days now.", company)
+                                   f"{_period_words(self.history_days())} now.", company)
         return {"id": aid, "message": f"Done. {bank} is connected for {entity.name}."}
 
     def link_bank(self, bank: str, company_id: str, ibans: Sequence[str], consent_until: date) -> dict[str, Any]:
@@ -1217,14 +1220,7 @@ class BackOfficeService:
             return datetime.fromisoformat(value) if isinstance(value, str) and value else None
 
         start, end, last = when("coverage_start"), when("coverage_end"), when("last_successful_sync")
-        # Known holes inside the window are never assumed complete: every month they touch stays open until they
-        # are read (a mailbox catches up by itself; days a bank no longer serves need a statement).
-        unreachable = {(g.get("start"), g.get("end")) for g in state.get("unreachable_gaps") or []
-                       if isinstance(g, Mapping)}
-        c.gaps = tuple(sorted(
-            (datetime.fromisoformat(g["start"]), datetime.fromisoformat(g["end"]),
-             (g["start"], g["end"]) not in unreachable)
-            for g in state.get("known_gaps") or [] if isinstance(g, Mapping) and g.get("start") and g.get("end")))
+        c.gaps = _known_gaps(state)
         c.healthy = not state.get("reconnect_required")
         c.covered_from, c.covered_until = start, end
         c.last_synced_at = last or c.last_synced_at
@@ -1271,10 +1267,13 @@ class BackOfficeService:
             missed = any(g[2] for g in c.gaps)
             days = self._synced(c, state)
             if days is not None:
-                self.orchestrator.activity(self._now(), "checked", f"Read {c.account}: the last {days} days are in.")
+                self.orchestrator.activity(self._now(), "checked",
+                                           f"Read {c.account}: the last {_period_words(days)} are in.")
             if backfill and missed and not any(g[2] for g in c.gaps):
-                self.orchestrator.activity(self._now(), "checked", f"Caught up on the email I had missed from "
-                                                                   f"{c.account}.")
+                further = self.reading_back.pop(c.id, None)  # the older months the owner asked for (A9)
+                self.orchestrator.activity(self._now(), "checked", (
+                    f"Read the older email from {c.account}: the last {_period_words(further)} are in."
+                    if further else f"Caught up on the email I had missed from {c.account}."))
             self.orchestrator.log("discovery", "connector_backfilled" if backfill else "connector_synced",
                                   subject_id=c.id, values={"messages": len(messages)})
             self.orchestrator.run()
@@ -1303,7 +1302,10 @@ class BackOfficeService:
         if state is not None:
             days = self._synced(c, state)
             if days is not None:
-                self.orchestrator.activity(self._now(), "checked", f"Imported the last {days} days from {c.name}.")
+                self.orchestrator.activity(self._now(), "checked",
+                                           f"Imported the last {_period_words(days)} from {c.name}.")
+            if backfill and c.id in self.reading_back and not any(g[2] for g in c.gaps):
+                self._read_back_bank(c, self.reading_back.pop(c.id))  # the older months the owner asked for (A9)
             self.orchestrator.log("discovery", "connector_backfilled" if backfill else "connector_synced",
                                   subject_id=c.id, values={"rows": len(known), "kept": kept})
             self.orchestrator.run()
@@ -2411,6 +2413,123 @@ class BackOfficeService:
         return {**cfg, "companyNames": names, "ownerEmail": self.repo.owner.email,
                 "summary": f"On working day {cfg['day']} of each month I send the closed month to {who}."}
 
+    # ----------------------------------------------------------------- How I read the mail and the banks (§6, §8)
+
+    # How far back the first read of a new connection goes (§6): the last 90 days by default, or the last 12 months.
+    HISTORY_CHOICES: Mapping[str, int] = {"90d": 90, "12m": 365}
+    DEFAULT_HISTORY_DAYS = 90
+
+    def history_days(self) -> int:
+        """How far back a new connection is read the first time, as the owner chose (§6)."""
+        return self.repo.history_days or self.DEFAULT_HISTORY_DAYS
+
+    def reading_settings(self, body: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """GET/POST ``/api/settings/reading``: how far back I read the first time, and whether I look in spam
+        (§6, §8, checklist A9, B8).
+
+        POST ``{history?: "90d" | "12m", lookInSpam?: bool}`` (owner only, recorded in the audit log).
+
+        * ``history``: how far back the first read of each new mailbox and bank goes: the last 90 days (the
+          default) or the last 12 months. Choosing 12 months once mailboxes and banks are read also reads their
+          older months: each gets those months as a known gap, which the sync worker reads a week of mail at a time
+          (server/sync.py); until then every month in it says it is catching up, never closed. Going back to 90
+          days changes only what is connected next; nothing already read or started is dropped.
+        * ``lookInSpam`` (off by default): the spam folder is read and searched for invoices too: Gmail's spam,
+          Microsoft 365's Junk Email folder, an IMAP mailbox's Junk or Spam folder. Never the trash.
+        """
+        repo = self.repo
+        message = None
+        if body:
+            known = [k for k in ("history", "lookInSpam") if k in body]
+            if not known:
+                raise ServiceError(400, "Choose how far back I read, or whether I look in spam.")
+            history = body.get("history")
+            if "history" in body and history not in self.HISTORY_CHOICES:
+                raise ServiceError(400, "Choose the last 90 days or the last 12 months.")
+            spam = body.get("lookInSpam")
+            if "lookInSpam" in body and not isinstance(spam, bool):
+                raise ServiceError(400, "Switch it on or off with true or false.")
+            parts: list[str] = []
+            if "history" in body:
+                days = self.HISTORY_CHOICES[str(history)]
+                before = self.history_days()
+                repo.history_days = days
+                further = self._read_further_back(days) if days > before else []
+                self.orchestrator.log("discovery", "history_chosen", values={"days": days, "before": before,
+                                                                             "further": [c.id for c in further]},
+                                      actor=f"owner:{repo.owner.email}")
+                if further:
+                    names = join_and([c.account if c.kind == "email" else c.name for c in further])
+                    parts.append(f"I will read the last {_period_words(days)}. I'm reading the older months of "
+                                 f"{names} now")
+                else:
+                    parts.append(f"I will read the last {_period_words(days)} of what you connect")
+            if "lookInSpam" in body and bool(spam) != repo.look_in_spam:
+                repo.look_in_spam = bool(spam)
+                self.orchestrator.log("discovery", "spam_reading_changed", values={"on": bool(spam)},
+                                      actor=f"owner:{repo.owner.email}")
+            if "lookInSpam" in body:
+                parts.append("I will also look in spam for invoices" if spam else "I won't look in spam")
+            self.orchestrator.run()
+            message = "Done. " + ". ".join(parts) + "."
+        days = self.history_days()
+        choice = next(k for k, v in self.HISTORY_CHOICES.items() if v == days) \
+            if days in self.HISTORY_CHOICES.values() else "90d"
+        out: dict[str, Any] = {
+            "history": choice,
+            "historyOptions": [{"id": "90d", "label": "Last 90 days"}, {"id": "12m", "label": "Last 12 months"}],
+            "historyLabel": "How far back I read the first time",
+            "historyDetail": "When you connect your email or a bank, I read this far back to learn how your business "
+                             "works.",
+            "lookInSpam": repo.look_in_spam,
+            "spamLabel": "Also look in spam for invoices",
+            "spamDetail": "Sometimes an invoice lands in spam. I look there too, but never in the trash.",
+            "reading": sorted(c.account if c.kind == "email" else c.name for c in repo.connectors.values()
+                              if c.id in self.reading_back),
+        }
+        if message:
+            out["ok"], out["message"] = True, message
+        return out
+
+    def _read_further_back(self, days: int) -> list[ConnectorState]:
+        """Mailboxes and banks already read the first time now read back ``days`` too (checklist A9): the months
+        before what they read become a known gap, which the sync worker reads (server/sync.py). Every month in it
+        stays open, catching up, until it is read: nothing is assumed. Returns the connections extended."""
+        from datetime import timezone
+
+        start = (self._now() - timedelta(days=days)).astimezone(timezone.utc)
+        extended: list[ConnectorState] = []
+        for c in sorted(self.repo.connectors.values(), key=lambda c: (c.kind != "email", c.id)):  # mail first
+            state = self.sync_states.get(c.id) or {}
+            covered = state.get("coverage_start")
+            if c.kind not in ("email", "bank") or not state.get("last_successful_sync") or \
+                    not isinstance(covered, str) or not covered:
+                continue  # not read yet: its first read takes the new window by itself
+            begin = datetime.fromisoformat(covered)
+            if begin - start <= timedelta(days=1):
+                continue  # already read that far back
+            gaps = [dict(g) for g in state.get("known_gaps") or [] if isinstance(g, Mapping)]
+            gaps.append({"start": start.isoformat(), "end": begin.isoformat()})
+            state = {**state, "coverage_start": start.isoformat(), "known_gaps": gaps}
+            self.sync_states[c.id] = state
+            c.gaps, c.covered_from = _known_gaps(state), start
+            self.reading_back[c.id] = days
+            extended.append(c)
+        return extended
+
+    def _read_back_bank(self, c: ConnectorState, days: int) -> None:
+        """A bank's older months, read as far as it shares them (checklist A9): said once, plainly."""
+        now = self._now()
+        kept = [g for g in c.gaps if not g[2]]  # days the bank no longer shares: only a statement completes them
+        if not kept:
+            self.orchestrator.activity(now, "checked", f"Imported the older payments from {c.name}: the last "
+                                       f"{_period_words(days)} are in.")
+            return
+        first = max(g[1] for g in kept).astimezone(TZ).date()
+        self.orchestrator.activity(now, "checked", f"{c.name} only shares the payments from "
+                                   f"{day_month(first, now.astimezone(TZ).date())} on. For the months before, send "
+                                   "me a bank statement.")
+
     # ----------------------------------------------------------------- What I may do on my own (§25)
 
     # The owner's switches for what runs "automatically if authorized" (policy/actions.py): key, action, plain name,
@@ -2476,6 +2595,13 @@ class BackOfficeService:
             if key == "monthlyPackage":
                 detail = (f"On working day {self._report_settings()['day']} after each month, I send your "
                           "accountant the documents, the ledger and the originals.")
+            elif key == "supplierRequests":  # where the supplier's answer goes (K8: a mailbox I read)
+                reply_to = self.orchestrator.reply_address()
+                read = any(c.kind == "email" and c.searchable and c.account.lower() == reply_to
+                           for c in repo.connectors.values())
+                if reply_to:
+                    detail += (f" Their reply comes to {reply_to}, and I read it there." if read else
+                               f" Their reply comes to {reply_to}.")
             items.append({"id": key, "label": label, "detail": detail, "on": everywhere,
                           "onFor": [p["companyId"] for p in per_company if p["on"]], "companies": per_company,
                           "level": "automatic_if_authorized", "levelLabel": "Only when you allow it"})
@@ -5117,6 +5243,8 @@ class BackOfficeService:
             ("POST", r("/api/settings/report"), lambda b: self.report_settings(b or {})),
             ("GET", r("/api/settings/automation"), lambda b: self.automation_settings()),
             ("POST", r("/api/settings/automation"), lambda b: self.automation_settings(b or {"nothing": True})),
+            ("GET", r("/api/settings/reading"), lambda b: self.reading_settings()),
+            ("POST", r("/api/settings/reading"), lambda b: self.reading_settings(b or {"nothing": True})),
             ("GET", r("/api/accountant/api-keys"), lambda b: self.api_keys()),
             ("POST", r("/api/accountant/api-keys"), lambda b: self.api_key_create(b)),
             ("POST", r(f"/api/accountant/api-keys/{seg}/revoke"), lambda b, kid: self.api_key_revoke(kid)),
@@ -5165,6 +5293,24 @@ class _Reply(Exception):
         super().__init__(status)
         self.status = status
         self.body = body
+
+
+def _known_gaps(state: Mapping[str, Any]) -> tuple[tuple[datetime, datetime, bool], ...]:
+    """A synced connection's known holes (connectors.base.ConnectorState as JSON) as (start, end, reachable).
+
+    Known holes inside the window are never assumed complete: every month they touch stays open until they are
+    read (a mailbox catches up by itself; days a bank no longer serves need a statement)."""
+    unreachable = {(g.get("start"), g.get("end")) for g in state.get("unreachable_gaps") or []
+                   if isinstance(g, Mapping)}
+    return tuple(sorted(
+        (datetime.fromisoformat(g["start"]), datetime.fromisoformat(g["end"]),
+         (g["start"], g["end"]) not in unreachable)
+        for g in state.get("known_gaps") or [] if isinstance(g, Mapping) and g.get("start") and g.get("end")))
+
+
+def _period_words(days: int) -> str:
+    """How far back, as the owner chose it: "90 days", "12 months"."""
+    return "12 months" if days >= 360 else f"{days} days"
 
 
 _NUMBER_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten")

@@ -7,9 +7,15 @@ backoffice.server.worker`` repeats it):
    months) even when nobody opens the app.
 2. **Mailboxes** (Gmail, Microsoft 365, IMAP) and **banks** (GoCardless, PSD2)
    the owner connected with a real sign-in are read with the engine's
-   connectors. The first sync reads the history window (90 days by default,
-   §6); later syncs continue from the saved cursor. Access tokens are
-   refreshed through the vault, which keeps any rotated refresh token.
+   connectors. The first sync reads the history window the owner chose (the
+   last 90 days by default, or the last 12 months, §6; the server's
+   BACKOFFICE_HISTORY_DAYS for a business that never chose); later syncs
+   continue from the saved cursor. Choosing 12 months later gives each
+   mailbox and bank already read its older months as a known gap, read as in
+   10. below. Spam (Gmail's spam, Microsoft 365's Junk Email, an IMAP Junk or
+   Spam folder) is read and searched only when the owner allows it; the trash
+   never. Access tokens are refreshed through the vault, which keeps any
+   rotated refresh token.
 3. Whatever a sync fetched becomes **events** in the tenant's log, in batches:
    ``sync.mail`` (the raw messages, stored in the object store; PDFs and photos
    read before the event is recorded) and ``sync.bank`` (booked transactions).
@@ -188,6 +194,10 @@ class _Connection:
     # accounting software's account name, the company's tax number (to find it in Moloni).
     options: Mapping[str, Any] = field(default_factory=dict)
     sign_in: Mapping[str, Any] = field(default_factory=dict)  # the engine's sign-in state (a code awaited...)
+    # What the owner chose for how the business is read (checklist A9, B8): how far back a first read goes (None:
+    # the server's default) and whether spam is read and searched too (never the trash).
+    history_days: int | None = None
+    spam: bool = False
 
     @property
     def key(self) -> str:
@@ -921,6 +931,11 @@ class SyncWorker:
         state = record_failure(state, at=self.now(), error=ReconnectRequired("search_sign_in_refused"))
         return state.model_dump(mode="json")
 
+    def _history(self, c: _Connection) -> timedelta:
+        """How far back a first read of this connection goes: what the owner chose (§6: the last 90 days or the
+        last 12 months, checklist A9), else this server's default (BACKOFFICE_HISTORY_DAYS)."""
+        return timedelta(days=c.history_days) if c.history_days else self.history
+
     def _mail_interval(self, state: Any, now: datetime) -> timedelta:
         """Hourly while push works (a safety net); every few minutes after a loss, until a push arrives again."""
         from backoffice.connectors.base import WebhookState
@@ -947,7 +962,7 @@ class SyncWorker:
             host = str(secret.get("host") or "")
             if not host:
                 raise _Unconfigured("imap_without_host")
-            config = IMAPConfig(host=host, history_window=self.history)
+            config = IMAPConfig(host=host, history_window=self._history(c), include_junk=c.spam)
             auth = IMAPAuth(str(secret.get("username") or c.account), password=secret.get("password"))
             kwargs: dict[str, Any] = {"client_factory": self.imap_factory} if self.imap_factory else {}
             return IMAPConnector(config, auth, clock=self.now, **kwargs)
@@ -984,7 +999,7 @@ class SyncWorker:
         if c.kind == "files":
             from backoffice.connectors.cloud_storage import CloudStorageConfig, GoogleDriveConnector, OneDriveConnector
 
-            files = CloudStorageConfig(folder=c.options.get("folder") or None, history_window=self.history,
+            files = CloudStorageConfig(folder=c.options.get("folder") or None, history_window=self._history(c),
                                        drive=str(c.options.get("drive") or "me/drive"))
             if provider == "google":
                 return GoogleDriveConnector(tokens, client=self.http_client, config=files, clock=self.now)
@@ -992,12 +1007,12 @@ class SyncWorker:
         if provider == "google":
             from backoffice.connectors.gmail import GmailConfig, GmailConnector
 
-            config = GmailConfig(history_window=self.history,
+            config = GmailConfig(history_window=self._history(c), include_spam=c.spam,
                                  user_id=c.account if c.mailbox == "delegated" else None,
                                  delivered_to=c.account if c.mailbox == "alias" else None)
             return GmailConnector(tokens, client=self.http_client, config=config, clock=self.now)
         return MicrosoftMailConnector(tokens, client=self.http_client,
-                                      config=GraphMailConfig(history_window=self.history,
+                                      config=GraphMailConfig(history_window=self._history(c), include_junk=c.spam,
                                                              mailbox=c.account if shared else None), clock=self.now)
 
     def _bank_connector(self, c: _Connection) -> Any:
@@ -1023,7 +1038,7 @@ class SyncWorker:
         mapping = {provider_id: ours or _unknown_account(accounts.get(provider_id), provider_id)
                    for provider_id, ours in mapping.items()}
         return OpenBankingConnector(aggregator, requisition, account_ids=mapping,
-                                    config=BankSyncConfig(history_window=self.history), clock=self.now,
+                                    config=BankSyncConfig(history_window=self._history(c)), clock=self.now,
                                     unknown_account=_unknown_account)
 
 
@@ -1033,7 +1048,7 @@ def _accounting_connector_for(worker: SyncWorker, c: _Connection, meta: Any) -> 
     from backoffice.connectors import accounting as A
 
     secret = worker.vault.open(c.tenant_id, c.id)
-    history = worker.history
+    history = worker._history(c)
     if meta.provider == "invoicexpress":
         connector: Any = A.InvoiceXpressConnector(str(secret.get("account") or c.options.get("account") or ""),
                                                   str(secret.get("api_key") or ""), client=worker.http_client,
@@ -1099,7 +1114,8 @@ def _connections(tenant_id: str, svc: Any, kinds: tuple[str, ...] = ("email", "b
             options["taxId"] = repo.companies[c.company_ids[0]].tax_id
         out.append(_Connection(tenant_id, c.id, c.kind, c.name, c.account, c.healthy,
                                svc.sync_states.get(c.id), ibans if c.kind == "bank" else {},
-                               str(info.get("mailbox") or "own"), options, info))
+                               str(info.get("mailbox") or "own"), options, info,
+                               history_days=repo.history_days, spam=bool(repo.look_in_spam)))
     return out
 
 

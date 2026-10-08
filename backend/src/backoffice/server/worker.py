@@ -8,7 +8,8 @@ OAuth apps, GoCardless keys, SMTP, Expo, Anthropic, document reading), plus:
 =============================  ==========================================================
 ``BACKOFFICE_SYNC_INTERVAL``   seconds between syncs of one mailbox (default 900); banks
                                sync at most every 6 hours (GoCardless allows 4 a day)
-``BACKOFFICE_HISTORY_DAYS``    how far back a first sync reads (default 90, up to 365, §6)
+``BACKOFFICE_HISTORY_DAYS``    how far back a first sync reads when the owner did not
+                               choose (default 90, up to 365, §6)
 ``S3_ERASURE_ROLE_ARN``        the evidence-deletion role it assumes to delete an erased
                                business's files (AWS; its task role must be trusted)
 ``S3_REPLICA_BUCKET``          the evidence bucket's disaster-recovery copy, erased too

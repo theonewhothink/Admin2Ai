@@ -86,7 +86,7 @@ class ServerConfig:
     log_level: str = "INFO"
     strict_reads: bool = False  # a read that changes a tenant raises (tests); otherwise logged and rebuilt
     sync_interval_s: int = 900  # the sync worker: how often each connection is read
-    history_days: int = 90  # the first sync of a mailbox or bank reads this far back (§6: 90, or 365)
+    history_days: int = 90  # a first sync reads this far back unless the owner chose (§6: 90, or 365)
     # Push notifications (server/webhooks.py). Gmail: the Pub/Sub topic its watches publish to, and the service
     # account Pub/Sub signs its pushes with (checked when set). Microsoft Graph: on by default when the API is
     # served over HTTPS (Graph only notifies public HTTPS addresses).

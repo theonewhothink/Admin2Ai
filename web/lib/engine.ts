@@ -29,7 +29,7 @@ const VERSION = process.env.NEXT_PUBLIC_ENGINE_BUILD ?? "dev";
 const JOURNAL_KEY = "admin2ai:engine-journal";
 const JOURNAL_MAX_CHARS = 3_000_000;
 /** Requests that change the engine's state and so must be replayed after a reload. */
-const MUTATING = /^\/api\/(chat(\/outbox\/[^/]+\/send|\/tool)?|tasks(\/[^/]+\/done)?|settings\/(report|accountant|automation|mailboxes)|accountant\/api-keys(\/[^/]+\/revoke)?|sources(\/[^/]+\/remove)?|needs-you\/[^/]+\/answer|evidence(\/upload)?|receipts|share|connections\/[^/]+\/(stale|reconnect)|accountant\/(rules|invitations|clients\/[^/]+\/rules)|companies\/[^/]+\/(cost-centers|profile|identity)|portals\/[^/]+\/code|cost-centers\/[^/]+|documents\/[^/]+\/sensitive|employees(\/[^/]+)?|expense-claims|(employee|manager)\/receipts|transactions\/[^/]+\/evidence|obligations\/[^/]+\/done|expected-invoices\/[^/]+\/not-coming|onboarding\/seen)$/;
+const MUTATING = /^\/api\/(chat(\/outbox\/[^/]+\/send|\/tool)?|tasks(\/[^/]+\/done)?|settings\/(report|accountant|automation|mailboxes|reading)|accountant\/api-keys(\/[^/]+\/revoke)?|sources(\/[^/]+\/remove)?|needs-you\/[^/]+\/answer|evidence(\/upload)?|receipts|share|connections\/[^/]+\/(stale|reconnect)|accountant\/(rules|invitations|clients\/[^/]+\/rules)|companies\/[^/]+\/(cost-centers|profile|identity)|portals\/[^/]+\/code|cost-centers\/[^/]+|documents\/[^/]+\/sensitive|employees(\/[^/]+)?|expense-claims|(employee|manager)\/receipts|transactions\/[^/]+\/evidence|obligations\/[^/]+\/done|expected-invoices\/[^/]+\/not-coming|onboarding\/seen)$/;
 
 export interface EngineReply {
   status: number;

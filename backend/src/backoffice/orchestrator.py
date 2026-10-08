@@ -392,6 +392,10 @@ CHASE_AFTER_DAYS = 3  # a payment this old without its invoice is worth a polite
 LINK_GIVE_UP_AFTER = timedelta(days=3)  # an invoice link whose site has not answered for this long: another way
 ANSWER_SECONDS = 40  # owner time recorded for one tap on a Needs-You item (§59)
 MESSAGE_ID_DOMAIN = "backoffice.example"  # right-hand side of the Message-IDs of the emails we write
+# One plain address (no display name, no list, no line break): what a Reply-To header may carry (header safety).
+_REPLY_ADDRESS = re.compile(
+    r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+@"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+")
 # Emails the back office writes on its own, and the permission each needs (§25). It is checked again when the
 # email is sent: switched off in the owner's settings meanwhile, what was written but not sent is held back.
 GATED_MESSAGES: Mapping[str, ActionKind] = {
@@ -1351,6 +1355,11 @@ class Repository:
         self.company_addresses: dict[str, list[str]] = {}
         self.company_sectors: dict[str, str] = {}
         self.mailboxes: dict[str, str] = {}  # a mailbox or alias -> the company the owner said it belongs to
+        # How the mail and the banks are read, as the owner chose (§6, §8, checklist A9, B8): how far back a new
+        # connection is read the first time (None: the default, the last 90 days), and whether spam is looked in
+        # for invoices (never the trash). The production sync worker follows them (server/sync.py).
+        self.history_days: int | None = None
+        self.look_in_spam = False
         # Learned expected evidence (§21, J7): the owner's or accountant's answer ("this never has an invoice"),
         # used for every later payment to that counterparty. Company-limited accountant rules keep their own.
         self.expectation_overrides = InMemoryExpectationOverrides()
@@ -7488,12 +7497,12 @@ class Orchestrator:
         sent = []
         for message in self.sendable_messages():
             try:
-                self._transmit(message, self.transport)
+                headers = self._transmit(message, self.transport)
             except Exception as exc:  # it stays waiting; the owner is told (never "sent")
                 message.failures += 1
                 self.log("mailer", "send_failed", subject_id=message.id, response={"error": type(exc).__name__})
                 continue
-            self._sent(message, now, self.transport)
+            self._sent(message, now, self.transport, headers)
             sent.append(message.id)
         return sent
 
@@ -7505,21 +7514,48 @@ class Orchestrator:
         message = self.repo.outbox.get(message_id)
         if message is None or message.sent or self.held_back(message):
             return False
-        self._transmit(message, transport)
-        self._sent(message, at or self.repo.clock.now(), transport)
+        headers = self._transmit(message, transport)
+        self._sent(message, at or self.repo.clock.now(), transport, headers)
         self.run(at)
         return True
 
-    @staticmethod
-    def _transmit(message: OutgoingMessage, transport: Any) -> None:
-        transport.send([message.to, *message.cc], message.subject, message.body, list(message.files),
-                       headers=dict(message.headers))
+    def reply_address(self, company_id: str | None = None) -> str | None:
+        """Where the answer to an email I write goes (§22 "the system monitors the thread"): a mailbox I read.
 
-    def _sent(self, message: OutgoingMessage, at: datetime, transport: Any) -> None:
+        Every email leaves from the one sending address nobody reads, so it carries this as its Reply-To. A
+        supplier's or the accountant's answer then lands in a mailbox the sync reads and is matched to my email by
+        its thread. The company's own mailbox first, a working one before one that needs signing in again. With no
+        mailbox I read, the owner's own address: the answer still reaches a person (it is not watched then).
+        None when neither is one plain address."""
+        mailboxes = sorted((c for c in self.repo.connectors.values() if c.kind == "email" and c.searchable),
+                           key=lambda c: (company_id is not None and company_id not in c.company_ids, not c.healthy,
+                                          c.id))
+        for candidate in [*(c.account for c in mailboxes), self.repo.owner.email]:
+            address = (candidate or "").strip().lower()
+            if _REPLY_ADDRESS.fullmatch(address):
+                return address
+        return None
+
+    def _transmit(self, message: OutgoingMessage, transport: Any) -> dict[str, str]:
+        """Hand one email to the transport, with where its answer goes; returns the headers it went with."""
+        headers = dict(message.headers)
+        reply_to = self.reply_address(message.company_id)
+        if reply_to and not any(name.lower() == "reply-to" for name in headers):
+            headers["Reply-To"] = reply_to
+        transport.send([message.to, *message.cc], message.subject, message.body, list(message.files),
+                       headers=headers)
+        return headers
+
+    def _sent(self, message: OutgoingMessage, at: datetime, transport: Any,
+              headers: Mapping[str, str] | None = None) -> None:
         message.status = "sent"
         message.sent_at = at
         message.files = ()  # the transport has them now; the audit log keeps their names and hashes
-        self.log("mailer", "sent", subject_id=message.id, values={"kind": message.kind, "to": message.to},
+        values: dict[str, Any] = {"kind": message.kind, "to": message.to}
+        if headers is not None and headers.get("Reply-To"):  # kept with the email: where its answer goes
+            message.headers = tuple(headers.items())
+            values["reply_to"] = headers["Reply-To"]
+        self.log("mailer", "sent", subject_id=message.id, values=values,
                  response={"simulated": is_simulated(transport)})
         if message.kind == "supplier_request" and message.subject_id in self.repo.chases:
             self.missing.sent(self.repo.chases[message.subject_id], at)

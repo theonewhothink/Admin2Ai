@@ -11,7 +11,9 @@
   the history cursor stays the source of truth (missed pushes lose nothing).
 
 No folder or label is required (§8: does not depend on an "Invoices" folder).
-Drafts and chats are skipped; spam and trash are opt-in.
+Drafts and chats are skipped. Spam is read and searched only when the owner allows it
+(``GmailConfig.include_spam``, checklist B8: ``includeSpamTrash`` with ``-in:trash``
+in the query, so the trash never is); ``include_spam_trash`` reads both.
 
 **Delegated and alias addresses** (checklist O2), configured per mailbox connection:
 
@@ -84,6 +86,8 @@ class GmailConfig:
     history_window: timedelta = timedelta(days=90)  # §6; 365 days when the owner opts in
     page_size: int = 500
     include_spam_trash: bool = False
+    # Spam too, never the trash: the owner's "Also look in spam for invoices" (checklist B8).
+    include_spam: bool = False
     max_pages: int = 10_000
     # A delegated mailbox read as the API's userId (/users/{address}) where Google allows it; None: "me".
     user_id: str | None = None
@@ -215,8 +219,20 @@ class GmailConnector:
         return history_id, window_start
 
     def _scoped(self, query: str) -> str:
-        """The search, limited to mail delivered to the alias when the connection reads one (O2)."""
+        """The search, limited to mail delivered to the alias when the connection reads one (O2), and never the
+        trash when spam is allowed (B8: listing with spam lists the trash too unless the query leaves it out)."""
+        if self._spam_only:
+            query = f"{query} -in:trash"
         return f"{query} deliveredto:{self._alias}" if self._alias else query
+
+    @property
+    def _spam_only(self) -> bool:
+        return self.config.include_spam and not self.config.include_spam_trash
+
+    def _include_spam_trash(self) -> str:
+        """The ``includeSpamTrash`` listing parameter: true when spam is allowed (the query then leaves the trash
+        out, :meth:`_scoped`)."""
+        return str(self.config.include_spam_trash or self.config.include_spam).lower()
 
     def _delivered_to_alias(self, raw: bytes) -> bool:
         """True when the message was delivered or addressed to the alias (its own delivery headers)."""
@@ -232,7 +248,7 @@ class GmailConnector:
 
     def _list_ids(self, query: str) -> Iterator[str]:
         params: dict[str, Any] = {"q": query, "maxResults": self.config.page_size,
-                                  "includeSpamTrash": str(self.config.include_spam_trash).lower()}
+                                  "includeSpamTrash": self._include_spam_trash()}
         for page in self._pages(f"{self.base_url}/messages", params):
             for message in object_list(page, "messages", "gmail"):
                 yield required_str(message, "id", "gmail")
@@ -262,7 +278,11 @@ class GmailConnector:
         labels = set(labels)
         if labels & _SKIP_LABELS:
             return False
-        return self.config.include_spam_trash or not labels & {"SPAM", "TRASH"}
+        if self.config.include_spam_trash:
+            return True
+        if "TRASH" in labels:
+            return False  # never the trash
+        return self.config.include_spam or "SPAM" not in labels
 
     def _pages(self, url: str, params: dict[str, Any], *, expired_on_404: bool = False) -> Iterator[Mapping[str, Any]]:
         token: str | None = None
@@ -308,9 +328,10 @@ class GmailConnector:
     def search_messages(self, query: MailQuery) -> list[MailItem]:
         """Messages matching ``query`` anywhere in the mailbox (every label, archived mail included), newest
         first, each as ``format=raw`` (§22: current and historical email). Drafts and chats are never searched;
-        spam and trash only when the connection opted in. An alias connection searches only the alias's mail."""
+        spam only when the owner allowed it (B8), the trash never. An alias connection searches only the alias's
+        mail."""
         params: dict[str, Any] = {"q": self._scoped(gmail_query(query)), "maxResults": query.limit,
-                                  "includeSpamTrash": str(self.config.include_spam_trash).lower()}
+                                  "includeSpamTrash": self._include_spam_trash()}
         page = self._http.get_json(f"{self.base_url}/messages", params=params)
         items: list[MailItem] = []
         for message in object_list(page, "messages", "gmail")[: query.limit]:
@@ -323,7 +344,7 @@ class GmailConnector:
         """Every message of one thread (``threads.get``), oldest first, each as ``format=raw``.
 
         A reply may point at an invoice sent earlier in the same thread, even before the history
-        window (§8 "previous attachments"). Drafts and chats are skipped; spam and trash unless opted in.
+        window (§8 "previous attachments"). Drafts and chats are skipped; spam unless allowed, the trash always.
         """
         response = self._http.request("GET", f"{self.base_url}/threads/{quote(thread_id, safe='')}",
                                       params={"format": "minimal"}, allow=(404,))

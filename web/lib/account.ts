@@ -217,6 +217,11 @@ export function setAccountant(input: { email: string; name?: string }) {
   return write("/api/onboarding/accountant", body, "I couldn’t save your accountant. Try again.");
 }
 
+/** How far back the first read of each new mailbox and bank goes (spec §6): POST /api/settings/reading. */
+export function chooseHistory(history: "90d" | "12m") {
+  return write("/api/settings/reading", { history }, "I couldn’t save that. Try again.");
+}
+
 /** Full-page link to the provider's consent screen; the API brings the owner back. */
 export function oauthStartUrl(provider: "google" | "microsoft"): string {
   return `${API_URL}/api/oauth/start?provider=${provider}`;
