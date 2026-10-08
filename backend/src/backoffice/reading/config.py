@@ -13,6 +13,13 @@ Variable                               Meaning
 ``BACKOFFICE_OCR_VL_URL``              PaddleOCR-VL sidecar (PaddleX layout-parsing serving);
                                        ``BACKOFFICE_OCR_VL_PATH`` (``/layout-parsing``),
                                        ``BACKOFFICE_OCR_VL_API_KEY``
+``BACKOFFICE_OCR_UNLIMITED_URL``       Unlimited-OCR for long documents (§16): an OpenAI-compatible
+                                       server such as ``vllm serve``, e.g. ``http://unlimited-ocr:8000``;
+                                       ``_MODEL`` (served model name, ``Unlimited-OCR``), ``_PATH``
+                                       (``/v1/chat/completions``), ``_API_KEY``, ``_TIMEOUT`` (s, per
+                                       request, default 300), ``_MAX_PAGES`` (longer documents are never
+                                       sent, default 200), ``_PAGES_PER_REQUEST`` (8), ``_MAX_TOKENS``
+                                       (8192), ``_DPI`` (PDF pages rendered as images, 150)
 ``BACKOFFICE_EXTERNAL_AI``             ``on`` allows the Claude vision fallback; anything else
                                        (the default) means no file ever leaves (§53)
 ``ANTHROPIC_API_KEY``                  needed for the fallback
@@ -24,7 +31,15 @@ Variable                               Meaning
                                        default ``5.00`` (§17: paid OCR is the exception)
 =====================================  ==========================================================
 
-The sidecar contract is PaddleX pipeline serving (see
+Unlimited-OCR runs only where it belongs in the chain (``backoffice.ocr.router``): a document of
+``RouterConfig.long_document_pages`` pages or more whose fields are still missing or disputed after the
+local engines, or as the fallback when the layout engine gave nothing. Its transcription is one more
+reading (source ``<evidence>@unlimited-ocr``, method VLM): it never settles a field on its own, a field
+needs an independent source to become verified, and it can confirm the document's own structured data,
+never overrule it (§17-19). A PDF's pages are sent as PNG images when pypdfium2 is installed (the
+production image has it), ``_PAGES_PER_REQUEST`` at a time, else the PDF whole as a file part.
+
+The PP-OCRv6 sidecar contract is PaddleX pipeline serving (see
 ``backoffice.ocr.providers._paddlex``)::
 
     POST <BACKOFFICE_OCR_URL>/ocr
@@ -60,14 +75,50 @@ def _decimal(value: str | None, default: str) -> Decimal:
     return out
 
 
-def _endpoint(env: Mapping[str, str], prefix: str):  # type: ignore[no-untyped-def]
+def _endpoint(env: Mapping[str, str], prefix: str, *, timeout: float = 60):  # type: ignore[no-untyped-def]
     from backoffice.ocr import EndpointConfig
 
     return EndpointConfig(
         base_url=env[f"{prefix}_URL"].strip(),
-        timeout_seconds=float(env.get(f"{prefix}_TIMEOUT") or 60),
+        timeout_seconds=float(env.get(f"{prefix}_TIMEOUT") or timeout),
         api_key=env.get(f"{prefix}_API_KEY") or None,
     )
+
+
+def _positive(env: Mapping[str, str], name: str, default: int) -> int:
+    raw = (env.get(name) or "").strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        raise ValueError(f"{name} must be a whole number: {raw!r}") from None
+    if value < 1:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
+def _unlimited_ocr(env: Mapping[str, str]):  # type: ignore[no-untyped-def]
+    """Unlimited-OCR behind its OpenAI-compatible server, with timeouts and page limits (table above)."""
+    from backoffice.extraction._optional import MissingDependencyError, import_optional
+    from backoffice.ocr import UNLIMITED_OCR, PdfPageRasterizer, UnlimitedOCRConfig, UnlimitedOCRProvider
+
+    prefix = "BACKOFFICE_OCR_UNLIMITED"
+    max_pages = _positive(env, f"{prefix}_MAX_PAGES", 200)
+    config = UnlimitedOCRConfig(
+        endpoint=_endpoint(env, prefix, timeout=300),
+        model=(env.get(f"{prefix}_MODEL") or "Unlimited-OCR").strip(),
+        path=(env.get(f"{prefix}_PATH") or "/v1/chat/completions").strip(),
+        name=UNLIMITED_OCR,
+        max_pages=max_pages,
+        pages_per_request=_positive(env, f"{prefix}_PAGES_PER_REQUEST", 8),
+        max_tokens=_positive(env, f"{prefix}_MAX_TOKENS", 8192),
+    )
+    try:  # PDF pages as images when the renderer is installed; else the PDF is sent whole
+        import_optional("pypdfium2", feature="Rendering PDF pages")
+        import_optional("PIL.Image", feature="Rendering PDF pages", package="Pillow")
+        rasterizer = PdfPageRasterizer(max_pages=max_pages, dpi=_positive(env, f"{prefix}_DPI", 150))
+    except (MissingDependencyError, OSError):
+        rasterizer = None
+    return UnlimitedOCRProvider(config, rasterizer=rasterizer)
 
 
 def external_ai_enabled(env: Mapping[str, str] | None = None) -> bool:
@@ -104,6 +155,8 @@ def reader_from_env(env: Mapping[str, str] | None = None) -> DocumentReader | No
     if env.get("BACKOFFICE_OCR_VL_URL"):
         registry.register(PaddleOCRVLProvider(PaddleOCRVLConfig(
             endpoint=_endpoint(env, "BACKOFFICE_OCR_VL"), path=env.get("BACKOFFICE_OCR_VL_PATH") or "/layout-parsing")))
+    if (env.get("BACKOFFICE_OCR_UNLIMITED_URL") or "").strip():
+        registry.register(_unlimited_ocr(env))  # long documents whose fields are still unsettled (§16)
     external = external_ai_enabled(env) and bool((env.get("ANTHROPIC_API_KEY") or "").strip())
     budget = None
     if external:

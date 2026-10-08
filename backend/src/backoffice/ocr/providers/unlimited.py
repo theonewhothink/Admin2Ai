@@ -45,6 +45,7 @@ if TYPE_CHECKING:  # only for annotations: httpx is imported where a request is 
 
 __all__ = [
     "DEFAULT_TRANSCRIBE_PROMPT",
+    "PdfPageRasterizer",
     "Rasterizer",
     "UnlimitedOCRConfig",
     "UnlimitedOCRProvider",
@@ -54,6 +55,46 @@ __all__ = [
 _UNKNOWN_PDF_PAGE_LIMIT = 5000
 
 Rasterizer = Callable[[PageImage], Sequence[PageImage]]
+
+
+@dataclass(frozen=True)
+class PdfPageRasterizer:
+    """A PDF's pages as PNG images (pypdfium2 and Pillow, the ``ocr-local`` / ``vision`` extras), numbered from
+    the PDF's own first page. A PDF longer than ``max_pages`` is refused whole, never read in part: a
+    transcription missing its last pages could miss the totals (§17)."""
+
+    max_pages: int
+    dpi: int = 150
+    engine: str = "unlimited-ocr"
+
+    def __post_init__(self) -> None:
+        if self.max_pages < 1 or self.dpi < 36:
+            raise ValueError("max_pages must be positive and dpi at least 36")
+
+    def __call__(self, page: PageImage) -> Sequence[PageImage]:
+        from backoffice.extraction._optional import import_optional
+        from backoffice.extraction.fields import StructuredDataError
+        from backoffice.extraction.pdf import render_pdf_pages
+
+        from ..base import OCRInputError
+
+        pdfium = import_optional("pypdfium2", feature="Rendering PDF pages")
+        try:
+            document = pdfium.PdfDocument(page.data)
+        except Exception:  # damaged or encrypted: nothing can be sent
+            raise OCRInputError(self.engine, "pdf_unrenderable") from None
+        try:
+            total = len(document)
+        finally:
+            document.close()
+        if total > self.max_pages:
+            raise OCRInputError(self.engine, f"more than {self.max_pages} pages")
+        try:
+            rendered = render_pdf_pages(page.data, max_pages=self.max_pages, dpi=self.dpi)
+        except StructuredDataError as exc:
+            raise OCRInputError(self.engine, exc.code) from None
+        return [PageImage(data=png, mime_type="image/png", number=page.number + i, width=w, height=h)
+                for i, (png, w, h) in enumerate(rendered)]
 
 
 @dataclass(frozen=True)
@@ -187,6 +228,9 @@ class UnlimitedOCRProvider:
             for n in wanted
         ]
         return pages, warnings
+
+    async def aclose(self) -> None:
+        await self._http.aclose()
 
 
 def _page_numbers(chunk: Sequence[PageImage]) -> tuple[list[int], bool]:

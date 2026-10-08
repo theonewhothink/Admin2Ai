@@ -1,0 +1,16 @@
+Baltic Timber Ltd
+14 Dock Road, Hull HU1 2AB, United Kingdom
+VAT number: GB287461903
+INVOICE
+Invoice number: BT-20417
+Invoice date: 18 September 2026
+Billed to: Hazel Tree Interiores, Lda.
+VAT number: PT516123459
+Item  Unit price  Qty  VAT  Amount
+Oak veneer sheet 2500x1250 mm  86.40  12  0%  1,036.80
+(A grade, crown cut)
+Edge banding oak 22 mm (50 m)  23.75  8  0%  190.00
+Hardwax oil 2.5 L  41.20  3  0%  123.60
+Subtotal: €1,350.40
+VAT (0%): €0.00
+Total due: €1,350.40

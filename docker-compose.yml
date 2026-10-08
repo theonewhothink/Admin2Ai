@@ -66,7 +66,12 @@ x-production-env: &production-env
   BACKOFFICE_DOCUMENT_READING: ${BACKOFFICE_DOCUMENT_READING:-on}
   # Invoice links opened before each change is recorded (§9); off: they wait unopened.
   BACKOFFICE_LINK_FETCHING: ${BACKOFFICE_LINK_FETCHING:-on}
+  # Script-only invoice pages in Chromium, one fresh browser per link (when Playwright is installed).
+  BACKOFFICE_LINK_BROWSER: ${BACKOFFICE_LINK_BROWSER:-auto}
   BACKOFFICE_OCR_URL: ${BACKOFFICE_OCR_URL:-}
+  # Unlimited-OCR for long documents (§16): its OpenAI-compatible server (vllm serve), when you run one.
+  BACKOFFICE_OCR_UNLIMITED_URL: ${BACKOFFICE_OCR_UNLIMITED_URL:-}
+  BACKOFFICE_OCR_UNLIMITED_MODEL: ${BACKOFFICE_OCR_UNLIMITED_MODEL:-Unlimited-OCR}
   # No sidecar: PP-OCRv6 runs in the API process (the image installs it); off: photos wait unread.
   BACKOFFICE_OCR_LOCAL: ${BACKOFFICE_OCR_LOCAL:-auto}
   BACKOFFICE_EXTERNAL_AI: ${BACKOFFICE_EXTERNAL_AI:-off}

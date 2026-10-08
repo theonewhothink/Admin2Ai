@@ -10,7 +10,9 @@ keeps "Total:" and "45,60 €" on one line.
 
 Each joined line keeps the union of its boxes as its location and the lowest
 score of its parts as its confidence (a line is only as sure as its weakest
-part). Pure Python: the browser engine uses it too.
+part), and its parts themselves, left to right (``Row.members``): a table's
+columns are read from where each part sits (``backoffice.reading.tables``).
+Pure Python: the browser engine uses it too.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ from dataclasses import dataclass
 
 from .layout import Box, geometry
 
-__all__ = ["Row", "TextBox", "join_rows", "normalize_text"]
+__all__ = ["Member", "Row", "TextBox", "join_rows", "normalize_text"]
 
 # Full-width ASCII punctuation a multilingual recogniser sometimes returns ("ATCUD：..."), mapped back to ASCII.
 # Only this block: a general NFKC fold would also turn "n.º" into "n.o".
@@ -45,6 +47,15 @@ class TextBox:
 
 
 @dataclass(frozen=True)
+class Member:
+    """One part of a printed line as the engine found it: its text, box and score."""
+
+    text: str
+    box: Box
+    confidence: float | None
+
+
+@dataclass(frozen=True)
 class Row:
     """One printed line: its parts joined left to right."""
 
@@ -53,6 +64,7 @@ class Row:
     confidence: float | None
     angle: float | None
     parts: int
+    members: tuple[Member, ...] = ()
 
 
 def join_rows(boxes: Sequence[TextBox]) -> list[Row]:
@@ -101,6 +113,7 @@ def join_rows(boxes: Sequence[TextBox]) -> list[Row]:
             confidence=min(scores) if len(scores) == len(row) else None,
             angle=round(statistics.median(angles), 2) if angles else None,
             parts=len(row),
+            members=tuple(Member(text=e[1], box=e[2], confidence=e[5]) for e in row),
         ))
     return out
 

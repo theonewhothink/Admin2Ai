@@ -8,8 +8,8 @@ the orchestrator's Document agent needs:
    into field observations (``ReadRequest.stage0_fields``).
 2. **The OCR chain**: the existing :class:`~backoffice.ocr.router.OCRRouter`
    with the engines registered by name (a PP-OCRv6 / PaddleOCR-VL sidecar, or
-   PP-OCRv6 in this process when no sidecar is configured, the Claude vision
-   fallback). The router skips OCR entirely when Stage 0
+   PP-OCRv6 in this process when no sidecar is configured, Unlimited-OCR for
+   long documents, the Claude vision fallback). The router skips OCR entirely when Stage 0
    settles every required field, never pays when the document contradicts
    itself, and only calls the paid external engine while fields are missing
    or disputed, within the tenant's budget (§17).
@@ -52,6 +52,7 @@ from backoffice.extraction.fields import FieldExtractor
 from backoffice.extraction.media import IMAGE_MIME_TYPES, MIME_PDF, sniff_mime
 
 from .stage0 import QRDecoder, ReadStep, Stage0, StepState, find_qr_decoder, read_image_stage0, read_pdf_stage0
+from .tables import WordRow, word_rows
 
 __all__ = ["AUTO", "DocumentReader", "ReadOutcome", "ReadRequest", "run_sync"]
 
@@ -143,6 +144,9 @@ class ReadOutcome:
     image_quality: tuple[str, ...] = ()
     # Every engine that could run did, and required fields are still missing or disagree (§17: a person's turn).
     needs_person: bool = False
+    # Where each word sits on the pages, as the first engine that located words read them (.tables): a table's
+    # columns are read from it (backoffice.line_prices), never from the joined text alone.
+    word_rows: tuple[WordRow, ...] = ()
 
     @property
     def retake_worthy(self) -> tuple[str, ...]:
@@ -218,7 +222,7 @@ class DocumentReader:
             outcome,
             readings=ocr["readings"], reading_text=ocr["text"], supplier_name=ocr["supplier"],
             doc_type=ocr["doc_type"], steps=(*steps, *ocr["steps"]), cost=ocr["cost"],
-            needs_person=ocr["needs_person"],
+            needs_person=ocr["needs_person"], word_rows=ocr["word_rows"],
         )
 
     def stage0_pdf(self, data: bytes) -> Stage0:
@@ -345,6 +349,7 @@ class DocumentReader:
             "steps": [*extra, *_steps(result)],
             "cost": result.total_cost,
             "needs_person": result.needs_human,
+            "word_rows": _word_rows(result),
         }
 
 
@@ -429,6 +434,14 @@ def _readings(outcome: Any) -> dict[str, tuple[FieldObservation, ...]]:
             if observation not in bucket:
                 bucket.append(observation)
     return {k: tuple(v) for k, v in found.items() if v}
+
+
+def _word_rows(outcome: Any) -> tuple[WordRow, ...]:
+    """The words of the first engine that located them (the local engine's boxes), row by row."""
+    for result in outcome.results:
+        if any(line.words for page in result.pages for line in page.lines):
+            return word_rows(result.pages)
+    return ()
 
 
 def _reading_text(outcome: Any) -> str:
