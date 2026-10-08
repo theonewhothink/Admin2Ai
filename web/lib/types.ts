@@ -33,6 +33,23 @@ export interface CompanySummary {
   months: MonthKey[];
   /** Needs-you items that hold this company's status. When all are answered, the status reads "On track". */
   pendingItemIds?: string[];
+  /** Production: what the EU VAT register says about the company, while the owner has not chosen yet. */
+  identityCheck?: IdentityCheck;
+}
+
+/** The EU VAT register's details for a company, with a one-tap choice when they differ from what was typed. */
+export interface IdentityCheck {
+  status: string;
+  /** "EU VAT register (VIES)" */
+  source: string;
+  vatNumber?: string | null;
+  /** Plain words: "The EU VAT register lists this number as … Use these details?" */
+  message: string;
+  legalName?: string;
+  address?: string;
+  /** "Use these details" / "Keep what I typed": POST `{ use: true | false }` to `confirmPath`. */
+  options?: { id: string; label: string }[];
+  confirmPath?: string;
 }
 
 export interface DueItem {
@@ -168,7 +185,35 @@ export interface NeedsYouApprovalItem {
   keepBlocked: { label: string; optionId: string; message: string };
 }
 
-export type NeedsYouItem = NeedsYouChoiceItem | NeedsYouApprovalItem;
+/** A supplier's website sent the owner a one-time sign-in code: one box to enter it. */
+export interface NeedsYouCodeItem {
+  id: string;
+  kind: "code";
+  tone: Tone;
+  eyebrow: string;
+  /** The supplier: "Vodafone". */
+  merchant: string;
+  /** "Vodafone needs a sign-in code." */
+  title: string;
+  amount: null;
+  currency: string;
+  /** The day the website asked. */
+  date: ISODate | null;
+  companyId?: string;
+  question: string;
+  /** Where the code goes: POST `{ code }` to `submitPath` (`/api/portals/{connection}/code`). */
+  code: {
+    submitPath: string;
+    label: string;
+    /** "sms", "email", "app" … where the website sent it, when it said. */
+    channel: string | null;
+    /** Until when the code works, when the website said. */
+    expiresAt: ISODateTime | null;
+  };
+  why: string[];
+}
+
+export type NeedsYouItem = NeedsYouChoiceItem | NeedsYouApprovalItem | NeedsYouCodeItem;
 
 export interface AnswerResult {
   ok: boolean;
@@ -176,6 +221,15 @@ export interface AnswerResult {
   message?: string;
   /** The rule the engine learned from the answer ("Always use Hazel Tree for IKEA ..."), when it learned one. */
   learned?: string;
+}
+
+/** What a supplier's website said about the code the owner entered. */
+export interface CodeResult {
+  /** Signed in: the invoices are fetched and the question is closed. */
+  done: boolean;
+  /** Not done, but nothing went wrong: the website sent a new code, or asked for one more. */
+  waiting: boolean;
+  message: string;
 }
 
 /* ---------- Activity ---------- */

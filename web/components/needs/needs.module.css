@@ -376,6 +376,44 @@
   flex-shrink: 0;
 }
 
+/* Code: one box for the sign-in code a supplier's website sent */
+.codeForm {
+  display: grid;
+  gap: var(--s-2);
+}
+
+.codeForm .question {
+  margin-bottom: 0;
+  max-width: 60ch;
+}
+
+.codeRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-1);
+}
+
+.codeInput {
+  flex: 1 1 180px;
+  max-width: 260px;
+  font-size: 20px;
+  letter-spacing: 0.12em;
+}
+
+@media (max-width: 519px) {
+  .codeInput {
+    max-width: none;
+  }
+
+  .codeRow > :global(.btn) {
+    flex: 1 1 100%;
+  }
+}
+
+.codeHint {
+  margin-top: var(--s-1);
+}
+
 /* Empty state */
 .empty {
   display: grid;

@@ -867,6 +867,9 @@ class BackOfficeService:
             ("accountant", "Accountant", "Receives the monthly package and asks questions here.",
              [{"id": c["id"], "name": c["name"], "company": "All companies", "detail": c["account"],
                "status": c["status"], "lastSyncedAt": c.get("lastSyncedAt")} for c in conn("accountant")]),
+            ("portals", "Supplier websites", "Where I sign in to fetch your invoices.",
+             [{"id": c["id"], "name": c["name"], "company": "All companies", "detail": c["account"],
+               "status": c["status"], "lastSyncedAt": c.get("lastSyncedAt")} for c in conn("portal")]),
             ("files", "Cloud storage", "Searched for missing invoices; a folder you choose is read as files arrive.",
              [{"id": c["id"], "name": c["name"], "company": "All companies", "detail": c["account"],
                "status": c["status"], "lastSyncedAt": c.get("lastSyncedAt")} for c in conn("files")]),
@@ -880,11 +883,6 @@ class BackOfficeService:
             ("lenders", "Loans", "Repayments are matched to loan statements.", rel("lender")),
             ("government", "Tax and government", "Letters, deadlines and payments.", rel("government")),
         ]
-        portals = conn("portal")
-        if portals:  # supplier websites I sign in to (only listed when there are some)
-            groups.insert(4, ("portals", "Supplier websites", "Where I sign in to fetch your invoices.",
-                              [{"id": c["id"], "name": c["name"], "company": "All companies", "detail": c["account"],
-                                "status": c["status"], "lastSyncedAt": c.get("lastSyncedAt")} for c in portals]))
         for _, _, _, items in groups:
             for item in items:
                 label = self._sign_in_label(item["id"])
@@ -895,9 +893,9 @@ class BackOfficeService:
                         "Demo connection: no real sign-in was made."
                 if label:
                     item["signIn"] = label
-        # Cloud storage and accounting software are shown once something is connected there (older screens unchanged).
-        return {"groups": [{"id": g, "title": t, "description": d, "items": items} for g, t, d, items in groups
-                           if items or g not in ("files", "accounting")],
+        # Every group is listed, empty ones too, so the owner can add the first supplier website, cloud storage or
+        # accounting software from Sources.
+        return {"groups": [{"id": g, "title": t, "description": d, "items": items} for g, t, d, items in groups],
                 "companies": [{"id": cid, "name": n} for cid, n in names.items()]}
 
     # ----------------------------------------------------------------- Adding and removing sources
@@ -950,8 +948,9 @@ class BackOfficeService:
             until = _as_date(info["access_until"])
             return (f"Signed in. This sign-in ends on {until.day} {until.strftime('%B %Y')}. "
                     "I will remind you a week before.")
-        if info.get("purpose") == "accounting" and info.get("provider") in ("invoicexpress", "toconline"):
-            return "Connected with the API access you gave. It is kept safely and never shown again."
+        if info.get("purpose") == "accounting" and info.get("provider") in ("invoicexpress", "toconline") \
+                and info.get("stored"):
+            return "Connected with the access details you gave. They are kept safely and never shown again."
         if info.get("stored") and kind in ("shared", "delegated", "alias"):
             who = f" as {info['signInAs']}" if info.get("signInAs") else ""
             read = "only the mail sent to this address" if kind == "alias" else "this mailbox with your access"

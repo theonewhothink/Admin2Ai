@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { CostCenters } from "@/components/companies/CostCenters";
+import { IdentityCheck } from "@/components/companies/IdentityCheck";
 import { MonthView } from "@/components/companies/MonthView";
 import styles from "@/components/companies/companies.module.css";
 import { CompanyStatus } from "@/components/CompanyStatus";
@@ -36,6 +37,12 @@ export function CompanyView({
         </div>
         <CompanyStatus company={company} />
       </header>
+
+      {company.identityCheck ? (
+        <div className={styles.identity}>
+          <IdentityCheck check={company.identityCheck} />
+        </div>
+      ) : null}
 
       <nav aria-label="Month" className={styles.monthNav}>
         <div className="segmented">

@@ -30,9 +30,7 @@ function subscribe(listener: () => void) {
   return () => listeners.delete(listener);
 }
 
-export function markAnswered(id: string) {
-  const next = new Set(read());
-  next.add(id);
+function save(next: ReadonlySet<string>) {
   current = next;
   try {
     window.sessionStorage.setItem(KEY, JSON.stringify([...next]));
@@ -40,6 +38,22 @@ export function markAnswered(id: string) {
     // Storage can be unavailable (private mode); the in-memory set still works.
   }
   listeners.forEach((l) => l());
+}
+
+export function markAnswered(id: string) {
+  const next = new Set(read());
+  next.add(id);
+  save(next);
+}
+
+/**
+ * Open again: an item the engine lists anew under the same id (a supplier's website asking for another
+ * sign-in code). Changes nothing when none of them was answered here.
+ */
+export function forgetAnswered(ids: readonly string[]) {
+  const known = read();
+  if (!ids.some((id) => known.has(id))) return;
+  save(new Set([...known].filter((id) => !ids.includes(id))));
 }
 
 export function resetAnswered() {

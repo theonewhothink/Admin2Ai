@@ -60,6 +60,10 @@
   gap: var(--s-1);
 }
 
+.identity {
+  margin-bottom: var(--s-4);
+}
+
 .monthNav {
   margin-bottom: var(--s-3);
   max-width: 100%;

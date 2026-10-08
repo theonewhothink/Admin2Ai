@@ -19,7 +19,7 @@
  * HttpOnly session cookie, and every call sends it (credentials: "include").
  */
 import { API_URL, BASE_PATH } from "./mode";
-import { OFFLINE_MESSAGE, apiFetch, errorMessage, toSignIn } from "./api";
+import { OFFLINE_MESSAGE, apiFetch, downloadFile, errorMessage, toSignIn } from "./api";
 import type { Session } from "./owner";
 
 export type { Session, SessionUser } from "./owner";
@@ -172,40 +172,9 @@ export async function signOut(): Promise<void> {
 
 /* ---------- Account (GDPR, spec §52) ---------- */
 
-function filenameFrom(disposition: string | null): string {
-  const star = disposition?.match(/filename\*=(?:UTF-8'')?([^;]+)/i);
-  if (star?.[1]) {
-    try {
-      return decodeURIComponent(star[1].trim().replace(/^"|"$/g, ""));
-    } catch {
-      // fall through to the plain filename
-    }
-  }
-  const plain = disposition?.match(/filename="?([^";]+)"?/i);
-  const name = plain?.[1]?.trim();
-  return name && !/[\\/]/.test(name) ? name : "admin2ai-export.zip";
-}
-
 /** Download everything the tenant has, as a zip. Returns null when done, or a message saying why not. */
-export async function exportAccount(): Promise<string | null> {
-  let res: Response;
-  try {
-    res = await apiFetch("/api/account/export", { headers: { Accept: "application/zip, application/json" } }, 300000);
-  } catch {
-    return OFFLINE_MESSAGE;
-  }
-  if (res.status === 401) return toSignIn();
-  if (!res.ok) return errorMessage(res, "I couldn’t prepare your file. Try again in a moment.");
-  const blob = await res.blob();
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filenameFrom(res.headers.get("Content-Disposition"));
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 10000);
-  return null;
+export function exportAccount(): Promise<string | null> {
+  return downloadFile("/api/account/export", "admin2ai-export.zip", "I couldn’t prepare your file. Try again in a moment.");
 }
 
 /**

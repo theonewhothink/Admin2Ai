@@ -3,15 +3,16 @@
 /**
  * Command Center: the product's health for the team, computed by the engine
  * (GET /api/internal/overview): the spec's success targets, a health score,
- * what needs fixing now, the pipeline, tenants and companies, and go-live readiness.
+ * what needs fixing now, background jobs that kept failing, the pipeline, tenants and companies, and
+ * go-live readiness.
  */
 import Link from "next/link";
 import type { CSSProperties } from "react";
-import type { CriticalFix, GoldenTotal, InternalOverview, TenantRow } from "@/lib/internal-types";
+import type { CriticalFix, DeadLetter, GoldenTotal, InternalOverview, TenantRow } from "@/lib/internal-types";
 import { AdminIcon, type AdminIconName } from "./icons";
 import { ReadinessGrid } from "./ReadinessView";
 import { useOverview } from "./store";
-import { Bar, Card, Chip, COLORS, Gauge, PageHeader, Pill, Ring, scoreColor, SectionLabel, Waiting } from "./widgets";
+import { ago, Bar, Card, Chip, COLORS, Gauge, PageHeader, Pill, Ring, scoreColor, SectionLabel, Waiting, when } from "./widgets";
 import styles from "./admin.module.css";
 
 const GOLDEN_LOOK: Record<string, { color: string; icon: AdminIconName }> = {
@@ -139,6 +140,41 @@ function FixesCard({ fixes }: { fixes: CriticalFix[] }) {
           <AdminIcon name="checkCircle" size={18} />
           All systems healthy. No critical issues found.
         </p>
+      )}
+    </Card>
+  );
+}
+
+/** Jobs that failed every attempt, parked as dead letters (server/jobs.py): what failed, why and since when. */
+function DeadLettersCard({ jobs, now }: { jobs: DeadLetter[]; now: string }) {
+  return (
+    <Card delay={60} aria-labelledby="dead-title">
+      <h3 id="dead-title" className={styles.cardTitle}>
+        <AdminIcon name="inbox" size={16} style={{ color: jobs.length ? COLORS.red : COLORS.green }} />
+        Failed jobs
+        {jobs.length ? <span className={styles.count}>{jobs.length}</span> : null}
+      </h3>
+      {jobs.length ? (
+        <ul className={styles.fixList}>
+          {jobs.map((j) => (
+            <li key={j.id}>
+              <div className={styles.fix} data-severity="red">
+                <AdminIcon name="alertTriangle" size={18} className={styles.fixIcon} />
+                <span className={styles.fixText}>
+                  <strong>{j.label}</strong>
+                  <span>{j.lastError || "No reason was recorded."}</span>
+                  <span>
+                    Failed {j.attempts} {j.attempts === 1 ? "time" : "times"} · parked {ago(j.since, now)} ({when(j.since)}) ·
+                    tenant {j.tenant}
+                    {j.connection ? ` · ${j.connection}` : ""}
+                  </span>
+                </span>
+              </div>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className={styles.muted}>No failed jobs.</p>
       )}
     </Card>
   );
@@ -344,6 +380,11 @@ function Overview({ data }: { data: InternalOverview }) {
           <HealthCard health={data.health} />
           <FixesCard fixes={data.fixes} />
         </div>
+      </section>
+
+      <section aria-labelledby="dead-label" className={styles.section}>
+        <SectionLabel id="dead-label">Background jobs</SectionLabel>
+        <DeadLettersCard jobs={data.deadLetters ?? []} now={data.generatedAt} />
       </section>
 
       <section aria-labelledby="pipeline-label" className={styles.section}>

@@ -827,6 +827,24 @@ export const sources: SourcesData = {
       ]
     },
     {
+      "id": "portals",
+      "title": "Supplier websites",
+      "description": "Where I sign in to fetch your invoices.",
+      "items": []
+    },
+    {
+      "id": "files",
+      "title": "Cloud storage",
+      "description": "Searched for missing invoices; a folder you choose is read as files arrive.",
+      "items": []
+    },
+    {
+      "id": "accounting",
+      "title": "Accounting software",
+      "description": "Your invoices there, and the documents I look for.",
+      "items": []
+    },
+    {
       "id": "suppliers",
       "title": "Suppliers",
       "description": "Recognised from invoices and payments.",

@@ -1,18 +1,32 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Icon } from "@/components/Icon";
+import { getNeedsYou } from "@/lib/api";
 import { countWord } from "@/lib/format";
-import { markAnswered, useAnswered } from "@/lib/resolved-store";
+import { forgetAnswered, markAnswered, useAnswered } from "@/lib/resolved-store";
 import type { NeedsYouItem } from "@/lib/types";
 import { DecisionCard } from "./DecisionCard";
 import styles from "./needs.module.css";
 
 export function NeedsYouList({ items, companyNames }: { items: NeedsYouItem[]; companyNames: Record<string, string> }) {
   const answered = useAnswered();
-  const open = items.filter((i) => !answered.has(i.id));
-  const resolve = useCallback((id: string) => markAnswered(id), []);
+  // The list as read again after a sign-in code went through; until then, the one the page loaded.
+  const [fresh, setFresh] = useState<NeedsYouItem[] | null>(null);
+  const list = fresh ?? items;
+  const open = list.filter((i) => !answered.has(i.id));
+
+  // A website asks for a new sign-in code under the same id: whenever the engine lists one, it is open.
+  useEffect(() => {
+    forgetAnswered(list.filter((i) => i.kind === "code").map((i) => i.id));
+  }, [list]);
+
+  const resolve = useCallback((item: NeedsYouItem) => {
+    markAnswered(item.id);
+    // The invoices the website gave may raise questions of their own: read the list again.
+    if (item.kind === "code") void getNeedsYou().then(setFresh, () => undefined);
+  }, []);
 
   const lead =
     open.length === 0
@@ -37,7 +51,7 @@ export function NeedsYouList({ items, companyNames }: { items: NeedsYouItem[]; c
               key={item.id}
               item={item}
               companyName={item.companyId ? companyNames[item.companyId] : undefined}
-              onResolved={() => resolve(item.id)}
+              onResolved={() => resolve(item)}
             />
           ))}
         </div>

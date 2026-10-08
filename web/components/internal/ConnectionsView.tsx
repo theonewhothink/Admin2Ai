@@ -7,8 +7,22 @@ import { useOverview } from "./store";
 import { ago, Card, Chip, COLORS, PageHeader, Pill, SectionLabel, Waiting, when } from "./widgets";
 import styles from "./admin.module.css";
 
-const KIND_ICON: Record<string, AdminIconName> = { email: "mail", bank: "bank", accountant: "users" };
-const KIND_LABEL: Record<string, string> = { email: "Email", bank: "Bank", accountant: "Accountant" };
+const KIND_ICON: Record<string, AdminIconName> = {
+  email: "mail",
+  bank: "bank",
+  accountant: "users",
+  files: "database",
+  accounting: "clipboard",
+  portal: "globe",
+};
+const KIND_LABEL: Record<string, string> = {
+  email: "Email",
+  bank: "Bank",
+  accountant: "Accountant",
+  files: "Cloud storage",
+  accounting: "Accounting software",
+  portal: "Supplier website",
+};
 
 function day(iso: string | null) {
   return iso ? when(iso).split(",")[0] : "–";

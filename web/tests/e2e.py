@@ -45,6 +45,7 @@ import threading
 import time
 import urllib.request
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any, Iterator
@@ -100,6 +101,8 @@ class MockApi:
         self.lock = threading.Lock()
         self.reconnects: list[str] = []
         self.checkouts: list[dict[str, Any]] = []
+        self.dead_letters: list[dict[str, Any]] = []  # the server's parked jobs, as GET /api/internal/overview lists them
+        self.portal_codes: dict[str, str] = {}  # supplier website → the code it sent the owner
 
     def session_for(self, headers: Any) -> dict[str, Any] | None:
         cookie = SimpleCookie(headers.get("Cookie") or "")
@@ -248,7 +251,27 @@ def make_handler(api: MockApi) -> type[http.server.BaseHTTPRequestHandler]:
                                         "via": "checkout", "plan": body.get("plan")})
             if path == "/api/connections/bank/start":
                 return self.reply(200, {"redirectUrl": f"http://{HOST}:{self.server.server_address[1]}/fake-bank?institution={body.get('institutionId')}"})
+            code = re.fullmatch(r"/api/portals/([^/]+)/code", path)
+            if code and method == "POST":
+                # Production contract (server/portals.py): the website signs in with the code and the invoices are
+                # fetched before the answer; a wrong code leaves it waiting.
+                cid, sent = code.group(1), re.sub(r"[\s-]", "", str(body.get("code") or ""))
+                if cid not in api.portal_codes:
+                    return self.reply(404, {"error": "not_found", "message": "Vodafone isn't waiting for a code right now."})
+                if sent != api.portal_codes[cid]:
+                    return self.reply(400, {"error": "bad_request", "message": "That code didn't work. Check it and try again."})
+                del api.portal_codes[cid]
+                api.engine.portal_retrieved(cid, [], None)
+                return self.reply(200, {"ok": True, "documents": 2,
+                                        "message": "Done. I signed in to Vodafone and fetched 2 invoices."})
+            export = re.fullmatch(r"/api/accounting/([^/]+)/export", path)
+            if export and method == "GET":  # the month as the accounting software has it: a ZIP (server/http.py)
+                if not re.fullmatch(r"month=\d{4}-\d{2}", query):
+                    return self.reply(400, {"error": "bad_request", "message": "Choose a month like 2026-09."})
+                return self.reply(200, raw=b"PK\x05\x06" + b"\x00" * 18, ctype="application/zip")
             status, data = api.engine.dispatch(method, path + (f"?{query}" if query else ""), body or None)
+            if path == "/api/internal/overview" and status == 200:  # the production server adds its parked jobs
+                data = data | {"deadLetters": api.dead_letters}
             if path == "/api/home":  # production labels a stale Google mailbox's button like this
                 data = data | {"connections": [c | ({"action": f"Sign in to {c['name']} again"}
                                                     if c["status"] == "stale" and c["kind"] == "email" else {})
@@ -262,7 +285,8 @@ def make_handler(api: MockApi) -> type[http.server.BaseHTTPRequestHandler]:
         @staticmethod
         def who(session: dict[str, Any]) -> dict[str, Any]:
             u = session["user"]
-            return {"user": {"id": u["id"], "email": u["email"], "name": u["name"]}, "tenant": {"id": "t1", "name": session["tenant"]}, "role": "owner"}
+            return {"user": {"id": u["id"], "email": u["email"], "name": u["name"]}, "tenant": {"id": "t1", "name": session["tenant"]},
+                    "role": session.get("role", "owner")}
 
     return Handler
 
@@ -498,6 +522,8 @@ def production() -> None:
         expect(page.get_by_text("Signed in as")).to_be_visible(timeout=15000)
 
         owner_screens(page, api, expect)
+        sources_and_codes(page, api, expect)
+        team_dashboard(page, api, expect)
 
         print("sign out")
         page.goto("/settings")
@@ -779,6 +805,148 @@ def owner_screens(page: Any, api: MockApi, expect: Any) -> None:
     done = posts(api, r"/api/obligations/[^/]+/done")
     check(bool(done) and json.loads(done[-1]["body"]) == {"outcome": "sent"} and done[-1]["csrf"] == "admin2ai",
           "It is done posts the confirmation the API offers")
+
+
+def sources_and_codes(page: Any, api: MockApi, expect: Any) -> None:
+    """Supplier websites, cloud storage and accounting software added from Sources; a website's sign-in code entered
+    in Needs you; a month catching up on missed email; the EU VAT register's details used in one tap."""
+    print("sources: supplier websites, cloud storage and accounting software can be added")
+    page.goto("/sources")
+    expect(page.get_by_role("heading", name="Sources", level=1)).to_be_visible(timeout=15000)
+    for group, title in (("portals", "Supplier websites"), ("files", "Cloud storage"), ("accounting", "Accounting software")):
+        section = page.locator(f"section#{group}")
+        expect(section.get_by_role("heading", name=title)).to_be_visible()
+        check(section.get_by_role("button", name="+ Add").count() == 1, f"{title}: + Add is there while it is empty")
+
+    portals = page.locator("section#portals")
+    portals.get_by_role("button", name="+ Add").click()
+    portals.get_by_label("Supplier").fill("Vodafone")
+    portals.get_by_label("Your username on their website").fill("laura@hazeltree.pt")
+    portals.get_by_label("Password").fill("portal pass 1 ")
+    portals.get_by_role("button", name="Add", exact=True).click()
+    expect(page.get_by_text("Done. I will sign in to Vodafone and fetch your invoices from there.")).to_be_visible(timeout=15000)
+    sent = posts(api, r"/api/sources")
+    check(bool(sent) and json.loads(sent[-1]["body"]) == {
+        "kind": "portal", "supplier": "Vodafone", "username": "laura@hazeltree.pt", "password": "portal pass 1 "}
+        and sent[-1]["csrf"] == "admin2ai", "a supplier website is posted with its sign-in (the password as typed)")
+    expect(portals.get_by_text("Vodafone", exact=True)).to_be_visible()
+
+    files = page.locator("section#files")
+    files.get_by_role("button", name="+ Add").click()
+    files.get_by_label("Where your files are").select_option("microsoft")
+    files.get_by_label("Microsoft account").fill("laura@hazeltree.pt")
+    files.get_by_label("Folder to watch (optional)").fill("/Invoices/2026")
+    files.get_by_role("button", name="Sign in and connect").click()
+    expect(page.get_by_text("Done. I will search your OneDrive for missing invoices.")).to_be_visible(timeout=15000)
+    check(json.loads(posts(api, r"/api/sources")[-1]["body"]) == {
+        "kind": "files", "provider": "microsoft", "address": "laura@hazeltree.pt", "folder": "/Invoices/2026"},
+        "cloud storage is posted with its provider, account and folder")
+
+    accounting = page.locator("section#accounting")
+    accounting.get_by_role("button", name="+ Add").click()
+    accounting.get_by_label("Client identifier").fill("typed-for-toconline")
+    accounting.get_by_label("Accounting software").select_option("invoicexpress")
+    accounting.get_by_label("Account name").fill("hazeltree")
+    accounting.get_by_label("Access key").fill("secret-key")
+    accounting.get_by_role("button", name="Add", exact=True).click()
+    expect(page.get_by_text("Done. I will read Hazel Tree's documents in InvoiceXpress.")).to_be_visible(timeout=15000)
+    check(json.loads(posts(api, r"/api/sources")[-1]["body"]) == {
+        "kind": "accounting", "provider": "invoicexpress", "account": "hazeltree", "apiKey": "secret-key",
+        "companyId": "hazel-tree"}, "accounting software is posted with only the chosen program's fields")
+    shots(page, "sources")
+    no_sideways_scroll(page, "/sources")
+    with page.expect_download() as dl:
+        accounting.get_by_role("button", name=re.compile(r"^Download \w+ from InvoiceXpress$")).click()
+    check(re.fullmatch(r"InvoiceXpress-\d{4}-\d{2}\.zip", dl.value.suggested_filename) is not None,
+          f"the accounting software's month downloads as a ZIP ({dl.value.suggested_filename})")
+    asked = [r for r in api.requests if re.fullmatch(r"/api/accounting/accounting-invoicexpress-hazel-tree/export", r["path"])]
+    check(bool(asked) and re.fullmatch(r"month=\d{4}-\d{2}", asked[-1]["query"]) is not None, "the export asks for one month")
+
+    print("needs you: a supplier website's sign-in code")
+    with api.lock:
+        api.portal_codes["portal-vodafone"] = "000001"
+        api.engine.portal_code_needed("portal-vodafone", channel="sms",
+                                      expires_at=datetime.now(timezone.utc) + timedelta(minutes=10), state=None)
+    page.goto("/needs-you")
+    card = page.locator("article", has_text="Sign-in code")
+    expect(card.get_by_role("heading", name="Vodafone", exact=True)).to_be_visible(timeout=15000)
+    expect(card.get_by_text("Vodafone sent you a sign-in code to your phone. Enter it so I can fetch your invoices.")) \
+        .to_be_visible(timeout=15000)
+    expect(card.get_by_text(re.compile(r"^The code works until \d{2}:\d{2}\.$"))).to_be_visible()
+    box = card.get_by_role("textbox", name="Sign-in code")
+    check(box.get_attribute("autocomplete") == "one-time-code", "the code box offers the code the phone received")
+    box.fill("999999")
+    card.get_by_role("button", name="Confirm").click()
+    expect(card.get_by_role("alert")).to_have_text("That code didn't work. Check it and try again.", timeout=15000)
+    shots(page, "needs-code")
+    no_sideways_scroll(page, "/needs-you")
+    box.fill("000 001")
+    card.get_by_role("button", name="Confirm").click()
+    expect(page.get_by_text("Done. I signed in to Vodafone and fetched 2 invoices.")).to_be_visible(timeout=15000)
+    sent = posts(api, r"/api/portals/portal-vodafone/code")
+    check([json.loads(r["body"]) for r in sent] == [{"code": "999999"}, {"code": "000 001"}]
+          and all(r["csrf"] == "admin2ai" for r in sent), "the code is posted to the item's own address")
+    expect(card).to_have_count(0, timeout=15000)
+    since = api.requests.index(sent[-1])
+    for _ in range(50):  # the list is read again once the card has folded away
+        if any(r["method"] == "GET" and r["path"] == "/api/needs-you" for r in api.requests[since:]):
+            break
+        page.wait_for_timeout(100)
+    check(any(r["method"] == "GET" and r["path"] == "/api/needs-you" for r in api.requests[since:]),
+          "the list is read again once the website signed in")
+
+    print("month: catching up on email it missed")
+    with api.lock:
+        start = datetime(2026, 9, 10, tzinfo=timezone.utc)
+        api.engine.repo.connectors["gmail"].gaps = ((start, start + timedelta(days=3), True),)
+        api.engine.orchestrator.run()
+    page.goto("/companies/hazel-tree")
+    expect(page.get_by_text("Catching up on 3 days of email from laura@hazeltree.pt.")).to_be_visible(timeout=15000)
+    check(True, "the month says it is catching up on the email it missed")
+    with api.lock:
+        api.engine.repo.connectors["gmail"].gaps = ()
+        api.engine.orchestrator.run()
+
+    print("company: the EU VAT register's details in one tap")
+    with api.lock:
+        company_b = api.engine.repo.companies["company-b"]
+        api.engine.repo.identity_suggestions["company-b"] = {
+            "status": "found", "country": "PT", "number": company_b.tax_id, "legal_name": "COMPANY B LDA",
+            "address": "RUA DE SANTA CATARINA 112, 4000-447 PORTO", "source": "VIES"}
+        said = next(c for c in api.engine.companies()["companies"] if c["id"] == "company-b")["identityCheck"]["message"]
+    page.goto("/companies/company-b")
+    expect(page.get_by_text(said, exact=True)).to_be_visible(timeout=15000)
+    page.get_by_role("button", name="Use these details").click()
+    expect(page.get_by_text("Done. Company B now has the legal name and address from the EU VAT register.")) \
+        .to_be_visible(timeout=15000)
+    used = posts(api, r"/api/companies/company-b/identity")
+    check(bool(used) and json.loads(used[-1]["body"]) == {"use": True} and used[-1]["csrf"] == "admin2ai",
+          "Use these details posts use: true")
+
+
+def team_dashboard(page: Any, api: MockApi, expect: Any) -> None:
+    """The team's Command Center lists background jobs that kept failing (the server's dead letters)."""
+    print("admin: failed background jobs")
+    with api.lock:
+        for s in api.sessions.values():
+            s["role"] = "admin"
+    page.goto("/internal")
+    expect(page.get_by_role("heading", name="Failed jobs")).to_be_visible(timeout=30000)
+    expect(page.get_by_text("No failed jobs.")).to_be_visible()
+    with api.lock:
+        api.dead_letters = [{"id": "job:41", "tenant": "t1", "kind": "sync.connection",
+                             "label": "Reading a mailbox after a push notification", "connection": "gmail",
+                             "attempts": 5, "lastError": "Gmail did not answer", "since": "2026-10-02T08:10:00+00:00"}]
+    page.get_by_role("button", name="Refresh").click()
+    jobs = page.get_by_role("region", name=re.compile(r"^Failed jobs"))
+    expect(jobs.get_by_text("Reading a mailbox after a push notification")).to_be_visible(timeout=15000)
+    expect(jobs.get_by_text("Gmail did not answer")).to_be_visible()
+    expect(jobs.get_by_text(re.compile(r"Failed 5 times · parked .* · tenant t1 · gmail"))).to_be_visible()
+    shots(page, "internal-failed-jobs")
+    with api.lock:
+        for s in api.sessions.values():
+            s["role"] = "owner"
+        api.dead_letters = []
 
 
 # --------------------------------------------------------------------------- demo

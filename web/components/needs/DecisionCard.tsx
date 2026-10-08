@@ -1,11 +1,18 @@
 "use client";
 
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { Icon } from "@/components/Icon";
 import { Bullets, Disclosure } from "@/components/ui";
-import { answerNeedsYou } from "@/lib/api";
-import { formatDay, formatMoney } from "@/lib/format";
-import type { NeedsYouApprovalItem, NeedsYouChoiceItem, NeedsYouItem, SplitPart } from "@/lib/types";
+import { answerNeedsYou, submitSignInCode } from "@/lib/api";
+import { formatDay, formatMoney, formatTime } from "@/lib/format";
+import type {
+  AnswerResult,
+  NeedsYouApprovalItem,
+  NeedsYouChoiceItem,
+  NeedsYouCodeItem,
+  NeedsYouItem,
+  SplitPart,
+} from "@/lib/types";
 import { SplitEditor, splitReady, type SplitDraft } from "./SplitEditor";
 import styles from "./needs.module.css";
 
@@ -35,10 +42,11 @@ function useResolution(onResolved: () => void, serverMessage = false) {
     }
   }, [phase, onResolved]);
 
-  const submit = async (id: string, optionId: string, remember: boolean, doneMessage: string, split?: SplitPart[]) => {
+  /** One write: the card folds into its "Done." line when it worked; otherwise the reason shows under it. */
+  const run = async (write: () => Promise<AnswerResult>, doneMessage: string) => {
     setFailed(null);
     setPhase("sending");
-    const res = await answerNeedsYou(id, optionId, remember, split);
+    const res = await write();
     if (res.ok) {
       const said = serverMessage && res.message ? res.message : doneMessage;
       // The engine's own words say what really happened; "I will remember this." only when it learned a rule.
@@ -52,7 +60,10 @@ function useResolution(onResolved: () => void, serverMessage = false) {
     }
   };
 
-  return { phase, message, failed, submit };
+  const submit = (id: string, optionId: string, remember: boolean, doneMessage: string, split?: SplitPart[]) =>
+    run(() => answerNeedsYou(id, optionId, remember, split), doneMessage);
+
+  return { phase, message, failed, submit, run };
 }
 
 interface CardProps<T extends NeedsYouItem> {
@@ -62,6 +73,7 @@ interface CardProps<T extends NeedsYouItem> {
 }
 
 export function DecisionCard({ item, companyName, onResolved }: CardProps<NeedsYouItem>) {
+  if (item.kind === "code") return <CodeCard item={item} companyName={companyName} onResolved={onResolved} />;
   return item.kind === "choice" ? (
     <ChoiceCard item={item} companyName={companyName} onResolved={onResolved} />
   ) : (
@@ -333,6 +345,75 @@ function ApprovalCard({ item, companyName, onResolved }: CardProps<NeedsYouAppro
           </div>
         </div>
       )}
+
+      {failed ? (
+        <p className={styles.retry} role="alert">
+          {failed}
+        </p>
+      ) : null}
+
+      <WhyBlock why={item.why} />
+    </Shell>
+  );
+}
+
+/* ---------- Code: a supplier's website sent the owner a one-time sign-in code ---------- */
+
+function CodeCard({ item, companyName, onResolved }: CardProps<NeedsYouCodeItem>) {
+  const inputId = useId();
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [code, setCode] = useState("");
+  const { phase, message, failed, run } = useResolution(onResolved, true);
+  const busy = phase !== "open";
+  const expires = item.code.expiresAt ? new Date(item.code.expiresAt) : null;
+  const until = expires && expires.getTime() > new Date().getTime() ? formatTime(item.code.expiresAt!) : null;
+
+  const send = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!code.trim() || busy) return;
+    void run(async (): Promise<AnswerResult> => {
+      // The website signs in and the invoices are fetched before the server answers.
+      const r = await submitSignInCode(item.code.submitPath, code);
+      if (r.waiting) setCode(""); // a new code is on its way: this one is no use any more
+      if (!r.done) inputRef.current?.focus();
+      return { ok: r.done, message: r.message };
+    }, "Done.");
+  };
+
+  return (
+    <Shell item={item} phase={phase} message={message}>
+      <Header item={item} companyName={companyName} />
+
+      <form className={styles.codeForm} onSubmit={send} noValidate>
+        <p className={styles.question}>{item.question}</p>
+        <div>
+          <label className="label" htmlFor={inputId}>
+            {item.code.label}
+          </label>
+          <div className={styles.codeRow}>
+            <input
+              id={inputId}
+              ref={inputRef}
+              className={`input num ${styles.codeInput}`}
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+              autoComplete="one-time-code"
+              autoCapitalize="characters"
+              spellCheck={false}
+              maxLength={24}
+              aria-describedby={until ? `${inputId}-until` : undefined}
+            />
+            <button type="submit" className="btn btn-primary" disabled={!code.trim() || busy}>
+              {phase === "sending" ? "Signing in…" : "Confirm"}
+            </button>
+          </div>
+          {until ? (
+            <p id={`${inputId}-until`} className={`meta ${styles.codeHint}`}>
+              The code works until {until}.
+            </p>
+          ) : null}
+        </div>
+      </form>
 
       {failed ? (
         <p className={styles.retry} role="alert">

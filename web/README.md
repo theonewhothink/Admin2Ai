@@ -103,8 +103,9 @@ Evidence ids use prefixes so the UI can link them: `month:<company>:<yyyy-mm>`, 
 | ----------------------------------- | ---------------------------------------------------------------------------- |
 | `/`                                 | Home: greeting, status line, ask box, tiles, businesses, coming up, handled |
 | `/?demo=stale`                      | Home with the "Gmail needs reconnecting" banner                              |
-| `/needs-you`                        | Decision cards: IKEA (which company?), Vodafone IBAN change (hard approval)  |
-| `/companies`, `/companies/[id]`     | Businesses list; month close (`?month=2026-08`) with "Why?" provenance      |
+| `/needs-you`                        | Decision cards: IKEA (which company?), Vodafone IBAN change (hard approval), a supplier website's one-time sign-in code (`kind: "code"`: one box, `POST { code }` to the item's `code.submitPath`, `/api/portals/{id}/code`; the list is read again once it goes through) |
+| `/sources`                          | Everything connected or learned (`GET /api/sources`), with "+ Add" per group (`POST /api/sources`): email, banks, cards, supplier websites (`kind: "portal"`), cloud storage (`kind: "files"`: Google Drive, OneDrive or SharePoint), accounting software (`kind: "accounting"`: TOConline, Moloni, InvoiceXpress), suppliers and the rest; remove (`POST /api/sources/{id}/remove`). Production: last month from the accounting software as a ZIP (`GET /api/accounting/{id}/export?month=`) |
+| `/companies`, `/companies/[id]`     | Businesses list; month close (`?month=2026-08`) with "Why?" provenance and what is left (including "Catching up on 3 days of email from …" while a connection reads back days it missed); the EU VAT register's details in one tap while the owner has not chosen (`identityCheck`, `POST /api/companies/{id}/identity { use }`) |
 | `/activity`                         | Quiet timeline of what was handled, grouped by day                          |
 | `/ask`                              | Ask box, example prompts, answers with evidence chips (`/ask?q=…`)          |
 | `/scan`                             | Upload receipts; explains that capture lives on the phone                   |

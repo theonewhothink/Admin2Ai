@@ -120,6 +120,23 @@ export interface Readiness {
   percent: number;
 }
 
+/** Background work that failed every attempt and is parked for the team (server/jobs.py), never dropped. */
+export interface DeadLetter {
+  id: string;
+  tenant: string;
+  /** "sync.connection", "subscription.renew" … */
+  kind: string;
+  /** The job in words: "Reading a mailbox after a push notification". */
+  label: string;
+  /** The connection it was for, when there is one. */
+  connection: string;
+  attempts: number;
+  /** Why the last attempt failed. */
+  lastError: string;
+  /** When it was parked. */
+  since: string | null;
+}
+
 export interface InternalOverview {
   generatedAt: string;
   today: string;
@@ -138,6 +155,8 @@ export interface InternalOverview {
   targets: TargetRow[];
   readiness: Readiness;
   quick: { id: string; label: string; value: number }[];
+  /** The production server's parked jobs (absent where there is no job queue, e.g. the in-browser engine). */
+  deadLetters?: DeadLetter[];
 }
 
 export interface OperationsActivity {

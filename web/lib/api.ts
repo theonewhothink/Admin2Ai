@@ -30,6 +30,7 @@ import type {
   AnswerResult,
   AskAnswer,
   AuditResult,
+  CodeResult,
   CompanySummary,
   HomeData,
   MonthClose,
@@ -270,6 +271,9 @@ export function getHome(): Promise<HomeData> {
   );
 }
 
+/** Where a supplier website's sign-in code goes (a Needs-you "code" item's `submitPath`). Nothing else is posted to. */
+const CODE_PATH = /^\/api\/portals\/[^/?#]+\/code$/;
+
 export function getNeedsYou(): Promise<NeedsYouItem[]> {
   return request<NeedsYouItem[]>(
     "/api/needs-you",
@@ -278,7 +282,12 @@ export function getNeedsYou(): Promise<NeedsYouItem[]> {
       const list = arrayFrom(v, "items");
       if (!list) return null;
       return list.filter(
-        (i): i is NeedsYouItem => isRecord(i) && typeof i.id === "string" && (i.kind === "choice" || i.kind === "approval"),
+        (i): i is NeedsYouItem =>
+          isRecord(i) &&
+          typeof i.id === "string" &&
+          (i.kind === "choice" ||
+            i.kind === "approval" ||
+            (i.kind === "code" && isRecord(i.code) && typeof i.code.submitPath === "string" && CODE_PATH.test(i.code.submitPath))),
       );
     },
     () => sample.needsYou,
@@ -392,6 +401,29 @@ export async function answerNeedsYou(id: string, optionId: string, remember: boo
     () => ({ ok: true }),
     () => ({ ok: true }),
   );
+}
+
+/** The server's own words when they are plain (short, no stack trace), else `fallback`. */
+function plainMessage(body: unknown, fallback: string): string {
+  const m = isRecord(body) ? body.message : undefined;
+  return typeof m === "string" && m.trim() && m.length <= 300 && !/traceback|exception|\n\s+at\s/i.test(m) ? m.trim() : fallback;
+}
+
+/**
+ * The one-time code a supplier's website sent the owner: POST `{ code }` to the item's `submitPath`. The
+ * server signs in with it and fetches the invoices before it answers, so this can take a while.
+ * 200: done. 202: the website asked for one more code. 410: the code expired and the website sent a new one.
+ * Anything else (a wrong code, the website not answering) says why in plain words.
+ */
+export async function submitSignInCode(path: string, code: string): Promise<CodeResult> {
+  if (!CODE_PATH.test(path)) return { done: false, waiting: false, message: "I couldn’t send that code. Reload the page and try again." };
+  const r = await call("POST", path, { code: code.trim() }, 120000);
+  if (r.status === 200) return { done: true, waiting: false, message: plainMessage(r.body, "Done.") };
+  if (r.status === 202 || r.status === 410) {
+    return { done: false, waiting: true, message: plainMessage(r.body, "Enter the new code when it arrives.") };
+  }
+  const fallback = r.status === 429 ? "Too many attempts. Wait a few minutes, then try again." : "I couldn’t send that code. Try again in a moment.";
+  return { done: false, waiting: false, message: r.status >= 500 && r.status !== 502 && r.status !== 503 ? fallback : plainMessage(r.body, fallback) };
 }
 
 function sampleAnswer(question: string): AskAnswer {
@@ -703,7 +735,12 @@ export interface CallResult<T = Record<string, unknown>> {
 }
 
 /** Plain call to the engine (browser) or the backend (HTTP). No sample fallback: actions need a real engine. */
-export async function call<T = Record<string, unknown>>(method: "GET" | "POST", path: string, body?: unknown): Promise<CallResult<T>> {
+export async function call<T = Record<string, unknown>>(
+  method: "GET" | "POST",
+  path: string,
+  body?: unknown,
+  timeoutMs = 30000,
+): Promise<CallResult<T>> {
   const offline = { ok: false, status: 503, body: { message: "Connect the backend to use this." } as unknown as T };
   if (browserEngine) {
     try {
@@ -722,7 +759,7 @@ export async function call<T = Record<string, unknown>>(method: "GET" | "POST", 
         headers: body !== undefined ? { "Content-Type": "application/json" } : {},
         body: method === "POST" ? JSON.stringify(body ?? {}) : undefined,
       },
-      30000,
+      timeoutMs,
     );
     if (production && res.status === 401) return toSignIn();
     const parsed: unknown = await res.json().catch(() => ({}));
@@ -752,6 +789,47 @@ export function saveFile(file: { filename: string; contentType: string; data: st
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/** The file name the server gave (Content-Disposition), else `fallback`. Never a path. */
+export function filenameFrom(disposition: string | null, fallback: string): string {
+  const star = disposition?.match(/filename\*=(?:UTF-8'')?([^;]+)/i);
+  if (star?.[1]) {
+    try {
+      return decodeURIComponent(star[1].trim().replace(/^"|"$/g, ""));
+    } catch {
+      // fall through to the plain filename
+    }
+  }
+  const plain = disposition?.match(/filename="?([^";]+)"?/i);
+  const name = plain?.[1]?.trim();
+  return name && !/[\\/]/.test(name) ? name : fallback;
+}
+
+/**
+ * A file the backend sends as it is (a ZIP, not JSON), saved as a download. Returns null when done, or a
+ * plain message saying why not. Production and api modes only: the in-browser engine sends JSON files
+ * (see `download`).
+ */
+export async function downloadFile(path: string, name: string, fallback: string, timeoutMs = 300000): Promise<string | null> {
+  if (!hasApi) return "Connect the backend to download this.";
+  let res: Response;
+  try {
+    res = await apiFetch(path, { headers: { Accept: "application/zip, application/json" } }, timeoutMs);
+  } catch {
+    return OFFLINE_MESSAGE;
+  }
+  if (production && res.status === 401) return toSignIn();
+  if (!res.ok) return errorMessage(res, fallback);
+  const url = URL.createObjectURL(await res.blob());
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filenameFrom(res.headers.get("Content-Disposition"), name);
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+  return null;
 }
 
 export async function download(path: string, method: "GET" | "POST" = "GET", body?: unknown): Promise<string | null> {
