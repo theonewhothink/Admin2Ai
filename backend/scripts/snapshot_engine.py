@@ -46,6 +46,11 @@ STATIC_PATHS = (
     "/api/internal/operations",
     "/api/internal/readiness",
     "/api/internal/acceptance",
+    "/api/obligations",
+    "/api/billing",
+    "/api/settings/automation",
+    "/api/employees",
+    "/api/expense-claims",
 )
 
 
