@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="pt-PT">
+<head><meta charset="utf-8"><title>Faturas $ano | Área de Cliente EDP</title></head>
+<body class="area-cliente">
+  <header class="cabecalho"><a class="logotipo" href="/">EDP</a>
+    <nav class="menu"><a href="/area-cliente/inicio">Início</a> <a href="/area-cliente/faturas">Faturas</a>
+      <a href="/area-cliente/sair">Sair</a></nav></header>
+  <main data-area-cliente="1" class="conteudo">
+    <h1>As suas faturas</h1>
+    <form class="filtro-ano" method="get" action="/area-cliente/faturas">
+      <label for="ano">Ano</label>
+      <select id="ano" name="ano"><option value="2025">2025</option><option value="2026" selected>2026</option></select>
+    </form>
+    $lista
+    $paginacao
+  </main>
+  <footer class="rodape"><a href="/privacidade">Privacidade</a></footer>
+</body>
+</html>

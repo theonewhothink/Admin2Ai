@@ -2,9 +2,11 @@
 any supplier is asked for it, and every search is recorded.
 
 The places are the connections that can be searched (``ConnectorState.searchable``: a mailbox, Google Drive or
-OneDrive, the accounting software). When a payment's document is missing (§21: it needs one, nothing matched it
-for a few days), :meth:`SearchAgent.requests` describes it for the production sync worker, which searches the
-places live and records what each gave, before the event is recorded (server/search.py, missing/searches.py).
+OneDrive, the accounting software) and the supplier's own website when the owner connected it
+(backoffice.supplier_websites: the website learned to hold that supplier's invoices is asked first). When a
+payment's document is missing (§21: it needs one, nothing matched it for a few days), :meth:`SearchAgent.requests`
+describes it for the production sync worker, which searches the places live and records what each gave, before
+the event is recorded (server/search.py, missing/searches.py).
 :meth:`SearchAgent.record` applies that record, live and on replay alike:
 
 * the autopilot (``missing.MissingEvidenceAutopilot``) goes through the places in the spec's order (current email,
@@ -93,11 +95,14 @@ _COMMON = frozenset({"the", "and", "for", "your", "you", "from", "with", "fwd", 
 
 
 def place_of(c: ConnectorState) -> str:
-    """A connection as the owner reads it in "I searched ...": "your email", "your Google Drive", "Moloni"."""
+    """A connection as the owner reads it in "I searched ...": "your email", "your Google Drive", "Moloni",
+    "your account on EDP's website"."""
     if c.kind == "email":
         return "your email"
     if c.kind == "files":
         return f"your {c.name}"
+    if c.kind == "portal":
+        return f"your account on {c.name}'s website"
     return c.name
 
 
@@ -141,13 +146,34 @@ class SearchAgent(_Agent):
                        and (company_id is None or not c.company_ids or company_id in c.company_ids)),
                       key=lambda c: (c.kind != "email", c.kind, c.id))
 
-    def place_names(self, company_id: str | None) -> list[str]:
-        return list(dict.fromkeys(place_of(c) for c in self.places(company_id)))
+    def place_names(self, company_id: str | None, subject_id: str | None = None) -> list[str]:
+        places = self.places_for(subject_id, company_id) if subject_id else self.places(company_id)
+        return list(dict.fromkeys(place_of(c) for c in places))
+
+    def supplier_of(self, subject_id: str) -> Any:
+        """The supplier a missing document is from (a payment's, or a usual invoice's), or None."""
+        rec = self.repo.transactions.get(subject_id)
+        if rec is not None:
+            return self.repo.resolver().resolve_transaction(rec.tx).supplier
+        expected = self.repo.expected_invoices.get(subject_id)
+        return self.repo.suppliers.get(expected.supplier_id or "") if expected is not None else None
+
+    def websites(self, subject_id: str, company_id: str | None) -> list[tuple[ConnectorState, bool]]:
+        """The supplier's websites the business connected, each with whether it is asked first (learned)."""
+        if not any(c.kind == "portal" for c in self.repo.connectors.values()):
+            return []  # no supplier website connected (most businesses, the demo): nothing to resolve
+        return self.o.websites.connections_for(self.supplier_of(subject_id), company_id)
+
+    def places_for(self, subject_id: str, company_id: str | None) -> list[ConnectorState]:
+        """Where this document is searched, in order: the supplier's website learned to hold its invoices, the
+        connected places, then the supplier's other connected website (§22 search 4)."""
+        sites = self.websites(subject_id, company_id)
+        return [c for c, first in sites if first] + self.places(company_id) + [c for c, first in sites if not first]
 
     def waiting(self, subject_id: str, company_id: str | None) -> bool:
         """True while the document is still to be searched for: no supplier is asked before (§22)."""
         record = self.repo.evidence_searches.get(subject_id)
-        if not self.places(company_id):
+        if not self.places_for(subject_id, company_id):
             return False
         return record is None or record.status == "retry"
 
@@ -177,23 +203,25 @@ class SearchAgent(_Agent):
     def requests(self, now: datetime) -> list[dict[str, Any]]:
         """The documents to search for now, each described for the sync worker (JSON). Changes nothing."""
         repo = self.repo
-        if not any(c.searchable and c.healthy for c in repo.connectors.values()):
+        if not any(c.healthy and (c.searchable or c.kind == "portal") for c in repo.connectors.values()):
             return []
         out: list[SearchRequest] = []
         for rec in sorted(repo.transactions.values(), key=lambda r: (r.tx.booked_on, r.id)):
             if not self.payment_missing(rec):
                 continue
             number = self._next_round(rec.id, now)
-            places = self.places(rec.company_id)
+            places = self.places_for(rec.id, rec.company_id)
             if number is not None and places:
-                out.append(self._payment_request(rec, number, places))
+                first = tuple(c.id for c, f in self.websites(rec.id, rec.company_id) if f)
+                out.append(self._payment_request(rec, number, places, first))
         for record in sorted(repo.expected_invoices.values(), key=lambda e: e.id):
             if record.status != "missing" or record.message is not None:
                 continue
             number = self._next_round(record.id, now)
-            places = self.places(record.company_id)
+            places = self.places_for(record.id, record.company_id)
             if number is not None and places:
-                out.append(self._expected_request(record, number, places, now))
+                first = tuple(c.id for c, f in self.websites(record.id, record.company_id) if f)
+                out.append(self._expected_request(record, number, places, now, first))
         return [r.to_json() for r in out[:SEARCHES_PER_PASS]]
 
     def _supplier_terms(self, supplier: Any) -> tuple[tuple[str, ...], SearchPattern | None]:
@@ -204,7 +232,8 @@ class SearchAgent(_Agent):
             domains.append(supplier.contact_email.split("@", 1)[1].lower())
         return tuple(dict.fromkeys(domains)), self.pattern(supplier.id)
 
-    def _payment_request(self, rec: TxRecord, number: int, places: Sequence[ConnectorState]) -> SearchRequest:
+    def _payment_request(self, rec: TxRecord, number: int, places: Sequence[ConnectorState],
+                         first: Sequence[str] = ()) -> SearchRequest:
         supplier = self.repo.resolver().resolve_transaction(rec.tx).supplier
         domains, pattern = self._supplier_terms(supplier)
         sales = rec.decision is not None and rec.decision.rule == "customer_refund"
@@ -215,10 +244,11 @@ class SearchAgent(_Agent):
             counterparty=rec.tx.counterparty, supplier_name=display_name(supplier.name) if supplier else None,
             supplier_tax_id=supplier.tax_id if supplier else None, supplier_domains=domains,
             invoice_number=self.o.statements.number_for(rec), direction="sales" if sales else "purchases",
-            pattern=pattern, connections=tuple(c.id for c in places), entity_id=rec.tx.entity_id)
+            pattern=pattern, connections=tuple(c.id for c in places), entity_id=rec.tx.entity_id,
+            first=tuple(first))
 
     def _expected_request(self, record: Any, number: int, places: Sequence[ConnectorState],
-                          now: datetime) -> SearchRequest:
+                          now: datetime, first: Sequence[str] = ()) -> SearchRequest:
         supplier = self.repo.suppliers.get(record.supplier_id or "")
         domains, pattern = self._supplier_terms(supplier)
         series = record.series
@@ -229,7 +259,7 @@ class SearchAgent(_Agent):
             window_start=record.earliest, window_end=max(now.astimezone(TZ).date(), record.due_on),
             counterparty=record.supplier_name, supplier_name=record.supplier_name,
             supplier_tax_id=supplier.tax_id if supplier else None, supplier_domains=domains, pattern=pattern,
-            connections=tuple(c.id for c in places), entity_id=record.company_id)
+            connections=tuple(c.id for c in places), entity_id=record.company_id, first=tuple(first))
 
     def pattern(self, supplier_id: str) -> SearchPattern | None:
         """How this supplier's invoices usually arrive, from the earlier ones that came by email: the usual
@@ -292,9 +322,11 @@ class SearchAgent(_Agent):
             request = self._payment_request(rec, round_number, ())
         else:
             request = self._expected_request(expected, round_number, (), at)
+        # The place learned to hold this supplier's invoices was asked first live; it is asked first here too.
+        first = tuple(dict.fromkeys(SearchSource(a["source"]) for a in clean if a.get("first")))
         pilot = MissingEvidenceAutopilot(searches, authorize=lambda r: self._may_ask(r.entity_id, subject_id),
                                          timeout_seconds=None, clock=lambda: at,
-                                         message_id_domain=MESSAGE_ID_DOMAIN)
+                                         message_id_domain=MESSAGE_ID_DOMAIN, first=first)
         outcome = run_recorded(pilot.run(request.evidence_query(repo.tenant_id), company=company, supplier=supplier,
                                          today=at.astimezone(TZ).date(),
                                          allow_incomplete=round_number >= MAX_SEARCH_ROUNDS))
@@ -334,6 +366,12 @@ class SearchAgent(_Agent):
                                                                "outcome", "found", "failure")} for a in clean]},
                  response={"status": status, "next_step": outcome.next_step.value,
                            "found": found.evidence_id if found else None})
+        if found is not None and found.source is SearchSource.SUPPLIER_PORTAL:  # its invoices are there (L6)
+            doc = repo.documents.get(found.document_id or "")
+            where = next((str(f.provenance["connectionId"]) for f in by_source.get(found.source, ([], []))[1]
+                          if f.provenance.get("connectionId")), None)
+            who = (doc.supplier_id if doc is not None else None) or (supplier.id if supplier is not None else None)
+            self.o.websites.learn(who, "found", at, connection_id=where, evidence_ids=[found.evidence_id])
         self._tell(record, rec, expected, found, at)
         self.o.run(at)  # nothing found: the supplier request (when allowed) is written now, not before
         return {"ok": True, "status": status, "documents": list(record.document_ids),
@@ -354,6 +392,8 @@ class SearchAgent(_Agent):
                "outcome": outcome, "found": found if isinstance(found, int) and not isinstance(found, bool) else 0}
         if raw.get("failure"):
             out["failure"] = str(raw["failure"])[:120]  # internal (the audit log), never owner copy
+        if raw.get("first") is True:
+            out["first"] = True  # the place learned to hold the supplier's invoices: asked first
         return out
 
     def _may_ask(self, company_id: str | None, subject_id: str) -> bool:
@@ -442,7 +482,7 @@ class SearchAgent(_Agent):
         """While the search is still to happen (no supplier is asked before it)."""
         if not self.waiting(subject_id, company_id):
             return None
-        places = join_and(self.place_names(company_id))
+        places = join_and(self.place_names(company_id, subject_id))
         record = self.repo.evidence_searches.get(subject_id)
         if record is not None and record.unreachable:
             return (f"I'm looking for {what} in {places}. I couldn't reach {join_and(record.unreachable)} yet, "

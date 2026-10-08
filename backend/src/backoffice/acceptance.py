@@ -152,10 +152,15 @@ SECTIONS: tuple[tuple[str, str, tuple[Check, ...]], ...] = (
         _c("C4", "HTML receipts captured.", "pass", SERVER, "",
            T + "test_acceptance_links_body.py::test_page_without_a_file_is_preserved_as_rendered_evidence_and_read"),
         _c("C5", "Login-required portals supported.", "partial", SERVER,
-           "Sign-in, sign-in codes and daily retrieval run on the server, proven with a test website; no adapter "
-           "for a real supplier website is written.",
+           "A deterministic EDP adapter (sign-in, SMS code, invoice list, PDF download) is tested on recorded pages "
+           "imitating its customer area; it still needs checking with a real EDP account.",
            T + "test_ingest_portals.py::test_valid_session_skips_login",
-           T + "test_acceptance_resilience.py::test_a_sign_in_code_resumes_the_portal_and_the_invoices_are_read_before_recording"),
+           T + "test_acceptance_resilience.py::test_a_sign_in_code_resumes_the_portal_and_the_invoices_are_read_before_recording",
+           T + "test_portal_invoice_pages.py::test_the_edp_adapter_signs_in_lists_every_year_and_downloads_the_original_pdfs",
+           T + "test_portal_invoice_pages.py::test_a_sign_in_code_a_wrong_code_and_an_expired_code_on_the_edp_website",
+           T + "test_portal_invoice_pages.py::test_a_refused_password_an_outage_and_a_changed_website_are_told_apart",
+           T + "test_portal_invoice_pages.py::test_a_session_the_website_signed_out_is_replaced_by_one_new_sign_in",
+           T + "test_portal_invoice_pages.py::test_the_adapter_never_leaves_the_suppliers_website"),
         _c("C6", "MFA interruptions resume correctly.", "pass", SERVER,
            "A code is asked by push and in Needs you, and the sign-in resumes once it is entered; proven with a "
            "test website, as no real supplier website is connected (C5).",
@@ -419,10 +424,13 @@ SECTIONS: tuple[tuple[str, str, tuple[Check, ...]], ...] = (
            T + "test_acceptance_search_connectors.py::test_invoicexpress_lists_documents_with_the_customers_key_and_downloads_pdfs",
            T + "test_acceptance_search_connectors.py::test_moloni_signs_in_with_the_developer_app_and_reads_sales_and_purchases",
            T + "test_acceptance_search_connectors.py::test_toconline_authorizes_with_the_companys_api_data_and_reads_documents"),
-        _c("K5", "Searches supplier portal.", "partial", SERVER,
-           "A supplier's website can join the search before asking, but no adapter for a real supplier website "
-           "exists (C5) and no test runs a website search.",
-           T + "test_ingest_portals.py::test_sync_retrieves_only_new_documents"),
+        _c("K5", "Searches supplier portal.", "pass", SERVER,
+           "The supplier's website is searched before asking, first once it is known to hold its invoices; run end "
+           "to end with the EDP adapter on recorded pages (a real account: C5).",
+           T + "test_acceptance_portal_search.py::test_the_worker_searches_edps_website_before_asking_and_closes_the_payment",
+           T + "test_acceptance_portal_search.py::test_when_the_website_does_not_have_it_the_supplier_is_asked",
+           T + "test_acceptance_portal_search.py::test_a_search_never_sends_the_owner_a_code_nobody_asked_them_for",
+           T + "test_acceptance_portal_search.py::test_a_website_added_under_a_suppliers_name_is_searched_in_order_until_its_invoices_are_found_there"),
         _c("K6", "Uses recurring history.", "pass", SERVER,
            "The supplier's usual sender, subject and file name are learned and searched; a late usual invoice is "
            "searched for before it is chased.",
@@ -460,9 +468,14 @@ SECTIONS: tuple[tuple[str, str, tuple[Check, ...]], ...] = (
            T + "test_acceptance_small_gaps.py::test_a_payment_from_another_card_is_noted_not_held"),
         _c("L5", "Entity learned.", "pass", DEMO, '',
            T + "test_orchestrator_pipeline.py::test_one_tap_learning_resolves_similar_items_now_and_later"),
-        _c("L6", "Portal retrieval path learned.", "missing", NOWHERE,
-           "Nothing learns which supplier website holds a supplier's invoices; no real supplier website is "
-           "connected (C5)."),
+        _c("L6", "Portal retrieval path learned.", "pass", SERVER,
+           "Learned from invoices fetched there, a search that found one, an email linking only there, or the "
+           "owner naming it; shown on the supplier, replayed, searched first once its invoices were seen there.",
+           T + "test_acceptance_portal_search.py::test_the_website_learned_to_hold_a_suppliers_invoices_is_searched_first_next_time",
+           T + "test_acceptance_portal_search.py::test_the_worker_searches_edps_website_before_asking_and_closes_the_payment",
+           T + "test_acceptance_portal_search.py::test_an_invoice_email_that_only_links_to_edps_website_teaches_where_edps_invoices_are",
+           T + "test_acceptance_portal_search.py::test_only_a_link_to_the_suppliers_own_known_website_teaches_anything",
+           T + "test_acceptance_portal_search.py::test_a_website_added_under_a_suppliers_name_is_searched_in_order_until_its_invoices_are_found_there"),
         _c("L7", "Missing recurring invoice detected proactively.", "pass", DEMO, "",
            T + "test_acceptance_live_obligations.py::test_an_overdue_usual_invoice_is_raised_once_asked_for_and_closed_when_it_arrives",
            T + "test_acceptance_live_obligations.py::test_nothing_is_expected_from_a_supplier_without_a_learned_rhythm"),

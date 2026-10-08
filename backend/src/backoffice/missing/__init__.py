@@ -28,8 +28,9 @@ Concrete searches — :mod:`.searches`
     ``MailboxSearch`` (current and historical email), ``RecurringMailSearch`` (the supplier's usual way),
     ``CloudStorageSearch`` (Drive / OneDrive), ``PortalSearch``, ``AccountingSearch`` (TOConline, Moloni,
     InvoiceXpress): live, each returns ``FoundFile`` s; ``run_searches(request, searches, clock=)`` asks them in
-    order and notes every attempt. ``RecordedSearch`` + ``run_recorded`` give a recorded result to the
-    autopilot when the engine applies it (backoffice.evidence_search).
+    order and notes every attempt; a place learned to hold the supplier's invoices (``first``) is asked first.
+    ``RecordedSearch`` + ``run_recorded`` give a recorded result to the autopilot when the engine applies it
+    (backoffice.evidence_search).
 
 Safety: ``run`` refuses (``ValueError``) a company or supplier from another
 tenant, or a company other than the payment's own; a payment with no company
@@ -53,6 +54,7 @@ from .searches import (
     amount_words,
     run_recorded,
     run_searches,
+    search_order,
 )
 from .autopilot import (
     MISSING_INVOICE_PROMPT,
@@ -119,6 +121,7 @@ __all__ = [
     "amount_words",
     "run_recorded",
     "run_searches",
+    "search_order",
     "MISSING_INVOICE_PROMPT",
     "SEARCH_ORDER",
     "AttemptOutcome",

@@ -285,12 +285,16 @@ class MissingEvidenceAutopilot:
         timeout_seconds: float | None = 30.0,
         clock: Callable[[], datetime] = utcnow,
         message_id_domain: str = "mail.backoffice.invalid",
+        first: Sequence[SearchSource] = (),
     ) -> None:
+        """``first``: places learned to hold this supplier's invoices (its website): asked before the spec's order."""
         if timeout_seconds is not None and timeout_seconds <= 0:
             raise ValueError("timeout must be positive")
         rank = {source: i for i, source in enumerate(SEARCH_ORDER)}
+        early = frozenset(first)
         indexed = list(enumerate(searches))
-        self._searches = [s for _, s in sorted(indexed, key=lambda pair: (rank[pair[1].source], pair[0]))]
+        self._searches = [s for _, s in sorted(indexed, key=lambda pair: (
+            pair[1].source not in early, rank[pair[1].source], pair[0]))]
         self._authorize = authorize
         self._verifier = verifier
         self._timeout = timeout_seconds
