@@ -1737,7 +1737,7 @@ class BackOfficeService:
         if len(message) > 4000:
             raise ServiceError(400, "That is too long. Try a shorter request.")
         history = body.get("history") if isinstance(body.get("history"), list) else []
-        from backoffice.assistant import ClaudeBrain, RuleBrain
+        from backoffice.assistant import RuleBrain
 
         brain = getattr(self, "brain", None)
         try:

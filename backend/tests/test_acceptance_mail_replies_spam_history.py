@@ -36,7 +36,7 @@ from backoffice.connectors.gmail import GmailConfig, GmailConnector
 from backoffice.connectors.imap import IMAPAuth, IMAPConfig, IMAPConnector, decode_mailbox_name
 from backoffice.connectors.mail_search import MailQuery, MailTerm, TermKind
 from backoffice.connectors.microsoft import GraphMailConfig, MicrosoftMailConnector
-from backoffice.connectors.open_banking import BankConsent, ConsentStatus
+from backoffice.connectors.open_banking import BankConsent
 from backoffice.demo import evidence as E
 from backoffice.language import find_jargon, find_off_tone
 from backoffice.mailer import SimulatedOutbox, SmtpMailer

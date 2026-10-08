@@ -276,6 +276,10 @@ _V["line_prices.head:disc"] = (r"desconto",)
 _V["line_prices.base_label"] = (r"base tributavel", r"base de incidencia", r"incidencia", r"valor liquido",
                                 r"total liquido", r"total sem iva")
 _V["line_prices.vat_label"] = (r"imposto",)
+_V["line_prices.column:unit"] = (r"unidade",)
+_V["line_prices.column:vat_amount"] = (r"valor iva", r"montante iva")
+_V["line_prices.column:gross"] = (r"total c iva", r"total com iva", r"valor c iva")
+_V["line_prices.table_end"] = (r"totais", r"portes", r"resumo", r"descontos?")
 
 # backoffice.payroll: a payslip's title and labels, and a figure's labels (plain).
 _V["payroll.title"] = (r"recibos?\s+de\s+vencimentos?", r"recibo\s+de\s+(?:salario|remuneracoes?)",

@@ -609,18 +609,30 @@ def read_text_lines(text: str) -> tuple[PriceLine, ...]:
 
 # What a column's heading says it holds (folded, letters only; the longest heading wins: "valor unit" is a price,
 # "valor" a line total). "gross" is a line total with VAT, "vat_amount" the VAT of each line: neither is read.
-_COLUMN_WORDS: dict[str, str] = {
-    **_HEAD_WORDS,
-    "unit": r"un|und|unid|unidade|unidad|um|u m|uom|unit|units",
-    "vat_amount": r"valor iva|montante iva|vat amount|tax amount|importe iva|cuota iva|cuota",
-    "gross": r"total c iva|total com iva|valor c iva|total incl vat|total inc vat|gross|total con iva|pvp total",
+_COLUMN_EXTRA = {
+    "unit": r"un|und|unid|unidad|um|u m|uom|unit|units",
+    "vat_amount": r"vat amount|tax amount|importe iva|cuota iva|cuota",
+    "gross": r"total incl vat|total inc vat|gross|total con iva|pvp total",
 }
+
+
+@cache
+def _column_words() -> dict[str, str]:
+    """Each column's heading words: the core's and every pack's ("line_prices.head:<column>", and
+    "line_prices.column:<kind>" for the unit, the VAT of each line and the line total with VAT)."""
+    out = {name: f"{pack_alternatives(f'line_prices.head:{name}')}|{pattern}" for name, pattern in _HEAD_WORDS.items()}
+    out.update({name: f"{pack_alternatives(f'line_prices.column:{name}')}|{pattern}"
+                for name, pattern in _COLUMN_EXTRA.items()})
+    return out
+
+
 _TEXT_COLUMNS = frozenset({"code", "desc"})
 _PRICED_COLUMNS = ("qty", "price", "total")
-# A row that starts like this is under the table: its totals, VAT summary, charges outside the lines.
-_TABLE_END = re.compile(r"^(?:sub ?total|total|totais|base|iva|vat|net|taxable|portes|transporte|envio|shipping|"
-                        r"delivery|carriage|resumo|summary|importe|valor total|descontos?|discount|amount due|"
-                        r"balance|saldo|a pagar|to pay)\b")
+# A row that starts like this is under the table: its totals, VAT summary, charges outside the lines (and a
+# pack's own words for them, "line_prices.table_end").
+_TABLE_END = LazyPattern(lambda: rf"^(?:{pack_alternatives('line_prices.table_end')}|sub ?total|total|base|iva|vat|"
+                                 r"net|taxable|transporte|envio|shipping|delivery|carriage|summary|importe|"
+                                 r"valor total|discount|amount due|balance|saldo|a pagar|to pay)\b")
 
 
 @dataclass(frozen=True)
@@ -671,7 +683,7 @@ def _table_columns(row: Any) -> tuple[list[_Column], float] | None:
         letters = _letters(word.text)
         per = (word.x1 - word.x0) / max(1, len(word.text))
         widths.append(per)
-        found = [(m.start(), m.end(), kind) for kind, pattern in _COLUMN_WORDS.items()
+        found = [(m.start(), m.end(), kind) for kind, pattern in _column_words().items()
                  for m in re.finditer(rf"\b(?:{pattern})\b", letters)]
         chosen: list[tuple[int, int, str]] = []
         for start, end, kind in sorted(found, key=lambda f: (f[0] - f[1], f[0])):
@@ -792,7 +804,7 @@ def _priced_line(cells: Mapping[str, list[str]], mark: str, total_kind: str) -> 
     quantity = (_amount([c.raw for c in numbers], mark) or (None, 0))[0] if len(numbers) > 1 else numbers[0].value
     printed_unit = " ".join(cells.get("unit", ())).strip()
     if printed_unit:
-        units.append(_UNITS.get(fold(printed_unit).rstrip(".")))
+        units.append(_units().get(fold(printed_unit).rstrip(".")))
         if units[-1] is None:
             raise _Refused("unit")
     if len(set(units)) > 1:
