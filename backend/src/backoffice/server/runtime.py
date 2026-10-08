@@ -277,6 +277,7 @@ class TenantManager:
         reader: Any = None,
         link_fetcher: Any = None,
         billing: Any = None,
+        company_lookup: Any = None,
         cache_size: int = 200,
         strict_reads: bool = False,
     ) -> None:
@@ -297,6 +298,10 @@ class TenantManager:
         # The payment provider (server/billing.py), or None. With one, new businesses are held to their plan
         # (backoffice.billing): evidence over a limit, after the grace period, waits instead of being read.
         self.billing = billing
+        # The EU VAT register (backoffice.company_lookup.ViesClient), or None. Like the reader it only ever runs
+        # before an event is recorded: a company's details are looked up, then the event keeps the answer, and
+        # applying it (live or on replay) reads the answer, never the register.
+        self.company_lookup = company_lookup
         self.cache_size = cache_size
         # Reads must never change a tenant. In tests a read that does raises; in production it is
         # logged and the tenant is rebuilt from its log on the next request.
@@ -578,8 +583,11 @@ class TenantManager:
         created: dict[str, Any] = {"owner": {"name": owner_name, "email": owner_email}}
         if self.billing is not None:  # recorded only with payments: older logs replay unchanged
             created["billing"] = {"enforced": True}
-        for kind, data in (("tenant.created", created),
-                           ("company.added", {"name": company_name, "taxId": tax_id or "", "legalName": ""})):
+        company: dict[str, Any] = {"name": company_name, "taxId": tax_id or "", "legalName": ""}
+        found = self.lookup_company(tax_id, "PT")
+        if found is not None:  # recorded only with a register: older logs replay unchanged
+            company["lookup"] = found
+        for kind, data in (("tenant.created", created), ("company.added", company)):
             at = self._event_time(rt)
             if rt.svc is not None:
                 rt.svc.repo.clock.advance_to(at)
@@ -843,13 +851,34 @@ class TenantManager:
                                self.live_env(secret=secret), index=index)
 
     def add_company(self, tenant_id: str, actor: str, body: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
-        data = {"name": str(body.get("name") or ""), "taxId": str(body.get("taxId") or ""),
-                "legalName": str(body.get("legalName") or "")}
+        data: dict[str, Any] = {"name": str(body.get("name") or ""), "taxId": str(body.get("taxId") or ""),
+                                "legalName": str(body.get("legalName") or "")}
         country = str(body.get("country") or "").strip().upper()
         if country and country != "PT":  # recorded only for another country: older events replay unchanged
             data["country"] = country
+        if str(body.get("address") or "").strip():  # recorded only when given, likewise
+            data["address"] = " ".join(str(body.get("address")).split())[:200]
+        # The EU VAT register is asked now, before the event: the event keeps its answer (QA A2).
+        found = self.lookup_company(data["taxId"], country or "PT")
+        if found is not None:
+            data["lookup"] = found
         with self.open(tenant_id) as rt:
             return self.record(rt, "company.added", data, actor, self.live_env())
+
+    def lookup_company(self, tax_id: Any, country: str) -> dict[str, Any] | None:
+        """The EU VAT register's answer for a VAT number, as an event records it; None without a register or for a
+        number its country's pack refuses (the apply refuses it). Never raises: a register that fails is recorded
+        as unavailable and the owner types the details."""
+        if self.company_lookup is None or not str(tax_id or "").strip():
+            return None
+        from backoffice.company_lookup import lookup_company
+
+        try:
+            found = lookup_company(str(tax_id), country, self.company_lookup)
+        except Exception:
+            log.warning("company_lookup_failed")
+            return None
+        return found.to_json() if found is not None else None
 
     def set_accountant(self, tenant_id: str, actor: str, body: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
         """The business's accountant, or (``companyId``) one company's own accountant (§28, §51)."""
@@ -1060,8 +1089,10 @@ def _tenant_created(m: TenantManager, rt: TenantRuntime, event: Event, env: Env)
 
 def _company_added(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:
     d = event.data
+    # The register's answer was recorded with the event: applying it never asks the register again (QA A2).
     return 200, rt.service.add_company(d.get("name"), d.get("taxId") or None, d.get("legalName") or None,
-                                       country=d.get("country") or None)
+                                       d.get("address") or None, country=d.get("country") or None,
+                                       lookup=d.get("lookup") if isinstance(d.get("lookup"), Mapping) else None)
 
 
 def _accountant_set(m: TenantManager, rt: TenantRuntime, event: Event, env: Env) -> tuple[int, dict[str, Any]]:

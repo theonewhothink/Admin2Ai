@@ -201,18 +201,19 @@ _MONTHS: Mapping[str, int] = MappingProxyType(
         _fold(name): number
         for number, names in enumerate(
             (
-                ("jan", "january", "janeiro", "enero", "ene"),
-                ("feb", "february", "fev", "fevereiro", "febrero"),
-                ("mar", "march", "marco", "março", "marzo"),
-                ("apr", "april", "abr", "abril"),
-                ("may", "mai", "maio", "mayo"),
-                ("jun", "june", "junho", "junio"),
-                ("jul", "july", "julho", "julio"),
-                ("aug", "august", "ago", "agosto"),
-                ("sep", "sept", "september", "set", "setembro", "septiembre", "setiembre"),
-                ("oct", "october", "out", "outubro", "octubre"),
-                ("nov", "november", "novembro", "noviembre"),
-                ("dec", "december", "dez", "dezembro", "dic", "diciembre"),
+                # English, Portuguese, Spanish, then French, German and Italian (checklist E9).
+                ("jan", "january", "janeiro", "enero", "ene", "janvier", "januar", "jänner", "gennaio"),
+                ("feb", "february", "fev", "fevereiro", "febrero", "février", "februar", "febbraio"),
+                ("mar", "march", "marco", "março", "marzo", "mars", "märz", "maerz"),
+                ("apr", "april", "abr", "abril", "avril", "aprile"),
+                ("may", "mai", "maio", "mayo", "maggio"),
+                ("jun", "june", "junho", "junio", "juin", "juni", "giugno"),
+                ("jul", "july", "julho", "julio", "juillet", "juli", "luglio"),
+                ("aug", "august", "ago", "agosto", "août", "aout"),
+                ("sep", "sept", "september", "set", "setembro", "septiembre", "setiembre", "septembre", "settembre"),
+                ("oct", "october", "out", "outubro", "octubre", "octobre", "oktober", "ottobre"),
+                ("nov", "november", "novembro", "noviembre", "novembre"),
+                ("dec", "december", "dez", "dezembro", "dic", "diciembre", "décembre", "dezember", "dicembre"),
             ),
             start=1,
         )
@@ -224,7 +225,7 @@ _ISO_DATE = re.compile(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[T ].*|Z|[+-]\d{2
 _COMPACT_DATE = re.compile(r"(\d{4})(\d{2})(\d{2})")
 _NUMERIC_DATE = re.compile(r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})")
 _DAY_MONTH_YEAR = re.compile(
-    r"(\d{1,2})(?:st|nd|rd|th|º)?\.?\s*(?:de\s+)?([^\W\d_]+)\.?,?\s*(?:de\s+)?(\d{4})",
+    r"(\d{1,2})(?:st|nd|rd|th|er|º)?\.?\s*(?:de\s+)?([^\W\d_]+)\.?,?\s*(?:de\s+)?(\d{4})",
     re.IGNORECASE,
 )
 _MONTH_DAY_YEAR = re.compile(

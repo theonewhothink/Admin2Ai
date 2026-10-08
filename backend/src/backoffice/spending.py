@@ -621,6 +621,8 @@ class Ledger:
         kind = _KIND.get(decision.expectation, "cost")
         if kind == "bank_fee" and not (tx.kind is TransactionKind.FEE or decision.rule.startswith("bank_fee")):
             kind = "cost"  # "the bank statement is enough" taught for something that is not a bank charge
+        if decision.rule == "bank_fee_document":
+            kind = "bank_fee"  # a bank charge whose country wants the bank's own document (QA J6): still a fee
         if tx.amount > 0:
             kind = {"bank_fee": "interest", "tax": "tax_refund", "cost": "income"}.get(kind, kind)
         if decision.rule == "grant" and tx.amount > 0:

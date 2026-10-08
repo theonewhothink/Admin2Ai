@@ -8,9 +8,9 @@ against live bank feeds (verified_as_of: never). Extend them as feeds are seen.
 
 from __future__ import annotations
 
-from backoffice.countries.base import BankWording
+from backoffice.countries.base import BankFeePolicy, BankWording
 
-__all__ = ["BANK_WORDING"]
+__all__ = ["BANK_FEE_POLICY", "BANK_WORDING"]
 
 BANK_WORDING = BankWording(
     # The tax office and Social Security named outright ("PAG ESTADO IVA 2026/08", "SEG SOCIAL CONTRIBUICOES").
@@ -54,4 +54,17 @@ BANK_WORDING = BankWording(
     payroll_words=frozenset({"SALARIO", "SALARIOS", "VENCIMENTO", "VENCIMENTOS", "ORDENADO", "ORDENADOS",
                              "REMUNERACAO", "REMUNERACOES"}),
     loans=("PRESTACAO EMPRESTIMO", "PREST EMPRESTIMO", "AMORTIZACAO EMPRESTIMO", "EMPRESTIMO", "MUTUO"),
+)
+
+
+# Which of its bank's own charges the bank statement alone covers in Portugal (QA J6): the bank's fees and
+# commissions, the stamp duty (imposto do selo) it charges on them and on interest, and the interest itself. A
+# Portuguese bank's statement shows each of these as its own line (bank_fees above find them). An owner's or
+# accountant's rule still wins.
+BANK_FEE_POLICY = BankFeePolicy(
+    country="Portugal",
+    covers=frozenset({"fee", "stamp_duty", "interest"}),
+    interest_words=("JUROS", "INTEREST"),
+    stamp_duty_words=("IMPOSTO DO SELO", "IMPOSTO SELO", "IMP SELO"),
+    source="Bank fees and stamp duty: the statement is enough (product policy for Portugal, QA J6).",
 )

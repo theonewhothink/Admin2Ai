@@ -70,8 +70,8 @@ CHARGEBACK_RULES = frozenset({"chargeback", "chargeback_won"})
 # Decisions a chargeback never overrides: learned by the owner or accountant, money between own accounts, a card
 # paid off, taxes, loans, salaries, a grant, the tourist tax, a bank's own declared fee.
 _KEEP_RULES = frozenset({"learned", "zero_amount", "own_iban", "own_company_iban", "bank_marked_internal", "own_name",
-                         "card_repayment", "bank_fee", "loan_wording", "employee_iban", "payroll_wording", "grant",
-                         "tourist_tax", "tax_wording", "expense_claim", "security_deposit"})
+                         "card_repayment", "bank_fee", "bank_fee_document", "loan_wording", "employee_iban",
+                         "payroll_wording", "grant", "tourist_tax", "tax_wording", "expense_claim", "security_deposit"})
 QUESTION_KIND = "chargeback"
 LOOK_BACK_DAYS = 180  # a dispute can come months after the sale
 

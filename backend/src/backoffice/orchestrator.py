@@ -81,6 +81,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
+from types import SimpleNamespace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -822,6 +823,10 @@ class ObligationRecord:
     declined_tx_ids: list[str] = field(default_factory=list)  # payments the owner said do not pay it
     how: str = ""  # plain words once done: "Paid on 2 November." / "Renewed on 20 October."
     agency: str | None = None  # a grant letter: the agency it names ("IFAP"), as a bank line would name it too
+    # A deadline the company's country's calendar sets (QA P6): the calendar entry and the period it is for
+    # ("pt-vat-payment-monthly", "2026-08"). Its pack decides which receipt or payment proves it.
+    calendar: str = ""
+    period: str = ""
 
     @property
     def proof(self) -> ProofKind:
@@ -1338,6 +1343,13 @@ class Repository:
         # read without their number that look like one on file, waiting for the owner, by question id.
         self.captures: dict[str, Any] = {}
         self.pending_copies: dict[str, Any] = {}
+        # Each company's tax profile as the owner or the accountant set it (QA P6): {"vat": "monthly", "employees":
+        # True, ..., "by": {"vat": "owner"}}; what is not set here is learned from the company's evidence
+        # (backoffice.tax_profiles). The country's calendar reads it.
+        self.tax_settings: dict[str, dict[str, Any]] = {}
+        # The company details the EU VAT register gave for a company's tax number, waiting for the owner's one tap
+        # (backoffice.company_lookup): company id -> the lookup's record. Never applied on their own.
+        self.identity_suggestions: dict[str, dict[str, Any]] = {}
 
     # ----------------------------------------------------------------- set-up
 
@@ -3256,6 +3268,14 @@ def _lower_first(text: str) -> str:
     return text[:1].lower() + text[1:] if text else text
 
 
+def _in_sentence(title: str) -> str:
+    """A title inside a sentence: "Quarterly VAT return" -> "quarterly VAT return"; an acronym ("VAT return") or
+    a name ("Social Security payment") keeps its capital."""
+    if title[1:2].isupper() or title.startswith("Social Security"):
+        return title
+    return _lower_first(title)
+
+
 def _join_and(items: Sequence[str]) -> str:
     if len(items) <= 1:
         return "".join(items)
@@ -3312,21 +3332,31 @@ class ObligationAgent(_Agent):
         return pack_vocabulary(self.repo.countries()) or None
 
     def calendar(self, now: datetime) -> list[ObligationRecord]:
-        """Obligations a company's country sets by the calendar, with no letter (Spain's quarterly VAT return,
-        modelo 303): each once per company and period, from its own country's pack. Nothing for a country
-        whose deadlines arrive by letter (Portugal)."""
+        """Obligations a company's country sets by the calendar, with no letter: Spain's quarterly VAT return
+        (modelo 303); Portugal's statutory calendar (VAT, invoice report, salaries, Social Security, Modelo 22,
+        IES, Modelo 10, advance payments) by what is known of the company (its tax profile, set by the owner or
+        the accountant or learned from its evidence: backoffice.tax_profiles). Each once per company and period,
+        from its own country's pack. A deadline a letter already put on file is that letter's."""
+        from backoffice import tax_profiles
+
         repo = self.repo
         today = now.astimezone(TZ).date()
         made: list[ObligationRecord] = []
         for company_id, entity in sorted(repo.companies.items()):
-            for periodic in company_pack(entity.country).periodic_obligations(company_id, today):
+            pack = company_pack(entity.country)
+            profile = tax_profiles.profile(repo, company_id, today)
+            for periodic in pack.periodic_obligations(company_id, today, profile):
                 oid = "obl_" + hashlib.sha256(periodic.key.encode("utf-8")).hexdigest()[:16]
                 if oid in repo.obligations:
                     continue
-                body = json.dumps({"kind": "calendar", "country": entity.country, "obligation": periodic.kind,
-                                   "period": periodic.period, "company": company_id,
-                                   "due_on": periodic.due_on.isoformat(), "title": periodic.title},
-                                  sort_keys=True).encode()
+                if periodic.calendar and self._letter_for(company_id, periodic) is not None:
+                    continue  # the tax office's own letter for this deadline is on file: it is the one tracked
+                fields = {"kind": "calendar", "country": entity.country, "obligation": periodic.kind,
+                          "period": periodic.period, "company": company_id, "due_on": periodic.due_on.isoformat(),
+                          "title": periodic.title}
+                if periodic.calendar:  # recorded only for a calendar entry: Spain's evidence stays as it was
+                    fields["calendar"] = periodic.calendar
+                body = json.dumps(fields, sort_keys=True).encode()
                 reg = repo.registry.register(body, tenant_id=repo.tenant_id, source_kind=SourceKind.GOVERNMENT,
                                              format=EvidenceFormat.JSON, mime_type="application/json",
                                              retrieved_at=now, metadata={"kind": "country_calendar"})
@@ -3340,16 +3370,67 @@ class ObligationAgent(_Agent):
                 record = ObligationRecord(
                     obligation=obligation, evidence_id=reg.evidence.id, title=periodic.title,
                     reasons=(*periodic.reasons, f"Due {day_month(periodic.due_on, today)}"),
-                    reference=None, issuer=Issuer.TAX_AUTHORITY.value, received_on=today)
+                    reference=None, issuer=periodic.issuer or Issuer.TAX_AUTHORITY.value, received_on=today,
+                    calendar=periodic.calendar, period=periodic.period if periodic.calendar else "")
                 repo.obligations[oid] = record
-                self.log("calendar_obligation", subject_id=oid, evidence_ids=[reg.evidence.id],
-                         values={"kind": periodic.kind, "period": periodic.period, "due_on": periodic.due_on,
-                                 "entity_id": company_id, "country": entity.country})
-                self.o.activity(now, "collected", f"Added the deadline for the {periodic.title[0].lower()}"
-                                f"{periodic.title[1:]}: {day_month(periodic.due_on, today)}.", company_id,
+                values: dict[str, Any] = {"kind": periodic.kind, "period": periodic.period, "due_on": periodic.due_on,
+                                          "entity_id": company_id, "country": entity.country}
+                if periodic.calendar:
+                    values["calendar"] = periodic.calendar
+                self.log("calendar_obligation", subject_id=oid, evidence_ids=[reg.evidence.id], values=values)
+                self.o.activity(now, "collected", f"Added the deadline for the {_in_sentence(periodic.title)}: "
+                                f"{day_month(periodic.due_on, today)}.", company_id,
                                 evidence_ids=[reg.evidence.id])
                 made.append(record)
         return made
+
+    def _letter_for(self, company_id: str, periodic: Any) -> ObligationRecord | None:
+        """A letter on file for the same deadline as a calendar entry: same company, deadline, office and kind of
+        proof (a payment, or a filing). When several letters share that deadline, the one whose words name the entry
+        (and its period) is it; none named: none is."""
+        payable = proof_for(ObligationKind(periodic.kind)) is ProofKind.PAYMENT
+        issuer = periodic.issuer or Issuer.TAX_AUTHORITY.value
+        found = [o for o in sorted(self.repo.obligations.values(), key=lambda o: o.obligation.id)
+                 if not o.calendar and o.obligation.entity_id == company_id and o.obligation.due_on == periodic.due_on
+                 and o.issuer == issuer and o.payable == payable]
+        if len(found) <= 1:
+            return found[0] if found else None
+        entity = self.repo.companies[company_id]
+        try:
+            pack = company_pack(entity.country)
+        except CountryPackError:
+            return None
+        named = [o for o in found if pack.calendar_proof(self._letter_text(o), periodic.calendar, periodic.period,
+                                                         payment=payable)]
+        return named[0] if len(named) == 1 else None
+
+    def _letter_text(self, ob: ObligationRecord) -> str:
+        """The words of the letter an obligation came from (empty when its original is not text)."""
+        try:
+            return self.repo.registry.open(self.repo.tenant_id, ob.evidence_id).decode("utf-8", "replace")
+        except Exception:
+            return ""
+
+    def _calendar_deadline(self, obligation: Obligation, issuer: str, text: str) -> ObligationRecord | None:
+        """The open calendar deadline a letter is about: same company, deadline, office and kind of proof; when
+        several share them, the one the letter's words name (with its period)."""
+        payable = proof_for(obligation.kind) is ProofKind.PAYMENT
+        found = [o for o in sorted(self.repo.obligations.values(), key=lambda o: o.obligation.id)
+                 if not o.done and o.calendar and o.obligation.entity_id == obligation.entity_id
+                 and o.obligation.due_on == obligation.due_on and o.issuer == issuer and o.payable == payable]
+        if len(found) > 1:
+            found = [o for o in found if self._calendar_proof(o, text, payment=payable)]
+        return found[0] if len(found) == 1 else None
+
+    def _calendar_proof(self, ob: ObligationRecord, text: str, *, payment: bool, on: date | None = None) -> bool:
+        """Whether ``text`` proves a calendar deadline: its company's country's pack decides (QA P6)."""
+        entity = self.repo.companies.get(ob.obligation.entity_id)
+        if entity is None or not ob.calendar:
+            return False
+        try:
+            return company_pack(entity.country).calendar_proof(text, ob.calendar, ob.period, payment=payment, on=on)
+        except CountryPackError:
+            return False
 
     # ------------------------------------------------------------------ letters that ask for something
 
@@ -3403,6 +3484,20 @@ class ObligationAgent(_Agent):
             self.log("obligation_already_known", subject_id=same.obligation.id,
                      evidence_ids=[evidence_id, same.evidence_id])
             return same
+        calendar = self._calendar_deadline(obligation, finding.issuer.value, text)
+        if calendar is not None:
+            # The tax office's letter for a deadline its calendar already set: the same deadline. A payment's letter
+            # brings its amount and reference (what proves the payment) and becomes its evidence.
+            self.log("obligation_already_known", subject_id=calendar.obligation.id,
+                     evidence_ids=[evidence_id, calendar.evidence_id])
+            if calendar.payable and (obligation.amount is not None or finding.reference):
+                calendar.obligation = calendar.obligation.model_copy(update={
+                    "amount": obligation.amount, "verification_condition": obligation.verification_condition})
+                calendar.reference = finding.reference
+                calendar.evidence_id = evidence_id
+                calendar.received_on, calendar.sender = received_on, sender
+                calendar.reasons = (*calendar.reasons, "The letter gives the amount and the payment reference.")
+            return calendar
         payee_supplier, ibans, key = self._payee(text, sender)
         record = ObligationRecord(
             obligation=obligation, evidence_id=evidence_id, title=finding.title, reasons=tuple(finding.reasons),
@@ -3482,6 +3577,8 @@ class ObligationAgent(_Agent):
             and not (finding.issuer is not Issuer.OTHER and ob.issuer not in ("", Issuer.OTHER.value)
                      and ob.issuer != finding.issuer.value)
             and not (reference and ob.reference and normalize_reference(ob.reference) != reference)
+            # A calendar deadline is closed only by the receipt that names it (and its period, when one is named).
+            and (not ob.calendar or self._calendar_proof(ob, text, payment=False))
         ]
         self.log("read_confirmation", evidence_ids=[evidence_id],
                  values={"proof": finding.proof.value, "candidates": [ob.obligation.id for ob in candidates]},
@@ -3505,7 +3602,9 @@ class ObligationAgent(_Agent):
         for ob in sorted(self.repo.obligations.values(), key=lambda o: o.obligation.id):
             if ob.done or not ob.payable:
                 continue
-            if ob.obligation.kind in (ObligationKind.TAX_DEADLINE, ObligationKind.TOURIST_TAX):
+            if ob.calendar and ob.obligation.amount is None and not ob.reference:
+                self._prove_calendar_payment(ob)
+            elif ob.obligation.kind in (ObligationKind.TAX_DEADLINE, ObligationKind.TOURIST_TAX):
                 proven += self._prove_tax(ob)
             elif ob.obligation.kind is ObligationKind.GRANT_PAYMENT:
                 proven += self._prove_grant(ob)
@@ -3546,6 +3645,35 @@ class ObligationAgent(_Agent):
                     rec.proof_note = "The payment matches the tourist tax letter's amount and reference."
                 proven.append(rec)
         return proven
+
+    def _prove_calendar_payment(self, ob: ObligationRecord) -> None:
+        """A payment deadline the calendar set (QA P6), with no letter: proven by a tax payment of that company whose
+        bank line names the tax and the period (its country's pack decides), one payment per deadline. A tax
+        payment that names neither proves nothing: a payment alone never says what it paid (§3). The payment keeps
+        its own rule (the tax notice or payment proof for the accountant)."""
+        repo = self.repo
+        used = {e for o in repo.obligations.values() if o is not ob and o.calendar for e in o.satisfied_by}
+        for rec in sorted((r for r in repo.transactions.values()
+                           if r.company_id == ob.obligation.entity_id and r.tx.amount < 0 and r.decision is not None
+                           and r.decision.expectation.value == "tax_notice_or_proof"
+                           and r.decision.rule not in ("tourist_tax", "grant") and r.id not in ob.declined_tx_ids
+                           and r.evidence_id not in used),
+                          key=lambda r: (r.tx.booked_on, r.id)):
+            text = f"{rec.tx.counterparty} {rec.tx.description} {rec.tx.reference or ''}"
+            if not self._calendar_proof(ob, text, payment=True, on=rec.tx.booked_on):
+                continue
+            paid = rec.tx.booked_on
+            how = f"Paid on {day_month(paid, ob.obligation.due_on)}. The bank line names the tax and the period."
+            if paid > ob.obligation.due_on:
+                how += f" That was {count_phrase((paid - ob.obligation.due_on).days, 'day')} after the deadline."
+            done = SimpleNamespace(evidence_ids=(rec.evidence_id,), obligation=ob.obligation.model_copy(
+                update={"satisfied_by_evidence_ids": sorted({*ob.obligation.satisfied_by_evidence_ids,
+                                                              rec.evidence_id})}))
+            self.log("satisfy", subject_id=ob.obligation.id, evidence_ids=[ob.evidence_id, rec.evidence_id],
+                     response={"satisfied": True, "quality": Quality.GREEN.value},
+                     validations=["The bank line names the tax and the period."])
+            self._done(ob, done, how=how)
+            return
 
     # ------------------------------------------------------------------ grants (checklist X30)
 
@@ -8687,6 +8815,9 @@ class Orchestrator:
             report.transitions += moved
             if not moved:
                 break
+        if self.obligations.calendar(now):  # what this run learned (a second VAT payment) may add deadlines (QA P6)
+            self.obligations.prove()
+            self.closure.progress()
         self.cost_centers.allocate(now)  # which job, property, vehicle ...: nothing at all without cost centers
         self._ask_about_refund_amounts(now)  # a refund that does not match its credit note: one question
         self.staged.ask(now)  # a deposit, a part payment or a deposit given back that is not proven: one question
@@ -10585,20 +10716,21 @@ def _text_currency(text: str, source: str, method: ExtractionMethod) -> FieldObs
 
 # What a document calls itself, on folded (lower-case, accent-free) text; the most specific name first,
 # so "Fatura pró-forma" is a pro-forma and "Fatura-recibo" an invoice-receipt, not an invoice (§50).
-_FATURA = r"(?:fatura|factura)"
+_FATURA = r"(?:fatura|factura|facture|fattura)"  # Portuguese, Spanish, French, Italian (checklist E9)
 _KIND_NAMES: tuple[tuple[DocumentType, str], ...] = (
-    (DocumentType.PRO_FORMA, rf"{_FATURA}\s*[-:]?\s*pro[\s-]*forma|pro[\s-]*forma(?:\s+invoice)?"),
+    (DocumentType.PRO_FORMA, rf"{_FATURA}\s*[-:]?\s*pro[\s-]*forma|pro[\s-]*forma(?:\s+invoice|[\s-]*rechnung)?"),
     (DocumentType.QUOTE, r"orcamento|quotation|quote"),
     (DocumentType.DELIVERY_NOTE, r"guia\s+de\s+(?:remessa|transporte)|delivery\s+note|transport\s+document"),
     (DocumentType.ORDER_CONFIRMATION,
      r"confirmacao\s+(?:de|da)\s+encomenda|nota\s+de\s+encomenda|order\s+confirmation|purchase\s+order"),
     (DocumentType.SUPPLIER_STATEMENT,
      r"extrato\s+(?:de\s+)?conta[\s-]+corrente|statement\s+of\s+account|supplier\s+statement"),
-    (DocumentType.CREDIT_NOTE, r"nota\s+de\s+credito|credit\s+note"),
+    (DocumentType.CREDIT_NOTE, r"nota\s+de\s+credito|credit\s+note|facture\s+d.avoir|gutschrift|rechnungskorrektur"
+                               r"|nota\s+di\s+credito"),
     (DocumentType.DEBIT_NOTE, r"nota\s+de\s+debito|debit\s+note"),
     (DocumentType.INVOICE_RECEIPT, rf"{_FATURA}[\s-]+recibo|invoice[\s-]+receipt"),
     (DocumentType.SIMPLIFIED_INVOICE, rf"{_FATURA}\s+simplificada|simplified\s+invoice"),
-    (DocumentType.INVOICE, rf"{_FATURA}|(?:tax\s+)?invoice"),
+    (DocumentType.INVOICE, rf"{_FATURA}|(?:tax\s+)?invoice|rechnung"),
     (DocumentType.RECEIPT, r"recibo|receipt|talao(?:\s+de\s+venda)?"),
 )
 _KIND_TITLES = tuple((kind, re.compile(rf"(?:{words})(?![a-z])")) for kind, words in _KIND_NAMES)
@@ -10712,7 +10844,8 @@ def _says_paid_in_cash(text: str) -> bool:
 
 
 _TITLE_WORDS = ("nif", "fatura", "invoice", "data", "atcud")
-_FOREIGN_TITLE_WORDS = (*_TITLE_WORDS, "tax invoice", "factura", "receipt", "recibo", "bill to", "page", "vat ")
+_FOREIGN_TITLE_WORDS = (*_TITLE_WORDS, "tax invoice", "factura", "receipt", "recibo", "bill to", "page", "vat ",
+                        "facture", "rechnung", "fattura")
 
 
 def _first_line(text: str, *, foreign: bool = False, pack: CompanyPack | None = None) -> str | None:

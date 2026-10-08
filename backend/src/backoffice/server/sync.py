@@ -480,7 +480,8 @@ class SyncWorker:
             scopes = (GRAPH_SHARED_MAIL_SCOPES if shared else GRAPH_MAIL_SCOPES) if provider == "microsoft" else ()
             refresher = OAuthRefresher(OAuthClientConfig(app.client_id, app.client_secret, app.token_url, scopes=scopes),
                                        client=self.http_client, provider=provider, clock=self.now)
-            tokens = self.vault.token_provider(c.tenant_id, c.id, refresher)  # rotations are saved in the vault
+            # Rotations are saved in the vault; the token's lifetime is read by the worker's own clock.
+            tokens = self.vault.token_provider(c.tenant_id, c.id, refresher, clock=self.now)
             self._tokens[c.key] = (meta.version, tokens)
         if provider == "google":
             from backoffice.connectors.gmail import GmailConfig, GmailConnector

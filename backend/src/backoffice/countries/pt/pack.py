@@ -8,18 +8,23 @@ from datetime import date
 from decimal import Decimal
 
 from backoffice.countries.base import (
+    BankFeePolicy,
     BankWording,
     FiscalQRResult,
+    LearnedProfile,
     NamedObservation,
     NativeDocumentType,
     PeriodicObligation,
     TaxIdCheck,
+    TaxProfile,
+    TaxSignal,
     Term,
     VATRate,
 )
 from backoffice.domain.models import DocumentType, ExtractionMethod, VatPart
 
 from . import atcud, banking_words, documents, holidays, nif, qr, text_fields
+from . import calendar as pt_calendar
 from . import obligations as pt_obligations
 from . import vat as pt_vat
 
@@ -145,9 +150,23 @@ class PortugalPack:
         """An AT fiscal QR payload with ``fields`` in the order the specification fixes (empty ones left out)."""
         return "*".join(f"{k}:{fields[k]}" for k in qr.FIELD_ORDER if fields.get(k) not in (None, ""))
 
-    def periodic_obligations(self, company_id: str, today: date) -> tuple[PeriodicObligation, ...]:
-        """None yet: Portuguese deadlines come from the letters and messages that announce them."""
-        return ()
+    def periodic_obligations(self, company_id: str, today: date,
+                             profile: TaxProfile | None = None) -> tuple[PeriodicObligation, ...]:
+        """Portugal's statutory calendar (VAT, invoice report, salaries, Social Security, Modelo 22, IES, Modelo 10,
+        advance payments) for what is known of the company (:mod:`backoffice.countries.pt.calendar`)."""
+        return pt_calendar.obligations(company_id, today, profile)
+
+    def learn_tax_profile(self, signals: Sequence[TaxSignal], today: date) -> LearnedProfile:
+        """VAT rhythm, salaries and advance payments, from the company's own payments and payslips."""
+        return pt_calendar.learn_profile(signals, today=today)
+
+    def calendar_proof(self, text: str, calendar: str, period: str, *, payment: bool,
+                       on: date | None = None) -> bool:
+        return pt_calendar.calendar_proof(text, calendar, period, payment=payment, on=on)
+
+    def bank_fee_policy(self) -> BankFeePolicy:
+        """Bank fees, commissions, stamp duty and interest: the statement is enough in Portugal."""
+        return banking_words.BANK_FEE_POLICY
 
     def is_private_person(self, tax_id: str | None) -> bool:
         """A NIF starting with 1, 2 or 3 belongs to a private person (the check digits are not needed)."""

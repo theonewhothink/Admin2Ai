@@ -17,10 +17,11 @@ from __future__ import annotations
 import importlib
 import threading
 from collections.abc import Collection, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
 
 from backoffice.domain.models import (
@@ -236,9 +237,31 @@ class BankWording:
 
 
 @dataclass(frozen=True)
+class BankFeePolicy:
+    """Which of its bank's own charges a company's bank statement proves on its own, by country (§21, QA J6).
+
+    A bank charge (a line the bank flags as a fee, or that its wording names as one) is one of three kinds: its
+    ``interest_words`` make it interest charged, its ``stamp_duty_words`` stamp duty, anything else a fee or
+    commission. ``covers`` names the kinds the statement line alone is enough for ("fee", "stamp_duty",
+    "interest"); any other needs the bank's own document for it (an interest settlement). Money the bank pays in
+    (interest earned) is never a charge. An owner's or accountant's rule always wins: it is read before any policy.
+    ``country`` names the country for the owner ("Portugal"); ``source`` says where the policy comes from."""
+
+    country: str
+    covers: frozenset[str]
+    interest_words: tuple[str, ...] = ("INTEREST",)
+    stamp_duty_words: tuple[str, ...] = ()
+    source: str = ""
+
+
+@dataclass(frozen=True)
 class PeriodicObligation:
     """An obligation a country's calendar sets for a company, with no letter needed (e.g. a quarterly
-    VAT return). ``key`` is stable per company and period, so the same obligation is created once."""
+    VAT return). ``key`` is stable per company and period, so the same obligation is created once.
+
+    ``calendar`` names the calendar entry it comes from ("pt-vat-return-monthly"; empty for an entry the
+    core needs to know nothing more about): the pack then decides what proves it
+    (:meth:`CompanyPack.calendar_proof`). ``issuer`` is who it is owed to (an ``Issuer`` value)."""
 
     key: str
     kind: str  # an ObligationKind value
@@ -249,6 +272,57 @@ class PeriodicObligation:
     consequence: str
     required_evidence: str
     reasons: tuple[str, ...] = ()
+    issuer: str = "tax_authority"
+    calendar: str = ""
+
+
+@dataclass(frozen=True)
+class TaxProfile:
+    """What a country's tax calendar needs to know about one company (QA P6).
+
+    ``vat``: "monthly", "quarterly" or "exempt" (no periodic VAT return); None while it is not known.
+    ``employees``: it pays salaries. ``advance_payments``: it makes this year's advance payments of
+    corporate income tax. ``other_income``: it pays rents or fees with tax withheld (reported once a
+    year). None always means "not known": a calendar entry that depends on it stays out. ``tax_id`` is the
+    company's own tax number (some entries depend on what kind of taxpayer it names)."""
+
+    vat: str | None = None
+    employees: bool | None = None
+    advance_payments: bool | None = None
+    other_income: bool | None = None
+    tax_id: str = ""
+
+    def over(self, base: TaxProfile) -> TaxProfile:
+        """This profile's known facts over ``base``'s (what the owner or accountant said over what was learned)."""
+        return TaxProfile(
+            vat=self.vat if self.vat is not None else base.vat,
+            employees=self.employees if self.employees is not None else base.employees,
+            advance_payments=self.advance_payments if self.advance_payments is not None else base.advance_payments,
+            other_income=self.other_income if self.other_income is not None else base.other_income,
+            tax_id=self.tax_id or base.tax_id,
+        )
+
+
+@dataclass(frozen=True)
+class TaxSignal:
+    """One piece of a company's own evidence that may say something about its tax profile.
+
+    ``kind``: "tax" (a payment to the tax office or Social Security, read from its bank line), "salary"
+    (a salary paid) or "payslip" (a payslip on file, ``on`` its month). ``text`` is the bank line's words."""
+
+    on: date
+    kind: str
+    text: str = ""
+    evidence_id: str = ""
+
+
+@dataclass(frozen=True)
+class LearnedProfile:
+    """What a company's evidence says about its tax profile, with the plain reasons per fact
+    ("vat", "employees", "advance_payments")."""
+
+    profile: TaxProfile = field(default_factory=TaxProfile)
+    reasons: Mapping[str, tuple[str, ...]] = field(default_factory=lambda: MappingProxyType({}))
 
 
 class CountryPackError(Exception):
@@ -394,7 +468,26 @@ class CompanyPack(CountryPack, Protocol):
         """One money amount as the country writes it ("1.492,30"); None when the text is not one amount."""
         ...
 
-    def periodic_obligations(self, company_id: str, today: date) -> tuple[PeriodicObligation, ...]: ...
+    def periodic_obligations(self, company_id: str, today: date,
+                             profile: TaxProfile | None = None) -> tuple[PeriodicObligation, ...]:
+        """The deadlines the country's calendar sets for one company today, by what is known of it
+        (``profile``): each while its window is open, never one whose deadline already passed."""
+        ...
+
+    def learn_tax_profile(self, signals: Sequence[TaxSignal], today: date) -> LearnedProfile:
+        """What a company's own evidence (tax payments, salaries, payslips) says about its tax profile."""
+        ...
+
+    def calendar_proof(self, text: str, calendar: str, period: str, *, payment: bool,
+                       on: date | None = None) -> bool:
+        """Whether ``text`` (a filing receipt, or a payment's bank line booked ``on`` when ``payment``) is the
+        proof of one calendar deadline: it names that obligation and, when it names a period, that period. A
+        payment must name the period: a tax payment alone never says what it paid."""
+        ...
+
+    def bank_fee_policy(self) -> BankFeePolicy:
+        """Which of its bank's own charges the bank statement alone covers in this country."""
+        ...
 
     def is_private_person(self, tax_id: str | None) -> bool:
         """True when the tax number belongs to a private person (for the accountant's rent flag)."""

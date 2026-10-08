@@ -8,13 +8,17 @@ from datetime import date
 from decimal import Decimal
 
 from backoffice.countries.base import (
+    BankFeePolicy,
     BankWording,
     FiscalQRResult,
+    LearnedProfile,
     NamedObservation,
     NativeDocumentType,
     PeriodicObligation,
     TaxIdCheck,
     TaxIdKind,
+    TaxProfile,
+    TaxSignal,
     Term,
     TextReading,
     VATRate,
@@ -109,8 +113,23 @@ class SpainPack:
             return None
         return _parse_amount(text.strip())
 
-    def periodic_obligations(self, company_id: str, today: date) -> tuple[PeriodicObligation, ...]:
+    def periodic_obligations(self, company_id: str, today: date,
+                             profile: TaxProfile | None = None) -> tuple[PeriodicObligation, ...]:
+        """The quarterly VAT return (modelo 303), for every Spanish company that charges IVA."""
         return obligations.quarterly_vat_return(company_id, today)
+
+    def learn_tax_profile(self, signals: Sequence[TaxSignal], today: date) -> LearnedProfile:
+        """Nothing yet: Spain's calendar needs no profile."""
+        return LearnedProfile()
+
+    def calendar_proof(self, text: str, calendar: str, period: str, *, payment: bool,
+                       on: date | None = None) -> bool:
+        """No Spanish entry needs it: the modelo 303 is closed by its filing receipt like any filing."""
+        return False
+
+    def bank_fee_policy(self) -> BankFeePolicy:
+        """Bank commissions: the statement is enough in Spain; interest charged needs the bank's settlement."""
+        return banking_words.BANK_FEE_POLICY
 
     def is_private_person(self, tax_id: str | None) -> bool:
         check = nif.validate_nif(tax_id)

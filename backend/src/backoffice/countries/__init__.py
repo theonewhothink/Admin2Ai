@@ -17,6 +17,7 @@ merely because the company is.
 """
 
 from .base import (
+    BankFeePolicy,
     BankWording,
     CompanyPack,
     CountryPack,
@@ -24,11 +25,14 @@ from .base import (
     DocumentFamily,
     FiscalQRError,
     FiscalQRResult,
+    LearnedProfile,
     NamedObservation,
     NativeDocumentType,
     PeriodicObligation,
     TaxIdCheck,
     TaxIdKind,
+    TaxProfile,
+    TaxSignal,
     Term,
     TextReading,
     UnknownCountryError,
@@ -45,6 +49,7 @@ from .base import (
 )
 
 __all__ = [
+    "BankFeePolicy",
     "BankWording",
     "CompanyPack",
     "CountryPack",
@@ -52,11 +57,14 @@ __all__ = [
     "DocumentFamily",
     "FiscalQRError",
     "FiscalQRResult",
+    "LearnedProfile",
     "NamedObservation",
     "NativeDocumentType",
     "PeriodicObligation",
     "TaxIdCheck",
     "TaxIdKind",
+    "TaxProfile",
+    "TaxSignal",
     "Term",
     "TextReading",
     "UnknownCountryError",

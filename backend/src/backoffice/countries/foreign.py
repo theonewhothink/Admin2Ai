@@ -18,11 +18,16 @@ merely because the *company* is Portuguese:
   and, where the country has them, its check digits;
 * :func:`vat_rates` lists the standard and reduced VAT rates of EU countries
   and the UK (a small dated table);
-* :func:`read_foreign_text` reads English and Spanish invoice labels
-  ("Invoice number", "Factura nº", "Amount due", "Importe total",
-  "Base imponible", "VAT (21%)"...) with
+* :func:`read_foreign_text` reads English, Spanish, French, German and Italian invoice labels
+  ("Invoice number", "Factura nº", "Amount due", "Importe total", "Base imponible", "VAT (21%)",
+  "Facture n°", "Total HT", "TVA 20 %", "Total TTC", "Rechnung Nr.", "Rechnungsdatum", "Nettobetrag",
+  "MwSt. 19 %", "Gesamtbetrag", "Fattura n.", "Imponibile", "IVA 22%", "Totale"...) with
   :class:`~backoffice.extraction.labelled.LabelledFieldExtractor`, adding
-  line locations, stated VAT rates, the tax numbers' roles and the currency;
+  line locations, stated VAT rates, the tax numbers' roles and the currency. Amounts are read as
+  each country writes them ("1 234,56 €", "1.234,56 €"). VAT numbers are checked by their own country's
+  rules (France's key, Germany's ISO 7064 check digit, Italy's partita IVA Luhn check); an Italian
+  partita IVA printed without its IT prefix is read by its label, and a French SIREN or SIRET must carry
+  the French VAT number printed with it (a different one is a disagreement for verification);
 * :func:`mentions_reverse_charge` spots "reverse charge", "autoliquidação",
   "VAT to be accounted for by the recipient"...
 
@@ -49,6 +54,8 @@ from backoffice.verification.normalize import iban_is_valid
 __all__ = [
     "EU_MEMBERS",
     "FOREIGN_LABELS",
+    "french_vat_from_siren",
+    "find_sirens",
     "HOME_LANGUAGE",
     "ForeignFields",
     "IssuerProfile",
@@ -398,6 +405,14 @@ _ES_LABEL = re.compile(
     r"([A-Z]-?\d{7}-?[0-9A-Z]|\d{8}-?[A-Z]|[XYZ]-?\d{7}-?[A-Z])(?![A-Za-z0-9])",
     re.I,
 )
+# An Italian VAT number (partita IVA) printed without its IT prefix: "P.IVA 00743110157", "Partita IVA: 007...".
+_IT_LABEL = re.compile(
+    r"(?<![A-Za-z])(?:partita\s+iva|p\.\s?iva|p\.\s?i\.)(?![A-Za-z])[^0-9\n]{0,8}?(?:IT\s?)?(\d{11})(?!\d)",
+    re.I,
+)
+# A French company's SIREN (9 digits) or SIRET (its SIREN and a 5-digit establishment number), both Luhn-checked.
+_SIREN_LABEL = re.compile(r"(?<![A-Za-z])(?:siren|siret)(?![A-Za-z])[^0-9\n]{0,6}(\d{3}\s?\d{3}\s?\d{3}(?:\s?\d{5})?)"
+                          r"(?!\d)", re.I)
 _EIN_LABEL = re.compile(
     r"(?<![a-z])(?:f?ein|federal\s+(?:tax\s+)?(?:id|identification)(?:\s+(?:no\.?|number))?"
     r"|employer\s+identification\s+number|(?:us\s+)?tax\s+id(?:\s+(?:no\.?|number))?|tin)(?![a-z])"
@@ -406,10 +421,12 @@ _EIN_LABEL = re.compile(
 )
 _CUSTOMER_WORDS = re.compile(
     r"(?<![a-z])(?:customer|client|bill(?:ed)?\s+to|invoice\s+to|sold\s+to|buyer|your|recipient"
-    r"|cliente|destinatario|adquirente|comprador|facturar\s+a)(?![a-z])"
+    r"|cliente|destinatario|adquirente|comprador|facturar\s+a"
+    r"|destinataire|acheteur|kunde|kunden|rechnungsempfanger|leistungsempfanger|committente|cessionario)(?![a-z])"
 )
 _SUPPLIER_WORDS = re.compile(
-    r"(?<![a-z])(?:supplier|seller|vendor|issued\s+by|our|proveedor|emisor|vendedor|fornecedor|emitente)(?![a-z])"
+    r"(?<![a-z])(?:supplier|seller|vendor|issued\s+by|our|proveedor|emisor|vendedor|fornecedor|emitente"
+    r"|fournisseur|vendeur|lieferant|verkaufer|fornitore|cedente|prestatore)(?![a-z])"
 )
 _CUSTOMER_HEADER = re.compile(
     r"^\s*(?:bill(?:ed)?\s+to|invoice\s+to|sold\s+to|ship\s+to|customer|client|buyer|cliente|facturar\s+a"
@@ -497,11 +514,36 @@ def find_tax_numbers(text: str) -> list[TaxNumber]:
                         role=_role(folded, index, folded[index][:m.start()]))
             if tn.valid:
                 keep(tn)
+        for m in _IT_LABEL.finditer(line):
+            tn = _judge("IT", m.group(1), line=index + 1, role=_role(folded, index, folded[index][:m.start()]))
+            if tn.valid:
+                keep(tn)
         for m in _EIN_LABEL.finditer(line):
             ein = check_tax_number(m.group(1))
             if ein is not None and ein.format_ok:
                 keep(replace(ein, line=index + 1, role=_role(folded, index, folded[index][:m.start()])))
     return [tn for tn in found.values() if tn.format_ok]
+
+
+def french_vat_from_siren(siren: str) -> str:
+    """The French VAT number a SIREN carries: FR, the key (12 + 3 × (SIREN mod 97)) mod 97, the SIREN."""
+    return f"FR{(12 + 3 * (int(siren) % 97)) % 97:02d}{siren}"
+
+
+def find_sirens(text: str) -> list[tuple[str, int, str | None]]:
+    """French SIRENs printed with their label (a SIRET counts by its first nine digits), whose Luhn check passes:
+    [(SIREN, line, role)]. A SIREN is not a VAT number: it only checks the French VAT number printed with it."""
+    lines = (text or "").replace("\r\n", "\n").split("\n")
+    folded = [_fold(line) for line in lines]
+    out: list[tuple[str, int, str | None]] = []
+    for index, line in enumerate(lines):
+        for m in _SIREN_LABEL.finditer(line):
+            digits = re.sub(r"\s", "", m.group(1))
+            siren = digits[:9]
+            if _luhn_sum(digits) != 0 or _luhn_sum(siren) != 0:
+                continue
+            out.append((siren, index + 1, _role(folded, index, folded[index][:m.start()])))
+    return out
 
 
 # --------------------------------------------------------------------------- the issuer's country
@@ -566,11 +608,18 @@ _LANGUAGE_MARKERS: Mapping[str, re.Pattern[str]] = MappingProxyType({
                      r"|numero de factura)(?![a-z])"),
     "en": re.compile(r"(?<![a-z])(invoice|amount due|subtotal|bill to|billed to|date of issue|vat number|total due"
                      r"|due date|receipt|quantity|unit price|description|balance due|amount paid)(?![a-z])"),
+    "fr": re.compile(r"(?<![a-z])(facture|tva|total ht|total ttc|montant ht|montant ttc|hors taxes|net a payer|siren"
+                     r"|siret|tva intracommunautaire|date d'echeance|echeance|conditions de paiement)(?![a-z])"),
+    "de": re.compile(r"(?<![a-z])(rechnung|rechnungsnummer|rechnungsdatum|mwst|ust|umsatzsteuer|nettobetrag"
+                     r"|gesamtbetrag|bruttobetrag|ust-idnr|steuernummer|zahlbar|netto|brutto)(?![a-z])"),
+    "it": re.compile(r"(?<![a-z])(fattura|partita iva|p\.\s?iva|imponibile|totale|data fattura|codice fiscale"
+                     r"|scadenza|aliquota|totale documento)(?![a-z])"),
 })  # fmt: skip
 
 
 def document_language(text: str) -> str | None:
-    """"pt", "es" or "en" by the invoice words the text uses (distinct markers); None when unclear."""
+    """"pt", "es", "en", "fr", "de" or "it" by the invoice words the text uses (distinct markers); None when
+    unclear."""
     folded = _fold(text or "")
     counts = {lang: len(set(p.findall(folded))) for lang, p in _LANGUAGE_MARKERS.items()}
     best = max(counts.values())
@@ -724,32 +773,63 @@ FOREIGN_LABELS: Mapping[CriticalField, tuple[str, ...]] = MappingProxyType({
         "número de factura", "numero de factura", "nº de factura", "n.º de factura", "no. de factura",
         "núm. factura", "num. factura", "factura nº", "factura n.º", "factura n°", "factura no.", "factura núm.",
         "factura num.", "factura número", "factura numero", "nº factura", "n.º factura", "n° factura",
+        # French (checklist E9): "Facture n° FA-2026-0915", "Numéro de facture : 2026-118"
+        "facture n°", "facture nº", "facture no", "facture no.", "facture n.", "facture numéro", "facture numero",
+        "numéro de facture", "numero de facture", "n° de facture", "nº de facture", "n° facture", "n. facture",
+        # German: "Rechnung Nr. 2026-311", "Rechnungsnummer: RE-4471"
+        "rechnungsnummer", "rechnung nr.", "rechnung nr", "rechnung-nr.", "rechnungs-nr.", "rechnungs-nr",
+        "rechnungsnr.", "re-nr.",
+        # Italian: "Fattura n. 118/2026", "Numero fattura: FT-77"
+        "fattura n.", "fattura n", "fattura nr.", "fattura n°", "fattura nº", "fattura numero", "numero fattura",
+        "numero della fattura", "n. fattura", "nr. fattura", "num. fattura",
     ),
     F.ISSUE_DATE: (
         "invoice date", "date of issue", "issue date", "date issued", "issued on", "billing date", "document date",
         "receipt date", "date paid", "date",
         "fecha de emisión", "fecha de emision", "fecha de expedición", "fecha de expedicion", "fecha de factura",
         "fecha factura", "fecha",
+        "date de facture", "date de facturation", "date d'émission", "date d’émission", "date d'emission",
+        "date de la facture",
+        "rechnungsdatum", "ausstellungsdatum", "datum",
+        "data fattura", "data documento", "data di emissione", "data emissione", "data",
     ),
-    F.DUE_DATE: ("due date", "payment due date", "payment due", "due", "fecha de vencimiento", "vencimiento"),
+    F.DUE_DATE: (
+        "due date", "payment due date", "payment due", "due", "fecha de vencimiento", "vencimiento",
+        "date d'échéance", "date d’échéance", "date d'echeance", "échéance", "echeance", "date limite de paiement",
+        "fälligkeitsdatum", "faelligkeitsdatum", "fällig am", "faellig am", "zahlbar bis",
+        "data scadenza", "data di scadenza", "scadenza",
+    ),
     F.NET_AMOUNT: (
         "subtotal", "sub-total", "sub total", "net amount", "net total", "total net", "total excl. vat",
         "total excluding vat", "total excl. tax", "total before tax", "amount excl. vat",
         "base imponible", "importe neto", "total sin iva", "subtotal sin iva",
+        "total ht", "montant ht", "total hors taxes", "montant hors taxes", "sous-total ht", "base ht", "net ht",
+        "nettobetrag", "netto", "summe netto", "gesamtbetrag netto", "nettosumme", "zwischensumme",
+        "imponibile", "totale imponibile", "imponibile iva", "totale netto",
     ),
     F.VAT_AMOUNT: (
         "vat", "vat amount", "total vat", "vat total", "tax", "tax amount", "total tax", "sales tax",
         "iva", "cuota iva", "cuota de iva", "importe iva", "importe del iva", "total iva",
+        "tva", "montant tva", "montant de la tva", "total tva",
+        "mwst.", "mwst", "mehrwertsteuer", "ust.", "ust", "umsatzsteuer", "summe mwst", "summe ust",
+        "totale iva", "importo iva", "imposta",
     ),
     F.GROSS_AMOUNT: (
         "total", "total amount", "total amount due", "grand total", "total due", "amount due", "balance due",
         "invoice total",
         "total incl. vat", "total including vat", "total inc. vat", "total incl. tax", "amount paid", "total paid",
         "total to pay", "importe total", "total factura", "total a pagar", "total con iva", "total iva incluido",
+        "total ttc", "montant ttc", "montant total ttc", "net à payer", "net a payer", "total à payer",
+        "montant à payer", "montant a payer",
+        "gesamtbetrag", "bruttobetrag", "rechnungsbetrag", "gesamtsumme", "summe brutto", "brutto", "endbetrag",
+        "zahlbetrag", "zu zahlen", "gesamtbetrag brutto",
+        "totale", "totale fattura", "totale documento", "totale da pagare", "importo totale", "netto a pagare",
+        "totale complessivo",
     ),
-    F.CURRENCY: ("currency", "moneda", "divisa"),
+    F.CURRENCY: ("currency", "moneda", "divisa", "devise", "währung", "waehrung", "valuta"),
     F.IBAN: ("iban",),
-    F.PAYMENT_REFERENCE: ("payment reference", "referencia de pago"),
+    F.PAYMENT_REFERENCE: ("payment reference", "referencia de pago", "référence de paiement",
+                          "reference de paiement", "verwendungszweck", "zahlungsreferenz"),
 })  # fmt: skip
 
 _VAT_LABELS = frozenset(_fold(label) for label in FOREIGN_LABELS[F.VAT_AMOUNT])
@@ -846,8 +926,8 @@ def read_foreign_text(
     issuer = issuer or IssuerProfile()
     if issuer.country == "US":
         day_first: bool | None = False
-    elif issuer.country is not None or issuer.language == "es":
-        day_first = True
+    elif issuer.country is not None or issuer.language in ("es", "fr", "de", "it"):
+        day_first = True  # every EU language writes the day first ("15.09.2026", "15/09/2026")
     else:
         day_first = None
     extractor = _extractor(day_first)
@@ -877,6 +957,7 @@ def read_foreign_text(
     if F.CURRENCY not in found and issuer.country == "US" and dollar_line is not None:
         add(F.CURRENCY, FieldObservation(value="USD", source=source, method=method, confidence=_TEXT_CONFIDENCE,
                                          location=f"text:line {dollar_line} ($ on a US invoice)"))  # fmt: skip
+    french: list[TaxNumber] = []
     for tn in find_tax_numbers(text):
         if not tn.valid:
             continue
@@ -885,6 +966,16 @@ def read_foreign_text(
         add(field, FieldObservation(value=tn.printed, source=source, method=method,
                                     confidence=_OWN_NUMBER_CONFIDENCE if own else _TAX_NUMBER_CONFIDENCE,
                                     location=f"text:line {tn.line}"))  # fmt: skip
+        if field is F.SUPPLIER_TAX_ID and tn.country == "FR" and tn.kind == "vat":
+            french.append(tn)
+    if french:
+        # A French supplier prints its SIREN (or SIRET) too: the VAT number it carries must be the one printed. A
+        # different one is a second reading of the supplier's number, for verification to see (never chosen).
+        for siren, line, role in find_sirens(text):
+            if role != "customer":
+                add(F.SUPPLIER_TAX_ID, FieldObservation(value=french_vat_from_siren(siren), source=source,
+                                                        method=method, confidence=_TAX_NUMBER_CONFIDENCE,
+                                                        location=f"text:line {line} (SIREN)"))  # fmt: skip
     return ForeignFields(
         observations=MappingProxyType({f: tuple(by_key.values()) for f, by_key in found.items()}),
         stated_rates=tuple(dict.fromkeys(rates)),

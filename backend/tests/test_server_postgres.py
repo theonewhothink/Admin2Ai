@@ -26,7 +26,16 @@ if str(REPO / "db") not in sys.path:
 
 pytest.importorskip("psycopg")
 
-from _server_support import NIF_B, PASSWORD, bearer, build_business, harness, read_paths, signup  # noqa: E402
+from _server_support import (  # noqa: E402
+    NIF_B,
+    PASSWORD,
+    FakeClock,
+    bearer,
+    build_business,
+    harness,
+    read_paths,
+    signup,
+)
 from backoffice_db import MigrationBlocked, PsqlError, PsqlExecutor, check_catalog, load_migrations, migrate  # noqa: E402
 from backoffice_db.migrations import bookkept_script  # noqa: E402
 from backoffice_db.testing import PostgresUnavailable, TemporaryPostgres  # noqa: E402
@@ -137,15 +146,19 @@ def test_ready_when_migrated(store: PostgresStore) -> None:
 # --------------------------------------------------------------------------- isolation (§52)
 
 
-def _account(tmp_path: Path, store: PostgresStore, email: str, **kwargs: object) -> tuple[object, dict]:
-    h = harness(tmp_path, store=store)
+def _account(tmp_path: Path, store: PostgresStore, email: str, *, clock: FakeClock | None = None,
+             **kwargs: object) -> tuple[object, dict]:
+    h = harness(tmp_path, store=store, **({"now": clock} if clock is not None else {}))
     return h, signup(h.client, email, **kwargs)  # type: ignore[arg-type]
 
 
 def test_row_level_security_on_the_new_tables(tmp_path: Path, database: dict, store: PostgresStore) -> None:
     db: PsqlExecutor = database["db"]
-    h, a = _account(tmp_path, store, f"a-{uuid.uuid4().hex[:6]}@example.pt")
-    _, b = _account(tmp_path / "b", store, f"b-{uuid.uuid4().hex[:6]}@example.pt", tax_id=NIF_B)
+    # Sign-in attempts older than a day are visible to anyone, for clean-up (migration 0007): the accounts are
+    # made on today's clock, so the "no scope, no rows" check below sees only fresh attempts, whatever the date.
+    today = FakeClock(now_=datetime.now(timezone.utc))
+    h, a = _account(tmp_path, store, f"a-{uuid.uuid4().hex[:6]}@example.pt", clock=today)
+    _, b = _account(tmp_path / "b", store, f"b-{uuid.uuid4().hex[:6]}@example.pt", clock=today, tax_id=NIF_B)
     ta, tb = a["tenant"]["id"], b["tenant"]["id"]
     ua = a["user"]["id"]
     # tenant scope: each business sees only its own events

@@ -112,7 +112,7 @@ _ROUTE_WORDS = frozenset(
     "onboarding company oauth start callback bank devices v1 healthz readyz internal overview operations "
     "readiness acceptance cost-centers allocate obligations transactions expected-invoices not-coming statement "
     "invitations accept employee employees card-payments expense-claims profile mailboxes seen automation manager "
-    "outlets sensitive access-log billing checkout portal webhook".split())
+    "outlets sensitive access-log billing checkout portal webhook identity".split())
 # One client company of any business: /api/accountant/clients/<tenant id>~<company id>[/…] (§28, §29).
 _CLIENT_REF = re.compile(r"/api/accountant/clients/(?P<tenant>[A-Za-z0-9][A-Za-z0-9_.-]{0,127})~(?P<company>[^/~]+)"
                          r"(?P<rest>/.*)?")
@@ -340,13 +340,15 @@ def _default_services(config: ServerConfig) -> dict[str, Any]:
 
             return GoCardlessBankAccountData(config.gocardless_secret_id, config.gocardless_secret_key,
                                              base_url=config.gocardless_api_url or GOCARDLESS_API)
+    from backoffice.company_lookup import company_lookup_from_env
+
     from .billing import billing_from_env
     from .links import link_fetcher_from_env
 
     return {"store": store, "objects": objects, "vault": vault, "authorizer": authorizer,
             "mailer": mailer_from_env(), "brain_factory": brain_factory, "notifier": notifier,
             "aggregator": aggregator, "reader": reader_from_env(), "link_fetcher": link_fetcher_from_env(),
-            "billing": billing_from_env(), "now": now}
+            "billing": billing_from_env(), "company_lookup": company_lookup_from_env(), "now": now}
 
 
 def production_services(config: ServerConfig, overrides: Mapping[str, Any]) -> dict[str, Any]:
@@ -363,7 +365,8 @@ def build_manager(config: ServerConfig, services: Mapping[str, Any]) -> TenantMa
         authorizer=services.get("authorizer"), mailer=services.get("mailer"),
         brain_factory=services.get("brain_factory"), notifier=services.get("notifier"),
         reader=services.get("reader"), link_fetcher=services.get("link_fetcher"),
-        billing=services.get("billing"), cache_size=config.tenant_cache_size,
+        billing=services.get("billing"), company_lookup=services.get("company_lookup"),
+        cache_size=config.tenant_cache_size,
         strict_reads=bool(services.get("strict_reads", config.strict_reads)))
 
 

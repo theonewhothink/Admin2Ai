@@ -250,8 +250,10 @@ class TokenVault:
         record = self._store.get(tenant_id, connection_id)
         return replace(record) if record else None
 
-    def token_provider(self, tenant_id: str, connection_id: str, refresher: Any) -> Any:
-        """An auto-refreshing access-token source whose rotations are saved back here."""
+    def token_provider(self, tenant_id: str, connection_id: str, refresher: Any,
+                       clock: Callable[[], datetime] | None = None) -> Any:
+        """An auto-refreshing access-token source whose rotations are saved back here. ``clock`` is the caller's
+        (the sync worker's): a token is judged expired by the same clock that dated it when it was refreshed."""
         from .oauth import OAuthToken, RefreshingTokenProvider  # lazy: needs httpx
 
         secret = self.open(tenant_id, connection_id)
@@ -263,4 +265,5 @@ class TokenVault:
                 self.store(tenant_id, connection_id, record.provider, self.open(tenant_id, connection_id),
                            expires_at=token.refresh_expires_at)
 
-        return RefreshingTokenProvider(refresher, secret["refresh_token"], on_rotate=on_rotate, clock=self._clock)
+        return RefreshingTokenProvider(refresher, secret["refresh_token"], on_rotate=on_rotate,
+                                       clock=clock or self._clock)

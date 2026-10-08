@@ -35,6 +35,7 @@ __all__ = [
     "find_jargon",
     "find_off_tone",
     "format_money",
+    "identity_check_message",
     "greeting",
     "render_why",
     "should_notify",
@@ -467,6 +468,31 @@ def _why_line(f: WhyFactor) -> str:
 def render_why(factors: Sequence[WhyFactor]) -> list[str]:
     """§54 provenance lines, in the given order, e.g. 'Invoice total €83.21'."""
     return [_why_line(f) for f in factors]
+
+
+# --------------------------------------------------------------------------- the company's details (§4, QA A2)
+
+
+def identity_check_message(status: str, *, legal_name: str | None = None, address: str | None = None,
+                           vat_number: str = "") -> str:
+    """What the owner reads after entering the company's VAT number at onboarding (backoffice.company_lookup).
+
+    The register's details are only ever offered: the owner confirms them with one tap. Nothing here blocks
+    onboarding: when the register cannot help, the owner types the details."""
+    if status == "found":
+        named = ", ".join(p for p in (legal_name, address) if p)
+        return f"The EU VAT register lists this number as {named}. Use these details?"
+    if status == "valid":
+        return ("The EU VAT register confirms this VAT number but doesn't share the company's name and address. "
+                "Please type them.")
+    if status == "invalid":
+        return (f"The EU VAT register doesn't list {vat_number or 'this number'} as active for trade with other "
+                "EU countries. Please check the number. You can type the company's details yourself.")
+    if status == "rate_limited":
+        return "The EU VAT register is busy right now. Please type the company's legal name and address."
+    if status == "unavailable":
+        return "I couldn't reach the EU VAT register just now. Please type the company's legal name and address."
+    return ""
 
 
 # --------------------------------------------------------------------------- linters (§36, §69–70)

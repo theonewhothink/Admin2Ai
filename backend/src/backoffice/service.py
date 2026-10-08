@@ -216,6 +216,10 @@ class BackOfficeService:
         # recording each event and says so in it (server/runtime.py), so a replay follows the record.
         self.billing = BillingState()
         self.decides_holds = True
+        # The EU VAT register (backoffice.company_lookup.ViesClient) for the company details behind a VAT number at
+        # onboarding. None in the demo and in production applies: the server looks the number up before it records
+        # the event and hands the answer in (``add_company(lookup=...)``); a replay never calls the register.
+        self.company_lookup: Any = None
 
     @classmethod
     def demo(cls) -> BackOfficeService:
@@ -255,14 +259,22 @@ class BackOfficeService:
         return svc
 
     def add_company(self, name: Any, tax_id: Any, legal_name: Any = None, address: Any = None,
-                    sector: Any = None, country: Any = None) -> dict[str, Any]:
+                    sector: Any = None, country: Any = None, lookup: Any = None) -> dict[str, Any]:
         """Add one of the owner's companies, in its own country (Portugal unless ``country`` says otherwise,
         e.g. "ES"). Its tax number is checked by that country's pack (§49): a NIF in Portugal, a NIF, NIE or
         CIF in Spain; every later document, VAT amount and letter of the company goes through that pack.
 
         ``address`` (its postal address) and ``sector`` (its line of business, in plain words) are optional:
         they help tell which company an invoice is for (H3) and which purchases are clearly personal (X23).
+
+        The VAT number is then looked up in the EU VAT register (§4 step 2, QA A2; backoffice.company_lookup):
+        ``lookup`` is the register's answer recorded before the change (production); without one, the service's
+        own ``company_lookup`` client is asked (none in the demo). The registered name and address are only
+        offered (``identity`` in the reply, one tap at ``POST /api/companies/{id}/identity``): what the owner typed
+        is kept until they say so. A register that says "invalid", is busy or cannot be reached never stops the
+        company being added.
         """
+        from backoffice.company_lookup import CompanyLookup, lookup_company
         from backoffice.countries import UnknownCountryError, company_pack
 
         try:
@@ -290,8 +302,10 @@ class BackOfficeService:
         company_id, n = base, 2
         while company_id in self.repo.companies:
             company_id, n = f"{base}-{n}", n + 1
-        self.repo.add_company(id=company_id, name=name, legal_name=legal, tax_id=nif,
-                              address=" ".join(str(address or "").split())[:200] or None,
+        typed_address = " ".join(str(address or "").split())[:200] or None
+        found = CompanyLookup.from_json(lookup) if lookup is not None else (
+            lookup_company(nif, pack.country_code, self.company_lookup) if nif else None)
+        self.repo.add_company(id=company_id, name=name, legal_name=legal, tax_id=nif, address=typed_address,
                               sector=" ".join(str(sector or "").split())[:80] or None, country=pack.country_code)
         self.orchestrator.milestone("company_added")
         self.orchestrator.setup_step("company", entity_id=company_id)
@@ -306,9 +320,97 @@ class BackOfficeService:
             added["country"] = pack.country_code
         self.orchestrator.log("entity", "company_added", subject_id=company_id, values=added,
                               actor=f"owner:{self.repo.owner.email}")
+        if found is not None:
+            self._record_identity(company_id, found, typed_legal=" ".join(str(legal_name or "").split()) or None,
+                                  typed_address=typed_address)
         self.orchestrator.run()
         self.billing_check()  # a company over the plan's allowance: the owner is told, nothing is refused
-        return {"ok": True, "company": self.company(company_id), "message": f"Done. {name} is set up."}
+        out = {"ok": True, "company": self.company(company_id), "message": f"Done. {name} is set up."}
+        if found is not None:
+            out["identity"] = self._identity_view(company_id, found)
+        return out
+
+    def _record_identity(self, company_id: str, found: Any, *, typed_legal: str | None,
+                         typed_address: str | None) -> None:
+        """Keep the register's answer as evidence (§55) and, when it names the company differently from what the
+        owner typed, as a suggestion for the owner's one tap; nothing is applied on its own."""
+        from backoffice.domain.models import EvidenceFormat
+
+        repo = self.repo
+        record = found.to_json()
+        body = json.dumps({"kind": "vat_register", **record}, sort_keys=True).encode()
+        reg = repo.registry.register(body, tenant_id=repo.tenant_id, source_kind=SourceKind.GOVERNMENT,
+                                     format=EvidenceFormat.JSON, mime_type="application/json",
+                                     retrieved_at=self._now(), metadata={"kind": "vat_register"})
+        self.orchestrator.log("entity", "company_lookup", subject_id=company_id, evidence_ids=[reg.evidence.id],
+                              values={"status": found.status, "source": found.source, "detail": found.detail,
+                                      "checked_at": found.checked_at})
+        if not found.has_details:
+            return
+        differs = (found.legal_name and found.legal_name != (typed_legal or repo.legal_names.get(company_id))) or (
+            found.address and found.address != typed_address)
+        if differs:
+            repo.identity_suggestions[company_id] = {**record, "evidenceId": reg.evidence.id}
+
+    def _identity_view(self, company_id: str, found: Any) -> dict[str, Any]:
+        """The register's answer as the owner sees it, with the one-tap choice when there is something to use."""
+        from backoffice.language import identity_check_message
+
+        view: dict[str, Any] = {"status": found.status, "source": "EU VAT register (VIES)",
+                                "vatNumber": found.vat_number,
+                                "message": identity_check_message(found.status, legal_name=found.legal_name,
+                                                                  address=found.address,
+                                                                  vat_number=found.vat_number)}
+        if found.legal_name:
+            view["legalName"] = found.legal_name
+        if found.address:
+            view["address"] = found.address
+        if company_id in self.repo.identity_suggestions:
+            view["options"] = [{"id": "use", "label": "Use these details"},
+                               {"id": "keep", "label": "Keep what I typed"}]
+            view["confirmPath"] = f"/api/companies/{company_id}/identity"
+        elif found.status == "found":
+            view["message"] = "The EU VAT register lists the same details you typed."
+        return view
+
+    def company_identity(self, company_id: str, body: Mapping[str, Any] | None) -> dict[str, Any]:
+        """``POST /api/companies/{id}/identity`` ``{"use": true | false}``: the owner's one tap on the details the EU
+        VAT register gave at onboarding. ``true`` uses its legal name and address; ``false`` keeps what was typed."""
+        company = self._company(company_id)
+        assert company is not None
+        repo = self.repo
+        suggestion = repo.identity_suggestions.get(company)
+        if suggestion is None:
+            raise ServiceError(409, "There is nothing to confirm for this company.")
+        use = (body or {}).get("use")
+        if not isinstance(use, bool):
+            raise ServiceError(400, "Say whether to use these details.")
+        repo.identity_suggestions.pop(company)
+        name = self._company_name(company)
+        if use:
+            if suggestion.get("legal_name"):
+                repo.legal_names[company] = str(suggestion["legal_name"])
+            if suggestion.get("address"):
+                repo.company_addresses[company] = [str(suggestion["address"])]
+            message = f"Done. {name} now has the legal name and address from the EU VAT register."
+        else:
+            message = f"Done. I kept the details you typed for {name}."
+        self.orchestrator.log("entity", "company_identity", subject_id=company,
+                              evidence_ids=[str(suggestion["evidenceId"])] if suggestion.get("evidenceId") else [],
+                              values={"used": use}, actor=f"owner:{repo.owner.email}")
+        self.orchestrator.run()
+        return {"ok": True, "message": message, "company": self.company(company)}
+
+    def onboarding_company(self, body: Mapping[str, Any] | None) -> dict[str, Any]:
+        """``POST /api/onboarding/company`` (the in-process API; the production server has its own route): add a
+        company from its name and VAT number, with the EU VAT register's details offered when a client is set."""
+        b = body or {}
+        if not str(b.get("taxId") or "").strip():
+            spain = str(b.get("country") or "").strip().upper() == "ES"
+            raise ServiceError(400, "I need the company's NIF or CIF. It has 9 characters." if spain
+                               else "I need the company's NIF. It has 9 digits.")
+        return self.add_company(b.get("name"), b.get("taxId"), b.get("legalName") or None, b.get("address") or None,
+                                b.get("sector") or None, b.get("country") or None)
 
     def set_accountant(self, email: Any, name: Any = None, software: Any = None, company_id: Any = None,
                        firm: Any = None) -> dict[str, Any]:
@@ -1678,16 +1780,25 @@ class BackOfficeService:
         return out
 
     def company_profile(self, company_id: str, body: Mapping[str, Any] | None) -> dict[str, Any]:
-        """``POST /api/companies/{id}/profile``: the company's address, line of business, and who runs its payroll.
+        """``POST /api/companies/{id}/profile``: the company's address, line of business, who runs its payroll, and
+        what its country's tax calendar needs to know about it.
 
-        ``{address?, sector?, payroll?: "owner" | "accountant"}``. The address helps tell which company an
-        invoice is for (H3); the line of business which purchases are clearly personal (X23); payroll who is
-        asked for a missing payslip (J3).
+        ``{address?, sector?, payroll?: "owner" | "accountant", vat?: "monthly" | "quarterly" | "exempt" | null,
+        employees?: bool | null, advancePayments?: bool | null, otherIncome?: bool | null}``. The address helps tell
+        which company an invoice is for (H3); the line of business which purchases are clearly personal (X23);
+        payroll who is asked for a missing payslip (J3); the tax facts which statutory deadlines the company has
+        (QA P6, backoffice.tax_profiles: what the owner says wins over what was learned; null forgets it).
         """
+        from backoffice import tax_profiles
+
         company = self._company(company_id)
         assert company is not None
         repo = self.repo
         body = body or {}
+        try:
+            tax = tax_profiles.clean_values(body)
+        except ValueError as exc:
+            raise ServiceError(400, str(exc)) from None
         if "address" in body:
             address = " ".join(str(body.get("address") or "").split())[:200]
             if address:
@@ -1705,16 +1816,36 @@ class BackOfficeService:
             if who not in ("owner", "accountant"):
                 raise ServiceError(400, "Say who runs payroll: you or your accountant.")
             repo.payroll_by[company] = who
-        self.orchestrator.log("entity", "company_profile", subject_id=company,
-                              values={"address": bool(repo.company_addresses.get(company)),
-                                      "sector": repo.company_sectors.get(company, ""),
-                                      "payroll": repo.payroll_by.get(company, "")},
+        values: dict[str, Any] = {"address": bool(repo.company_addresses.get(company)),
+                                  "sector": repo.company_sectors.get(company, ""),
+                                  "payroll": repo.payroll_by.get(company, "")}
+        if tax:  # recorded only when given: older audit entries read as before
+            tax_profiles.apply(repo, company, tax, by="owner")
+            values["tax"] = dict(tax)
+        self.orchestrator.log("entity", "company_profile", subject_id=company, values=values,
                               actor=f"owner:{repo.owner.email}")
         self.orchestrator.run()
-        return {"ok": True, "message": f"Done. {self._company_name(company)} is updated.",
-                "profile": {"address": (repo.company_addresses.get(company) or [None])[0],
-                            "sector": repo.company_sectors.get(company),
-                            "payroll": self.orchestrator.payroll.runner(company)}}
+        out = {"ok": True, "message": f"Done. {self._company_name(company)} is updated.",
+               "profile": {"address": (repo.company_addresses.get(company) or [None])[0],
+                           "sector": repo.company_sectors.get(company),
+                           "payroll": self.orchestrator.payroll.runner(company)}}
+        if tax:
+            out["profile"]["taxCalendar"] = self.tax_calendar(company)
+        return out
+
+    def tax_calendar(self, company_id: str) -> dict[str, Any]:
+        """What the company's tax calendar knows of it (each fact, who said it and why) and its open deadlines."""
+        from backoffice import tax_profiles
+
+        repo = self.repo
+        out = tax_profiles.describe(repo, company_id, self._today())
+        out["deadlines"] = [{"id": ob.obligation.id, "title": ob.title, "due": ob.obligation.due_on.isoformat(),
+                             "responsible": "Your accountant" if ob.obligation.responsible == "accountant" else "You",
+                             "status": "done" if ob.done else "open"}
+                            for ob in sorted(repo.obligations.values(), key=lambda o: (o.obligation.due_on,
+                                                                                      o.obligation.id))
+                            if ob.calendar and ob.obligation.entity_id == company_id]
+        return out
 
     # ----------------------------------------------------------------- deadlines from letters (§24)
 
@@ -2114,6 +2245,13 @@ class BackOfficeService:
                 "currentMonth": str(month), "months": sorted(months, reverse=True),
                 "pendingItemIds": [n.id for n in self._open_needs(company_id)],
             })
+            suggestion = self.repo.identity_suggestions.get(company_id)
+            if suggestion is not None:  # only while the owner has not tapped (the demo never has one)
+                from backoffice.company_lookup import CompanyLookup
+
+                found = CompanyLookup.from_json(suggestion)
+                if found is not None:
+                    out[-1]["identityCheck"] = self._identity_view(company_id, found)
         return {"companies": out}
 
     def company(self, company_id: str) -> dict[str, Any]:
@@ -3848,6 +3986,11 @@ class BackOfficeService:
             raise ServiceError(400, "Write the rule in one sentence, e.g. “Treat all Adobe subscriptions as Software”.")
         if company_id is not None and company_id not in self.repo.companies:
             raise ServiceError(404, "I can't find that client.")
+        from backoffice import tax_profiles
+
+        tax = tax_profiles.parse_setting(text)
+        if tax is not None:
+            return self._accountant_tax_setting(tax, company_id)
         try:
             rule, affected = self.orchestrator.accountant_rule(text, scope or "client", company_id)
         except PermissionError:
@@ -3863,6 +4006,34 @@ class BackOfficeService:
                                      "companyIds": list(rule.entity_ids)},
                 "affected": affected,
                 "message": f"Done. {rule.label}{where}. It applies to {affected} {noun} so far."}
+
+    def _accountant_tax_setting(self, values: Mapping[str, Any], company_id: str | None) -> dict[str, Any]:
+        """An accountant's sentence about a client's tax profile ("Hazel Tree files VAT every quarter", "No
+        employees"): saved for that company (it wins over what was learned) and its calendar deadlines follow."""
+        from backoffice import tax_profiles
+
+        repo = self.repo
+        if company_id is None:
+            if len(repo.companies) != 1:
+                raise ServiceError(400, "Say which client this is for.")
+            company_id = next(iter(repo.companies))
+        author = repo.accountant_for(company_id)
+        if author is None:
+            raise ServiceError(409, "No accountant is connected yet.")
+        before = {o for o, ob in repo.obligations.items() if ob.calendar}
+        tax_profiles.apply(repo, company_id, values, by="accountant")
+        self.orchestrator.log("accountant", "tax_profile", subject_id=company_id, values=dict(values),
+                              actor=f"accountant:{author.email}")
+        self.orchestrator.run()
+        added = [ob for o, ob in repo.obligations.items() if ob.calendar and o not in before
+                 and ob.obligation.entity_id == company_id]
+        label = tax_profiles.label(values)
+        name = self._company_name(company_id)
+        deadlines = f" I added {count_phrase(len(added), 'deadline')} from its tax calendar." if added else ""
+        return {"ok": True, "rule": {"id": f"tax_{company_id}", "label": label, "scope": "client",
+                                     "companyIds": [company_id]},
+                "affected": len(added), "message": f"Done. {name}: {label[:1].lower()}{label[1:]}.{deadlines}",
+                "taxCalendar": self.tax_calendar(company_id)}
 
     # ----------------------------------------------------------------- clients invited by the accountant (§29)
 
@@ -4370,6 +4541,8 @@ class BackOfficeService:
             ("GET", r("/api/settings/mailboxes"), lambda b: self.mailboxes()),
             ("POST", r("/api/settings/mailboxes"), lambda b: self.mailboxes(b or {"address": ""})),
             ("POST", r(f"/api/companies/{seg}/profile"), lambda b, c: self.company_profile(c, b)),
+            ("POST", r(f"/api/companies/{seg}/identity"), lambda b, c: self.company_identity(c, b)),
+            ("POST", r("/api/onboarding/company"), lambda b: self.onboarding_company(b)),
             ("GET", r("/api/obligations"), lambda b: self.obligations()),
             ("POST", r(f"/api/obligations/{seg}/done"), lambda b, oid: self.obligation_done(oid, b)),
             ("POST", r(f"/api/expected-invoices/{seg}/not-coming"), lambda b, eid: self.expected_not_coming(eid)),

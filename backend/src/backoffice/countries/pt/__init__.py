@@ -28,6 +28,10 @@ Text (text_fields)
     parse_pt_amount("1.492,30") -> Decimal;  parse_pt_date("18/09/2026") -> date
 Bank details (banking)
     is_valid_iban(raw), find_ibans(text), parse_multibanco(entity, reference)
+Tax calendar (calendar)
+    obligations(company_id, today, profile) -> PeriodicObligation...   VAT, invoice report, salaries,
+                                                Social Security, Modelo 22, IES, Modelo 10, advance payments
+    deadline("pt-vat-return-monthly", "2026-08") -> date(2026, 10, 20);  learn_profile(signals) -> LearnedProfile
 SAF-T (saft)
     parse_saft_sales_invoices(xml) -> SaftSalesInvoices
     saft_invoice_observations(invoice, header, evidence_id, include_cancelled=False)

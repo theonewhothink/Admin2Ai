@@ -23,7 +23,10 @@ Rules run in a fixed order, first hit wins:
    sale, checklist X26, X30),
 7. bank fees the bank itself flags,
 8. loans (before fee wording: a loan instalment mentions interest, 'JUROS'),
-9. bank fees and interest by wording,
+9. bank fees and interest by wording. Whether the bank statement alone covers a bank *charge* is the
+   country's policy (its pack's ``bank_fee_policy``, QA J6): Portugal's covers fees, commissions, stamp
+   duty and interest, Spain's only commissions (interest charged needs the bank's own settlement). A learned
+   override (the owner's or the accountant's rule, rule 1) always wins,
 10. other tax wording, then payroll,
 11. money in: refunds from suppliers, otherwise customer payments,
 12. money out: card purchases in a shop need a receipt, everything else an invoice.
@@ -50,7 +53,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
-from backoffice.countries import BankWording
+from backoffice.countries import BankFeePolicy, BankWording
 from backoffice.domain.models import (
     DocumentType,
     LegalEntity,
@@ -205,6 +208,15 @@ def bank_wording(countries: Iterable[str] = ()) -> BankWording:
     return wording
 
 
+def _charge_kind(policy: BankFeePolicy, text: str) -> str:
+    """"interest", "stamp_duty" or "fee": what a bank charge's line says it is, in its country's words."""
+    if phrase_in(text, policy.stamp_duty_words):
+        return "stamp_duty"  # 'IMPOSTO SELO S/ JUROS' is the stamp duty on interest, not the interest
+    if phrase_in(text, policy.interest_words):
+        return "interest"
+    return "fee"
+
+
 # --------------------------------------------------------------------------- results
 
 
@@ -350,6 +362,7 @@ class ExpectedEvidenceEngine:
         self._authorities = everywhere.tax_authorities
         self._authority_names = everywhere.authority_names
         self._wordings: dict[tuple[str, ...], BankWording] = {}
+        self._fee_policies: dict[str, BankFeePolicy | None] = {}
 
     def wording(self, tx: Transaction) -> BankWording:
         """The words ``tx`` is read with: its account's company's country's, else its company's, else the
@@ -507,15 +520,39 @@ class ExpectedEvidenceEngine:
                 return None
         elif not declared:
             return None
+        quality = Quality.GREEN if declared else Quality.AMBER
         if tx.amount > 0:
             reason = "Interest from your bank. Your bank statement is enough."
         else:
+            policy = self.fee_policy(tx)
+            if policy is not None and _charge_kind(policy, text) not in policy.covers:
+                # The country's policy does not let the statement line stand alone for this charge (QA J6).
+                return self._decide(
+                    tx, EvidenceExpectation.LOAN_STATEMENT,
+                    f"Charged by your bank. In {policy.country} the statement line is not enough for this charge: "
+                    "I need the bank's own document for it.", quality, "bank_fee_document",
+                )  # fmt: skip
             reason = "Bank charge. Your bank statement is enough."
-        quality = Quality.GREEN if declared else Quality.AMBER
         return self._decide(
             tx, EvidenceExpectation.BANK_EVIDENCE_SUFFICES, reason, quality,
             "bank_fee" if declared else "bank_fee_wording",
         )  # fmt: skip
+
+    def fee_policy(self, tx: Transaction) -> BankFeePolicy | None:
+        """The bank-fee evidence policy of the line's country (its account's company's, else its company's);
+        None when the line has no country or its country's pack sets none (the core's rule then: the statement
+        is enough for a bank charge)."""
+        from backoffice.countries import CountryPackError, company_pack
+
+        country = self.account_countries.get(tx.account_id) or self._entity_countries.get(tx.entity_id or "")
+        if not country:
+            return None
+        if country not in self._fee_policies:
+            try:
+                self._fee_policies[country] = company_pack(country).bank_fee_policy()
+            except CountryPackError:
+                self._fee_policies[country] = None
+        return self._fee_policies[country]
 
     def _tax(self, tx: Transaction, applies: bool) -> ExpectationDecision | None:
         if not applies:

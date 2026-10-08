@@ -8,9 +8,9 @@ against live bank feeds (verified_as_of: never). Extend them as feeds are seen.
 
 from __future__ import annotations
 
-from backoffice.countries.base import BankWording
+from backoffice.countries.base import BankFeePolicy, BankWording
 
-__all__ = ["BANK_WORDING"]
+__all__ = ["BANK_FEE_POLICY", "BANK_WORDING"]
 
 BANK_WORDING = BankWording(
     # The Agencia Tributaria and the Seguridad Social named outright ("AEAT MODELO 303", "SEG SOCIAL TGSS").
@@ -34,4 +34,15 @@ BANK_WORDING = BankWording(
     bank_fees=("COMISION", "COMISIONES", "COMISION MANTENIMIENTO", "COM MANTENIMIENTO", "INTERESES"),
     payroll_words=frozenset({"NOMINA", "NOMINAS", "SUELDO", "SUELDOS", "SALARIO", "SALARIOS"}),
     loans=("PRESTAMO", "CUOTA PRESTAMO", "AMORTIZACION PRESTAMO"),
+)
+
+
+# Which of its bank's own charges the bank statement alone covers in Spain (QA J6): the bank's commissions
+# ("COMISION MANTENIMIENTO"). Interest charged ("INTERESES") needs the bank's own settlement of it (liquidación). An
+# owner's or accountant's rule still wins.
+BANK_FEE_POLICY = BankFeePolicy(
+    country="Spain",
+    covers=frozenset({"fee"}),
+    interest_words=("INTERESES", "INTERES", "INTEREST"),
+    source="Bank commissions: the statement is enough (product policy for Spain, QA J6).",
 )
