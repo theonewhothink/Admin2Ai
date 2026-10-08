@@ -1,0 +1,115 @@
+.drop {
+  display: grid;
+  justify-items: center;
+  gap: var(--s-1);
+  padding: var(--s-6) var(--s-3);
+  border-radius: 16px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  outline: 1.5px dashed rgba(17, 19, 24, 0.16);
+  outline-offset: -10px;
+  text-align: center;
+  transition: background-color var(--t) var(--ease), outline-color var(--t) var(--ease);
+}
+
+.drop[data-over="true"] {
+  background: var(--surface-muted);
+  outline-color: var(--text);
+}
+
+.dropIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 52px;
+  height: 52px;
+  margin-bottom: var(--s-1);
+  border-radius: 50%;
+  background: var(--surface-muted);
+  color: var(--text-2);
+}
+
+.dropTitle {
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+
+.dropActions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--s-1);
+  margin-top: var(--s-2);
+}
+
+/* The camera button matters on phones; on desktop, choosing files is enough */
+@media (min-width: 900px) and (hover: hover) {
+  .cameraBtn {
+    display: none;
+  }
+}
+
+.upload {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-3);
+  flex-wrap: wrap;
+}
+
+.fileIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: var(--surface-muted);
+  color: var(--text-2);
+}
+
+.fileMain {
+  flex: 1 1 160px;
+  min-width: 0;
+  display: grid;
+}
+
+.fileName {
+  font-weight: 550;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fileState {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 15px;
+  color: var(--text-2);
+  animation: fade var(--t) var(--ease);
+}
+
+.fileState[data-state="received"] {
+  color: var(--good);
+  font-weight: 550;
+}
+
+.fileState[data-state="failed"] {
+  color: var(--attention);
+}
+
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.sample {
+  margin-top: var(--s-2);
+  font-size: 14px;
+}

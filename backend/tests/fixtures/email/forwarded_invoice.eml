@@ -1,0 +1,48 @@
+From: Ana Silva <ana@padaria-exemplo.pt>
+To: Ana Silva <ana@padaria-exemplo.pt>
+Subject: Fwd: Invoice 2026-0412
+Date: Thu, 24 Sep 2026 09:15:00 +0100
+Message-ID: <fwd-1@padaria-exemplo.pt>
+In-Reply-To: <req-77@backoffice.example>
+References: <chase-1@backoffice.example> <req-77@backoffice.example>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="===============8577458237851171786=="
+
+--===============8577458237851171786==
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Here is the invoice you asked for.
+
+--===============8577458237851171786==
+Content-Type: message/rfc822
+Content-Transfer-Encoding: 8bit
+MIME-Version: 1.0
+Content-Disposition: attachment
+
+From: Hazel Tree Lda <contas@hazeltree.pt>
+To: Ana Silva <ana@padaria-exemplo.pt>
+Subject: Invoice 2026-0412
+Date: Thu, 24 Sep 2026 09:15:00 +0100
+Message-ID: <orig-0412@hazeltree.pt>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="===============1697439309742155388=="
+
+--===============1697439309742155388==
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Segue em anexo a fatura 2026-0412.
+
+--===============1697439309742155388==
+Content-Type: application/pdf
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="FT_2026-0412.pdf"
+MIME-Version: 1.0
+
+JVBERi0xLjQKJSBzZWNvbmQgZG9jdW1lbnQKMSAwIG9iajw8IC9UeXBlIC9DYXRhbG9nID4+ZW5k
+b2JqCiUlRU9GCg==
+
+--===============1697439309742155388==--
+
+--===============8577458237851171786==--

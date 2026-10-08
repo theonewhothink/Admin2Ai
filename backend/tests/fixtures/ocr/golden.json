@@ -1,0 +1,86 @@
+{
+  "name": "synthetic-invoices",
+  "version": "2026-09-27",
+  "documents": [
+    {
+      "id": "inv-001",
+      "description": "Simple one-page Portuguese invoice with every critical field.",
+      "pages": ["pages/inv-001.txt"],
+      "tags": ["simple", "pt"],
+      "expected": {
+        "invoice_number": "FT 2026/183",
+        "supplier_tax_id": "PT509123457",
+        "customer_tax_id": "PT516123459",
+        "gross_amount": "483.60",
+        "net_amount": "393.17",
+        "vat_amount": "90.43",
+        "currency": "EUR",
+        "issue_date": "2026-09-18",
+        "due_date": "2026-10-18",
+        "iban": "PT50000201231234567890154",
+        "payment_reference": "RF18539007547034"
+      }
+    },
+    {
+      "id": "inv-002",
+      "description": "UK invoice in GBP with thousands separators.",
+      "pages": ["pages/inv-002.txt"],
+      "tags": ["simple", "gb"],
+      "expected": {
+        "invoice_number": "NW-2291",
+        "supplier_tax_id": "GB123456789",
+        "gross_amount": "1488.00",
+        "net_amount": "1240.00",
+        "vat_amount": "248.00",
+        "currency": "GBP",
+        "issue_date": "2026-09-03",
+        "iban": "GB82WEST12345698765432"
+      }
+    },
+    {
+      "id": "inv-003",
+      "description": "Two pages: header on page 1, totals on page 2.",
+      "pages": ["pages/inv-003-p1.txt", "pages/inv-003-p2.txt"],
+      "tags": ["multi-page", "pt"],
+      "expected": {
+        "invoice_number": "AP-7781",
+        "supplier_tax_id": "PT500123454",
+        "gross_amount": "553.50",
+        "net_amount": "450.00",
+        "vat_amount": "103.50",
+        "currency": "EUR",
+        "issue_date": "2026-08-28"
+      }
+    },
+    {
+      "id": "inv-004",
+      "description": "UBL 2.1 e-invoice: Stage 0 settles everything, OCR is skipped.",
+      "pages": ["pages/inv-004.txt"],
+      "structured": "einvoice/ubl_invoice.xml",
+      "tags": ["structured", "pt"],
+      "expected": {
+        "invoice_number": "INV-2026-0042",
+        "supplier_tax_id": "PT508602939",
+        "customer_tax_id": "PT516123459",
+        "gross_amount": "1230.00",
+        "net_amount": "1000.00",
+        "vat_amount": "230.00",
+        "currency": "EUR",
+        "issue_date": "2026-09-10",
+        "due_date": "2026-10-10"
+      }
+    },
+    {
+      "id": "rcp-005",
+      "description": "Café receipt with a day-first date and decimal comma.",
+      "pages": ["pages/rcp-005.txt"],
+      "tags": ["receipt", "pt"],
+      "expected": {
+        "supplier_tax_id": "PT987654322",
+        "gross_amount": "7.80",
+        "currency": "EUR",
+        "issue_date": "2026-09-12"
+      }
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "$comment": "Contract between the phone's offline queue (mobile/src/offline) and POST /api/evidence/upload. Checked by mobile/src/offline/__tests__/contract.test.ts and backend/tests/test_mobile_contract.py. Spec §43: the local copy is deleted only after the server's sha256 equals the phone's.",
+  "endpoint": "/api/evidence/upload",
+  "method": "POST",
+  "encoding": "multipart/form-data",
+  "idempotency_header": "Idempotency-Key",
+  "file_field": "file",
+  "fields": {
+    "sha256": "Lower-case hex sha256 of the file bytes, computed on the phone before encryption.",
+    "source": "Backend SourceKind value.",
+    "format": "Backend EvidenceFormat value.",
+    "captured_at": "ISO 8601 timestamp with offset, phone clock.",
+    "client_item_id": "Random id of the queue item; equals the Idempotency-Key header.",
+    "capture_id": "Optional. Groups the pages of one multi-page scan.",
+    "page": "Optional. 1-based page number inside capture_id.",
+    "page_count": "Optional. Number of pages in capture_id.",
+    "original_url": "Optional. The shared link, for format=url.",
+    "hints": "Optional. JSON object with advisory hints (qr, quality, title). Never evidence."
+  },
+  "required_fields": ["sha256", "source", "format", "captured_at", "client_item_id"],
+  "source_kinds": ["mobile_scan", "mobile_share"],
+  "formats": ["pdf", "image", "screenshot", "url", "eml", "text", "xml"],
+  "receipt": {
+    "$comment": "2xx (or 409 for an already-stored file) JSON body. sha256 MUST be computed by the server over the bytes it stored, not echoed from the request.",
+    "required": ["sha256"],
+    "optional": ["evidence_id", "duplicate"]
+  },
+  "hash_mismatch_error": "hash_mismatch",
+  "retryable_statuses": [408, 425, 429, 500, 502, 503, 504],
+  "auth_statuses": [401, 403]
+}

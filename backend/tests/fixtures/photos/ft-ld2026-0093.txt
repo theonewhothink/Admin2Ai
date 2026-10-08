@@ -1,0 +1,16 @@
+Lixas & Drogaria Bonfim, Lda.
+Rua do Bonfim 233, 4300-069 Porto
+NIF: 509418775
+FATURA
+Fatura n.º FT LD2026/93
+ATCUD: LDQ2M8R5-93
+Data de emissão: 22/09/2026
+Cliente: Hazel Tree Interiores, Lda.
+NIF: 516123459
+Descrição  Qtd.  Preço  IVA  Valor
+Lixa grão 120 (cx. 50)  3  12,90  23%  38,70
+Massa de reparação 1 kg  4  8,25  23%  33,00
+Portes de envio: 15,00
+Base tributável (23%): 86,70
+IVA 23%: 19,94
+Total: 106,64 €

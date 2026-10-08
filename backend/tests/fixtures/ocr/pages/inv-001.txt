@@ -1,0 +1,11 @@
+Hazel Tree Supplies Lda
+Invoice number: FT 2026/183
+Invoice date: 2026-09-18
+Due date: 2026-10-18
+Supplier VAT: PT509123457
+Customer VAT: PT516123459
+Subtotal: 393.17
+VAT: 90.43
+Total: 483.60 EUR
+IBAN: PT50 0002 0123 1234 5678 9015 4
+Payment reference: RF18539007547034

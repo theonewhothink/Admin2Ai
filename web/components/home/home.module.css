@@ -1,0 +1,167 @@
+.home {
+  display: grid;
+  gap: var(--s-4);
+}
+
+.headline {
+  display: grid;
+  gap: var(--s-1);
+  padding-top: var(--s-1);
+}
+
+.statusLine {
+  font-size: clamp(24px, 4.2vw, 36px);
+  line-height: 1.15;
+  font-weight: 500;
+  letter-spacing: -0.03em;
+  color: var(--text-2);
+}
+
+.statusLink {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text);
+  border-radius: 8px;
+}
+
+.statusArrow {
+  color: var(--text-3);
+  transition: transform var(--t) var(--ease), color var(--t) var(--ease);
+}
+
+.statusLink:hover .statusArrow {
+  color: var(--text);
+  transform: translateX(3px);
+}
+
+/* Ask box stays in reach while scrolling on larger screens */
+.askDock {
+  z-index: 10;
+}
+
+@media (min-width: 900px) {
+  .askDock {
+    position: sticky;
+    top: calc(var(--header-h) + 12px);
+  }
+}
+
+.columns {
+  display: grid;
+  gap: var(--s-4);
+}
+
+@media (min-width: 900px) {
+  .columns {
+    grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);
+    align-items: start;
+    gap: var(--s-3);
+  }
+}
+
+.companyName {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.rowMain {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.chev {
+  color: var(--text-3);
+}
+
+.handled {
+  display: grid;
+}
+
+.handledRow {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  padding: 14px var(--s-3);
+}
+
+.handledRow + .handledRow {
+  border-top: 1px solid var(--line);
+}
+
+.handledCount {
+  min-width: 2.2ch;
+  text-align: right;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.handledLabel {
+  font-size: 16px;
+  color: var(--text);
+}
+
+.cardFoot {
+  padding: 14px var(--s-3) 18px;
+  border-top: 1px solid var(--line);
+}
+
+.dueDate {
+  display: grid;
+  place-items: center;
+  width: 52px;
+  height: 52px;
+  border-radius: 12px;
+  background: var(--surface-muted);
+  line-height: 1.05;
+  flex-shrink: 0;
+}
+
+.dueDay {
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.dueMonth {
+  font-size: 12px;
+  font-weight: 550;
+  color: var(--text-2);
+}
+
+.dueTitle {
+  font-weight: 600;
+}
+
+.tileSub {
+  display: grid;
+  gap: 10px;
+}
+
+/* Company rows: on phones the status moves under the name so details get the full width */
+.companyRow {
+  display: grid !important;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+}
+
+@media (max-width: 519px) {
+  .companyRow {
+    grid-template-columns: minmax(0, 1fr) auto;
+    row-gap: 6px;
+  }
+
+  .companyRow > :nth-child(2) {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
+  .companyRow > :nth-child(3) {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+  }
+}

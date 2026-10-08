@@ -1,0 +1,132 @@
+/* The chat on every page (ChatDrawer). */
+
+.launcher {
+  position: fixed;
+  /* Phones: an icon in the header, beside the account button, so it never covers the page. */
+  top: calc(env(safe-area-inset-top) + (var(--header-h) - 38px) / 2);
+  right: calc(var(--gutter) + 38px + var(--s-1));
+  z-index: 41;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s-1);
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: inset 0 0 0 1px var(--line);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--t-fast) var(--ease), transform var(--t-fast) var(--ease);
+}
+
+.launcher:hover {
+  background: var(--bg);
+}
+
+.launcher:active {
+  transform: scale(0.98);
+}
+
+.launcher:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 3px;
+}
+
+.panel {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  animation: slideIn var(--t-slow) var(--ease);
+}
+
+.panel[hidden] {
+  display: none;
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-1);
+  min-height: var(--header-h);
+  padding: 0 var(--s-1) 0 var(--gutter);
+  padding-top: env(safe-area-inset-top);
+  background: var(--surface);
+  box-shadow: 0 1px 0 var(--line);
+}
+
+.body {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: var(--s-2) var(--gutter) calc(var(--s-2) + env(safe-area-inset-bottom));
+}
+
+/* Phones: the header icon says "Chat" to screen readers only. */
+.launcherLabel {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+
+@media (min-width: 900px) {
+  .launcher {
+    top: auto;
+    right: var(--s-3);
+    bottom: var(--s-3);
+    z-index: 45;
+    background: var(--ink);
+    color: var(--on-ink);
+    box-shadow: var(--shadow-raised);
+    width: auto;
+    height: auto;
+    min-height: 48px;
+    padding: 0 var(--s-2) 0 14px;
+  }
+
+  .launcher:hover {
+    background: var(--ink-hover);
+  }
+
+  .launcherLabel {
+    position: static;
+    width: auto;
+    height: auto;
+    overflow: visible;
+    clip: auto;
+  }
+
+  .panel {
+    inset: 0 0 0 auto;
+    width: min(460px, 100vw);
+    box-shadow: -1px 0 0 var(--line), -16px 0 40px rgba(16, 24, 40, 0.08);
+  }
+}
+
+@keyframes slideIn {
+  from {
+    transform: translateX(24px);
+    opacity: 0;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .panel {
+    animation: none;
+  }
+}

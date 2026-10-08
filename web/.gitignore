@@ -5,3 +5,10 @@ out/
 .env*.local
 npm-debug.log*
 .DS_Store
+
+# In-browser engine (built by `npm run build:pages`, never committed)
+/public/pyodide/
+/public/engine/backoffice.zip
+/public/engine/snapshot.json
+# In-browser OCR (tesseract.js, pdf.js; copied from node_modules by `npm run engine:ocr`)
+/public/ocr/

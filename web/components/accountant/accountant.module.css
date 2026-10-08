@@ -1,0 +1,600 @@
+/* ---------- Shell: a working tool, denser than the owner app ---------- */
+
+.shell {
+  min-height: 100dvh;
+  background: var(--bg);
+}
+
+.header {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  background: var(--surface);
+  box-shadow: 0 1px 0 var(--line);
+  padding-top: env(safe-area-inset-top);
+}
+
+.headerInner {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  height: var(--header-h);
+}
+
+.brand {
+  flex-shrink: 0;
+}
+
+.nav {
+  display: flex;
+  gap: 2px;
+  flex: 1;
+}
+
+.navLink {
+  display: inline-flex;
+  align-items: center;
+  min-height: 38px;
+  padding: 8px 14px;
+  border-radius: 10px;
+  font-size: 15px;
+  font-weight: 550;
+  background: var(--surface-muted);
+}
+
+@media (max-width: 719px) {
+  .nav {
+    display: none;
+  }
+}
+
+.right {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  margin-left: auto;
+}
+
+.ownerLink {
+  font-size: 14px;
+}
+
+@media (max-width: 479px) {
+  .ownerLink {
+    display: none;
+  }
+}
+
+.firm {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.firmAvatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: var(--surface-muted);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.firmName {
+  font-size: 15px;
+  font-weight: 550;
+}
+
+@media (max-width: 899px) {
+  .firmName {
+    display: none;
+  }
+}
+
+/* ---------- Summary ---------- */
+
+.summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--s-1);
+  margin-bottom: var(--s-3);
+}
+
+@media (min-width: 720px) {
+  .summary {
+    gap: var(--s-2);
+  }
+}
+
+.summary > div {
+  display: flex;
+  flex-direction: column-reverse;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: var(--s-2);
+}
+
+@media (min-width: 720px) {
+  .summary > div {
+    padding: var(--s-3);
+  }
+}
+
+.summary dt {
+  font-size: 14px;
+  line-height: 1.35;
+  color: var(--text-2);
+}
+
+.summary dd {
+  font-size: 30px;
+  line-height: 1;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+}
+
+/* ---------- Table ---------- */
+
+.tableCard {
+  overflow: hidden;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 15px;
+}
+
+.table th,
+.table td {
+  padding: 14px var(--s-2);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.table thead th {
+  padding-top: 12px;
+  padding-bottom: 12px;
+  font-size: 13px;
+  font-weight: 550;
+  color: var(--text-2);
+  background: var(--surface-muted);
+  white-space: nowrap;
+}
+
+.table tbody tr {
+  position: relative;
+  transition: background-color var(--t-fast) var(--ease);
+}
+
+.table tbody tr + tr {
+  border-top: 1px solid var(--line);
+}
+
+.table tbody tr:hover {
+  background: var(--surface-muted);
+}
+
+.table tbody th {
+  font-weight: 600;
+}
+
+.table th:first-child,
+.table td:first-child {
+  padding-left: var(--s-3);
+}
+
+.rowLink::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+
+.rowLink:focus-visible {
+  outline: none;
+}
+
+.rowLink:focus-visible::after {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+  border-radius: 8px;
+}
+
+.completeCol {
+  width: 26%;
+}
+
+.numCol {
+  text-align: right !important;
+  white-space: nowrap;
+}
+
+.complete {
+  display: grid;
+  grid-template-columns: minmax(60px, 1fr) 44px;
+  align-items: center;
+  gap: 12px;
+}
+
+.complete > :last-child {
+  text-align: right;
+}
+
+.zero {
+  color: var(--text-3);
+}
+
+.chevCell {
+  width: 40px;
+  color: var(--text-3);
+}
+
+/* Phones: each row becomes a compact card */
+@media (max-width: 719px) {
+  .table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+  }
+
+  .table tbody tr {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px var(--s-2);
+    padding: var(--s-2);
+  }
+
+  .table tbody th,
+  .table tbody td {
+    padding: 0 !important;
+  }
+
+  .table tbody th {
+    grid-column: 1 / -1;
+    font-size: 16px;
+  }
+
+  .monthCell {
+    display: none;
+  }
+
+  .completeCell {
+    grid-column: 1 / -1;
+  }
+
+  .numCol {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    text-align: left !important;
+  }
+
+  .numCol[data-label]::before {
+    content: attr(data-label);
+    color: var(--text-2);
+    font-size: 14px;
+  }
+
+  .chevCell {
+    display: none;
+  }
+}
+
+/* ---------- Client detail ---------- */
+
+.back {
+  margin-bottom: var(--s-3);
+}
+
+.clientHead {
+  display: grid;
+  gap: var(--s-1);
+  margin-bottom: var(--s-4);
+}
+
+.grid {
+  display: grid;
+  gap: var(--s-2);
+}
+
+@media (min-width: 900px) {
+  .grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start;
+  }
+}
+
+.panel {
+  display: grid;
+  gap: var(--s-2);
+  padding: var(--s-3);
+}
+
+.panelHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--s-2);
+}
+
+.facts div {
+  display: flex;
+  flex-direction: column-reverse;
+  justify-content: flex-end;
+  gap: 2px;
+}
+
+.facts dt {
+  font-size: 14px;
+  color: var(--text-2);
+}
+
+.facts dd {
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.items {
+  display: grid;
+}
+
+.items li {
+  display: flex;
+  gap: 12px;
+  padding: 12px 0;
+}
+
+.items li + li {
+  border-top: 1px solid var(--line);
+}
+
+.items li > :first-child {
+  margin-top: 8px;
+}
+
+.itemBody {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.itemTitle {
+  font-weight: 600;
+  font-size: 15px;
+}
+
+.itemDetail {
+  font-size: 15px;
+  color: var(--text-2);
+}
+
+.empty {
+  font-size: 15px;
+  color: var(--text-2);
+}
+
+.fullRow {
+  grid-column: 1 / -1;
+}
+
+/* Teach a rule */
+.teach {
+  display: grid;
+  gap: var(--s-2);
+  padding: var(--s-3);
+}
+
+@media (min-width: 720px) {
+  .teach {
+    padding: var(--s-4);
+  }
+}
+
+.teachRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s-2);
+}
+
+.teachResult {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: 15px;
+  animation: fade var(--t-slow) var(--ease);
+}
+
+.teachResult svg {
+  color: var(--good);
+  margin-top: 2px;
+}
+
+.rules {
+  display: grid;
+  gap: 6px;
+}
+
+.rules li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 15px;
+}
+
+.rules li svg {
+  color: var(--text-3);
+}
+
+@keyframes fade {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ---------- Home: the business a client company belongs to, invitations ---------- */
+
+.business {
+  display: block;
+  margin-top: 2px;
+  font-weight: 450;
+}
+
+.tableEmpty {
+  padding: var(--s-3);
+}
+
+.below {
+  margin-top: var(--s-3);
+}
+
+.inviteForm {
+  display: grid;
+  gap: var(--s-2);
+}
+
+@media (min-width: 900px) {
+  .inviteForm {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    align-items: end;
+  }
+
+  .inviteForm > div {
+    grid-column: 1 / -1;
+  }
+}
+
+.field {
+  display: grid;
+  gap: 6px;
+  font-size: 14px;
+  color: var(--text-2);
+}
+
+.inviteLine {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* ---------- Client: reconciliation and originals ---------- */
+
+.recon {
+  display: grid;
+}
+
+.reconRow {
+  display: grid;
+  gap: 10px;
+  padding: 14px 0;
+}
+
+.reconRow + .reconRow {
+  border-top: 1px solid var(--line);
+}
+
+.reconHead {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 4px var(--s-2);
+}
+
+.reconHead > :global(.pill) {
+  grid-column: 2 / -1;
+  justify-self: start;
+}
+
+@media (min-width: 720px) {
+  .reconHead {
+    grid-template-columns: 72px minmax(0, 1fr) auto auto;
+  }
+
+  .reconHead > :global(.pill) {
+    grid-column: auto;
+  }
+}
+
+.reconDate {
+  white-space: nowrap;
+}
+
+.reconPayee {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.reconDesc {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reconAmount {
+  font-weight: 600;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.evidenceList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* Chips inside a list item (a question's evidence): not rows of their own. */
+.items .evidenceList {
+  margin-top: 6px;
+}
+
+.items .evidenceList li {
+  display: block;
+  padding: 0;
+}
+
+.items .evidenceList li + li {
+  border-top: 0;
+}
+
+.items .evidenceList li > :first-child {
+  margin-top: 0;
+}
+
+.evidenceItem {
+  display: inline-grid;
+  gap: 4px;
+  max-width: 100%;
+}
+
+.evidenceItem :global(.chip) {
+  max-width: 100%;
+}
+
+.evidenceItem :global(.chip) span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.evidenceError {
+  font-size: 13px;
+}

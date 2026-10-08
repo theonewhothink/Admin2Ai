@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="pt-PT">
+<head><meta charset="utf-8"><title>Código de verificação | Área de Cliente EDP</title></head>
+<body class="pagina-codigo">
+  <header class="cabecalho"><a class="logotipo" href="/">EDP</a></header>
+  <section class="verificacao">
+    <h1>Confirme que é você</h1>
+    <p>Enviámos um código por SMS para o número terminado em 34. O código é válido durante 10 minutos.</p>
+    $erro
+    <form id="form-codigo" method="post" action="/area-cliente/codigo">
+      <input type="hidden" name="pedido" value="$pedido">
+      <label for="codigo">Código</label>
+      <input type="text" id="codigo" name="codigo" inputmode="numeric" maxlength="6" required>
+      <button type="submit" class="botao-principal">Confirmar</button>
+    </form>
+    <p><a href="/area-cliente/codigo/reenviar">Reenviar código</a></p>
+  </section>
+</body>
+</html>

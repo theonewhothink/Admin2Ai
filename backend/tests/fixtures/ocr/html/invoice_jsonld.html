@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Your invoice is ready</title>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "Invoice",
+        "identifier": "CLOUD-88213",
+        "accountId": "acct-4817",
+        "paymentStatus": "https://schema.org/PaymentDue",
+        "paymentDueDate": "2026-10-01",
+        "provider": {"@type": "Organization", "name": "CloudHost Europe", "vatID": "IE1234567T"},
+        "customer": {"@type": "Organization", "name": "Hazel Tree Lda", "vatID": "PT516123459"},
+        "totalPaymentDue": {"@type": "PriceSpecification", "price": 39.00, "priceCurrency": "EUR"}
+      }
+    ]
+  }
+  </script>
+  <script>var tracking = "not structured data";</script>
+</head>
+<body><p>Hello, your invoice CLOUD-88213 is ready.</p></body>
+</html>

@@ -1,0 +1,21 @@
+Madeiras & Tintas do Douro, Lda.
+Rua de Costa Cabral 912, 4200-225 Porto
+NIF: 513204113   Tel. 225 018 377
+FATURA
+Fatura n.º FT MT2026/518
+ATCUD: MTQ4K7P2-518
+Data de emissão: 15/09/2026
+Cliente: Hazel Tree Interiores, Lda.
+NIF: 516123459
+Código  Descrição  Qtd.  Un.  Preço unit.  Desc.  IVA  Total
+TIN15  Tinta aquosa branca 15 L  4  un  62,50  0%  23%  250,00
+PIN01  Pincel plano 50 mm  10  un  3,45  0%  23%  34,50
+MAD22  Ripa de pinho 22x45 mm  36  m  2,15  10%  23%  69,66
+COL05  Cola de madeira 5 kg  2  un  18,90  0%  23%  37,80
+PAR01  Parafusos inox 4x40  1.200  un  0,04  0%  23%  48,00
+LIV03  Livro: Guia de acabamentos  1  un  24,00  0%  6%  24,00
+Base tributável (6%): 24,00
+IVA 6%: 1,44
+Base tributável (23%): 439,96
+IVA 23%: 101,19
+Total: 566,59 €
