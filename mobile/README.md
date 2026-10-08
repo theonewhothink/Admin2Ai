@@ -176,6 +176,14 @@ month closed.
 - **Connections** (`app/connections.tsx`) lists what syncs and what needs
   reconnecting; reconnecting signs in to Google, Microsoft or the bank, which
   happens on the web, so the button opens the web app.
+- **Sources** (`app/sources.tsx`, from Home's "What I read: 1 mailbox, 3 bank
+  accounts, 4 cards" row): the summary and the verdict on every payment (never
+  green while a source is not read), one coverage line per source, the
+  companies with their tax number and the sources that feed them, and
+  "Something missing?": the text is understood by the server
+  (`POST /api/sources/understand`), then "Add it on the web" opens the web's
+  Sources with it filled in (`/sources?missing=…`), or "Ask about it" opens
+  Ask with the text ready. The tabs stay as the spec has them.
 
 ### Owner API, `src/api/`
 
@@ -185,6 +193,8 @@ month closed.
 | `GET /api/needs-you` | Needs You, tab badge, Home count |
 | `POST /api/needs-you/{id}/answer` `{option_id, remember}` | Decision cards |
 | `GET /api/activity` | Activity |
+| `GET /api/sources` | Home's Sources row, Sources |
+| `POST /api/sources/understand` `{text}` → `{kind, fields, message}` | Sources, "Something missing?" |
 | `POST /api/ask` `{question}` → `{answer, evidence[]}` | Ask |
 | `POST /api/evidence/upload` | Offline queue |
 | `POST /api/auth/login`, `POST /api/auth/logout` | Sign-in, sign-out |

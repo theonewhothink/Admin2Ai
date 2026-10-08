@@ -4,7 +4,7 @@
  * September is being closed. The screens label it as example data.
  */
 import type { DecimalString } from "../lib/money";
-import type { ActivityFeed, AskAnswer, HomeData, NeedsYouItem } from "./types";
+import type { ActivityFeed, AskAnswer, HomeData, NeedsYouItem, SourcesData } from "./types";
 
 const eur = (v: string) => v as DecimalString;
 
@@ -185,3 +185,99 @@ export function sampleAnswer(question: string): AskAnswer {
   if (q.includes("september") || q.includes("complete") || q.includes("closed")) return pick("Is September complete?");
   return sampleAskFallback;
 }
+
+/** What the business is read from, and how every payment stands (GET /api/sources, same sample world). */
+export const sampleSources: SourcesData = {
+  summary: "I read 1 mailbox, 3 bank accounts and 4 cards for your 3 companies.",
+  coverage:
+    "I checked all 14 payments since 1 September: 7 have their invoice or proof, 5 need none, 1 I'm still looking for and 1 needs your answer.",
+  tone: "attention",
+  groups: [
+    {
+      id: "email",
+      title: "Email",
+      items: [
+        {
+          id: "gmail",
+          name: "laura@hazeltree.es",
+          company: "All companies",
+          detail: "Gmail",
+          status: "healthy",
+          coverage: "Read since 1 June · 6 invoices and receipts found · last read 09:12",
+        },
+      ],
+    },
+    {
+      id: "banks",
+      title: "Bank accounts",
+      items: [
+        {
+          id: "cxb-ht",
+          name: "CaixaBank •••• 0265",
+          company: "Hazel Tree",
+          detail: "ES91 •••• 0265",
+          status: "healthy",
+          coverage: "3 of 6 payments since 1 September have their invoice or proof; 2 need none and I'm looking for 1.",
+        },
+        {
+          id: "cxb-cc",
+          name: "CaixaBank •••• 3382",
+          company: "Company C",
+          detail: "ES91 •••• 3382",
+          status: "healthy",
+          coverage: "2 payments since 1 September: none needs an invoice.",
+        },
+        {
+          id: "bbva-b",
+          name: "BBVA •••• 3007",
+          company: "Company B",
+          detail: "ES12 •••• 3007",
+          status: "healthy",
+          coverage: "1 of 2 payments since 1 September has its invoice; 1 needs none.",
+        },
+      ],
+    },
+    {
+      id: "cards",
+      title: "Cards",
+      items: [
+        { id: "card-5530", name: "Card •••• 5530", company: "Hazel Tree", detail: "CaixaBank", status: "healthy", coverage: "1 payment since 1 September: it has its invoice." },
+        { id: "card-7702", name: "Card •••• 7702", company: "Company B", detail: "BBVA", status: "healthy", coverage: "1 payment since 1 September: it has its invoice." },
+        { id: "card-2291", name: "Card •••• 2291", company: "Company C", detail: "CaixaBank", status: "healthy", coverage: "1 payment since 1 September: it has its invoice." },
+        {
+          id: "card-4817",
+          name: "Card •••• 4817",
+          company: "Company C",
+          detail: "CaixaBank · personal card used for business",
+          status: "healthy",
+          coverage: "1 payment since 1 September: it needs your answer.",
+        },
+      ],
+    },
+    {
+      id: "accountant",
+      title: "Accountant",
+      items: [
+        {
+          id: "accountant",
+          name: "Contabilidad Vidal",
+          company: "All companies",
+          detail: "marc@contabilidadvidal.es",
+          status: "healthy",
+          coverage: "2 questions from them: 1 answered, 1 open · last in touch 18:20 yesterday",
+        },
+      ],
+    },
+  ],
+  companies: [
+    { id: "hazel-tree", name: "Hazel Tree", taxIdLabel: "NIF", taxId: "B12345674", sources: ["laura@hazeltree.es", "CaixaBank •••• 0265", "Card •••• 5530"] },
+    { id: "company-b", name: "Company B", taxIdLabel: "NIF", taxId: "B87654321", sources: ["laura@hazeltree.es", "BBVA •••• 3007", "Card •••• 7702"] },
+    {
+      id: "company-c",
+      name: "Company C",
+      taxIdLabel: "NIF",
+      taxId: "B11223344",
+      sources: ["laura@hazeltree.es", "CaixaBank •••• 3382", "Card •••• 2291", "Card •••• 4817"],
+    },
+  ],
+};

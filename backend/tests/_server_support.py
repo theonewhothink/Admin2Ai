@@ -151,6 +151,7 @@ def build_business(h: Harness, token: str) -> dict[str, Any]:
     outlet = ok(c.post("/api/companies/padaria-lda/cost-centers", json={
         "name": "Loja Baixa", "kind": "Outlet", "identifiers": {"cards": ["2291"]}}, headers=H))
     seen["cost_centers"] = [outlet["costCenter"]["id"]]
+    seen["accounts"] = [bank["id"], card["id"]]
     glance()
     csv = BANK_CSV.replace(b"{acct}", bank["id"].encode()).replace(b"{card}", card["id"].encode())
     rows = ok(c.post("/api/evidence", files={"file": ("extrato.csv", csv, "text/csv")}, headers=H))

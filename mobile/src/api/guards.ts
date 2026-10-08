@@ -18,7 +18,14 @@ import type {
   NeedsYouChoiceItem,
   NeedsYouItem,
   RememberRule,
+  SourceGroup,
+  SourceItem,
+  SourcesCompany,
+  SourcesData,
+  SourceStatus,
   Tone,
+  UnderstoodKind,
+  UnderstoodSource,
 } from "./types";
 
 const TONES: readonly Tone[] = ["good", "attention", "risk", "neutral"];
@@ -226,4 +233,64 @@ export function parseAskAnswer(v: unknown): AskAnswer | null {
     ? compact(v.evidence.map((e) => (isRecord(e) && nonEmpty(e.label) && nonEmpty(e.id) ? { label: e.label, id: e.id } : null)))
     : [];
   return { answer: v.answer, evidence };
+}
+
+const SOURCE_STATUSES: readonly SourceStatus[] = ["healthy", "stale", "not_connected", "known", "hold"];
+const UNDERSTOOD_KINDS: readonly UnderstoodKind[] = ["email", "bank", "card", "files", "accounting", "portal", "ask"];
+
+function sourceItem(v: unknown): SourceItem | null {
+  if (!isRecord(v) || !nonEmpty(v.id) || !nonEmpty(v.name)) return null;
+  const out: SourceItem = {
+    id: v.id,
+    name: v.name,
+    company: str(v.company) ? v.company : "",
+    detail: str(v.detail) ? v.detail : "",
+    // An unknown status is read as "needs reconnecting": never green on doubt (§47-48).
+    status: SOURCE_STATUSES.includes(v.status as SourceStatus) ? (v.status as SourceStatus) : "stale",
+  };
+  const coverage = isRecord(v.coverage) ? v.coverage.text : undefined;
+  if (nonEmpty(coverage)) out.coverage = coverage;
+  return out;
+}
+
+function sourceGroup(v: unknown): SourceGroup | null {
+  if (!isRecord(v) || !nonEmpty(v.id) || !str(v.title) || !Array.isArray(v.items)) return null;
+  return { id: v.id, title: v.title, items: compact(v.items.map(sourceItem)) };
+}
+
+function sourcesCompany(v: unknown): SourcesCompany | null {
+  if (!isRecord(v) || !nonEmpty(v.id) || !nonEmpty(v.name)) return null;
+  const sources = Array.isArray(v.sources)
+    ? compact(v.sources.map((s) => (isRecord(s) && nonEmpty(s.name) ? s.name : null)))
+    : [];
+  return {
+    id: v.id,
+    name: v.name,
+    taxIdLabel: nonEmpty(v.taxIdLabel) ? v.taxIdLabel : "Tax number",
+    taxId: str(v.taxId) ? v.taxId : "",
+    sources,
+  };
+}
+
+/** GET /api/sources, with its summary. Without the summary lines there is nothing honest to show: null. */
+export function parseSources(v: unknown): SourcesData | null {
+  if (!isRecord(v) || !Array.isArray(v.groups) || !isRecord(v.summary)) return null;
+  const s = v.summary;
+  if (!nonEmpty(s.text) || !str(s.coverage)) return null;
+  return {
+    summary: s.text,
+    coverage: s.coverage,
+    tone: s.tone === "good" ? "good" : "attention",
+    groups: compact(v.groups.map(sourceGroup)),
+    companies: Array.isArray(v.companies) ? compact(v.companies.map(sourcesCompany)) : [],
+  };
+}
+
+/** POST /api/sources/understand. */
+export function parseUnderstood(v: unknown): UnderstoodSource | null {
+  if (!isRecord(v) || !UNDERSTOOD_KINDS.includes(v.kind as UnderstoodKind) || !nonEmpty(v.message)) return null;
+  const fields = isRecord(v.fields)
+    ? Object.fromEntries(Object.entries(v.fields).filter((e): e is [string, string] => str(e[1])))
+    : {};
+  return { kind: v.kind as UnderstoodKind, message: v.message, fields, already: v.already === true };
 }

@@ -254,8 +254,9 @@
 
 .main {
   min-height: calc(100dvh - var(--header-h));
-  /* Room for the bottom bar plus the Scan button that rises above it, so the last card stays visible. */
-  padding-bottom: calc(var(--bottom-nav-h) + env(safe-area-inset-bottom) + var(--s-6));
+  /* Room for the bottom bar, the Scan button that rises above it and the Chat button above that, so the last
+     card stays visible. */
+  padding-bottom: calc(var(--bottom-nav-h) + env(safe-area-inset-bottom) + var(--s-10));
 }
 
 @media (min-width: 900px) {

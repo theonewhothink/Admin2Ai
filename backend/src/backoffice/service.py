@@ -826,9 +826,14 @@ class BackOfficeService:
                     return c["status"]
             return "not_connected"
 
+        def bank_connection(bank: str) -> dict[str, str]:
+            c = next((c for c in conn("bank") if c["name"] == bank), None)
+            return {"connectionId": c["id"]} if c is not None else {}
+
         accounts = [
             {"id": a.id, "name": f"{a.bank} •••• {(a.iban or '')[-4:]}", "company": names.get(a.holder_id, ""),
-             "detail": a.iban[:4] + " •••• " + a.iban[-4:] if a.iban else "", "status": bank_status(a.bank)}
+             "detail": a.iban[:4] + " •••• " + a.iban[-4:] if a.iban else "", "status": bank_status(a.bank),
+             **bank_connection(a.bank)}
             for a in repo.accounts.values() if a.iban
         ]
         holders = self.orchestrator.staff.holder_of
@@ -836,7 +841,7 @@ class BackOfficeService:
             {"id": a.id, "name": f"Card •••• {a.card_last4}", "company": names.get(a.holder_id, ""),
              "detail": a.bank + ("" if a.owned else " · personal card used for business") +
              (f" · {h.name}'s card" if (h := holders(a.card_last4)) is not None else ""),
-             "status": bank_status(a.bank)}
+             "status": bank_status(a.bank), **bank_connection(a.bank)}
             for a in repo.accounts.values() if a.card_last4
         ]
         suppliers = []
@@ -901,10 +906,112 @@ class BackOfficeService:
                         "Demo connection: no real sign-in was made."
                 if label:
                     item["signIn"] = label
+        summary, companies = self._coverage(groups)
         # Every group is listed, empty ones too, so the owner can add the first supplier website, cloud storage or
         # accounting software from Sources.
         return {"groups": [{"id": g, "title": t, "description": d, "items": items} for g, t, d, items in groups],
-                "companies": [{"id": cid, "name": n} for cid, n in names.items()]}
+                "companies": companies, "summary": summary}
+
+    def _coverage(self, groups: Sequence[tuple[str, str, str, list[dict[str, Any]]]]
+                  ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Sources' proof (backoffice.source_coverage): one plain coverage line per source, the summary of what is
+        read and how every payment stands, and the companies with the sources that feed each."""
+        from backoffice.countries import UnknownCountryError, company_pack
+        from backoffice.source_coverage import SourceCoverage
+
+        repo = self.repo
+        cov = SourceCoverage(self)
+        connectors = repo.connectors
+        by_kind: dict[str, list[ConnectorState]] = {}
+        for c in connectors.values():
+            by_kind.setdefault(c.kind, []).append(c)
+        unlinked: list[str] = []
+        for gid, _, _, items in groups:
+            for item in items:
+                c = connectors.get(item["id"])
+                if gid in ("banks", "cards"):
+                    item["coverage"] = cov.account_line(item["id"])
+                    if item.get("status") == "not_connected":
+                        unlinked.append(item["name"])
+                elif c is None:
+                    continue
+                elif gid == "email":
+                    item["coverage"] = cov.mailbox_line(c, by_kind.get("email", []))
+                elif gid in ("files", "accounting"):
+                    item["coverage"] = cov.place_line(c, by_kind.get(c.kind, []))
+                elif gid == "portals":
+                    item["coverage"] = cov.portal_line(c)
+                elif gid == "accountant":
+                    item["coverage"] = cov.accountant_line(c)
+                if c is not None:
+                    item["connectionId"] = c.id
+        reading = {gid: len(items) for gid, _, _, items in groups
+                   if gid in ("email", "banks", "cards", "files", "accounting", "portals")}
+        summary = cov.summary(reading, self._stale_connectors(), unlinked)
+        companies = []
+        for cid, entity in repo.companies.items():
+            try:
+                label = company_pack(entity.country).tax_id_hint.split(".")[0].strip()
+            except UnknownCountryError:
+                label = "Tax number"
+            companies.append({"id": cid, "name": entity.name, "taxIdLabel": label, "taxId": entity.tax_id or "",
+                              "sources": cov.company_sources(cid, connectors.values())})
+        return summary, companies
+
+    def source_payments(self, source_id: str) -> dict[str, Any]:
+        """``GET /api/sources/{id}/payments``: one bank account's or card's payments, newest first, each with where
+        it stands in plain words ("Invoice found", "No invoice needed: ...", "Looking for the invoice since ...",
+        "Needs your answer", "Personal") and the page that shows it."""
+        from backoffice.source_coverage import SourceCoverage
+
+        account = self.repo.accounts.get(source_id)
+        if account is None:
+            raise ServiceError(404, "I can't find that bank account or card.")
+        cov = SourceCoverage(self)
+        name = f"Card •••• {account.card_last4}" if account.card_last4 else \
+            f"{account.bank} •••• {(account.iban or '')[-4:]}"
+        return {"id": account.id, "name": name, "coverage": cov.account_line(account.id),
+                "items": cov.payment_rows(account.id)}
+
+    def understand_source(self, body: Mapping[str, Any] | None) -> dict[str, Any]:
+        """``POST /api/sources/understand`` ``{text}``: what the owner typed in "Something missing?", understood as
+        a place to read (backoffice.source_intake): ``{kind, fields, message}``. It only reads: the owner adds the
+        source from the form it opens."""
+        from backoffice.source_intake import MAX_TEXT, IntakeContext, understand
+
+        text = (body or {}).get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ServiceError(400, "Tell me what I'm not reading yet.")
+        if len(text) > MAX_TEXT * 4:
+            raise ServiceError(400, "That is too long.")
+        repo = self.repo
+        mailboxes: dict[str, str] = {}
+        hosts: dict[str, str] = {}
+        for c in repo.connectors.values():
+            if c.kind != "email":
+                continue
+            provider = str((self.sign_in.get(c.id) or {}).get("provider") or "")
+            if provider not in ("google", "microsoft", "imap"):
+                provider = "google" if c.name.startswith("Gmail") else \
+                    "microsoft" if c.name.startswith("Outlook") else "imap"
+            mailboxes[c.account] = provider
+            if provider == "imap" and (m := re.fullmatch(r"Email \((.+)\)", c.name)):
+                hosts[c.account] = m.group(1)
+        context = IntakeContext(
+            mailboxes=mailboxes, mail_hosts=hosts,
+            ibans={a.iban: f"{a.bank} •••• {a.iban[-4:]}" for a in repo.accounts.values() if a.iban},
+            company_ibans={i: cid for cid, e in repo.companies.items() for i in e.own_ibans},
+            cards=[a.card_last4 for a in repo.accounts.values() if a.card_last4],
+            banks=[c.name for c in repo.connectors.values() if c.kind == "bank"],
+            files=[("google" if c.name == "Google Drive" else "microsoft", c.account)
+                   for c in repo.connectors.values() if c.kind == "files"],
+            portals=[c.name for c in repo.connectors.values() if c.kind == "portal"],
+            suppliers=[(s.name, tuple(s.aliases), tuple(s.email_domains)) for s in repo.suppliers.values()],
+            owner_email=repo.owner.email)
+        try:
+            return understand(text, context)
+        except ValueError:
+            raise ServiceError(400, "Tell me what I'm not reading yet.") from None
 
     # ----------------------------------------------------------------- Adding and removing sources
 
@@ -5263,6 +5370,8 @@ class BackOfficeService:
             ("POST", r("/api/accountant/api-keys"), lambda b: self.api_key_create(b)),
             ("POST", r(f"/api/accountant/api-keys/{seg}/revoke"), lambda b, kid: self.api_key_revoke(kid)),
             ("POST", r("/api/sources"), lambda b: self.add_source(b or {})),
+            ("POST", r("/api/sources/understand"), lambda b: self.understand_source(b)),
+            ("GET", r(f"/api/sources/{seg}/payments"), lambda b, sid: self.source_payments(sid)),
             ("POST", r(f"/api/sources/{seg}/remove"), lambda b, sid: self.remove_source(sid)),
             ("GET", r("/api/connections"), lambda b: self.connections()),
             ("POST", r(f"/api/connections/{seg}/stale"), lambda b, i: self.mark_connection_stale(i)),

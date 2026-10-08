@@ -12,6 +12,7 @@ import { buildHomeView, type Tile } from "../models/home";
 import { REQUIRES_SIGN_IN } from "../config";
 import { copy } from "../copy";
 import { sourceNote } from "../models/source";
+import { buildSourcesView } from "../models/sources";
 import { colors, space, toneColors } from "../theme/tokens";
 import { Icon } from "../ui/Icon";
 import { Banner, Card, Dot, FadeIn, Note, Screen, T } from "../ui/primitives";
@@ -21,6 +22,7 @@ export function HomeScreen() {
   const needs = useNeeds();
   const router = useRouter();
   const { loaded, refreshing, refresh } = useLoaded(() => api.getHome());
+  const sources = useLoaded(() => api.getSources());
 
   if (!loaded) {
     return (
@@ -41,6 +43,7 @@ export function HomeScreen() {
       onRefresh={() => {
         void refresh();
         void needs.refresh();
+        void sources.refresh();
       }}
     >
       <View style={styles.topRow}>
@@ -75,6 +78,8 @@ export function HomeScreen() {
           <TileCard key={tile.id} tile={tile} onPress={tile.id === "needs" ? () => router.navigate("/needs-you") : undefined} />
         ))}
       </View>
+
+      {sources.loaded ? <SourcesRow data={sources.loaded.data} onPress={() => router.push("/sources")} /> : null}
 
       <T variant="heading" style={styles.section}>
         Your businesses
@@ -111,6 +116,31 @@ function TileCard({ tile, onPress }: { tile: Tile; onPress?: (() => void) | unde
     <View style={{ flex: 1 }} accessible accessibilityLabel={`${tile.label} ${tile.value}`}>
       {body}
     </View>
+  );
+}
+
+/** "Sources · What I read: 1 mailbox, 3 bank accounts, 4 cards" → the Sources screen. */
+function SourcesRow({ data, onPress }: { data: Parameters<typeof buildSourcesView>[0]; onPress: () => void }) {
+  const view = buildSourcesView(data);
+  return (
+    <Pressable
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={`${copy.sources.title}. ${view.reads}`}
+      style={({ pressed }) => [{ marginTop: space.s1 }, pressed && { opacity: 0.85 }]}
+    >
+      <Card>
+        <View style={styles.companyRow}>
+          <Icon name="link" size={20} color={colors.text2} />
+          <View style={{ flex: 1, gap: 2 }}>
+            <T variant="bodyStrong">{copy.sources.title}</T>
+            <T variant="small">{view.reads}</T>
+          </View>
+          <Dot tone={view.coverage.tone} />
+          <Icon name="chevronRight" size={18} color={colors.text3} />
+        </View>
+      </Card>
+    </Pressable>
   );
 }
 

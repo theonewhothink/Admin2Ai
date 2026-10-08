@@ -5,21 +5,33 @@ import { useEffect, useRef, useState } from "react";
 import { Icon } from "@/components/Icon";
 import { isActive } from "@/components/shell/nav-items";
 import { ChatClient } from "./ChatClient";
+import { OPEN_CHAT_EVENT, type OpenChatDetail } from "./open-chat";
 import styles from "./drawer.module.css";
 
 /**
- * The chat on every page (computers and tablets): a button in the corner opens
- * a side panel with the same chat as the Ask page. The conversation stays
- * while the owner moves between pages. Phones use the Ask tab in the bottom
- * bar instead, and the Ask page has the chat already.
+ * The chat on every page: a button in the corner (on phones, just above the bottom bar) opens a panel with the
+ * same chat as the Ask page. The conversation stays while the owner moves between pages. A page can open it with
+ * a message ready to send (openChat). The Ask page has the chat already.
  */
 export function ChatDrawer({ examples }: { examples: string[] }) {
   const pathname = usePathname();
   const [open, setOpen] = useState(false);
   const [used, setUsed] = useState(false); // mount the chat on first open, then keep it
+  const [draft, setDraft] = useState<{ text: string; id: number } | undefined>(undefined);
   const panel = useRef<HTMLDivElement>(null);
   const opener = useRef<HTMLButtonElement>(null);
   const onAsk = isActive(pathname, "/ask");
+
+  useEffect(() => {
+    const onOpen = (e: Event) => {
+      const text = (e as CustomEvent<OpenChatDetail>).detail?.text ?? "";
+      setUsed(true);
+      setOpen(true);
+      setDraft({ text, id: Date.now() });
+    };
+    window.addEventListener(OPEN_CHAT_EVENT, onOpen);
+    return () => window.removeEventListener(OPEN_CHAT_EVENT, onOpen);
+  }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -54,7 +66,7 @@ export function ChatDrawer({ examples }: { examples: string[] }) {
           }}
         >
           <Icon name="ask" size={20} strokeWidth={1.8} />
-          <span>Chat</span>
+          <span className={styles.launcherLabel}>Chat</span>
         </button>
       ) : null}
       {used ? (
@@ -74,7 +86,7 @@ export function ChatDrawer({ examples }: { examples: string[] }) {
             </button>
           </div>
           <div className={styles.body}>
-            <ChatClient examples={examples} compact />
+            <ChatClient examples={examples} compact draft={draft} />
           </div>
         </div>
       ) : null}

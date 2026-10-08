@@ -85,9 +85,9 @@ __all__ = [
 
 log = logging.getLogger("backoffice.server")
 
-# POST routes that only read (a body carries their filters). /api/ask is not one: every answer
-# writes an audit record (the ask agent's answer_question), so it is recorded as an event.
-READ_ONLY_POSTS = frozenset({"/api/documents/export"})
+# POST routes that only read (a body carries their filters, or the text to understand). /api/ask is not one: every
+# answer writes an audit record (the ask agent's answer_question), so it is recorded as an event.
+READ_ONLY_POSTS = frozenset({"/api/documents/export", "/api/sources/understand"})
 _API_KEYS = "/api/accountant/api-keys"
 _REVOKE = re.compile(r"^/api/accountant/api-keys/([^/]+)/revoke$")
 _RECONNECT = re.compile(r"^/api/connections/([^/]+)/reconnect$")

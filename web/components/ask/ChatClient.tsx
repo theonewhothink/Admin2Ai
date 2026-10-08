@@ -483,14 +483,23 @@ export function ChatClient({
   initialQuestion,
   examples,
   compact = false,
+  draft,
 }: {
   initialQuestion?: string;
   examples: string[];
   /** Inside the chat panel: fewer examples and the message box pinned to the panel's bottom. */
   compact?: boolean;
+  /** A message put in the box, ready to send (a new `id` puts it there again). */
+  draft?: { text: string; id: number };
 }) {
   const [turns, setTurns] = useState<Turn[]>([]);
-  const [value, setValue] = useState("");
+  const [value, setValue] = useState(draft?.text ?? "");
+  const [draftSeen, setDraftSeen] = useState(draft?.id);
+  if (draft && draft.id !== draftSeen) {
+    // A new message to put in the box (the chat was opened with one): shown at once, sent by the owner.
+    setDraftSeen(draft.id);
+    setValue(draft.text);
+  }
   const [settingsOpen, setSettingsOpen] = useState(false);
   const nextId = useRef(1);
   const started = useRef(false);

@@ -646,15 +646,35 @@ def owner_screens(page: Any, api: MockApi, expect: Any) -> None:
             " return c.textContent.replace(/\\s+/g, ' ').trim(); })")
 
     names = labels(page.locator("header nav[aria-label=Main] a"))
-    check(names == ["Home", "Needs You", "Companies", "Activity", "Ask"], f"the header has exactly the five places {names}")
-    for name, url in (("Documents", "/documents"), ("Sources", "/sources"), ("Diagram", "/diagram")):
+    check(names == ["Home", "Needs You", "Companies", "Sources", "Activity"], f"the header has exactly the five places {names}")
+    page.locator("header nav[aria-label=Main]").get_by_role("link", name="Sources", exact=True).click()
+    page.wait_for_url(re.compile(r"/sources$"), timeout=15000)
+    expect(page.get_by_role("heading", name="Sources", level=1)).to_be_visible(timeout=15000)
+    check(True, "Sources is one tap away, on top")
+    for name, url in (("Documents", "/documents"), ("Ask", "/ask"), ("Diagram", "/diagram")):
         page.get_by_role("button", name="Account and settings").click()
         page.locator("header").get_by_role("link", name=name, exact=True).click()
         page.wait_for_url(re.compile(rf"{url}$"), timeout=15000)
         check(True, f"profile menu → {name} (two taps)")
+    page.get_by_role("button", name="Account and settings").click()
+    check(page.locator("header").get_by_role("link", name="Sources", exact=True).count() == 1,
+          "Sources is not repeated in the profile menu")
+    page.keyboard.press("Escape")
+    page.goto("/")
+    expect(page.get_by_role("heading", name=re.compile("^Good"))).to_be_visible(timeout=15000)
     page.set_viewport_size({"width": 390, "height": 844})
+    page.wait_for_timeout(200)
     bottom = labels(page.locator("nav[aria-label=Main]:not(header nav) a"))
-    check(bottom == ["Home", "Needs You", "Scan a receipt", "Activity", "Ask"], f"the phone bar keeps its five {bottom}")
+    check(bottom == ["Home", "Needs You", "Scan a receipt", "Sources", "Activity"], f"the phone bar has its five {bottom}")
+    chat = page.get_by_role("button", name="Chat", exact=True)
+    expect(chat).to_be_visible()
+    bar = page.locator("nav[aria-label=Main]:not(header nav)").bounding_box()
+    box = chat.bounding_box()
+    check(bool(bar and box and box["y"] + box["height"] <= bar["y"]), "on a phone the Chat button sits above the bottom bar")
+    chat.click()
+    expect(page.get_by_role("dialog", name="Ask")).to_be_visible()
+    check(True, "Ask is one tap away on a phone (the Chat button)")
+    page.get_by_role("dialog", name="Ask").get_by_role("button", name="Close").click()
     page.set_viewport_size({"width": 1280, "height": 900})
 
     print("cost centers: in the company's own words, a page each, an owner statement, a split")
@@ -844,49 +864,133 @@ def owner_screens(page: Any, api: MockApi, expect: Any) -> None:
 def sources_and_codes(page: Any, api: MockApi, expect: Any) -> None:
     """Supplier websites, cloud storage and accounting software added from Sources; a website's sign-in code entered
     in Needs you; a month catching up on missed email; the EU VAT register's details used in one tap."""
-    print("sources: supplier websites, cloud storage and accounting software can be added")
+    print("sources: what I read, how every payment stands, and what is missing")
     page.goto("/sources")
     expect(page.get_by_role("heading", name="Sources", level=1)).to_be_visible(timeout=15000)
-    for group, title in (("portals", "Supplier websites"), ("files", "Cloud storage"), ("accounting", "Accounting software")):
-        section = page.locator(f"section#{group}")
-        expect(section.get_by_role("heading", name=title)).to_be_visible()
-        check(section.get_by_role("button", name="+ Add").count() == 1, f"{title}: + Add is there while it is empty")
+    with api.lock:
+        engine = api.engine.sources()
+    summary = engine["summary"]
+    expect(page.locator("p.lead")).to_have_text(summary["text"], timeout=15000)
+    verdict = page.locator(f"[role=status][data-tone={summary['tone']}]", has_text=summary["coverage"])
+    expect(verdict).to_be_visible()
+    check(summary["tone"] == "attention" and verdict.locator(".dot-good").count() == 0,
+          f"the coverage line is the engine's and is not green while something is open ({summary['coverage'][:60]}…)")
+    check(re.match(r"I read \d+ mailbox", summary["text"]) is not None, f"the summary says what I read ({summary['text']})")
+    read = page.locator("section#read")
+    for group, item in (("email", "gmail"), ("banks", "mbcp-ht"), ("cards", "card-5530")):
+        line = next(i for g in engine["groups"] if g["id"] == group for i in g["items"] if i["id"] == item)["coverage"]["text"]
+        expect(read.locator(f"li[data-source={item}]").get_by_text(line, exact=True)).to_be_visible()
+    check(True, "each mailbox, bank account and card has its own coverage line")
 
-    portals = page.locator("section#portals")
-    portals.get_by_role("button", name="+ Add").click()
-    portals.get_by_label("Supplier").fill("Vodafone")
-    portals.get_by_label("Your username on their website").fill("laura@hazeltree.pt")
-    portals.get_by_label("Password").fill("portal pass 1 ")
-    portals.get_by_role("button", name="Add", exact=True).click()
+    print("sources: a card's payments, each with where it stands")
+    ikea = read.locator("li[data-source=card-4817]")
+    ikea.get_by_role("button", name="Show payments").click()
+    with api.lock:
+        rows = api.engine.source_payments("card-4817")["items"]
+    listed = ikea.get_by_role("list", name="Payments of Card •••• 4817")
+    expect(listed.get_by_role("link", name="IKEA")).to_be_visible(timeout=15000)
+    first = rows[0]
+    if first["state"] == "needs_you":
+        expect(listed.get_by_role("link", name="Needs your answer")).to_have_attribute("href", re.compile(r"/needs-you#nd_ikea_418$"))
+    else:
+        expect(listed.get_by_text(first["stateText"], exact=True)).to_be_visible()
+    check(listed.get_by_role("link", name="IKEA").get_attribute("href").endswith(f"/payments/detail?id={first['id']}"),
+          "a payment row opens the payment's own page")
+    check(any(r["method"] == "GET" and r["path"] == "/api/sources/card-4817/payments" for r in api.requests),
+          "expanding a card reads its payments")
+    card = read.locator("li[data-source=card-5530]")
+    card.get_by_role("button", name="Show payments").click()
+    expect(card.get_by_text("Receipt found", exact=True)).to_be_visible(timeout=15000)
+    bank = read.locator("li[data-source=mbcp-ht]")
+    bank.get_by_role("button", name="Show payments").click()
+    with api.lock:
+        bank_rows = api.engine.source_payments("mbcp-ht")["items"]
+    for row in bank_rows:
+        expect(bank.get_by_text(row["stateText"], exact=True).first).to_be_visible(timeout=15000)
+    check(True, "every payment of the account says where it stands (invoice found, no invoice needed, looking)")
+    shots(page, "sources-expanded")
+    no_sideways_scroll(page, "/sources (a card open)")
+    bank.get_by_role("button", name="Hide payments").click()
+
+    print("sources: the companies I cover")
+    companies = page.locator("section#companies")
+    hazel = companies.locator("li[data-company=hazel-tree]")
+    expect(hazel.get_by_text("Hazel Tree", exact=True)).to_be_visible()
+    expect(hazel.get_by_text(re.compile(r"NIF 516123459"))).to_be_visible()
+    expect(hazel.get_by_text(re.compile(r"^laura@hazeltree\.pt, Millennium BCP •••• 0265, Card •••• 5530"))).to_be_visible()
+    check(True, "each company with its tax number and the sources that feed it")
+
+    print("sources: Something missing? understands, opens the form filled in, adds nothing by itself")
+    box = page.get_by_role("textbox", name="What I’m not reading yet")
+    check("an email address, a bank, a card" in (box.get_attribute("placeholder") or ""), "the box says what it takes")
+    added_before = len(posts(api, r"/api/sources"))
+    box.fill("billing@hazeltree.pt")
+    page.get_by_role("button", name="Add it").click()
+    expect(page.get_by_text("hazeltree.pt is on Google, like laura@hazeltree.pt. Sign in once and I read it.")).to_be_visible(timeout=15000)
+    form = page.get_by_role("form", name="Add a source")
+    expect(form.get_by_label("Email address")).to_have_value("billing@hazeltree.pt")
+    expect(form.get_by_label("Provider")).to_have_value("google")
+    understood = posts(api, r"/api/sources/understand")
+    check(bool(understood) and json.loads(understood[-1]["body"]) == {"text": "billing@hazeltree.pt"}
+          and understood[-1]["csrf"] == "admin2ai", "the text goes to /api/sources/understand")
+    form.get_by_role("button", name="Cancel").click()
+    box.fill("PT76 0007 0000 0012 3456 7892 3")
+    page.get_by_role("button", name="Add it").click()
+    expect(page.get_by_text("PT76 •••• 8923 is a Novo Banco account. Check the company and tap Add.")).to_be_visible(timeout=15000)
+    expect(form.get_by_label("Bank")).to_have_value("Novo Banco")
+    expect(form.get_by_label("IBAN (optional)")).to_have_value("PT76000700000012345678923")
+    check(len(posts(api, r"/api/sources")) == added_before, "understanding adds nothing: only the form's Add does")
+    shots(page, "sources-missing-iban")
+    no_sideways_scroll(page, "/sources (an IBAN understood)")
+    form.get_by_role("button", name="Cancel").click()
+    box.fill("my lawyer's invoices")
+    page.get_by_role("button", name="Add it").click()
+    expect(page.get_by_text("I'll ask Claude to help with that.")).to_be_visible(timeout=15000)
+    chat = page.get_by_role("dialog", name="Ask")
+    expect(chat).to_be_visible()
+    expect(chat.get_by_role("textbox", name="Message")).to_have_value("my lawyer's invoices")
+    check(True, "anything else opens the chat with the text ready to send")
+    chat.get_by_role("button", name="Close").click()
+
+    print("sources: supplier websites, cloud storage and accounting software, one tap each")
+    page.get_by_role("button", name="Supplier website").click()
+    form = page.get_by_role("form", name="Add a source")
+    form.get_by_label("Supplier").fill("Vodafone")
+    form.get_by_label("Your username on their website").fill("laura@hazeltree.pt")
+    form.get_by_label("Password").fill("portal pass 1 ")
+    form.get_by_role("button", name="Add", exact=True).click()
     expect(page.get_by_text("Done. I will sign in to Vodafone and fetch your invoices from there.")).to_be_visible(timeout=15000)
     sent = posts(api, r"/api/sources")
     check(bool(sent) and json.loads(sent[-1]["body"]) == {
         "kind": "portal", "supplier": "Vodafone", "username": "laura@hazeltree.pt", "password": "portal pass 1 "}
         and sent[-1]["csrf"] == "admin2ai", "a supplier website is posted with its sign-in (the password as typed)")
+    portals = page.locator("#portals")
     expect(portals.get_by_text("Vodafone", exact=True)).to_be_visible()
+    expect(portals.get_by_text(re.compile(r"I sign in when an invoice is missing"))).to_be_visible()
 
-    files = page.locator("section#files")
-    files.get_by_role("button", name="+ Add").click()
-    files.get_by_label("Where your files are").select_option("microsoft")
-    files.get_by_label("Microsoft account").fill("laura@hazeltree.pt")
-    files.get_by_label("Folder to watch (optional)").fill("/Invoices/2026")
-    files.get_by_role("button", name="Sign in and connect").click()
+    page.get_by_role("button", name="Cloud storage").click()
+    form = page.get_by_role("form", name="Add a source")
+    form.get_by_label("Where your files are").select_option("microsoft")
+    form.get_by_label("Microsoft account").fill("laura@hazeltree.pt")
+    form.get_by_label("Folder to watch (optional)").fill("/Invoices/2026")
+    form.get_by_role("button", name="Sign in and connect").click()
     expect(page.get_by_text("Done. I will search your OneDrive for missing invoices.")).to_be_visible(timeout=15000)
     check(json.loads(posts(api, r"/api/sources")[-1]["body"]) == {
         "kind": "files", "provider": "microsoft", "address": "laura@hazeltree.pt", "folder": "/Invoices/2026"},
         "cloud storage is posted with its provider, account and folder")
 
-    accounting = page.locator("section#accounting")
-    accounting.get_by_role("button", name="+ Add").click()
-    accounting.get_by_label("Client identifier").fill("typed-for-toconline")
-    accounting.get_by_label("Accounting software").select_option("invoicexpress")
-    accounting.get_by_label("Account name").fill("hazeltree")
-    accounting.get_by_label("Access key").fill("secret-key")
-    accounting.get_by_role("button", name="Add", exact=True).click()
+    page.get_by_role("button", name="Accounting software").click()
+    form = page.get_by_role("form", name="Add a source")
+    form.get_by_label("Client identifier").fill("typed-for-toconline")
+    form.get_by_label("Accounting software").select_option("invoicexpress")
+    form.get_by_label("Account name").fill("hazeltree")
+    form.get_by_label("Access key").fill("secret-key")
+    form.get_by_role("button", name="Add", exact=True).click()
     expect(page.get_by_text("Done. I will read Hazel Tree's documents in InvoiceXpress.")).to_be_visible(timeout=15000)
     check(json.loads(posts(api, r"/api/sources")[-1]["body"]) == {
         "kind": "accounting", "provider": "invoicexpress", "account": "hazeltree", "apiKey": "secret-key",
         "companyId": "hazel-tree"}, "accounting software is posted with only the chosen program's fields")
+    accounting = page.locator("#accounting")
     shots(page, "sources")
     no_sideways_scroll(page, "/sources")
     with page.expect_download() as dl:
@@ -895,6 +999,29 @@ def sources_and_codes(page: Any, api: MockApi, expect: Any) -> None:
           f"the accounting software's month downloads as a ZIP ({dl.value.suggested_filename})")
     asked = [r for r in api.requests if re.fullmatch(r"/api/accounting/accounting-invoicexpress-hazel-tree/export", r["path"])]
     check(bool(asked) and re.fullmatch(r"month=\d{4}-\d{2}", asked[-1]["query"]) is not None, "the export asks for one month")
+
+    print("sources: what I learned stays one tap away, collapsed")
+    learned = page.locator("section#learned")
+    suppliers = learned.locator("details#suppliers")
+    check(suppliers.get_attribute("open") is None, "what I learned is collapsed")
+    suppliers.locator("summary").click()
+    expect(suppliers.get_by_text("EDP", exact=True)).to_be_visible()
+    expect(suppliers.get_by_role("button", name="Remove EDP")).to_be_visible()
+
+    print("sources: a connection that stopped is said, never green, with Reconnect")
+    with api.lock:
+        api.engine.mark_connection_stale("gmail")
+        stale = api.engine.sources()["summary"]["coverage"]
+    page.reload()
+    expect(page.locator("[role=status][data-tone=attention]", has_text=stale)).to_be_visible(timeout=15000)
+    check(stale.startswith("Gmail has not been read since"), f"the line says which connection stopped ({stale[:48]}…)")
+    gmail = page.locator("section#read li[data-source=gmail]")
+    expect(gmail.get_by_text("Needs reconnecting")).to_be_visible()
+    gmail.get_by_role("button", name="Reconnect").click()
+    page.wait_for_url(re.compile(r"/fake-google\?c=gmail$"), timeout=15000)
+    check(api.reconnects[-1] == "gmail", "Reconnect on Sources goes to the provider's sign-in")
+    with api.lock:
+        api.engine.reconnect("gmail")
 
     print("needs you: a supplier website's sign-in code")
     with api.lock:
@@ -986,6 +1113,63 @@ def team_dashboard(page: Any, api: MockApi, expect: Any) -> None:
 # --------------------------------------------------------------------------- demo
 
 
+def demo_sources(page: Any, port: int, expect: Any) -> None:
+    """Sources on the static demo: the engine in the browser says what it reads, how every payment stands, and
+    understands what is missing."""
+    sys.path.insert(0, str(BACKEND_SRC))
+    from backoffice.service import BackOfficeService
+
+    engine = BackOfficeService.demo()
+    summary = engine.sources()["summary"]
+    page.set_viewport_size({"width": 1280, "height": 900})
+    page.goto(f"http://{HOST}:{port}/Admin2Ai/sources/")
+    expect(page.get_by_role("heading", name="Sources", level=1)).to_be_visible(timeout=60000)
+    expect(page.locator("p.lead")).to_have_text(summary["text"], timeout=60000)
+    expect(page.locator("[role=status][data-tone=attention]", has_text=summary["coverage"])).to_be_visible()
+    check(True, f"demo /sources: {summary['text']} {summary['coverage']}")
+    read = page.locator("section#read")
+    for item in ("gmail", "mbcp-ht", "card-4817"):
+        line = next(i for g in engine.sources()["groups"] for i in g["items"] if i["id"] == item)["coverage"]["text"]
+        expect(read.locator(f"li[data-source={item}]").get_by_text(line, exact=True)).to_be_visible()
+    shots(page, "demo-sources")
+    card = read.locator("li[data-source=card-4817]")
+    card.get_by_role("button", name="Show payments").click()
+    expect(card.get_by_role("link", name="Needs your answer")).to_have_attribute(
+        "href", re.compile(r"/needs-you/?#nd_ikea_418$"), timeout=180000)
+    bank = read.locator("li[data-source=mbcp-ht]")
+    bank.get_by_role("button", name="Show payments").click()
+    for row in engine.source_payments("mbcp-ht")["items"]:
+        expect(bank.get_by_text(row["stateText"], exact=True).first).to_be_visible(timeout=180000)
+    check(True, "demo: a card and an account open to their payments, each with where it stands")
+    bank.scroll_into_view_if_needed()
+    shots(page, "demo-sources-expanded")
+    no_sideways_scroll(page, "demo /sources (a card open)")
+    hazel = page.locator("section#companies li[data-company=hazel-tree]")
+    expect(hazel.get_by_text("laura@hazeltree.pt, Millennium BCP •••• 0265, Card •••• 5530", exact=True)).to_be_visible()
+    box = page.get_by_role("textbox", name="What I’m not reading yet")
+    box.fill("ana@gmail.com")
+    page.get_by_role("button", name="Add it").click()
+    expect(page.get_by_text("ana@gmail.com is a Gmail address. Sign in with Google once and I read it.")).to_be_visible(timeout=180000)
+    form = page.get_by_role("form", name="Add a source")
+    expect(form.get_by_label("Email address")).to_have_value("ana@gmail.com")
+    box.fill("my Revolut card ending 4821")
+    page.get_by_role("button", name="Add it").click()
+    expect(page.get_by_text("Card •••• 4821 from Revolut. Check the company and tap Add.")).to_be_visible(timeout=60000)
+    expect(form.get_by_label("Last 4 digits")).to_have_value("4821")
+    expect(form.get_by_label("Issued by")).to_have_value("Revolut")
+    check(True, "demo: Something missing? understands an email address and a card in the browser")
+    shots(page, "demo-sources-missing")
+    no_sideways_scroll(page, "demo /sources (Something missing?)")
+    form.get_by_role("button", name="Cancel").click()
+    # The phone's "Add it on the web" arrives with what was typed: understood at once, the form filled in.
+    page.goto(f"http://{HOST}:{port}/Admin2Ai/sources/?missing=PT76%200007%200000%200012%203456%207892%203")
+    expect(page.get_by_text("PT76 •••• 8923 is a Novo Banco account. Check the company and tap Add.")).to_be_visible(timeout=180000)
+    form = page.get_by_role("form", name="Add a source")
+    expect(form.get_by_label("Bank")).to_have_value("Novo Banco")
+    expect(form.get_by_label("IBAN (optional)")).to_have_value("PT76000700000012345678923")
+    check(True, "demo: /sources?missing=<an IBAN> opens the bank form filled in")
+
+
 def demo() -> None:
     from playwright.sync_api import expect, sync_playwright
 
@@ -1032,7 +1216,8 @@ def demo() -> None:
             top = page.locator("header nav[aria-label=Main] a").evaluate_all(
                 "els => els.map(e => { const c = e.cloneNode(true); c.querySelectorAll('[class*=badge]').forEach(b => b.remove());"
                 " return c.textContent.replace(/\\s+/g, ' ').trim(); })")
-            check(top == ["Home", "Needs You", "Companies", "Activity", "Ask"], f"demo: the header has the five places {top}")
+            check(top == ["Home", "Needs You", "Companies", "Sources", "Activity"], f"demo: the header has the five places {top}")
+            demo_sources(page, port, expect)
             for path in ["/signin/", "/signup/"]:
                 r = urllib.request.Request(f"http://{HOST}:{port}/Admin2Ai{path}")
                 try:

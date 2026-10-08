@@ -3,7 +3,7 @@ import { ApiClient } from "../client";
 import { MemorySnapshotCache, SealedSnapshotCache } from "../cache";
 import { parseActivity, parseAskAnswer, parseHome, parseNeedsYou } from "../guards";
 import { normalizeBaseUrl, type HttpRequest, type HttpSend } from "../http";
-import { sampleActivity, sampleAnswer, sampleHome, sampleNeedsYou } from "../sample";
+import { sampleActivity, sampleAnswer, sampleHome, sampleNeedsYou, sampleSources } from "../sample";
 import type { RawFile } from "../../offline/journal";
 import { NodeCipher } from "../../offline/__tests__/fakes";
 
@@ -128,5 +128,35 @@ describe("sealed snapshot cache", () => {
     expect(Buffer.from(stored!).includes(Buffer.from("Hazel Tree"))).toBe(false);
     expect(await new SealedSnapshotCache(file, cipher).get("home")).toEqual({ savedAt: 5, data: sampleHome });
     expect(await new SealedSnapshotCache(file, new NodeCipher(new Uint8Array(32).fill(3))).get("home")).toBeNull();
+  });
+});
+
+describe("sources", () => {
+  const engine = {
+    groups: [{ id: "email", title: "Email", items: [{ id: "gmail", name: "laura@hazeltree.pt", company: "All companies", detail: "Gmail", status: "healthy", coverage: { text: "Read since 1 June · 6 invoices and receipts found · last read 09:12" } }] }],
+    companies: [],
+    summary: { text: "I read 1 mailbox for Hazel Tree.", coverage: "No payments to check yet.", tone: "attention" },
+  };
+
+  it("reads Sources live, and the labelled sample in the demo", async () => {
+    const res = await live(server({ "GET /api/sources": { status: 200, body: engine } }).send).getSources();
+    expect(res.source).toBe("live");
+    expect(res.data.groups[0]!.items[0]!.coverage).toBe("Read since 1 June · 6 invoices and receipts found · last read 09:12");
+    const demo = new ApiClient({ endpoint: { baseUrl: null, timeoutMs: 1 }, send: server({}).send });
+    expect(await demo.getSources()).toEqual({ data: sampleSources, source: "sample", asOf: null, reason: "demo" });
+  });
+
+  it("asks the server to understand what is missing, and never pretends", async () => {
+    const { calls, send } = server({
+      "POST /api/sources/understand": { status: 200, body: { kind: "email", fields: { address: "ana@gmail.com", provider: "google" }, message: "ana@gmail.com is a Gmail address." } },
+    });
+    expect(await live(send).understandSource("  ana@gmail.com ")).toEqual({
+      ok: true,
+      understood: { kind: "email", fields: { address: "ana@gmail.com", provider: "google" }, message: "ana@gmail.com is a Gmail address.", already: false },
+    });
+    expect(JSON.parse(calls[0]!.body as string)).toEqual({ text: "ana@gmail.com" });
+    expect(await live(server({}).send).understandSource("ana@gmail.com")).toEqual({ ok: false, reason: "unreachable" });
+    const demo = new ApiClient({ endpoint: { baseUrl: null, timeoutMs: 1 }, send: server({}).send });
+    expect(await demo.understandSource("ana@gmail.com")).toEqual({ ok: false, reason: "demo" });
   });
 });

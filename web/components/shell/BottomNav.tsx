@@ -11,9 +11,10 @@ const left: { href: string; label: string; icon: IconName }[] = [
   { href: "/", label: "Home", icon: "home" },
   { href: "/needs-you", label: "Needs You", icon: "needs" },
 ];
+/** Ask is the Chat button that floats above this bar on every page (and in the profile menu). */
 const right: { href: string; label: string; icon: IconName }[] = [
+  { href: "/sources", label: "Sources", icon: "link" },
   { href: "/activity", label: "Activity", icon: "activity" },
-  { href: "/ask", label: "Ask", icon: "ask" },
 ];
 
 export function BottomNav({ needsIds }: { needsIds: string[] }) {

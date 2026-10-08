@@ -37,8 +37,10 @@ import type {
   MonthKey,
   NeedsYouItem,
   Pipeline,
+  SourcePayments,
   SourcesData,
   SplitPart,
+  UnderstoodSource,
 } from "./types";
 
 const TIMEOUT_MS = 4000;
@@ -720,6 +722,41 @@ async function sourceWrite(path: string, body: unknown): Promise<SourceChange> {
 
 export function addSource(body: Record<string, unknown>): Promise<SourceChange> {
   return sourceWrite("/api/sources", body);
+}
+
+const isSourcePayments: Guard<SourcePayments> = (v) =>
+  isRecord(v) && typeof v.id === "string" && Array.isArray(v.items) && isRecord(v.coverage)
+    ? (v as unknown as SourcePayments)
+    : null;
+
+/**
+ * One bank account's or card's payments, each with where it stands. Engine or backend only (no sample): null
+ * with a plain message when they could not be read.
+ */
+export async function getSourcePayments(id: string): Promise<{ data: SourcePayments | null; message?: string }> {
+  const r = await call("GET", `/api/sources/${encodeURIComponent(id)}/payments`);
+  const data = r.ok ? isSourcePayments(r.body) : null;
+  if (data) return { data };
+  const m = r.body.message;
+  return { data: null, message: typeof m === "string" && m ? m : "I couldn’t load these payments. Try again in a moment." };
+}
+
+const KINDS: UnderstoodSource["kind"][] = ["email", "bank", "card", "files", "accounting", "portal", "ask"];
+
+/**
+ * "Something missing?": what the owner typed, understood as a place to read (POST /api/sources/understand). It only
+ * reads; nothing is added until the owner taps Add in the form it opens.
+ */
+export async function understandSource(text: string): Promise<{ ok: true; understood: UnderstoodSource } | { ok: false; message: string }> {
+  const r = await call("POST", "/api/sources/understand", { text });
+  const b = r.body;
+  if (r.ok && KINDS.includes(b.kind as UnderstoodSource["kind"]) && typeof b.message === "string") {
+    const fields = isRecord(b.fields)
+      ? Object.fromEntries(Object.entries(b.fields).filter((e): e is [string, string] => typeof e[1] === "string"))
+      : {};
+    return { ok: true, understood: { kind: b.kind as UnderstoodSource["kind"], fields, message: b.message, already: b.already === true } };
+  }
+  return { ok: false, message: typeof b.message === "string" && b.message ? b.message : "I couldn’t understand that. Try again." };
 }
 
 export function removeSource(id: string): Promise<SourceChange> {

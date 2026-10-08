@@ -1,0 +1,439 @@
+/* Sources (SourcesView): what I read, what it gave, and adding what is missing. */
+
+.verdict {
+  margin-bottom: var(--s-5);
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+.verdict > :global(.dot) {
+  margin-top: 8px;
+}
+
+.section {
+  display: grid;
+  gap: var(--s-2);
+  min-width: 0;
+}
+
+.sectionLead {
+  margin-top: calc(var(--s-1) * -1);
+}
+
+/* ---------- Something missing? ---------- */
+
+.ask {
+  display: flex;
+  gap: var(--s-1);
+}
+
+.ask :global(.input) {
+  flex: 1;
+  min-width: 0;
+}
+
+.ask :global(.btn) {
+  flex-shrink: 0;
+  min-height: 48px;
+}
+
+/* One line on computers; on phones two, so the whole hint shows, with the button below. */
+.askText {
+  height: 48px;
+  resize: none;
+  line-height: 24px;
+  overflow: hidden;
+  font-family: inherit;
+}
+
+.said {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s-1);
+  font-size: 15px;
+  color: var(--text);
+}
+
+.said svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--text-2);
+}
+
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--s-1);
+}
+
+.tile {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 56px;
+  padding: 10px 14px;
+  border-radius: var(--r-control);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  font-size: 15px;
+  font-weight: 500;
+  line-height: 1.25;
+  text-align: left;
+  transition: box-shadow var(--t-fast) var(--ease), background-color var(--t-fast) var(--ease);
+}
+
+.tile svg {
+  flex-shrink: 0;
+  color: var(--text-2);
+}
+
+.tile:hover {
+  box-shadow: var(--shadow-raised);
+}
+
+.tile[aria-pressed="true"] {
+  box-shadow: inset 0 0 0 1.5px var(--text);
+}
+
+/* ---------- What I read ---------- */
+
+.group {
+  display: grid;
+  gap: var(--s-1);
+  scroll-margin-top: calc(var(--header-h) + var(--s-2));
+}
+
+.groupTitle {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-1);
+  font-size: 14px;
+  font-weight: 550;
+  color: var(--text-2);
+}
+
+.source {
+  padding: var(--s-2) var(--s-3);
+}
+
+.sourceRow {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+}
+
+.sourceIcon {
+  flex-shrink: 0;
+  margin-top: 1px;
+  color: var(--text-2);
+}
+
+.sourceMain {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.sourceTop {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 2px var(--s-2);
+}
+
+.name {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.coverage {
+  margin-top: 4px;
+  font-size: 15px;
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.signIn {
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text-3);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s-1);
+  margin-top: var(--s-1);
+  padding-left: 34px;
+}
+
+.actions :global(.btn) {
+  min-height: 36px;
+  padding: 6px 12px;
+  font-size: 14px;
+}
+
+.push {
+  margin-left: auto;
+}
+
+.expand {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 6px 12px 6px 0;
+  border-radius: var(--r-control);
+  font-size: 14px;
+  font-weight: 550;
+  color: var(--text);
+}
+
+.expand svg {
+  color: var(--text-2);
+  transition: transform var(--t) var(--ease);
+}
+
+.expand[aria-expanded="true"] svg {
+  transform: rotate(180deg);
+}
+
+/* ---------- One account's payments ---------- */
+
+.payments {
+  margin-top: var(--s-1);
+  margin-left: 34px;
+  border-top: 1px solid var(--line);
+  animation: reveal var(--t-slow) var(--ease);
+}
+
+.payments > li + li {
+  border-top: 1px solid var(--line);
+}
+
+.payment {
+  display: grid;
+  gap: 2px;
+  padding: 12px 0;
+}
+
+.paymentMain {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--s-2);
+  border-radius: 6px;
+}
+
+.paymentMain:hover .paymentWho {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.paymentWho {
+  min-width: 0;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.paymentAmount {
+  flex-shrink: 0;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.paymentState {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--s-2);
+  font-size: 14px;
+  line-height: 1.45;
+  color: var(--text-2);
+}
+
+.stateLine {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.stateLine > :global(.dot) {
+  transform: translateY(-1px);
+}
+
+.paymentDate {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.paymentFor {
+  padding-left: 16px;
+  font-size: 13px;
+  color: var(--text-3);
+}
+
+.stateText {
+  color: var(--text);
+}
+
+.paymentsNote {
+  padding: 12px 0;
+  font-size: 14px;
+  color: var(--text-2);
+}
+
+/* ---------- Companies ---------- */
+
+.company {
+  display: grid;
+  gap: 4px;
+  padding: var(--s-2) var(--s-3);
+}
+
+.companyHead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px var(--s-1);
+}
+
+.companySources {
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+
+/* ---------- What I learned ---------- */
+
+.learned {
+  padding: 4px var(--s-3);
+}
+
+.learned > summary {
+  display: flex;
+  width: 100%;
+  min-height: 52px;
+  color: var(--text);
+}
+
+.learnedName {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.learnedName svg {
+  color: var(--text-2);
+}
+
+.learnedCount {
+  color: var(--text-2);
+  font-weight: 500;
+}
+
+.learnedBody {
+  display: grid;
+  gap: var(--s-1);
+  padding-bottom: var(--s-2);
+}
+
+.known {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s-2);
+  padding: 12px 0;
+}
+
+.known + .known {
+  border-top: 1px solid var(--line);
+}
+
+.knownMain {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.removeQuiet {
+  flex-shrink: 0;
+  min-height: 32px;
+  padding: 4px 10px;
+  border-radius: var(--r-control);
+  font-size: 14px;
+  color: var(--text-2);
+  transition: background-color var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
+}
+
+.removeQuiet:hover {
+  background: var(--surface-muted);
+  color: var(--text);
+}
+
+@keyframes reveal {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .payments {
+    animation: none;
+  }
+}
+
+/* ---------- Phones (one block per width, last in the file, so they always win) ---------- */
+
+@media (max-width: 599px) {
+  .ask {
+    flex-direction: column;
+  }
+
+  .ask .askText {
+    flex: none;
+    height: 72px;
+  }
+
+  .ask :global(.btn) {
+    align-self: flex-end;
+  }
+
+  .tiles {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 519px) {
+  .source {
+    padding: var(--s-2);
+  }
+
+  .actions {
+    padding-left: 0;
+  }
+
+  .payments {
+    margin-left: 0;
+  }
+
+  .company {
+    padding: var(--s-2);
+  }
+
+  .learned {
+    padding: 4px var(--s-2);
+  }
+}

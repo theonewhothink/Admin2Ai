@@ -2,6 +2,7 @@
  * Ask (§34-41): "Ask your business anything". Answers point to evidence; when
  * an answer has none, the screen says so (AI memory is never financial evidence).
  */
+import { useLocalSearchParams } from "expo-router";
 import { useState } from "react";
 import { KeyboardAvoidingView, Platform, Pressable, StyleSheet, TextInput, View } from "react-native";
 import type { AskAnswer } from "../api/types";
@@ -15,8 +16,15 @@ type State = { kind: "idle" } | { kind: "asking" } | { kind: "answer"; question:
 
 export function AskScreen() {
   const { api } = useServices();
-  const [question, setQuestion] = useState("");
+  const { q } = useLocalSearchParams<{ q?: string }>();
+  const [question, setQuestion] = useState(typeof q === "string" ? q : "");
   const [state, setState] = useState<State>({ kind: "idle" });
+  const [given, setGiven] = useState(q);
+  if (q !== given) {
+    // Opened with a question ready (Sources' "Ask about it"): it is put in the box, sent by the owner.
+    setGiven(q);
+    if (typeof q === "string" && q.trim()) setQuestion(q);
+  }
 
   const ask = async (q: string) => {
     const text = q.trim();

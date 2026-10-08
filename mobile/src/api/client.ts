@@ -7,6 +7,8 @@
  *   POST /api/needs-you/{id}/answer   { option_id, remember }
  *   GET  /api/activity
  *   POST /api/ask                     { question }
+ *   GET  /api/sources                 → what I read, how every payment stands, the companies
+ *   POST /api/sources/understand      { text } → { kind, fields, message } (only reads)
  *   GET  /api/auth/me                 → { user, tenant, role }
  *   POST /api/devices                 { expoPushToken, platform } → 204
  *   POST /api/devices/remove          { expoPushToken } → 204
@@ -24,9 +26,9 @@
  */
 import { authHeaders, isRecord, parseJson, type ApiEndpoint, type HttpSend } from "./http";
 import { MemorySnapshotCache, type SnapshotCache } from "./cache";
-import { parseActivity, parseAskAnswer, parseHome, parseNeedsYou } from "./guards";
-import { sampleActivity, sampleAnswer, sampleHome, sampleNeedsYou } from "./sample";
-import type { ActivityFeed, AskAnswer, HomeData, NeedsYouItem } from "./types";
+import { parseActivity, parseAskAnswer, parseHome, parseNeedsYou, parseSources, parseUnderstood } from "./guards";
+import { sampleActivity, sampleAnswer, sampleHome, sampleNeedsYou, sampleSources } from "./sample";
+import type { ActivityFeed, AskAnswer, HomeData, NeedsYouItem, SourcesData, UnderstoodSource } from "./types";
 
 export type DataSource = "live" | "cached" | "sample";
 
@@ -40,6 +42,9 @@ export interface Loaded<T> {
 }
 
 export type AskOutcome = { ok: true; answer: AskAnswer; source: "live" | "sample" } | { ok: false };
+
+/** "Something missing?": understood by the server, or why not ("demo": nothing to add to in the demo). */
+export type UnderstandOutcome = { ok: true; understood: UnderstoodSource } | { ok: false; reason: "demo" | "unreachable" };
 
 export interface Me {
   user: { id: string; email: string; name: string };
@@ -90,6 +95,20 @@ export class ApiClient {
 
   getActivity(): Promise<Loaded<ActivityFeed>> {
     return this.read("/api/activity", "activity", parseActivity, () => sampleActivity);
+  }
+
+  getSources(): Promise<Loaded<SourcesData>> {
+    return this.read("/api/sources", "sources", parseSources, () => sampleSources);
+  }
+
+  /** What the owner typed in "Something missing?", understood. It only reads: nothing is added. */
+  async understandSource(text: string): Promise<UnderstandOutcome> {
+    const t = text.trim();
+    if (this.isDemo) return { ok: false, reason: "demo" };
+    if (!t) return { ok: false, reason: "unreachable" };
+    const res = await this.request("POST", "/api/sources/understand", { text: t });
+    const understood = res && res.status >= 200 && res.status < 300 ? parseUnderstood(parseJson(res.text)) : null;
+    return understood ? { ok: true, understood } : { ok: false, reason: "unreachable" };
   }
 
   /** The signed-in owner, or null (demo mode, offline, or signed out). */

@@ -135,3 +135,53 @@ export interface AskAnswer {
   /** Answers point at evidence; AI memory is never financial evidence (§34-41). */
   evidence: EvidenceLink[];
 }
+
+/* ---------- Sources (GET /api/sources, POST /api/sources/understand) ---------- */
+
+export type SourceStatus = "healthy" | "stale" | "not_connected" | "known" | "hold";
+
+export interface SourceItem {
+  id: string;
+  name: string;
+  company: string;
+  detail: string;
+  status: SourceStatus;
+  /** One plain line about what it gave: "6 payments since 1 September: all have their invoice." */
+  coverage?: string;
+}
+
+export interface SourceGroup {
+  id: string;
+  title: string;
+  items: SourceItem[];
+}
+
+export interface SourcesCompany {
+  id: string;
+  name: string;
+  /** The company's country's name for its tax number ("NIF"). */
+  taxIdLabel: string;
+  taxId: string;
+  sources: string[];
+}
+
+export interface SourcesData {
+  /** "I read 1 mailbox, 3 bank accounts and 4 cards for your 3 companies." */
+  summary: string;
+  /** "I checked all 14 payments since 1 September: …" (a connection that stopped is said first). */
+  coverage: string;
+  /** Green only when every connection is read and nothing is open. */
+  tone: "good" | "attention";
+  groups: SourceGroup[];
+  companies: SourcesCompany[];
+}
+
+export type UnderstoodKind = "email" | "bank" | "card" | "files" | "accounting" | "portal" | "ask";
+
+/** What the owner typed in "Something missing?", understood (never added by itself). */
+export interface UnderstoodSource {
+  kind: UnderstoodKind;
+  message: string;
+  fields: Record<string, string>;
+  already: boolean;
+}

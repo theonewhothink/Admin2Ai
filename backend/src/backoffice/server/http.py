@@ -126,7 +126,7 @@ _ROUTE_WORDS = frozenset(
     "readiness acceptance cost-centers allocate obligations transactions expected-invoices not-coming statement "
     "invitations accept employee employees card-payments expense-claims profile mailboxes seen automation manager "
     "outlets sensitive access-log billing checkout portal webhook identity accounting webhooks gmail microsoft "
-    "lifecycle portals code reading".split())
+    "lifecycle portals code reading understand payments".split())
 # One client company of any business: /api/accountant/clients/<tenant id>~<company id>[/…] (§28, §29).
 _CLIENT_REF = re.compile(r"/api/accountant/clients/(?P<tenant>[A-Za-z0-9][A-Za-z0-9_.-]{0,127})~(?P<company>[^/~]+)"
                          r"(?P<rest>/.*)?")

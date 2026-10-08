@@ -78,6 +78,13 @@ def snapshot() -> dict[str, dict[str, Any]]:
         path = f"/api/accountant/clients/{client['id']}"
         replies[path] = _reply(service, path)
 
+    # Sources: each bank account's and card's payments, shown when the owner opens one.
+    for group in replies["/api/sources"]["body"].get("groups", []):
+        if group.get("id") in ("banks", "cards"):
+            for item in group.get("items", []):
+                path = f"/api/sources/{item['id']}/payments"
+                replies[path] = _reply(service, path)
+
     # Only successful replies: anything else is left to the engine.
     return {path: r for path, r in sorted(replies.items()) if r["status"] == 200}
 

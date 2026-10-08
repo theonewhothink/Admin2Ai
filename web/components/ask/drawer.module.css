@@ -2,15 +2,17 @@
 
 .launcher {
   position: fixed;
-  right: var(--s-3);
-  bottom: var(--s-3);
+  right: var(--gutter);
+  /* Phones: just above the bottom bar, never over it. */
+  bottom: calc(var(--bottom-nav-h) + env(safe-area-inset-bottom) + var(--s-2));
   z-index: 45;
-  /* Phones have the Ask tab in the bottom bar. */
-  display: none;
+  display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: var(--s-1);
-  min-height: 48px;
-  padding: 0 var(--s-2) 0 14px;
+  width: 52px;
+  height: 52px;
+  padding: 0;
   border: 0;
   border-radius: var(--r-pill);
   background: var(--ink);
@@ -68,9 +70,32 @@
   padding: var(--s-2) var(--gutter) calc(var(--s-2) + env(safe-area-inset-bottom));
 }
 
+/* Phones: the round button says "Chat" to screen readers only. */
+.launcherLabel {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+
 @media (min-width: 900px) {
   .launcher {
-    display: inline-flex;
+    right: var(--s-3);
+    bottom: var(--s-3);
+    width: auto;
+    height: auto;
+    min-height: 48px;
+    padding: 0 var(--s-2) 0 14px;
+  }
+
+  .launcherLabel {
+    position: static;
+    width: auto;
+    height: auto;
+    overflow: visible;
+    clip: auto;
   }
 
   .panel {

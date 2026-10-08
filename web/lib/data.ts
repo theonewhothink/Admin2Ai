@@ -744,7 +744,14 @@ export const sources: SourcesData = {
           "company": "All companies",
           "detail": "Gmail",
           "status": "healthy",
-          "lastSyncedAt": "2026-10-02T09:12:00+01:00"
+          "lastSyncedAt": "2026-10-02T09:12:00+01:00",
+          "coverage": {
+            "text": "Read since 1 June · 6 invoices and receipts found · last read 09:12",
+            "counts": {
+              "documents": 6
+            }
+          },
+          "connectionId": "gmail"
         }
       ]
     },
@@ -758,21 +765,57 @@ export const sources: SourcesData = {
           "name": "Millennium BCP •••• 0265",
           "company": "Hazel Tree",
           "detail": "PT50 •••• 0265",
-          "status": "healthy"
+          "status": "healthy",
+          "connectionId": "millennium",
+          "coverage": {
+            "text": "3 of 6 payments since 1 September have their invoice or proof; 2 need none and I'm looking for 1.",
+            "counts": {
+              "payments": 6,
+              "proven": 3,
+              "notNeeded": 2,
+              "looking": 1,
+              "needsYou": 0,
+              "personal": 0
+            }
+          }
         },
         {
           "id": "mbcp-cc",
           "name": "Millennium BCP •••• 3382",
           "company": "Company C",
           "detail": "PT50 •••• 3382",
-          "status": "healthy"
+          "status": "healthy",
+          "connectionId": "millennium",
+          "coverage": {
+            "text": "2 payments since 1 September: none needs an invoice.",
+            "counts": {
+              "payments": 2,
+              "proven": 0,
+              "notNeeded": 2,
+              "looking": 0,
+              "needsYou": 0,
+              "personal": 0
+            }
+          }
         },
         {
           "id": "cgd-b",
           "name": "Caixa Geral de Depósitos •••• 3007",
           "company": "Company B",
           "detail": "PT50 •••• 3007",
-          "status": "healthy"
+          "status": "healthy",
+          "connectionId": "cgd",
+          "coverage": {
+            "text": "1 of 2 payments since 1 September has its invoice; 1 needs none.",
+            "counts": {
+              "payments": 2,
+              "proven": 1,
+              "notNeeded": 1,
+              "looking": 0,
+              "needsYou": 0,
+              "personal": 0
+            }
+          }
         }
       ]
     },
@@ -786,28 +829,76 @@ export const sources: SourcesData = {
           "name": "Card •••• 5530",
           "company": "Hazel Tree",
           "detail": "Millennium BCP",
-          "status": "healthy"
+          "status": "healthy",
+          "connectionId": "millennium",
+          "coverage": {
+            "text": "1 payment since 1 September: it has its invoice.",
+            "counts": {
+              "payments": 1,
+              "proven": 1,
+              "notNeeded": 0,
+              "looking": 0,
+              "needsYou": 0,
+              "personal": 0
+            }
+          }
         },
         {
           "id": "card-7702",
           "name": "Card •••• 7702",
           "company": "Company B",
           "detail": "Caixa Geral de Depósitos",
-          "status": "healthy"
+          "status": "healthy",
+          "connectionId": "cgd",
+          "coverage": {
+            "text": "1 payment since 1 September: it has its invoice.",
+            "counts": {
+              "payments": 1,
+              "proven": 1,
+              "notNeeded": 0,
+              "looking": 0,
+              "needsYou": 0,
+              "personal": 0
+            }
+          }
         },
         {
           "id": "card-2291",
           "name": "Card •••• 2291",
           "company": "Company C",
           "detail": "Millennium BCP",
-          "status": "healthy"
+          "status": "healthy",
+          "connectionId": "millennium",
+          "coverage": {
+            "text": "1 payment since 1 September: it has its invoice.",
+            "counts": {
+              "payments": 1,
+              "proven": 1,
+              "notNeeded": 0,
+              "looking": 0,
+              "needsYou": 0,
+              "personal": 0
+            }
+          }
         },
         {
           "id": "card-4817",
           "name": "Card •••• 4817",
           "company": "Company C",
           "detail": "Millennium BCP · personal card used for business",
-          "status": "healthy"
+          "status": "healthy",
+          "connectionId": "millennium",
+          "coverage": {
+            "text": "1 payment since 1 September: it needs your answer.",
+            "counts": {
+              "payments": 1,
+              "proven": 0,
+              "notNeeded": 0,
+              "looking": 0,
+              "needsYou": 1,
+              "personal": 0
+            }
+          }
         }
       ]
     },
@@ -822,7 +913,15 @@ export const sources: SourcesData = {
           "company": "All companies",
           "detail": "marc@contabilidadevidal.pt",
           "status": "healthy",
-          "lastSyncedAt": "2026-10-01T18:20:00+01:00"
+          "lastSyncedAt": "2026-10-01T18:20:00+01:00",
+          "coverage": {
+            "text": "2 questions from them: 1 answered, 1 open · last in touch 18:20 yesterday",
+            "counts": {
+              "questions": 2,
+              "answered": 1
+            }
+          },
+          "connectionId": "accountant"
         }
       ]
     },
@@ -1020,15 +1119,90 @@ export const sources: SourcesData = {
   "companies": [
     {
       "id": "hazel-tree",
-      "name": "Hazel Tree"
+      "name": "Hazel Tree",
+      "taxIdLabel": "NIF",
+      "taxId": "516123459",
+      "sources": [
+        {
+          "id": "gmail",
+          "kind": "email",
+          "name": "laura@hazeltree.pt"
+        },
+        {
+          "id": "mbcp-ht",
+          "kind": "bank",
+          "name": "Millennium BCP •••• 0265"
+        },
+        {
+          "id": "card-5530",
+          "kind": "card",
+          "name": "Card •••• 5530"
+        }
+      ]
     },
     {
       "id": "company-b",
-      "name": "Company B"
+      "name": "Company B",
+      "taxIdLabel": "NIF",
+      "taxId": "514987650",
+      "sources": [
+        {
+          "id": "gmail",
+          "kind": "email",
+          "name": "laura@hazeltree.pt"
+        },
+        {
+          "id": "cgd-b",
+          "kind": "bank",
+          "name": "Caixa Geral de Depósitos •••• 3007"
+        },
+        {
+          "id": "card-7702",
+          "kind": "card",
+          "name": "Card •••• 7702"
+        }
+      ]
     },
     {
       "id": "company-c",
-      "name": "Company C"
+      "name": "Company C",
+      "taxIdLabel": "NIF",
+      "taxId": "517003210",
+      "sources": [
+        {
+          "id": "gmail",
+          "kind": "email",
+          "name": "laura@hazeltree.pt"
+        },
+        {
+          "id": "mbcp-cc",
+          "kind": "bank",
+          "name": "Millennium BCP •••• 3382"
+        },
+        {
+          "id": "card-2291",
+          "kind": "card",
+          "name": "Card •••• 2291"
+        },
+        {
+          "id": "card-4817",
+          "kind": "card",
+          "name": "Card •••• 4817"
+        }
+      ]
     }
-  ]
+  ],
+  "summary": {
+    "text": "I read 1 mailbox, 3 bank accounts and 4 cards for your 3 companies.",
+    "coverage": "I checked all 14 payments since 1 September: 7 have their invoice or proof, 5 need none, 1 I'm still looking for and 1 needs your answer.",
+    "tone": "attention",
+    "counts": {
+      "payments": 14,
+      "proven": 7,
+      "notNeeded": 5,
+      "looking": 1,
+      "needsYou": 1,
+      "personal": 0
+    }
+  }
 };

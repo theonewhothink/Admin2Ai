@@ -171,6 +171,26 @@ export const copy = {
     demo: "This is the demo. Nothing leaves this phone.",
   },
 
+  sources: {
+    title: "Sources",
+    whatIRead: "What I read",
+    nothingRead: "Nothing is read yet. Connect your email and bank on the web.",
+    read: "What I read",
+    companies: "Companies I cover",
+    nothingForCompany: "Nothing is read for it yet.",
+    notConnected: "Not connected",
+    onHold: "Payment on hold",
+    missing: "Something missing?",
+    missingPlaceholder: "An email address, a bank, a card…",
+    missingHint: "Tell me what I'm not reading yet.",
+    understand: "Add it",
+    finishOnWeb: "Add it on the web",
+    finishOnWebHint: "Opens Sources on the web with this filled in.",
+    askInstead: "Ask about it",
+    demo: "This is the demo, so nothing can be added here.",
+    offline: "I can't check right now. Try again when you're online.",
+  },
+
   connections: {
     title: "Connections",
     healthy: "Connected",

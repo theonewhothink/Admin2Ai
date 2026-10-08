@@ -22,10 +22,10 @@ interface MenuLink {
 /** Everything that is not one of the five top-level places (spec §34): one tap to open, one to go. */
 const business: MenuLink[] = [
   { href: "/companies", label: "Your businesses", icon: "building", phoneOnly: true },
+  { href: "/ask", label: "Ask", icon: "ask" },
   { href: "/documents", label: "Documents", icon: "document" },
   { href: "/deadlines", label: "Deadlines", icon: "clock" },
   { href: "/settings/people", label: "People and expenses", icon: "users" },
-  { href: "/sources", label: "Sources", icon: "link" },
   { href: "/diagram", label: "Diagram", icon: "flow" },
 ];
 

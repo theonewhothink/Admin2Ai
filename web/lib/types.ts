@@ -450,6 +450,22 @@ export interface AccountantInvitation {
 
 export type SourceStatus = "healthy" | "stale" | "not_connected" | "known" | "hold";
 
+/** How many of a bank account's or card's payments are in each state (they always add up to `payments`). */
+export interface PaymentCounts {
+  payments: number;
+  proven: number;
+  notNeeded: number;
+  looking: number;
+  needsYou: number;
+  personal: number;
+}
+
+/** One plain line about what a source gave ("6 payments since 1 September: all have their invoice."). */
+export interface SourceCoverage {
+  text: string;
+  counts?: Partial<PaymentCounts> & Record<string, number>;
+}
+
 export interface SourceItem {
   id: string;
   name: string;
@@ -461,6 +477,9 @@ export interface SourceItem {
   foundIn?: string;
   renewsOn?: string | null;
   signIn?: string;
+  coverage?: SourceCoverage;
+  /** The connection that reads it (Reconnect goes there): the mailbox itself, or a card's bank. */
+  connectionId?: string;
 }
 
 export interface SourceGroup {
@@ -470,9 +489,64 @@ export interface SourceGroup {
   items: SourceItem[];
 }
 
+export interface SourcesSummary {
+  /** "I read 1 mailbox, 3 bank accounts and 4 cards for your 3 companies." */
+  text: string;
+  /** "I checked all 14 payments since 1 September: …" (a connection that stopped is said first). */
+  coverage: string;
+  /** Green only when every connection is read and nothing is open. */
+  tone: "good" | "attention";
+  counts?: PaymentCounts;
+}
+
+export interface SourcesCompany {
+  id: string;
+  name: string;
+  /** The company's country's name for its tax number ("NIF"). */
+  taxIdLabel?: string;
+  taxId?: string;
+  sources?: { id: string; kind: string; name: string }[];
+}
+
 export interface SourcesData {
   groups: SourceGroup[];
-  companies: { id: string; name: string }[];
+  companies: SourcesCompany[];
+  summary?: SourcesSummary;
+}
+
+export type PaymentState = "proven" | "not_needed" | "looking" | "needs_you" | "personal";
+
+/** GET /api/sources/{id}/payments: one bank account's or card's payments, newest first. */
+export interface SourcePayment {
+  id: string;
+  date: string;
+  merchant: string;
+  amount: number;
+  currency: string;
+  direction: "in" | "out";
+  companyName?: string;
+  state: PaymentState;
+  /** "Invoice found", "No invoice needed: bank charge", "Looking for the invoice since 22 September"… */
+  stateText: string;
+  /** Where the state leads: the payment's page, or the question in Needs you. */
+  href: string;
+  /** The payment's own page. */
+  detailHref: string;
+}
+
+export interface SourcePayments {
+  id: string;
+  name: string;
+  coverage: SourceCoverage;
+  items: SourcePayment[];
+}
+
+/** POST /api/sources/understand: what the owner typed in "Something missing?", understood. */
+export interface UnderstoodSource {
+  kind: "email" | "bank" | "card" | "files" | "accounting" | "portal" | "ask";
+  fields: Record<string, string>;
+  message: string;
+  already?: boolean;
 }
 
 /* ---------- Diagram (GET /api/pipeline, backend/src/backoffice/pipeline.py) ---------- */

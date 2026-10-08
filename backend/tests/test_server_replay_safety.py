@@ -287,6 +287,8 @@ def _get_paths(h: Any, token: str, seen: dict[str, Any]) -> list[str]:
     paths += ["/api/settings/mailboxes", "/api/onboarding", "/api/settings/automation", "/api/settings/reading"]
     paths += ["/api/documents/access-log"]  # who opened sensitive documents (backoffice.sensitivity)
     paths += ["/api/billing"]  # the plan, usage and limits (backoffice.billing)
+    # Each bank account's and card's payments, with where each stands (Sources).
+    paths += [f"/api/sources/{a}/payments" for a in seen["accounts"]]
     return paths
 
 
@@ -318,8 +320,11 @@ def test_every_read_leaves_the_tenant_unchanged(tmp_path: Path) -> None:
     for name, args in READ_ONLY_TOOLS.items():
         res = h.client.post("/api/chat/tool", json={"name": name, "input": args}, headers=H)
         assert res.status_code == 200 and not res.json().get("isError"), (name, res.text)
+    read_only_bodies = {"/api/documents/export": {"from": "2026-09-01", "to": "2026-09-30"},
+                        "/api/sources/understand": {"text": "my Revolut card ending 4821"}}
+    assert set(read_only_bodies) == set(READ_ONLY_POSTS)
     for p in sorted(READ_ONLY_POSTS):
-        res = h.client.post(p, json={"from": "2026-09-01", "to": "2026-09-30"}, headers=H)
+        res = h.client.post(p, json=read_only_bodies[p], headers=H)
         assert res.status_code == 200, (p, res.text)
     key = seen["api_key"]
     for p in ("/api/v1/documents", "/api/v1/export?from=2026-09-01&to=2026-09-30",
