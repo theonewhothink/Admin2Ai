@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Collection, Mapping, Sequence
+from typing import Any
 from datetime import date
 from decimal import Decimal
 
@@ -148,6 +149,12 @@ class PortugalPack:
     def supplier_letters(self) -> pt_letters.PortugueseLetters:
         """Requests to suppliers in Portuguese (:mod:`.letters`)."""
         return pt_letters.LETTERS
+
+    def invoice_sites(self) -> tuple[Any, ...]:
+        """Portuguese suppliers' invoice websites (:mod:`.invoice_sites`)."""
+        from . import invoice_sites as pt_invoice_sites  # lazy: it imports the core's site description
+
+        return pt_invoice_sites.SITES
 
     def bank_wording(self) -> BankWording:
         """How Portuguese bank statements word taxes, fees, salaries, loans, grants and the tourist tax."""

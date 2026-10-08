@@ -18,9 +18,10 @@ website (``PortalChanged``), which flags it for the AI-browser fallback, never a
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from urllib.parse import urlsplit
 
-__all__ = ["EDP", "SITES", "InvoicePageSite", "host_of", "on_host", "site_for_host", "site_for_key", "site_for_name"]
+__all__ = ["InvoicePageSite", "host_of", "on_host", "site_for_host", "site_for_key", "site_for_name", "sites"]
 
 
 @dataclass(frozen=True)
@@ -55,21 +56,35 @@ class InvoicePageSite:
     verified: bool = False  # checked against a real customer account
 
 
-# EDP (electricity and gas, Portugal): the customer area's sign-in, its SMS code and the invoice list per year.
-# Written against recorded pages that imitate the area's structure; not yet checked with a real EDP account.
-EDP = InvoicePageSite(
-    key="edp_pt", name="EDP", hosts=("edp.pt",), names=("EDP", "EDP Comercial", "EDP Energia"),
-    sign_in_url="https://www.edp.pt/area-cliente/entrar",
-    sign_in_form="form#form-login", username_field="email", password_field="password",
-    signed_in="main[data-area-cliente]",
-    code_form="form#form-codigo", code_field="codigo", code_channel="sms", code_expired=".codigo-expirado",
-    invoices_url="https://www.edp.pt/area-cliente/faturas?ano={year}",
-    invoice_row="table.lista-faturas > tbody > tr", row_id="data-fatura-id",
-    number="td.numero", issue_date="td.data-emissao", amount="td.valor", download="a.descarregar-pdf",
-    period="td.periodo", no_invoices=".sem-faturas", next_page="nav.paginacao a[rel=next]",
-)
+def sites() -> tuple[InvoicePageSite, ...]:
+    """Every company pack's supplier websites (a Portuguese utility lives in the Portugal pack), in country order."""
+    return _sites()
 
-SITES: tuple[InvoicePageSite, ...] = (EDP,)
+
+@lru_cache(maxsize=1)
+def _sites() -> tuple[InvoicePageSite, ...]:
+    from backoffice.countries.base import CompanyPack, UnknownCountryError, available_countries, get_pack
+
+    out: list[InvoicePageSite] = []
+    for country in available_countries():
+        try:
+            pack = get_pack(country)
+        except UnknownCountryError:
+            continue
+        if isinstance(pack, CompanyPack):
+            out.extend(pack.invoice_sites())
+    return tuple(out)
+
+
+def __getattr__(name: str) -> object:
+    """``SITES`` (every pack's sites) and a site by its pack's name (``EDP``), read on first use."""
+    if name == "SITES":
+        return sites()
+    found = next((s for s in sites() if s.key.split("_", 1)[0].upper() == name), None)
+    if found is None:
+        raise AttributeError(name)
+    return found
+
 
 
 def host_of(url: str) -> str | None:
@@ -94,12 +109,12 @@ def on_host(host: str | None, domains: tuple[str, ...] | list[str]) -> str | Non
 
 
 def site_for_key(key: str | None) -> InvoicePageSite | None:
-    return next((s for s in SITES if s.key == key), None) if key else None
+    return next((s for s in sites() if s.key == key), None) if key else None
 
 
 def site_for_host(host: str | None) -> InvoicePageSite | None:
     """The known supplier website ``host`` is part of."""
-    return next((s for s in SITES if on_host(host, s.hosts)), None)
+    return next((s for s in sites() if on_host(host, s.hosts)), None)
 
 
 def site_for_name(name: str | None) -> InvoicePageSite | None:
@@ -107,4 +122,4 @@ def site_for_name(name: str | None) -> InvoicePageSite | None:
     wanted = " ".join((name or "").casefold().split())
     if not wanted:
         return None
-    return next((s for s in SITES if wanted in {" ".join(n.casefold().split()) for n in s.names}), None)
+    return next((s for s in sites() if wanted in {" ".join(n.casefold().split()) for n in s.names}), None)

@@ -2,7 +2,7 @@
 
 A customer area is the same everywhere: a sign-in form (often with a hidden anti-forgery field), sometimes a
 one-time code sent by SMS, then a page listing the invoices, one row each, with the number, the date, the total
-and a link to the original PDF. :class:`InvoicePagePortal` reads that, and :data:`backoffice.invoice_sites.SITES`
+and a link to the original PDF. :class:`InvoicePagePortal` reads that, and :func:`backoffice.invoice_sites.sites`
 says where each supplier keeps it (addresses and CSS selectors). :func:`site_adapter` makes the registered adapter
 class of one site (``EdpPortal`` for EDP), so the server's portal worker builds it by its key like any adapter.
 
@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from urllib.parse import urljoin, urlsplit
 
 from backoffice.domain.models import utcnow
-from backoffice.invoice_sites import SITES, InvoicePageSite, on_host
+from backoffice.invoice_sites import InvoicePageSite, on_host, sites
 
 from .base import (
     AuthResult,
@@ -296,7 +296,7 @@ class InvoicePagePortal(SupplierPortalConnector):
                 raise PortalError(f"http_{response.status_code}")
             raise PortalChanged("download_not_a_pdf")
         name = _filename(response.headers.get("content-disposition"),
-                         re.sub(r"[^\w-]+", "_", ref.invoice_number or ref.portal_id).strip("_") or "fatura")
+                         re.sub(r"[^\w-]+", "_", ref.invoice_number or ref.portal_id).strip("_") or "invoice")
         return PortalDocument(ref, data, "application/pdf", name, retrieved_at=self._clock(), source_url=url)
 
     def retrieve_statement(self, session: PortalSession, period_start: date, period_end: date) -> None:
@@ -311,5 +311,5 @@ def site_adapter(site: InvoicePageSite) -> type[InvoicePagePortal]:
         "__doc__": f"{site.name}'s customer area (backoffice.invoice_sites).", "__module__": __name__})
 
 
-ADAPTERS: dict[str, type[InvoicePagePortal]] = {s.key: register_portal(site_adapter(s)) for s in SITES}
+ADAPTERS: dict[str, type[InvoicePagePortal]] = {s.key: register_portal(site_adapter(s)) for s in sites()}
 EdpPortal = ADAPTERS["edp_pt"]

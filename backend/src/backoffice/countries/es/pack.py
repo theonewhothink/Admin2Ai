@@ -114,6 +114,10 @@ class SpainPack:
         """None yet: requests to Spanish suppliers are written in English."""
         return None
 
+    def invoice_sites(self) -> tuple[()]:
+        """None yet: no Spanish supplier's website is described."""
+        return ()
+
     def bank_wording(self) -> BankWording:
         """How Spanish bank statements word taxes, fees, salaries, loans, grants and local tourist taxes."""
         return banking_words.BANK_WORDING

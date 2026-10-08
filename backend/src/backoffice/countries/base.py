@@ -436,6 +436,7 @@ class CompanyPack(CountryPack, Protocol):
     ``vocabulary`` is the country's own words for the core's other readers and writers (till reports, fraud
     phrases, the owner's chat, bank lines ...), by concept: see :mod:`backoffice.countries.wording`.
     ``supplier_letters`` words the core's requests to suppliers in the country's language (None: English).
+    ``invoice_sites`` are the country's suppliers' invoice websites the back office can sign in to.
     ``tax_id_hint`` names the company's tax number and its length for the owner ("NIF. It has 9 digits.").
     """
 
@@ -450,6 +451,10 @@ class CompanyPack(CountryPack, Protocol):
     def supplier_letters(self) -> Any:
         """How a request to a supplier is worded in the country's language (backoffice.missing.chase), or None
         when the core's English is used."""
+        ...
+
+    def invoice_sites(self) -> tuple[Any, ...]:
+        """The country's suppliers' invoice websites (backoffice.invoice_sites.InvoicePageSite), or ``()``."""
         ...
 
     def read_text(

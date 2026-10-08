@@ -599,8 +599,9 @@ SECTIONS: tuple[tuple[str, str, tuple[Check, ...]], ...] = (
            T + "test_api_service.py::test_home_matches_contract_and_is_computed"),
     )),
     ("P", "Country packs", (
-        _c("P1", "Core remains jurisdiction-neutral.", "pass", DEMO, 'Some owner wording in the core is still Portuguese (fraud phrases, tills, understanding).',
+        _c("P1", "Core remains jurisdiction-neutral.", "pass", DEMO, 'Words Portuguese shares with Spanish stay in the core until the Spain pack holds its own.',
            T + "test_acceptance_spain_managers_sensitivity.py::test_the_core_goes_through_each_companys_pack",
+           T + "test_country_pack_isolation.py::test_no_core_module_holds_portuguese_words_outside_the_portugal_pack",
            T + "test_acceptance_audit_fixes.py::test_no_module_outside_the_country_packs_imports_the_portuguese_or_spanish_pack_directly"),
         _c("P2", "Portugal rules isolated in Portugal pack.", "pass", DEMO,
            "Portugal's words, letters and rules are read through its pack; a guard test finds none left in core "
